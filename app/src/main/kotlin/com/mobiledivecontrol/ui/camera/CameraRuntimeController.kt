@@ -1167,7 +1167,7 @@ class CameraRuntimeController(
                 return
             }
             val now = SystemClock.elapsedRealtime()
-            if (now - lastFocusAssistFrameAtMs < 120L) {
+            if (now - lastFocusAssistFrameAtMs < 80L) {
                 return
             }
             lastFocusAssistFrameAtMs = now
@@ -1177,6 +1177,11 @@ class CameraRuntimeController(
         }
     }
 
+    /**
+     * Create a focus peaking overlay bitmap.
+     * Uses Sobel edge detection on the luminance plane to find sharp edges,
+     * then draws them as bright green outlines (like professional focus assist).
+     */
     private fun createFocusAssistBitmap(image: ImageProxy): Bitmap? {
         val lumaPlane = image.planes.firstOrNull() ?: return null
         val buffer = lumaPlane.buffer
@@ -1185,61 +1190,70 @@ class CameraRuntimeController(
 
         val width = image.width
         val height = image.height
-        val sampleStep = 1
-        val outputWidth = (width / sampleStep).coerceAtLeast(1)
-        val outputHeight = (height / sampleStep).coerceAtLeast(1)
-        val gradients = IntArray(outputWidth * outputHeight)
-        val pixels = IntArray(outputWidth * outputHeight)
         val rowStride = lumaPlane.rowStride
         val pixelStride = lumaPlane.pixelStride
-        var gradientSum = 0L
-        var gradientCount = 0
-        var maxGradient = 0
 
-        for (y in 1 until outputHeight - 1) {
-            for (x in 1 until outputWidth - 1) {
-                val sourceX = x * sampleStep
-                val sourceY = y * sampleStep
-                val left = lumaAt(bytes, rowStride, pixelStride, sourceX - sampleStep, sourceY)
-                val right = lumaAt(bytes, rowStride, pixelStride, sourceX + sampleStep, sourceY)
-                val up = lumaAt(bytes, rowStride, pixelStride, sourceX, sourceY - sampleStep)
-                val down = lumaAt(bytes, rowStride, pixelStride, sourceX, sourceY + sampleStep)
-                val edgeMagnitude = kotlin.math.abs(right - left) + kotlin.math.abs(down - up)
-                gradients[y * outputWidth + x] = edgeMagnitude
-                gradientSum += edgeMagnitude.toLong()
-                gradientCount += 1
-                maxGradient = max(maxGradient, edgeMagnitude)
+        // Downsample for performance — every 2nd pixel
+        val step = 2
+        val outW = width / step
+        val outH = height / step
+        val gradients = IntArray(outW * outH)
+        val pixels = IntArray(outW * outH)
+        var maxGrad = 0
+
+        // Compute Sobel gradient magnitude at each downsampled pixel
+        for (oy in 1 until outH - 1) {
+            for (ox in 1 until outW - 1) {
+                val sx = ox * step
+                val sy = oy * step
+                // 3x3 Sobel kernel for horizontal and vertical
+                val tl = lumaAt(bytes, rowStride, pixelStride, sx - step, sy - step)
+                val tc = lumaAt(bytes, rowStride, pixelStride, sx, sy - step)
+                val tr = lumaAt(bytes, rowStride, pixelStride, sx + step, sy - step)
+                val ml = lumaAt(bytes, rowStride, pixelStride, sx - step, sy)
+                val mr = lumaAt(bytes, rowStride, pixelStride, sx + step, sy)
+                val bl = lumaAt(bytes, rowStride, pixelStride, sx - step, sy + step)
+                val bc = lumaAt(bytes, rowStride, pixelStride, sx, sy + step)
+                val br = lumaAt(bytes, rowStride, pixelStride, sx + step, sy + step)
+
+                val gx = (-tl - 2 * ml - bl) + (tr + 2 * mr + br)
+                val gy = (-tl - 2 * tc - tr) + (bl + 2 * bc + br)
+                val mag = kotlin.math.abs(gx) + kotlin.math.abs(gy)
+                gradients[oy * outW + ox] = mag
+                if (mag > maxGrad) maxGrad = mag
             }
         }
 
-        val adaptiveThreshold = max(
-            68,
-            ((gradientSum / gradientCount.coerceAtLeast(1).toDouble()) * 3.1).roundToInt(),
-        )
-        for (y in 1 until outputHeight - 1) {
-            for (x in 1 until outputWidth - 1) {
-                val index = y * outputWidth + x
-                val edgeMagnitude = gradients[index]
-                if (edgeMagnitude <= adaptiveThreshold) {
-                    continue
+        // Adaptive threshold: edges must be significantly above the noise floor
+        // Use a fixed lower threshold that catches real edges but not noise
+        val threshold = max(40, maxGrad / 5)
+        val peakColor = Color.argb(200, 0, 255, 0)       // Bright green, high alpha
+        val midColor = Color.argb(140, 0, 230, 40)        // Slightly dimmer green
+
+        for (oy in 1 until outH - 1) {
+            for (ox in 1 until outW - 1) {
+                val idx = oy * outW + ox
+                val mag = gradients[idx]
+                if (mag <= threshold) continue
+
+                // Compute a brightness factor based on edge strength
+                val strength = ((mag - threshold).toFloat() / (maxGrad - threshold).coerceAtLeast(1)).coerceIn(0f, 1f)
+
+                if (strength > 0.3f) {
+                    // Strong edge — bright green
+                    pixels[idx] = peakColor
+                    // Thicken: also color adjacent pixels for visibility
+                    if (ox + 1 < outW) pixels[idx + 1] = midColor
+                    if (oy + 1 < outH) pixels[idx + outW] = midColor
+                } else {
+                    // Moderate edge — dimmer
+                    val alpha = (60 + strength * 140).toInt().coerceIn(60, 200)
+                    pixels[idx] = Color.argb(alpha, 0, 220, 30)
                 }
-                val isLocalPeak =
-                    edgeMagnitude >= gradients[index - 1] &&
-                    edgeMagnitude >= gradients[index + 1] &&
-                    edgeMagnitude >= gradients[index - outputWidth] &&
-                    edgeMagnitude >= gradients[index + outputWidth]
-                if (!isLocalPeak) {
-                    continue
-                }
-                val normalized = ((edgeMagnitude - adaptiveThreshold).toFloat() /
-                        (maxGradient - adaptiveThreshold).coerceAtLeast(1)).coerceIn(0f, 1f)
-                val alpha = (42 + normalized * 118f).roundToInt().coerceIn(42, 160)
-                val color = Color.argb(alpha, 76, 255, 122)
-                pixels[index] = color
             }
         }
 
-        val bitmap = Bitmap.createBitmap(pixels, outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+        val bitmap = Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888)
         val rotationDegrees = image.imageInfo.rotationDegrees
         if (rotationDegrees == 0) {
             return bitmap
