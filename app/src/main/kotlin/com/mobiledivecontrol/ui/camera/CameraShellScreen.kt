@@ -35,6 +35,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Autorenew
 import androidx.compose.material.icons.rounded.CameraAlt
+import androidx.compose.material.icons.rounded.CenterFocusStrong
 import androidx.compose.material.icons.rounded.Exposure
 import androidx.compose.material.icons.rounded.Filter
 import androidx.compose.material.icons.rounded.FiberManualRecord
@@ -44,6 +45,7 @@ import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.PhotoSizeSelectLarge
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -80,6 +82,7 @@ import com.mobiledivecontrol.core.BottomBarItem
 import com.mobiledivecontrol.theme.DiveColors
 import kotlinx.coroutines.delay
 import androidx.compose.material3.Icon
+import java.util.Locale
 
 @Composable
 fun CameraShellScreen(
@@ -207,7 +210,7 @@ private fun ModeParametersStrip(
             .padding(horizontal = 10.dp, vertical = 6.dp),
     ) {
         displaySettings.forEach { spec ->
-            val value = displaySettingValue(spec, CameraCatalog.currentValue(cameraState, spec))
+            val value = displaySettingValue(cameraState, spec, CameraCatalog.currentValue(cameraState, spec))
             ParameterBadge(label = spec.label, value = value)
         }
     }
@@ -331,7 +334,7 @@ private fun BottomSettingsTrayLegacy(
             val spec = cameraState.selectedSetting
             if (spec != null) {
                 val rawValue = CameraCatalog.currentValue(cameraState, spec)
-                val value = displaySettingValue(spec, rawValue)
+                val value = displaySettingValue(cameraState, spec, rawValue)
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
@@ -493,7 +496,7 @@ private fun BottomSettingsTrayLegacy(
                                 )
                             }
                             is BottomBarItem.Setting -> {
-                                val value = displaySettingValue(item.spec, CameraCatalog.currentValue(cameraState, item.spec))
+                                val value = displaySettingValue(cameraState, item.spec, CameraCatalog.currentValue(cameraState, item.spec))
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
                                         text = item.spec.label,
@@ -542,8 +545,12 @@ private fun BottomSettingsTray(
             val spec = cameraState.selectedSetting
             if (spec != null) {
                 val rawValue = CameraCatalog.currentValue(cameraState, spec)
-                val value = displaySettingValue(spec, rawValue)
+                val value = displaySettingValue(cameraState, spec, rawValue)
                 val sensitivity = cameraState.sliderSensitivities[spec.id] ?: SliderSensitivity.DEFAULT
+                val focusAssistSpec = focusAssistSpec(cameraState, spec)
+                val focusAssistValue = focusAssistSpec?.let { assistSpec ->
+                    displaySettingValue(cameraState, assistSpec, CameraCatalog.currentValue(cameraState, assistSpec))
+                }
 
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -581,11 +588,25 @@ private fun BottomSettingsTray(
                                 SliderSensitivityMeter(current = sensitivity)
                             }
                         }
+
+                        if (focusAssistSpec != null && focusAssistValue != null) {
+                            BottomEditCard(
+                                title = "Focus Assist",
+                                value = focusAssistValue,
+                                selected = cameraState.sliderEditTarget == SliderEditTarget.FocusAssist,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                SliderMeterAdjuster(
+                                    spec = focusAssistSpec,
+                                    value = CameraCatalog.currentValue(cameraState, focusAssistSpec),
+                                )
+                            }
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "▲▼ Select  ·  ◀▶ Adjust",
+                        text = "UP/DOWN Select  LEFT/RIGHT Adjust",
                         color = DiveColors.TextMuted,
                         style = MaterialTheme.typography.labelSmall,
                     )
@@ -856,6 +877,7 @@ private fun bottomBarIcon(item: BottomBarItem): ImageVector = when (item) {
         item.spec.id.endsWith(".megapixels") -> Icons.Rounded.PhotoSizeSelectLarge
         item.spec.id.endsWith(".save_format") -> Icons.Rounded.Image
         item.spec.id.endsWith(".lens") -> Icons.Rounded.CameraAlt
+        item.spec.id.endsWith(".manual_focus") -> Icons.Rounded.CenterFocusStrong
         item.spec.id.endsWith(".exposure_compensation") || item.spec.id.endsWith(".exposure_value") -> Icons.Rounded.Exposure
         item.spec.id.endsWith(".hdr") || item.spec.id.endsWith(".hdr_log") || item.spec.id.endsWith(".log") -> Icons.Rounded.HdrAuto
         item.spec.id.endsWith(".filters") -> Icons.Rounded.Filter
@@ -876,12 +898,14 @@ private fun bottomBarValue(item: BottomBarItem, cameraState: CameraState): Strin
     is BottomBarItem.GalleryShortcut -> null
     is BottomBarItem.LensShortcut -> formatLensValue(item.value)
     is BottomBarItem.MoreSettings -> if (cameraState.showMoreSettings) "Less" else null
-    is BottomBarItem.Setting -> displaySettingValue(item.spec, CameraCatalog.currentValue(cameraState, item.spec))
+    is BottomBarItem.Setting -> displaySettingValue(cameraState, item.spec, CameraCatalog.currentValue(cameraState, item.spec))
 }
 
-private fun displaySettingValue(spec: CameraSettingSpec, value: String): String {
+private fun displaySettingValue(cameraState: CameraState?, spec: CameraSettingSpec, value: String): String {
     return when {
         spec.id.endsWith(".lens") -> formatLensValue(value)
+        spec.id.endsWith(".manual_focus") -> formatFocusValue(cameraState, spec, value)
+        spec.id.endsWith(".focus_peaking") -> if (focusLensValue(cameraState, spec) == "0.6x") "Off" else if (value == "On") "On" else "Off"
         else -> value
     }
 }
@@ -894,6 +918,34 @@ private fun formatLensValue(value: String): String = when (value) {
     "5x" -> "5"
     "front" -> "Front"
     else -> value
+}
+
+private fun formatFocusValue(cameraState: CameraState?, spec: CameraSettingSpec, value: String): String {
+    if (focusLensValue(cameraState, spec) == "0.6x") {
+        return "Fixed"
+    }
+    if (value == "AF") {
+        return value
+    }
+    val numeric = value.toDoubleOrNull() ?: return value
+    return String.format(Locale.US, "%.2f", numeric)
+}
+
+private fun focusLensValue(cameraState: CameraState?, spec: CameraSettingSpec): String? {
+    if (cameraState == null || !spec.id.endsWith(".manual_focus") && !spec.id.endsWith(".focus_peaking")) {
+        return null
+    }
+    val lensSettingId = spec.id.substringBeforeLast(".") + ".lens"
+    return cameraState.settingValues[lensSettingId]
+}
+
+private fun focusAssistSpec(
+    cameraState: CameraState,
+    focusSpec: CameraSettingSpec,
+): CameraSettingSpec? {
+    val assistSettingId = CameraCatalog.focusAssistSettingId(focusSpec.id) ?: return null
+    return CameraCatalog.settingsFor(cameraState.activeMode, cameraState.deviceVariant)
+        .firstOrNull { it.id == assistSettingId }
 }
 
 @Composable
@@ -1030,7 +1082,7 @@ private fun VerticalSliderMeter(
             ) {
                 for (i in visibleRange.reversed()) {
                     val opt = options[i]
-                    val displayOpt = displaySettingValue(spec, opt)
+                    val displayOpt = displaySettingValue(null, spec, opt)
                     val selected = i == currentIndex
                     Text(
                         text = displayOpt,
@@ -1125,7 +1177,7 @@ private fun SliderMeterAdjuster(
             ) {
                 spec.options.forEachIndexed { optIndex, opt ->
                     Text(
-                        text = displaySettingValue(spec, opt),
+                        text = displaySettingValue(null, spec, opt),
                         color = if (optIndex == index) DiveColors.DiveCyan else DiveColors.TextMuted,
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = if (optIndex == index) FontWeight.Bold else FontWeight.Normal,

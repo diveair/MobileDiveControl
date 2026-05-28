@@ -292,6 +292,104 @@ class ControlCoreTest {
     }
 
     @Test
+    fun `focus edit exposes value sensitivity and assist targets`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+
+        core.dispatch(CameraCommand.Confirm)
+        val focusSelected = core.dispatch(CameraCommand.NavigateLeft)
+        assertEquals("AF", focusSelected.state.camera.settingValues["photo.manual_focus"])
+
+        val editOutcome = core.dispatch(CameraCommand.Confirm)
+        assertTrue(editOutcome.state.camera.settingsEditing)
+        assertEquals(SliderEditTarget.Value, editOutcome.state.camera.sliderEditTarget)
+
+        val sensitivityTarget = core.dispatch(CameraCommand.NavigateDown)
+        assertEquals(SliderEditTarget.Sensitivity, sensitivityTarget.state.camera.sliderEditTarget)
+
+        val assistTarget = core.dispatch(CameraCommand.NavigateDown)
+        assertEquals(SliderEditTarget.FocusAssist, assistTarget.state.camera.sliderEditTarget)
+
+        val assistOn = core.dispatch(CameraCommand.NavigateRight)
+        assertEquals("On", assistOn.state.camera.settingValues["photo.focus_peaking"])
+
+        val backToSensitivity = core.dispatch(CameraCommand.NavigateUp)
+        assertEquals(SliderEditTarget.Sensitivity, backToSensitivity.state.camera.sliderEditTarget)
+
+        val backToValue = core.dispatch(CameraCommand.NavigateUp)
+        assertEquals(SliderEditTarget.Value, backToValue.state.camera.sliderEditTarget)
+    }
+
+    @Test
+    fun `focus uses 0_01 steps and sensitivity controls repeat cadence not step size`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
+            settingsCursor = 4,
+            settingValues = CameraCatalog.defaultSettingValues + ("photo.manual_focus" to "0.50"),
+            sliderSensitivities = CameraCatalog.defaultSliderSensitivities + ("photo.manual_focus" to SliderSensitivity(1)),
+        )
+        val state = AppState(camera = camera)
+
+        val tap = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 0)
+        assertEquals("0.51", tap.state.camera.settingValues["photo.manual_focus"])
+
+        val heldTooSoon = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 1)
+        assertEquals("0.50", heldTooSoon.state.camera.settingValues["photo.manual_focus"])
+
+        val heldAtStride = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 20)
+        assertEquals("0.51", heldAtStride.state.camera.settingValues["photo.manual_focus"])
+
+        val editingState = state.copy(
+            camera = state.camera.copy(
+                settingsEditing = true,
+                sliderEditTarget = SliderEditTarget.Value,
+            ),
+        )
+        val editRight = reducer.reduce(editingState, CameraCommand.NavigateRight, repeatCount = 0)
+        assertEquals("0.51", editRight.state.camera.settingValues["photo.manual_focus"])
+    }
+
+    @Test
+    fun `focus selection on fixed 0_6x lens switches to 1x before editing`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
+            settingsCursor = 4,
+            settingValues = CameraCatalog.defaultSettingValues + ("photo.lens" to "0.6x"),
+        )
+        val state = AppState(camera = camera)
+
+        val outcome = reducer.reduce(state, CameraCommand.Confirm)
+        assertTrue(outcome.state.camera.settingsEditing)
+        assertEquals("1x", outcome.state.camera.settingValues["photo.lens"])
+        assertEquals(
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SwitchLens("1x"))),
+            outcome.effects,
+        )
+    }
+
+    @Test
+    fun `focus adjustment on fixed 0_6x lens switches to 1x and applies the focus step`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
+            settingsCursor = 4,
+            settingValues = CameraCatalog.defaultSettingValues + ("photo.lens" to "0.6x"),
+        )
+        val state = AppState(camera = camera)
+
+        val outcome = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 0)
+        assertEquals("1x", outcome.state.camera.settingValues["photo.lens"])
+        assertEquals("0.00", outcome.state.camera.settingValues["photo.manual_focus"])
+        assertEquals(
+            listOf(
+                PlatformEffect.ExecuteCamera(CameraCommand.SwitchLens("1x")),
+                PlatformEffect.ExecuteCamera(CameraCommand.SetManualFocus(0.0)),
+            ),
+            outcome.effects,
+        )
+    }
+
+    @Test
     fun `gallery navigation cycles through items`() {
         val reducer = ControlReducer()
         val items = listOf(

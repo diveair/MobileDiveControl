@@ -5,6 +5,11 @@ import java.time.Duration
 class ControlReducer(
     private val safetyStateMachine: SafetyStateMachine = SafetyStateMachine(),
 ) {
+    private data class ManualFocusPreparation(
+        val state: AppState,
+        val effects: List<PlatformEffect> = emptyList(),
+    )
+
     fun applyRouteDecision(state: AppState, decision: RouteDecision, repeatCount: Int = 0): Reduction {
         var currentState = state
         val effects = mutableListOf<PlatformEffect>()
@@ -541,7 +546,7 @@ class ControlReducer(
         val camera = state.camera
         return when {
             camera.focusedZone == CameraUiZone.SettingsPanel && camera.settingsEditing -> {
-                if (camera.sliderEditTarget == SliderEditTarget.Sensitivity) {
+                if (camera.sliderEditTarget != SliderEditTarget.Value) {
                     Reduction(
                         state = state.copy(
                             camera = camera.copy(
@@ -737,14 +742,23 @@ class ControlReducer(
         }
 
         val nextIndex = (state.camera.settingsCursor + delta + totalItems) % totalItems
-        return Reduction(
-            state = state.copy(
-                camera = state.camera.copy(
-                    settingsCursor = nextIndex,
-                    settingsEditing = false,
-                    sliderEditTarget = SliderEditTarget.Value,
-                ),
+        val movedState = state.copy(
+            camera = state.camera.copy(
+                settingsCursor = nextIndex,
+                settingsEditing = false,
+                sliderEditTarget = SliderEditTarget.Value,
             ),
+        )
+        val highlightedItem = items.getOrNull(nextIndex)
+        val preparation = if (highlightedItem is BottomBarItem.Setting &&
+            highlightedItem.spec.id.endsWith(".manual_focus")) {
+            prepareStateForManualFocus(movedState, highlightedItem.spec)
+        } else {
+            ManualFocusPreparation(movedState)
+        }
+        return Reduction(
+            state = preparation.state,
+            effects = preparation.effects,
         )
     }
 
@@ -822,13 +836,19 @@ class ControlReducer(
                 Reduction(state = state.copy(camera = nextCamera))
             }
             is BottomBarItem.Setting -> {
+                val preparation = if (item.spec.id.endsWith(".manual_focus")) {
+                    prepareStateForManualFocus(state, item.spec)
+                } else {
+                    ManualFocusPreparation(state)
+                }
                 Reduction(
-                    state = state.copy(
-                        camera = state.camera.copy(
+                    state = preparation.state.copy(
+                        camera = preparation.state.camera.copy(
                             settingsEditing = true,
                             sliderEditTarget = SliderEditTarget.Value
                         )
-                    )
+                    ),
+                    effects = preparation.effects,
                 )
             }
         }
@@ -857,11 +877,11 @@ class ControlReducer(
     private fun moveSliderEditTarget(state: AppState, delta: Int): Reduction {
         val camera = state.camera
         val spec = camera.selectedSetting ?: return Reduction(state = state)
-        if (!spec.supportsSensitivity) {
+        val targets = editTargetsFor(camera, spec)
+        if (targets.size <= 1) {
             return Reduction(state = state)
         }
 
-        val targets = listOf(SliderEditTarget.Value, SliderEditTarget.Sensitivity)
         val currentIndex = targets.indexOf(camera.sliderEditTarget).coerceAtLeast(0)
         val nextIndex = (currentIndex + delta).coerceIn(0, targets.lastIndex)
         return Reduction(
@@ -896,45 +916,80 @@ class ControlReducer(
 
     private fun adjustSelectedSetting(state: AppState, step: Int, repeatCount: Int = 0): Reduction {
         val spec = state.camera.selectedSetting ?: return Reduction(state = state)
-        
-        val adjustingSensitivity = state.camera.settingsEditing &&
+        val manualFocusPreparation = if (spec.id.endsWith(".manual_focus")) {
+            prepareStateForManualFocus(state, spec)
+        } else {
+            ManualFocusPreparation(state)
+        }
+        val preparedState = manualFocusPreparation.state
+        val preparedCamera = preparedState.camera
+        val editTarget = preparedCamera.sliderEditTarget
+        val adjustingSensitivity = preparedCamera.settingsEditing &&
                 spec.kind == CameraSettingKind.Slider &&
                 spec.supportsSensitivity &&
-                state.camera.sliderEditTarget == SliderEditTarget.Sensitivity
+                editTarget == SliderEditTarget.Sensitivity
+        val adjustingFocusAssist = preparedCamera.settingsEditing &&
+                spec.id.endsWith(".manual_focus") &&
+                editTarget == SliderEditTarget.FocusAssist
 
         return if (adjustingSensitivity) {
             if (repeatCount > 0 && repeatCount % 4 != 0) {
-                return Reduction(state = state)
+                return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
             }
-            val current = state.camera.sliderSensitivities[spec.id] ?: SliderSensitivity.DEFAULT
+            val current = preparedCamera.sliderSensitivities[spec.id] ?: SliderSensitivity.DEFAULT
             val next = cycleSensitivity(current, step)
             Reduction(
-                state = state.copy(
-                    camera = state.camera.copy(
-                        sliderSensitivities = state.camera.sliderSensitivities + (spec.id to next),
+                state = preparedState.copy(
+                    camera = preparedCamera.copy(
+                        sliderSensitivities = preparedCamera.sliderSensitivities + (spec.id to next),
                     ),
                 ),
+                effects = manualFocusPreparation.effects,
+            )
+        } else if (adjustingFocusAssist) {
+            if (!supportsManualFocusForSelectedLens(preparedCamera, spec)) {
+                return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
+            }
+            val assistSpec = focusAssistSpec(preparedCamera, spec)
+                ?: return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
+            val currentValue = preparedCamera.settingValues[assistSpec.id] ?: assistSpec.defaultValue
+            val nextValue = advanceOption(
+                currentValue = currentValue,
+                options = assistSpec.options,
+                step = step,
+                wrap = false,
+            )
+            Reduction(
+                state = preparedState.copy(
+                    camera = applySettingValue(preparedCamera, assistSpec.id, nextValue),
+                ),
+                effects = manualFocusPreparation.effects,
             )
         } else {
             val isFocusSetting = spec.id.endsWith(".manual_focus")
-            val currentSensitivity = state.camera.sliderSensitivities[spec.id] ?: SliderSensitivity.DEFAULT
+            val currentSensitivity = preparedCamera.sliderSensitivities[spec.id] ?: SliderSensitivity.DEFAULT
 
             if (isFocusSetting) {
-                // Focus: sensitivity controls step size (1 = step 1 option, 100 = step 10 options)
-                val stepSize = (currentSensitivity.level / 50).coerceAtLeast(1)
-                val currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue
+                if (!supportsManualFocusForSelectedLens(preparedCamera, spec)) {
+                    return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
+                }
+                if (repeatCount > 0 && !shouldApplyFocusRepeat(currentSensitivity, repeatCount)) {
+                    return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
+                }
+                val currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue
                 val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
                 // During hold (repeatCount > 0), don't cross into AF (index 0).
                 // AF is only reachable on a fresh press (repeatCount == 0).
                 val minIndex = if (repeatCount > 0 && currentIndex > 0) 1 else 0
-                val rawNext = currentIndex + step * stepSize
+                val rawNext = currentIndex + step
                 val clampedIndex = rawNext.coerceIn(minIndex, spec.options.lastIndex)
                 val nextValue = spec.options[clampedIndex]
-                val nextCamera = applySettingValue(state.camera, spec.id, nextValue)
+                val nextCamera = applySettingValue(preparedCamera, spec.id, nextValue)
                 val effect = cameraEffectForSetting(spec.id, nextValue)
                 Reduction(
-                    state = state.copy(camera = nextCamera),
-                    effects = effect?.let { listOf(PlatformEffect.ExecuteCamera(it)) } ?: emptyList(),
+                    state = preparedState.copy(camera = nextCamera),
+                    effects = manualFocusPreparation.effects +
+                        (effect?.let { listOf(PlatformEffect.ExecuteCamera(it)) } ?: emptyList()),
                 )
             } else {
                 // Other sliders: sensitivity controls rate-limiting during holds
@@ -942,29 +997,59 @@ class ControlReducer(
                     val skipInterval = ((100 - currentSensitivity.level) / 10).coerceAtLeast(1)
                     val shouldApply = repeatCount % skipInterval == 0
                     if (!shouldApply) {
-                        return Reduction(state = state)
+                        return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
                     }
                 }
 
                 val shouldWrap = spec.kind != CameraSettingKind.Slider
                 val nextValue = advanceOption(
-                    currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue,
+                    currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue,
                     options = spec.options,
                     step = step,
                     wrap = shouldWrap,
                 )
-                val nextCamera = applySettingValue(state.camera, spec.id, nextValue)
+                val nextCamera = applySettingValue(preparedCamera, spec.id, nextValue)
                 val effect = cameraEffectForSetting(spec.id, nextValue)
                 Reduction(
-                    state = state.copy(camera = nextCamera),
-                    effects = effect?.let { listOf(PlatformEffect.ExecuteCamera(it)) } ?: emptyList(),
+                    state = preparedState.copy(camera = nextCamera),
+                    effects = manualFocusPreparation.effects +
+                        (effect?.let { listOf(PlatformEffect.ExecuteCamera(it)) } ?: emptyList()),
                 )
             }
         }
     }
 
+    private fun prepareStateForManualFocus(
+        state: AppState,
+        focusSpec: CameraSettingSpec,
+    ): ManualFocusPreparation {
+        if (supportsManualFocusForSelectedLens(state.camera, focusSpec)) {
+            return ManualFocusPreparation(state)
+        }
+        val lensSettingId = focusSpec.id.substringBeforeLast(".") + ".lens"
+        val fallbackLens = fallbackManualFocusLens(state.camera, focusSpec)
+            ?: return ManualFocusPreparation(state)
+        val currentLens = state.camera.settingValues[lensSettingId]
+        if (fallbackLens == currentLens) {
+            return ManualFocusPreparation(state)
+        }
+        val nextCamera = applySettingValue(state.camera, lensSettingId, fallbackLens)
+        return ManualFocusPreparation(
+            state = state.copy(camera = nextCamera),
+            effects = listOf(PlatformEffect.ExecuteCamera(CameraCommand.SwitchLens(fallbackLens))),
+        )
+    }
+
     private fun applySettingValue(camera: CameraState, settingId: String, value: String): CameraState {
-        val updatedValues = camera.settingValues + (settingId to value)
+        val updatedValues = if (settingId.endsWith(".lens") && value == "0.6x") {
+            val baseId = settingId.removeSuffix(".lens")
+            camera.settingValues +
+                    (settingId to value) +
+                    ("$baseId.manual_focus" to "AF") +
+                    ("$baseId.focus_peaking" to "Off")
+        } else {
+            camera.settingValues + (settingId to value)
+        }
         return if (settingId == "photo.zoom_level" || settingId == "video.zoom") {
             camera.copy(
                 zoomFactor = parseZoom(value) ?: camera.zoomFactor,
@@ -990,6 +1075,49 @@ class ControlReducer(
 
     private fun cycleSensitivity(current: SliderSensitivity, step: Int): SliderSensitivity {
         return SliderSensitivity.of(current.level + step)
+    }
+
+    private fun editTargetsFor(camera: CameraState, spec: CameraSettingSpec): List<SliderEditTarget> {
+        val targets = mutableListOf(SliderEditTarget.Value)
+        if (spec.supportsSensitivity) {
+            targets += SliderEditTarget.Sensitivity
+        }
+        if (focusAssistSpec(camera, spec) != null) {
+            targets += SliderEditTarget.FocusAssist
+        }
+        return targets
+    }
+
+    private fun focusAssistSpec(camera: CameraState, focusSpec: CameraSettingSpec): CameraSettingSpec? {
+        val assistSettingId = CameraCatalog.focusAssistSettingId(focusSpec.id) ?: return null
+        return CameraCatalog.settingsFor(camera.activeMode, camera.deviceVariant)
+            .firstOrNull { it.id == assistSettingId }
+    }
+
+    private fun supportsManualFocusForSelectedLens(camera: CameraState, focusSpec: CameraSettingSpec): Boolean {
+        val lensSettingId = focusSpec.id.substringBeforeLast(".") + ".lens"
+        val lensValue = camera.settingValues[lensSettingId]
+        return lensValue != null && lensValue != "0.6x" && lensValue != "front"
+    }
+
+    private fun fallbackManualFocusLens(camera: CameraState, focusSpec: CameraSettingSpec): String? {
+        val lensSettingId = focusSpec.id.substringBeforeLast(".") + ".lens"
+        val lensSpec = CameraCatalog.settingsFor(camera.activeMode, camera.deviceVariant)
+            .firstOrNull { it.id == lensSettingId }
+            ?: return null
+        val candidates = lensSpec.options.filter { it != "0.6x" && it != "front" }
+        return listOf("1x", "2x", "3x", "5x").firstOrNull { it in candidates } ?: candidates.firstOrNull()
+    }
+
+    private fun shouldApplyFocusRepeat(
+        sensitivity: SliderSensitivity,
+        repeatCount: Int,
+    ): Boolean {
+        if (repeatCount <= 0) {
+            return true
+        }
+        val repeatStride = 1 + ((SliderSensitivity.MAX.level - sensitivity.level) / 5)
+        return repeatCount % repeatStride == 0
     }
 
     private fun cameraEffectForSetting(settingId: String, value: String): CameraCommand? = when (settingId) {

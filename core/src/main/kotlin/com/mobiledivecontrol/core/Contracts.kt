@@ -109,6 +109,7 @@ value class SliderSensitivity(val level: Int) {
 enum class SliderEditTarget {
     Value,
     Sensitivity,
+    FocusAssist,
 }
 
 enum class GalaxyDeviceVariant {

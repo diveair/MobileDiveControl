@@ -316,6 +316,14 @@ object CameraCatalog {
         return camera.settingValues[spec.id] ?: spec.defaultValue
     }
 
+    fun focusAssistSettingId(focusSettingId: String): String? = when (focusSettingId) {
+        "photo.manual_focus" -> "photo.focus_peaking"
+        "expert.manual_focus" -> "expert.focus_peaking"
+        "pro.manual_focus" -> "pro.focus_peaking"
+        "pro_video.manual_focus" -> "pro_video.focus_peaking"
+        else -> null
+    }
+
     private fun choice(
         id: String,
         label: String,
@@ -398,6 +406,7 @@ object CameraCatalog {
                 choice("photo.save_format", "RAW / JPEG", "Core", listOf("JPEG", "RAW", "RAW + JPEG"), "JPEG"),
                 choice("photo.lens", "Lens", "Core", lenses, "1x"),
                 slider("photo.manual_focus", "Focus", "Core", focusOptions(), "AF"),
+                toggle("photo.focus_peaking", "Focus Assist", "Assist"),
                 slider("photo.exposure_compensation", "EV", "Core", evOptions(), "0"),
                 choice("photo.hdr_log", "HDR / LOG", "Assist", listOf("HDR", "LOG", "Off"), "HDR"),
                 choice("photo.filters", "Filters", "Core", underwaterFilterOptions(), "Off"),
@@ -425,6 +434,7 @@ object CameraCatalog {
                 slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions(), "5600K"),
                 slider("expert.iso", "ISO", "Manual", isoOptions(), "100"),
                 slider("expert.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
+                toggle("expert.focus_peaking", "Focus Assist", "Assist"),
                 slider("expert.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
                 slider("expert.exposure_value", "Exposure Value", "Manual", evOptions(), "0"),
                 toggle("expert.exposure_monitor", "Exposure monitor", "Assist"),
@@ -449,6 +459,7 @@ object CameraCatalog {
                 slider("pro.white_balance", "White balance", "Manual", whiteBalanceOptions(), "5600K"),
                 slider("pro.iso", "ISO", "Manual", isoOptions(), "100"),
                 slider("pro.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
+                toggle("pro.focus_peaking", "Focus Assist", "Assist"),
                 slider("pro.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
                 slider("pro.exposure_value", "Exposure Value", "Manual", evOptions(), "0"),
                 choice("pro.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
@@ -602,6 +613,7 @@ object CameraCatalog {
                 slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions(), "5600K"),
                 slider("pro_video.iso", "ISO", "Manual", isoOptions(), "100"),
                 slider("pro_video.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
+                toggle("pro_video.focus_peaking", "Focus Assist", "Assist"),
                 slider("pro_video.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
                 slider("pro_video.exposure_value", "Exposure Value", "Manual", evOptions(), "0"),
                 slider("pro_video.frame_rate", "Frame rate", "Manual", frameRates, "30fps"),
@@ -763,7 +775,7 @@ object CameraCatalog {
     private fun focusOptions(): List<String> = buildList {
         add("AF")
         for (step in 0..100) {
-            add("%.2f".format(step / 100.0))
+            add(String.format(Locale.US, "%.2f", step / 100.0))
         }
     }
 

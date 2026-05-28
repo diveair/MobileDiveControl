@@ -15,7 +15,9 @@ class CameraSessionStore(context: Context) {
             ?.let { stored -> runCatching { CameraModeId.valueOf(stored) }.getOrNull() }
             ?: CameraModeId.Photo
 
-        val settingValues = CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES)
+        val settingValues = normalizeRestoredSettingValues(
+            CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES),
+        )
         val sliderSensitivities = CameraCatalog.defaultSliderSensitivities + restoreSensitivityMap()
 
         return AppState(
@@ -52,6 +54,24 @@ class CameraSessionStore(context: Context) {
         return restoreStringMap(KEY_SLIDER_SENSITIVITIES).mapNotNull { (key, value) ->
             value.toIntOrNull()?.let { level -> key to SliderSensitivity.of(level) }
         }.toMap()
+    }
+
+    private fun normalizeRestoredSettingValues(values: Map<String, String>): Map<String, String> {
+        val normalized = values.toMutableMap()
+        values.forEach { (settingId, value) ->
+            if (settingId.endsWith(".lens") && value == "0.6x") {
+                val baseId = settingId.removeSuffix(".lens")
+                val manualFocusValue = values["$baseId.manual_focus"]
+                val focusPeakingValue = values["$baseId.focus_peaking"]
+                if ((manualFocusValue != null && manualFocusValue != "AF") || focusPeakingValue == "On") {
+                    normalized[settingId] = "1x"
+                } else {
+                    normalized["$baseId.manual_focus"] = "AF"
+                    normalized["$baseId.focus_peaking"] = "Off"
+                }
+            }
+        }
+        return normalized
     }
 
     private companion object {
