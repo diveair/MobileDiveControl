@@ -922,12 +922,14 @@ class ControlReducer(
             if (isFocusSetting) {
                 // Focus: sensitivity controls step size (1 = step 1 option, 100 = step 10 options)
                 val stepSize = (currentSensitivity.level / 50).coerceAtLeast(1)
-                val nextValue = advanceOption(
-                    currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue,
-                    options = spec.options,
-                    step = step * stepSize,
-                    wrap = false,
-                )
+                val currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue
+                val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
+                // During hold (repeatCount > 0), don't cross into AF (index 0).
+                // AF is only reachable on a fresh press (repeatCount == 0).
+                val minIndex = if (repeatCount > 0 && currentIndex > 0) 1 else 0
+                val rawNext = currentIndex + step * stepSize
+                val clampedIndex = rawNext.coerceIn(minIndex, spec.options.lastIndex)
+                val nextValue = spec.options[clampedIndex]
                 val nextCamera = applySettingValue(state.camera, spec.id, nextValue)
                 val effect = cameraEffectForSetting(spec.id, nextValue)
                 Reduction(

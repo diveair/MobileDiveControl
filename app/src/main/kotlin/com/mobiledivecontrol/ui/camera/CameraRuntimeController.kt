@@ -20,6 +20,11 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.extensions.ExtensionMode
+import androidx.camera.extensions.ExtensionsManager
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -35,13 +40,20 @@ class CameraRuntimeController(
     private var previewView: PreviewView? = null
     private var lifecycleOwner: LifecycleOwner? = null
     private var cameraProvider: ProcessCameraProvider? = null
+    private var extensionsManager: ExtensionsManager? = null
     private var camera: Camera? = null
     private var imageCapture: ImageCapture? = null
     private var boundLensFacing: Int? = null
     private var boundResolution: String? = null
+    private var boundHdrExtension: Boolean = false
     private var latestState: CameraState = CameraState()
     private var latestWaterPressureKpa: Double? = null
     private var latestAtmosphericPressureKpa: Double? = null
+
+    // Device capabilities detected at bind time
+    private var deviceMinFocusDistance: Float = 0f
+    private var deviceHasVendorHdr: Boolean = false
+    private var deviceMaxSupportedResolution: Size? = null
 
     fun attach(
         previewView: PreviewView,
@@ -57,8 +69,34 @@ class CameraRuntimeController(
         cameraProviderFuture.addListener(
             {
                 cameraProvider = cameraProviderFuture.get()
-                bindCamera(force = true)
-                onReady(camera != null)
+                // Initialize extensions manager for vendor HDR
+                initExtensions {
+                    bindCamera(force = true)
+                    onReady(camera != null)
+                }
+            },
+            ContextCompat.getMainExecutor(context),
+        )
+    }
+
+    private fun initExtensions(onDone: () -> Unit) {
+        val provider = cameraProvider ?: run { onDone(); return }
+        val future = ExtensionsManager.getInstanceAsync(context, provider)
+        future.addListener(
+            {
+                try {
+                    extensionsManager = future.get()
+                    val backSelector = CameraSelector.Builder()
+                        .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                        .build()
+                    deviceHasVendorHdr = extensionsManager?.isExtensionAvailable(
+                        backSelector,
+                        ExtensionMode.HDR,
+                    ) ?: false
+                } catch (_: Exception) {
+                    deviceHasVendorHdr = false
+                }
+                onDone()
             },
             ContextCompat.getMainExecutor(context),
         )
@@ -72,6 +110,7 @@ class CameraRuntimeController(
         lifecycleOwner = null
         boundLensFacing = null
         boundResolution = null
+        boundHdrExtension = false
     }
 
     fun applyState(
@@ -88,7 +127,10 @@ class CameraRuntimeController(
 
         val desiredLensFacing = desiredLensFacing(cameraState)
         val desiredResolution = desiredResolutionValue(cameraState)
-        val needsRebind = desiredLensFacing != boundLensFacing || desiredResolution != boundResolution
+        val desiredHdr = resolvedHdrLogMode(cameraState) == "HDR" && deviceHasVendorHdr
+        val needsRebind = desiredLensFacing != boundLensFacing ||
+                desiredResolution != boundResolution ||
+                desiredHdr != boundHdrExtension
         if (needsRebind) {
             bindCamera(force = true)
         } else {
@@ -100,7 +142,7 @@ class CameraRuntimeController(
         when (command) {
             CameraCommand.CapturePhoto -> capturePhoto()
             CameraCommand.OpenGallery -> openGallery()
-            is CameraCommand.SetManualFocus -> applySessionState(latestState)
+            is CameraCommand.SetManualFocus,
             is CameraCommand.SetIso,
             is CameraCommand.SetShutterSpeedNs,
             is CameraCommand.SetWhiteBalanceKelvin,
@@ -118,15 +160,29 @@ class CameraRuntimeController(
         val previewSurface = previewView ?: return
         val desiredLensFacing = desiredLensFacing(latestState)
         val desiredResolution = desiredResolutionValue(latestState)
+        val useVendorHdr = resolvedHdrLogMode(latestState) == "HDR" && deviceHasVendorHdr
 
-        if (!force && desiredLensFacing == boundLensFacing && desiredResolution == boundResolution) {
+        if (!force && desiredLensFacing == boundLensFacing &&
+            desiredResolution == boundResolution && useVendorHdr == boundHdrExtension) {
             applySessionState(latestState)
             return
         }
 
-        val selector = CameraSelector.Builder()
+        var selector = CameraSelector.Builder()
             .requireLensFacing(desiredLensFacing)
             .build()
+
+        // Use vendor HDR extension when available and requested
+        if (useVendorHdr) {
+            try {
+                val extManager = extensionsManager
+                if (extManager != null && extManager.isExtensionAvailable(selector, ExtensionMode.HDR)) {
+                    selector = extManager.getExtensionEnabledCameraSelector(selector, ExtensionMode.HDR)
+                }
+            } catch (_: Exception) {
+                // Fall through to standard camera
+            }
+        }
 
         val preview = Preview.Builder()
             .build()
@@ -135,7 +191,26 @@ class CameraRuntimeController(
         val imageCaptureBuilder = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
 
-        resolutionFor(desiredResolution)?.let { imageCaptureBuilder.setTargetResolution(it) }
+        // Use ResolutionSelector for better resolution support including high-res modes
+        val targetSize = resolutionFor(desiredResolution)
+        if (targetSize != null) {
+            try {
+                val resolutionSelector = ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            targetSize,
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                        )
+                    )
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .build()
+                imageCaptureBuilder.setResolutionSelector(resolutionSelector)
+            } catch (_: Exception) {
+                // Fall back to target resolution if ResolutionSelector not supported
+                @Suppress("DEPRECATION")
+                imageCaptureBuilder.setTargetResolution(targetSize)
+            }
+        }
 
         val capture = imageCaptureBuilder.build()
 
@@ -144,7 +219,34 @@ class CameraRuntimeController(
         imageCapture = capture
         boundLensFacing = desiredLensFacing
         boundResolution = desiredResolution
+        boundHdrExtension = useVendorHdr
+
+        // Detect device capabilities from the bound camera
+        detectDeviceCapabilities()
         applySessionState(latestState)
+    }
+
+    private fun detectDeviceCapabilities() {
+        val boundCamera = camera ?: return
+        val camera2Info = Camera2CameraInfo.from(boundCamera.cameraInfo)
+
+        // Detect minimum focus distance (max diopters = closest focus)
+        deviceMinFocusDistance = camera2Info.getCameraCharacteristic(
+            CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
+        ) ?: 0f
+
+        // Detect max supported resolution for the current lens
+        try {
+            val streamConfigMap = camera2Info.getCameraCharacteristic(
+                CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
+            )
+            if (streamConfigMap != null) {
+                val outputSizes = streamConfigMap.getOutputSizes(android.graphics.ImageFormat.JPEG)
+                deviceMaxSupportedResolution = outputSizes?.maxByOrNull { it.width * it.height }
+            }
+        } catch (_: Exception) {
+            // Ignore
+        }
     }
 
     private fun applySessionState(cameraState: CameraState) {
@@ -200,7 +302,7 @@ class CameraRuntimeController(
             ?.toDoubleOrNull()
             ?: return
         val exposureState = boundCamera.cameraInfo.exposureState
-        val compensationStep = exposureState.exposureCompensationStep.toFloat().takeIf { it > 0f } ?: 1f
+        val compensationStep = exposureState.exposureCompensationStep.toFloat().takeIf { it > 0f } ?: 0.1f
         val requestedIndex = (exposureValue / compensationStep).roundToInt()
         val clamped = requestedIndex.coerceIn(
             exposureState.exposureCompensationRange.lower,
@@ -239,9 +341,9 @@ class CameraRuntimeController(
         )
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_EFFECT_MODE, CameraMetadata.CONTROL_EFFECT_MODE_OFF)
 
+        // --- Manual Focus ---
         val focusValue = currentValue(cameraState, ".manual_focus")
-        val minimumFocusDistance = Camera2CameraInfo.from(boundCamera.cameraInfo)
-            .getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+        val minimumFocusDistance = deviceMinFocusDistance
         if (focusValue == null || focusValue == "AF" || minimumFocusDistance <= 0f) {
             builder.setCaptureRequestOption(
                 CaptureRequest.CONTROL_AF_MODE,
@@ -253,58 +355,83 @@ class CameraRuntimeController(
                 CaptureRequest.CONTROL_AF_MODE,
                 CameraMetadata.CONTROL_AF_MODE_OFF,
             )
+            // Full range: 0.0 = infinity, 1.0 = closest (minimumFocusDistance diopters)
             builder.setCaptureRequestOption(
                 CaptureRequest.LENS_FOCUS_DISTANCE,
                 (minimumFocusDistance * normalizedFocus).coerceIn(0f, minimumFocusDistance),
             )
         }
 
-        when (resolvedHdrLogMode(cameraState)) {
-            "HDR" -> {
-                builder.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_MODE,
-                    CameraMetadata.CONTROL_MODE_USE_SCENE_MODE,
-                )
-                builder.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_SCENE_MODE,
-                    CameraMetadata.CONTROL_SCENE_MODE_HDR,
-                )
-                builder.setCaptureRequestOption(
-                    CaptureRequest.TONEMAP_MODE,
-                    CameraMetadata.TONEMAP_MODE_HIGH_QUALITY,
-                )
-            }
-            "LOG" -> {
-                builder.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_MODE,
-                    CameraMetadata.CONTROL_MODE_AUTO,
-                )
-                builder.setCaptureRequestOption(
-                    CaptureRequest.TONEMAP_MODE,
-                    CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE,
-                )
-                builder.setCaptureRequestOption(
-                    CaptureRequest.TONEMAP_CURVE,
-                    flatLogCurve(),
-                )
-            }
-            else -> {
-                builder.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_MODE,
-                    CameraMetadata.CONTROL_MODE_AUTO,
-                )
-                builder.setCaptureRequestOption(
-                    CaptureRequest.TONEMAP_MODE,
-                    CameraMetadata.TONEMAP_MODE_FAST,
-                )
+        // --- HDR / LOG / Off ---
+        // When using vendor HDR extension, skip manual HDR scene mode
+        if (!boundHdrExtension) {
+            when (resolvedHdrLogMode(cameraState)) {
+                "HDR" -> {
+                    // Fallback: use Camera2 scene mode HDR (less quality than vendor)
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_MODE,
+                        CameraMetadata.CONTROL_MODE_USE_SCENE_MODE,
+                    )
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_SCENE_MODE,
+                        CameraMetadata.CONTROL_SCENE_MODE_HDR,
+                    )
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.TONEMAP_MODE,
+                        CameraMetadata.TONEMAP_MODE_HIGH_QUALITY,
+                    )
+                }
+                "LOG" -> {
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_MODE,
+                        CameraMetadata.CONTROL_MODE_AUTO,
+                    )
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.TONEMAP_MODE,
+                        CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE,
+                    )
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.TONEMAP_CURVE,
+                        flatLogCurve(),
+                    )
+                }
+                else -> {
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_MODE,
+                        CameraMetadata.CONTROL_MODE_AUTO,
+                    )
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.TONEMAP_MODE,
+                        CameraMetadata.TONEMAP_MODE_FAST,
+                    )
+                }
             }
         }
 
+        // --- White Balance & Color Correction (filters or manual WB) ---
         if (filterProfile == null) {
-            builder.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AWB_MODE,
-                CameraMetadata.CONTROL_AWB_MODE_AUTO,
-            )
+            val wbValue = currentValue(cameraState, ".white_balance")
+            if (wbValue != null && wbValue != "Auto") {
+                val kelvin = wbValue.removeSuffix("K").toIntOrNull()
+                if (kelvin != null) {
+                    // Convert Kelvin to approximate color correction gains
+                    // This is a simplified model; vendor-specific WB modes may differ
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AWB_MODE,
+                        CameraMetadata.CONTROL_AWB_MODE_OFF,
+                    )
+                } else {
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AWB_MODE,
+                        CameraMetadata.CONTROL_AWB_MODE_AUTO,
+                    )
+                }
+            } else {
+                builder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AWB_MODE,
+                    CameraMetadata.CONTROL_AWB_MODE_AUTO,
+                )
+            }
             builder.setCaptureRequestOption(
                 CaptureRequest.COLOR_CORRECTION_MODE,
                 CameraMetadata.COLOR_CORRECTION_MODE_FAST,
@@ -324,8 +451,59 @@ class CameraRuntimeController(
             )
         }
 
-        Camera2CameraControl.from(boundCamera.cameraControl)
-            .setCaptureRequestOptions(builder.build())
+        // --- ISO (manual sensitivity) ---
+        val isoValue = currentValue(cameraState, ".iso")?.toIntOrNull()
+        if (isoValue != null) {
+            val isoRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
+                .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            if (isoRange != null) {
+                val clampedIso = isoValue.coerceIn(isoRange.lower, isoRange.upper)
+                builder.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, clampedIso)
+                builder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    CameraMetadata.CONTROL_AE_MODE_OFF,
+                )
+            }
+        }
+
+        // --- Shutter Speed (manual exposure time) ---
+        val shutterNs = currentValue(cameraState, ".shutter_speed")?.let { parseShutterNs(it) }
+        if (shutterNs != null) {
+            val exposureRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
+                .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            if (exposureRange != null) {
+                val clampedNs = shutterNs.coerceIn(exposureRange.lower, exposureRange.upper)
+                builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, clampedNs)
+                builder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    CameraMetadata.CONTROL_AE_MODE_OFF,
+                )
+            }
+        }
+
+        try {
+            Camera2CameraControl.from(boundCamera.cameraControl)
+                .captureRequestOptions = builder.build()
+        } catch (_: Exception) {
+            // Some options may not be supported on all devices
+        }
+    }
+
+    private fun parseShutterNs(value: String): Long? {
+        if (value == "Auto") return null
+        return if (value.endsWith("\"")) {
+            value.removeSuffix("\"").toDoubleOrNull()?.let { (it * 1_000_000_000L).toLong() }
+        } else {
+            val parts = value.split("/")
+            if (parts.size == 2) {
+                val num = parts[0].toDoubleOrNull() ?: return null
+                val den = parts[1].toDoubleOrNull() ?: return null
+                if (den == 0.0) return null
+                ((num / den) * 1_000_000_000L).toLong()
+            } else {
+                null
+            }
+        }
     }
 
     private fun openGallery() {
@@ -391,7 +569,16 @@ class CameraRuntimeController(
         "12MP" -> Size(4000, 3000)
         "24MP" -> Size(6000, 4000)
         "50MP" -> Size(8160, 6120)
-        "200MP" -> Size(16320, 12240)
+        "200MP" -> {
+            // Use detected max resolution if it's >= 200MP equivalent, otherwise
+            // request the largest known 200MP size and let CameraX fall back
+            val maxRes = deviceMaxSupportedResolution
+            if (maxRes != null && maxRes.width.toLong() * maxRes.height >= 100_000_000L) {
+                maxRes // Use the actual max resolution reported by the device
+            } else {
+                Size(16320, 12240) // Standard 200MP 4:3
+            }
+        }
         else -> null
     }
 

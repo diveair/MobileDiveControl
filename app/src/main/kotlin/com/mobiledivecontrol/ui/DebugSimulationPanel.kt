@@ -288,16 +288,6 @@ private fun DebugButtonCluster(
         ) {
             viewModel.simulateButton(HousingButtonEvent.Down)
         }
-        Spacer(modifier = Modifier.height(8.dp))
-        HousingButton(
-            label = "BACK",
-            color = Color.White,
-            width = 60.dp,
-            backgroundColor = Color.DarkGray,
-            borderColor = Color.Gray,
-        ) {
-            viewModel.simulateButton(HousingButtonEvent.BackOrSafety)
-        }
     }
 }
 

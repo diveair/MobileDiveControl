@@ -776,7 +776,8 @@ object CameraCatalog {
     }
 
     private fun evOptions(): List<String> = buildList {
-        for (step in -40..40) {
+        // Matches typical Samsung flagship AE_COMPENSATION_RANGE [-20,20] at step 0.1
+        for (step in -20..20) {
             val value = step / 10.0
             if (value == 0.0) {
                 add("0")
