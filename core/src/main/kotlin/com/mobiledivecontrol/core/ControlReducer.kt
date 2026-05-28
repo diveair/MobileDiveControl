@@ -916,6 +916,7 @@ class ControlReducer(
                     currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue,
                     options = spec.options,
                     step = step * stepSize,
+                    wrap = false,
                 )
                 val nextCamera = applySettingValue(state.camera, spec.id, nextValue)
                 val effect = cameraEffectForSetting(spec.id, nextValue)
@@ -933,10 +934,12 @@ class ControlReducer(
                     }
                 }
 
+                val shouldWrap = spec.kind != CameraSettingKind.Slider
                 val nextValue = advanceOption(
                     currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue,
                     options = spec.options,
                     step = step,
+                    wrap = shouldWrap,
                 )
                 val nextCamera = applySettingValue(state.camera, spec.id, nextValue)
                 val effect = cameraEffectForSetting(spec.id, nextValue)
@@ -960,12 +963,16 @@ class ControlReducer(
         }
     }
 
-    private fun advanceOption(currentValue: String, options: List<String>, step: Int): String {
+    private fun advanceOption(currentValue: String, options: List<String>, step: Int, wrap: Boolean = false): String {
         if (options.isEmpty()) {
             return currentValue
         }
         val currentIndex = options.indexOf(currentValue).takeIf { it >= 0 } ?: 0
-        val nextIndex = (currentIndex + step).coerceIn(0, options.lastIndex)
+        val nextIndex = if (wrap) {
+            ((currentIndex + step) % options.size + options.size) % options.size
+        } else {
+            (currentIndex + step).coerceIn(0, options.lastIndex)
+        }
         return options[nextIndex]
     }
 
