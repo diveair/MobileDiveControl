@@ -205,7 +205,17 @@ class ControlReducer(
     }
 
     private fun reduceCamera(state: AppState, command: CameraCommand, repeatCount: Int = 0): Reduction = when (command) {
-        CameraCommand.CapturePhoto -> emitCameraEffect(state, command)
+        CameraCommand.CapturePhoto -> {
+            val nextCamera = state.camera.copy(captureCounter = state.camera.captureCounter + 1)
+            if (!state.permissions.camera) {
+                warning(state, "Camera Permission: Disabled")
+            } else {
+                Reduction(
+                    state = state.copy(camera = nextCamera),
+                    effects = listOf(PlatformEffect.ExecuteCamera(command)),
+                )
+            }
+        }
         CameraCommand.ToggleVideoRecording -> Reduction(
             state = state.copy(
                 camera = state.camera.copy(recording = !state.camera.recording),
@@ -425,7 +435,7 @@ class ControlReducer(
             }
             CameraUiZone.SettingsPanel -> {
                 if (camera.settingsEditing) {
-                    adjustSelectedSetting(state, +1, repeatCount)
+                    moveSliderEditTarget(state, -1)
                 } else {
                     when (selectedBottomBarItem(camera)) {
                         is BottomBarItem.ModesButton -> cycleModeFromSettingsBar(state, -1)
@@ -457,7 +467,7 @@ class ControlReducer(
             }
             CameraUiZone.SettingsPanel -> {
                 if (camera.settingsEditing) {
-                    adjustSelectedSetting(state, -1, repeatCount)
+                    moveSliderEditTarget(state, +1)
                 } else {
                     when (selectedBottomBarItem(camera)) {
                         is BottomBarItem.ModesButton -> cycleModeFromSettingsBar(state, +1)
@@ -489,7 +499,7 @@ class ControlReducer(
             }
             CameraUiZone.SettingsPanel -> {
                 if (camera.settingsEditing) {
-                    moveSliderEditTarget(state, -1)
+                    adjustSelectedSetting(state, -1, repeatCount)
                 } else {
                     moveSettingsCursor(state, -1)
                 }
@@ -504,7 +514,7 @@ class ControlReducer(
             CameraUiZone.ModeRail -> enterFromModeRail(state)
             CameraUiZone.SettingsPanel -> {
                 if (camera.settingsEditing) {
-                    moveSliderEditTarget(state, +1)
+                    adjustSelectedSetting(state, +1, repeatCount)
                 } else {
                     moveSettingsCursor(state, +1)
                 }
@@ -911,7 +921,7 @@ class ControlReducer(
 
             if (isFocusSetting) {
                 // Focus: sensitivity controls step size (1 = step 1 option, 100 = step 10 options)
-                val stepSize = (currentSensitivity.level / 10).coerceAtLeast(1)
+                val stepSize = (currentSensitivity.level / 50).coerceAtLeast(1)
                 val nextValue = advanceOption(
                     currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue,
                     options = spec.options,
@@ -927,8 +937,8 @@ class ControlReducer(
             } else {
                 // Other sliders: sensitivity controls rate-limiting during holds
                 if (repeatCount > 0) {
-                    val divisor = (101 - currentSensitivity.level).coerceAtLeast(1)
-                    val shouldApply = if (divisor <= 1) true else repeatCount % divisor == 0
+                    val skipInterval = ((100 - currentSensitivity.level) / 10).coerceAtLeast(1)
+                    val shouldApply = repeatCount % skipInterval == 0
                     if (!shouldApply) {
                         return Reduction(state = state)
                     }

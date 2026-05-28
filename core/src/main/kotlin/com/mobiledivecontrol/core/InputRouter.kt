@@ -97,7 +97,7 @@ class InputRouter {
         HousingButtonEvent.Ok -> RouteDecision(commands = listOf(GalleryCommand.Confirm))
         HousingButtonEvent.Shutter -> RouteDecision(commands = listOf(GalleryCommand.InitiateDelete))
         HousingButtonEvent.ZoomIn -> RouteDecision(commands = listOf(GalleryCommand.CreateFolder))
-        HousingButtonEvent.ZoomOut -> RouteDecision(commands = listOf(GalleryCommand.DeleteFolder))
+        HousingButtonEvent.ZoomOut -> RouteDecision(commands = listOf(GalleryCommand.Back))
         HousingButtonEvent.BackOrSafety -> RouteDecision(commands = listOf(GalleryCommand.Back))
         is HousingButtonEvent.Unknown -> RouteDecision()
     }

@@ -167,16 +167,16 @@ class ControlCoreTest {
         assertTrue(editOutcome.state.camera.settingsEditing)
         assertEquals(SliderEditTarget.Value, editOutcome.state.camera.sliderEditTarget)
 
-        // Move right to the Sensitivity slider, then verify decrement works.
-        val targetOutcome = core.dispatch(CameraCommand.NavigateRight)
+        // Navigate down to the Sensitivity target, then verify decrement works.
+        val targetOutcome = core.dispatch(CameraCommand.NavigateDown)
         assertEquals(SliderEditTarget.Sensitivity, targetOutcome.state.camera.sliderEditTarget)
 
-        // Press down once: sensitivity goes from 50 (default) to 49
-        core.dispatch(CameraCommand.NavigateDown)
+        // Press right once: sensitivity goes from 50 (default) to 49
+        core.dispatch(CameraCommand.NavigateLeft)
         assertEquals(SliderSensitivity(49), core.state.camera.sliderSensitivities["pro.white_balance"])
 
-        // Move back left to the Value slider.
-        val exitSensOutcome = core.dispatch(CameraCommand.NavigateLeft)
+        // Move back up to the Value target.
+        val exitSensOutcome = core.dispatch(CameraCommand.NavigateUp)
         assertEquals(SliderEditTarget.Value, exitSensOutcome.state.camera.sliderEditTarget)
 
         // Set sensitivity to 1 directly for rate-limiting test
@@ -189,21 +189,21 @@ class ControlCoreTest {
 
         val reducer = ControlReducer()
 
-        // repeatCount = 1: ignored under sensitivity 1 (divisor = 100)
+        // repeatCount = 1: ignored under sensitivity 1 (skipInterval = 9)
         val red1 = reducer.reduce(stateWithLowSens.copy(
             camera = stateWithLowSens.camera.copy(settingsEditing = true, sliderEditTarget = SliderEditTarget.Value)
-        ), CameraCommand.NavigateUp, repeatCount = 1)
+        ), CameraCommand.NavigateRight, repeatCount = 1)
         assertEquals(initialVal, red1.state.camera.settingValues["pro.white_balance"])
 
-        // repeatCount = 100: applied under sensitivity 1 (100 % 100 == 0)
-        val red100 = reducer.reduce(stateWithLowSens.copy(
+        // repeatCount = 9: applied under sensitivity 1 (9 % 9 == 0)
+        val red9 = reducer.reduce(stateWithLowSens.copy(
             camera = stateWithLowSens.camera.copy(settingsEditing = true, sliderEditTarget = SliderEditTarget.Value)
-        ), CameraCommand.NavigateUp, repeatCount = 100)
-        assertTrue(red100.state.camera.settingValues["pro.white_balance"] != initialVal)
+        ), CameraCommand.NavigateRight, repeatCount = 9)
+        assertTrue(red9.state.camera.settingValues["pro.white_balance"] != initialVal)
     }
 
     @Test
-    fun `separate up button taps each adjust white balance once`() {
+    fun `separate right button taps each adjust white balance once`() {
         val core = ControlCore()
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
@@ -223,14 +223,15 @@ class ControlCoreTest {
         assertTrue(editOutcome.state.camera.settingsEditing)
         assertEquals("5600K", editOutcome.state.camera.settingValues["pro.white_balance"])
 
+        // 0x10 = Right button (now adjusts value +1)
         val firstPress = core.handleButtonPayload(
-            payload = byteArrayOf(0x30),
+            payload = byteArrayOf(0x10),
             receivedAt = Instant.parse("2026-05-27T12:00:00Z"),
         )
         assertEquals("6500K", firstPress.state.camera.settingValues["pro.white_balance"])
 
         val secondPress = core.handleButtonPayload(
-            payload = byteArrayOf(0x30),
+            payload = byteArrayOf(0x10),
             receivedAt = Instant.parse("2026-05-27T12:00:00.250Z"),
         )
         assertEquals("7500K", secondPress.state.camera.settingValues["pro.white_balance"])

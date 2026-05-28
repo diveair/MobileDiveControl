@@ -11,6 +11,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.Image
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -554,12 +555,12 @@ private fun BottomSettingsTray(
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                     )
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
 
                     Column(
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth(0.7f),
                     ) {
                         BottomEditCard(
                             title = "Value",
@@ -581,6 +582,13 @@ private fun BottomSettingsTray(
                             }
                         }
                     }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "▲▼ Select  ·  ◀▶ Adjust",
+                        color = DiveColors.TextMuted,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
                 }
             }
         } else {
@@ -678,14 +686,14 @@ private fun BottomEditCard(
         modifier = modifier
             .background(
                 color = if (selected) DiveColors.DiveCyan.copy(alpha = 0.14f) else DiveColors.SurfaceCard.copy(alpha = 0.5f),
-                shape = RoundedCornerShape(16.dp),
+                shape = RoundedCornerShape(12.dp),
             )
             .border(
                 width = 1.dp,
                 color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.55f),
-                shape = RoundedCornerShape(16.dp),
+                shape = RoundedCornerShape(12.dp),
             )
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(horizontal = 8.dp, vertical = 6.dp),
     ) {
         Row(
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -694,17 +702,17 @@ private fun BottomEditCard(
             Text(
                 text = title,
                 color = if (selected) DiveColors.TextPrimary else DiveColors.TextSecondary,
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.Bold,
             )
             Text(
                 text = value,
                 color = if (selected) DiveColors.DiveCyan else DiveColors.TextMuted,
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.Bold,
             )
         }
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(4.dp))
         content()
     }
 }
@@ -722,8 +730,8 @@ private fun BottomBarChip(
     val horizontalPadding = if (compact) 7.dp else 10.dp
     val verticalPadding = if (compact) 3.dp else 5.dp
     val iconSize = when {
-        item is BottomBarItem.GalleryShortcut && compact -> 16.dp
-        item is BottomBarItem.GalleryShortcut -> 19.dp
+        item is BottomBarItem.GalleryShortcut && compact -> 28.dp
+        item is BottomBarItem.GalleryShortcut -> 32.dp
         compact -> 12.dp
         else -> 15.dp
     }
@@ -798,6 +806,7 @@ private fun BottomBarChip(
                 GalleryChipPreview(
                     selected = selected,
                     size = iconSize,
+                    captureCounter = cameraState.captureCounter,
                 )
             } else {
                 Icon(
@@ -891,21 +900,22 @@ private fun formatLensValue(value: String): String = when (value) {
 private fun GalleryChipPreview(
     selected: Boolean,
     size: androidx.compose.ui.unit.Dp,
+    captureCounter: Int = 0,
 ) {
-    val thumbnail = rememberLatestGalleryThumbnail()
-    val frameSize = size + 8.dp
+    val thumbnail = rememberLatestGalleryThumbnail(captureCounter)
 
     if (thumbnail != null) {
         Image(
             bitmap = thumbnail,
             contentDescription = null,
+            contentScale = ContentScale.Crop,
             modifier = Modifier
-                .size(frameSize)
-                .clip(RoundedCornerShape(6.dp))
+                .size(size)
+                .clip(CircleShape)
                 .border(
-                    width = 1.dp,
+                    width = 2.dp,
                     color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.6f),
-                    shape = RoundedCornerShape(6.dp),
+                    shape = CircleShape,
                 ),
         )
     } else {
@@ -919,11 +929,13 @@ private fun GalleryChipPreview(
 }
 
 @Composable
-private fun rememberLatestGalleryThumbnail(): androidx.compose.ui.graphics.ImageBitmap? {
+private fun rememberLatestGalleryThumbnail(refreshKey: Int = 0): androidx.compose.ui.graphics.ImageBitmap? {
     val context = LocalContext.current
     var thumbnail by remember(context) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
 
-    LaunchedEffect(context) {
+    LaunchedEffect(context, refreshKey) {
+        // Small delay after capture to let MediaStore index the new file
+        if (refreshKey > 0) kotlinx.coroutines.delay(500)
         thumbnail = loadLatestGalleryThumbnail(context)?.asImageBitmap()
     }
 

@@ -221,6 +221,7 @@ data class CameraState(
     ),
     val selectedControlIndex: Int = 0,
     val showMoreSettings: Boolean = false,
+    val captureCounter: Int = 0,
 )
 
 val CameraState.selectedControl: CameraControl

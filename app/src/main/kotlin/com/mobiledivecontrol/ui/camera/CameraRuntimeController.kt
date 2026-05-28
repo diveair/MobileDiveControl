@@ -100,6 +100,14 @@ class CameraRuntimeController(
         when (command) {
             CameraCommand.CapturePhoto -> capturePhoto()
             CameraCommand.OpenGallery -> openGallery()
+            is CameraCommand.SetManualFocus -> applySessionState(latestState)
+            is CameraCommand.SetIso,
+            is CameraCommand.SetShutterSpeedNs,
+            is CameraCommand.SetWhiteBalanceKelvin,
+            is CameraCommand.SetExposureCompensation,
+            is CameraCommand.SetFlashMode,
+            is CameraCommand.SetHdrLogMode,
+            is CameraCommand.SetFilter -> applySessionState(latestState)
             else -> Unit
         }
     }
