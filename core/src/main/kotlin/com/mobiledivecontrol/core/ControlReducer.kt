@@ -1101,19 +1101,38 @@ class ControlReducer(
         val gallery = state.gallery
         return when (command) {
             GalleryCommand.NavigateUp -> {
-                if (gallery.viewMode == GalleryViewMode.Browser && gallery.items.isNotEmpty()) {
-                    val nextIndex = (gallery.selectedIndex - 1).coerceAtLeast(0)
-                    Reduction(state = state.copy(gallery = gallery.copy(selectedIndex = nextIndex)))
-                } else {
-                    Reduction(state = state)
+                when (gallery.viewMode) {
+                    GalleryViewMode.Browser -> {
+                        if (gallery.items.isNotEmpty()) {
+                            val nextIndex = (gallery.selectedIndex - 1).coerceAtLeast(0)
+                            Reduction(state = state.copy(gallery = gallery.copy(selectedIndex = nextIndex)))
+                        } else {
+                            Reduction(state = state)
+                        }
+                    }
+                    GalleryViewMode.ConfirmDelete, GalleryViewMode.ConfirmFolderDelete, GalleryViewMode.CreateFolder -> {
+                        // Toggle between confirm (0) and cancel (1)
+                        val next = if (gallery.confirmButtonIndex == 0) 1 else 0
+                        Reduction(state = state.copy(gallery = gallery.copy(confirmButtonIndex = next)))
+                    }
+                    else -> Reduction(state = state)
                 }
             }
             GalleryCommand.NavigateDown -> {
-                if (gallery.viewMode == GalleryViewMode.Browser && gallery.items.isNotEmpty()) {
-                    val nextIndex = (gallery.selectedIndex + 1).coerceAtMost(gallery.items.lastIndex)
-                    Reduction(state = state.copy(gallery = gallery.copy(selectedIndex = nextIndex)))
-                } else {
-                    Reduction(state = state)
+                when (gallery.viewMode) {
+                    GalleryViewMode.Browser -> {
+                        if (gallery.items.isNotEmpty()) {
+                            val nextIndex = (gallery.selectedIndex + 1).coerceAtMost(gallery.items.lastIndex)
+                            Reduction(state = state.copy(gallery = gallery.copy(selectedIndex = nextIndex)))
+                        } else {
+                            Reduction(state = state)
+                        }
+                    }
+                    GalleryViewMode.ConfirmDelete, GalleryViewMode.ConfirmFolderDelete, GalleryViewMode.CreateFolder -> {
+                        val next = if (gallery.confirmButtonIndex == 0) 1 else 0
+                        Reduction(state = state.copy(gallery = gallery.copy(confirmButtonIndex = next)))
+                    }
+                    else -> Reduction(state = state)
                 }
             }
             GalleryCommand.NavigateLeft -> {
@@ -1140,6 +1159,10 @@ class ControlReducer(
                             )),
                             effects = listOf(PlatformEffect.LoadGalleryItems),
                         )
+                    }
+                    GalleryViewMode.ConfirmDelete, GalleryViewMode.ConfirmFolderDelete, GalleryViewMode.CreateFolder -> {
+                        val next = if (gallery.confirmButtonIndex == 0) 1 else 0
+                        Reduction(state = state.copy(gallery = gallery.copy(confirmButtonIndex = next)))
                     }
                     else -> Reduction(state = state)
                 }
@@ -1169,6 +1192,10 @@ class ControlReducer(
                             effects = listOf(PlatformEffect.LoadGalleryItems),
                         )
                     }
+                    GalleryViewMode.ConfirmDelete, GalleryViewMode.ConfirmFolderDelete, GalleryViewMode.CreateFolder -> {
+                        val next = if (gallery.confirmButtonIndex == 0) 1 else 0
+                        Reduction(state = state.copy(gallery = gallery.copy(confirmButtonIndex = next)))
+                    }
                     else -> Reduction(state = state)
                 }
             }
@@ -1196,21 +1223,9 @@ class ControlReducer(
                         }
                     }
                     GalleryViewMode.ConfirmDelete -> {
-                        val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
-                        val nextItems = gallery.items.toMutableList().apply { removeAt(gallery.selectedIndex) }
-                        val nextIndex = gallery.selectedIndex.coerceAtMost((nextItems.size - 1).coerceAtLeast(0))
-                        Reduction(
-                            state = state.copy(gallery = gallery.copy(
-                                viewMode = GalleryViewMode.Browser,
-                                items = nextItems,
-                                selectedIndex = nextIndex,
-                            )),
-                            effects = listOf(PlatformEffect.DeleteGalleryItem(item)),
-                        )
-                    }
-                    GalleryViewMode.ConfirmFolderDelete -> {
-                        val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
-                        if (item.isFolder) {
+                        if (gallery.confirmButtonIndex == 0) {
+                            // Delete confirmed
+                            val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
                             val nextItems = gallery.items.toMutableList().apply { removeAt(gallery.selectedIndex) }
                             val nextIndex = gallery.selectedIndex.coerceAtMost((nextItems.size - 1).coerceAtLeast(0))
                             Reduction(
@@ -1218,19 +1233,53 @@ class ControlReducer(
                                     viewMode = GalleryViewMode.Browser,
                                     items = nextItems,
                                     selectedIndex = nextIndex,
+                                    confirmButtonIndex = 1,
                                 )),
-                                effects = listOf(PlatformEffect.DeleteGalleryFolder(item.path)),
+                                effects = listOf(PlatformEffect.DeleteGalleryItem(item)),
                             )
                         } else {
-                            Reduction(state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.Browser)))
+                            // Cancel
+                            Reduction(state = state.copy(gallery = gallery.copy(
+                                viewMode = GalleryViewMode.Browser,
+                                confirmButtonIndex = 1,
+                            )))
+                        }
+                    }
+                    GalleryViewMode.ConfirmFolderDelete -> {
+                        if (gallery.confirmButtonIndex == 0) {
+                            val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
+                            if (item.isFolder) {
+                                val nextItems = gallery.items.toMutableList().apply { removeAt(gallery.selectedIndex) }
+                                val nextIndex = gallery.selectedIndex.coerceAtMost((nextItems.size - 1).coerceAtLeast(0))
+                                Reduction(
+                                    state = state.copy(gallery = gallery.copy(
+                                        viewMode = GalleryViewMode.Browser,
+                                        items = nextItems,
+                                        selectedIndex = nextIndex,
+                                        confirmButtonIndex = 1,
+                                    )),
+                                    effects = listOf(PlatformEffect.DeleteGalleryFolder(item.path)),
+                                )
+                            } else {
+                                Reduction(state = state.copy(gallery = gallery.copy(
+                                    viewMode = GalleryViewMode.Browser,
+                                    confirmButtonIndex = 1,
+                                )))
+                            }
+                        } else {
+                            Reduction(state = state.copy(gallery = gallery.copy(
+                                viewMode = GalleryViewMode.Browser,
+                                confirmButtonIndex = 1,
+                            )))
                         }
                     }
                     GalleryViewMode.CreateFolder -> {
-                        if (gallery.folderName.isNotBlank()) {
+                        if (gallery.confirmButtonIndex == 0 && gallery.folderName.isNotBlank()) {
                             Reduction(
                                 state = state.copy(gallery = gallery.copy(
                                     viewMode = GalleryViewMode.Browser,
                                     folderName = "",
+                                    confirmButtonIndex = 1,
                                 )),
                                 effects = listOf(
                                     PlatformEffect.CreateGalleryFolder(gallery.folderName),
@@ -1238,7 +1287,11 @@ class ControlReducer(
                                 ),
                             )
                         } else {
-                            Reduction(state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.Browser)))
+                            Reduction(state = state.copy(gallery = gallery.copy(
+                                viewMode = GalleryViewMode.Browser,
+                                folderName = "",
+                                confirmButtonIndex = 1,
+                            )))
                         }
                     }
                     else -> Reduction(state = state)
@@ -1282,7 +1335,7 @@ class ControlReducer(
                 if (gallery.viewMode == GalleryViewMode.Browser || gallery.viewMode == GalleryViewMode.Preview) {
                     val item = gallery.items.getOrNull(gallery.selectedIndex)
                     if (item != null && !item.isFolder) {
-                        Reduction(state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.ConfirmDelete)))
+                        Reduction(state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.ConfirmDelete, confirmButtonIndex = 1)))
                     } else {
                         Reduction(state = state)
                     }
@@ -1298,6 +1351,7 @@ class ControlReducer(
                         state = state.copy(gallery = gallery.copy(
                             viewMode = GalleryViewMode.CreateFolder,
                             folderName = folderName,
+                            confirmButtonIndex = 1,
                         )),
                     )
                 } else {
@@ -1308,7 +1362,7 @@ class ControlReducer(
                 if (gallery.viewMode == GalleryViewMode.Browser && gallery.tab == GalleryTab.Folders) {
                     val item = gallery.items.getOrNull(gallery.selectedIndex)
                     if (item != null && item.isFolder) {
-                        Reduction(state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.ConfirmFolderDelete)))
+                        Reduction(state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.ConfirmFolderDelete, confirmButtonIndex = 1)))
                     } else {
                         Reduction(state = state)
                     }

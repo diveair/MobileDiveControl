@@ -76,8 +76,9 @@ fun GalleryScreen(
                 ConfirmationOverlay(
                     title = "Delete Item?",
                     message = galleryState.items.getOrNull(galleryState.selectedIndex)?.name ?: "",
-                    confirmLabel = "OK to Delete",
-                    cancelLabel = "Back to Cancel",
+                    confirmLabel = "Delete",
+                    cancelLabel = "Cancel",
+                    selectedIndex = galleryState.confirmButtonIndex,
                 )
             }
             GalleryViewMode.ConfirmFolderDelete -> {
@@ -85,8 +86,9 @@ fun GalleryScreen(
                 ConfirmationOverlay(
                     title = "Delete Folder?",
                     message = galleryState.items.getOrNull(galleryState.selectedIndex)?.name ?: "",
-                    confirmLabel = "OK to Delete",
-                    cancelLabel = "Back to Cancel",
+                    confirmLabel = "Delete",
+                    cancelLabel = "Cancel",
+                    selectedIndex = galleryState.confirmButtonIndex,
                 )
             }
             GalleryViewMode.CreateFolder -> {
@@ -94,8 +96,9 @@ fun GalleryScreen(
                 ConfirmationOverlay(
                     title = "Create Folder",
                     message = galleryState.folderName,
-                    confirmLabel = "OK to Create",
-                    cancelLabel = "Back to Cancel",
+                    confirmLabel = "Create",
+                    cancelLabel = "Cancel",
+                    selectedIndex = galleryState.confirmButtonIndex,
                 )
             }
         }
@@ -467,6 +470,7 @@ private fun ConfirmationOverlay(
     message: String,
     confirmLabel: String,
     cancelLabel: String,
+    selectedIndex: Int, // 0 = confirm, 1 = cancel
 ) {
     Box(
         contentAlignment = Alignment.Center,
@@ -478,7 +482,7 @@ private fun ConfirmationOverlay(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
                 .background(DiveColors.SurfaceCard, RoundedCornerShape(20.dp))
-                .border(1.5.dp, DiveColors.DiveCyan, RoundedCornerShape(20.dp))
+                .border(1.5.dp, DiveColors.DiveCyan.copy(alpha = 0.6f), RoundedCornerShape(20.dp))
                 .padding(horizontal = 32.dp, vertical = 24.dp),
         ) {
             Icon(
@@ -505,19 +509,75 @@ private fun ConfirmationOverlay(
                 overflow = TextOverflow.Ellipsis,
             )
             Spacer(modifier = Modifier.height(20.dp))
+
+            // Two selectable buttons
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                modifier = Modifier.fillMaxWidth(0.8f),
+            ) {
+                // Confirm button (index 0)
+                ConfirmDialogButton(
+                    label = confirmLabel,
+                    isSelected = selectedIndex == 0,
+                    isDestructive = true,
+                    modifier = Modifier.weight(1f),
+                )
+                // Cancel button (index 1)
+                ConfirmDialogButton(
+                    label = cancelLabel,
+                    isSelected = selectedIndex == 1,
+                    isDestructive = false,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
             Text(
-                text = confirmLabel,
-                color = DiveColors.DiveCyan,
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Bold,
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = cancelLabel,
+                text = "▲▼ ◀▶  Select  ·  OK  Execute",
                 color = DiveColors.TextMuted,
-                style = MaterialTheme.typography.bodySmall,
+                style = MaterialTheme.typography.labelSmall,
             )
         }
+    }
+}
+
+@Composable
+private fun ConfirmDialogButton(
+    label: String,
+    isSelected: Boolean,
+    isDestructive: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val bgColor = when {
+        isSelected && isDestructive -> DiveColors.Critical.copy(alpha = 0.25f)
+        isSelected -> DiveColors.DiveCyan.copy(alpha = 0.2f)
+        else -> DiveColors.SurfaceCard.copy(alpha = 0.4f)
+    }
+    val borderColor = when {
+        isSelected && isDestructive -> DiveColors.Critical
+        isSelected -> DiveColors.DiveCyan
+        else -> DiveColors.SurfaceBorder.copy(alpha = 0.3f)
+    }
+    val textColor = when {
+        isSelected && isDestructive -> DiveColors.Critical
+        isSelected -> DiveColors.DiveCyan
+        else -> DiveColors.TextMuted
+    }
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .background(bgColor, RoundedCornerShape(12.dp))
+            .border(1.5.dp, borderColor, RoundedCornerShape(12.dp))
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+    ) {
+        Text(
+            text = label,
+            color = textColor,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 

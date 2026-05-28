@@ -323,7 +323,7 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `gallery delete confirmation flow`() {
+    fun `gallery delete confirmation flow with selectable buttons`() {
         val reducer = ControlReducer()
         val items = listOf(
             GalleryItem(id = 1, name = "photo1.jpg", path = "/photo1.jpg"),
@@ -333,13 +333,24 @@ class ControlCoreTest {
             gallery = GalleryState(items = items, selectedIndex = 0),
         )
 
-        // Initiate delete
+        // Initiate delete — defaults to Cancel (index 1)
         val initDelete = reducer.reduce(state, GalleryCommand.InitiateDelete)
         assertEquals(GalleryViewMode.ConfirmDelete, initDelete.state.gallery.viewMode)
+        assertEquals(1, initDelete.state.gallery.confirmButtonIndex)
 
-        // Cancel via Back
-        val cancel = reducer.reduce(initDelete.state, GalleryCommand.Back)
-        assertEquals(GalleryViewMode.Browser, cancel.state.gallery.viewMode)
+        // OK while Cancel is highlighted — cancels back to browser
+        val cancelViaOk = reducer.reduce(initDelete.state, GalleryCommand.Confirm)
+        assertEquals(GalleryViewMode.Browser, cancelViaOk.state.gallery.viewMode)
+
+        // Initiate again, then switch to Delete with arrow
+        val initAgain = reducer.reduce(state, GalleryCommand.InitiateDelete)
+        val switchToDelete = reducer.reduce(initAgain.state, GalleryCommand.NavigateLeft)
+        assertEquals(0, switchToDelete.state.gallery.confirmButtonIndex)
+
+        // OK while Delete is highlighted — executes delete
+        val confirmDelete = reducer.reduce(switchToDelete.state, GalleryCommand.Confirm)
+        assertEquals(GalleryViewMode.Browser, confirmDelete.state.gallery.viewMode)
+        assertTrue(confirmDelete.effects.any { it is PlatformEffect.DeleteGalleryItem })
     }
 
     @Test

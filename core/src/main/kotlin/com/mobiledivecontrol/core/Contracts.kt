@@ -279,6 +279,7 @@ data class GalleryState(
     val currentFolder: String? = null,
     val folderName: String = "",
     val previewExifLines: List<String> = emptyList(),
+    val confirmButtonIndex: Int = 1, // 0 = Delete/Confirm, 1 = Cancel (default to Cancel for safety)
 )
 
 data class AppState(
