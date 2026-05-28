@@ -16,6 +16,7 @@ import android.util.Log
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
@@ -52,6 +53,7 @@ class CameraRuntimeController(
     private var boundLensFacing: Int? = null
     private var boundResolution: String? = null
     private var boundHdrExtension: Boolean = false
+    private var boundFocusMode: Boolean = false // true = manual focus, false = AF
     private var latestState: CameraState = CameraState()
     private var latestWaterPressureKpa: Double? = null
     private var latestAtmosphericPressureKpa: Double? = null
@@ -142,8 +144,13 @@ class CameraRuntimeController(
 
         val desiredLensFacing = desiredLensFacing(cameraState)
         val desiredResolution = desiredResolutionValue(cameraState)
+        // Only rebind when switching between AF and manual focus (not every distance change)
+        val desiredManualFocus = currentValue(cameraState, ".manual_focus").let {
+            it != null && it != "AF" && deviceMinFocusDistance > 0f
+        }
         val needsRebind = desiredLensFacing != boundLensFacing ||
-                desiredResolution != boundResolution
+                desiredResolution != boundResolution ||
+                desiredManualFocus != boundFocusMode
         if (needsRebind) {
             Log.d(TAG, "applyState: rebinding camera")
             bindCamera(force = true)
@@ -189,7 +196,24 @@ class CameraRuntimeController(
         // It blocks Camera2 interop, preventing manual focus/ISO/shutter from working.
         // HDR is applied via Camera2 SCENE_MODE_HDR in applyCamera2Options instead.
 
-        val preview = Preview.Builder()
+        // Check if manual focus is active — if so, disable AF at bind time via Camera2Interop
+        val focusValue = currentValue(latestState, ".manual_focus")
+        val isManualFocus = focusValue != null && focusValue != "AF" && deviceMinFocusDistance > 0f
+
+        val previewBuilder = Preview.Builder()
+        if (isManualFocus) {
+            // Set AF_MODE_OFF in the repeating request template at bind time.
+            // This is the only reliable way to disable Samsung's AF pipeline —
+            // runtime Camera2 interop is accepted but Samsung HAL ignores AF_MODE changes.
+            val normalizedFocus = focusValue!!.toFloatOrNull()?.coerceIn(0f, 1f) ?: 0f
+            val focusDistance = (deviceMinFocusDistance * normalizedFocus).coerceIn(0f, deviceMinFocusDistance)
+            Camera2Interop.Extender(previewBuilder)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+            Log.d(TAG, "bindCamera: AF_MODE_OFF + focus=$focusDistance set at bind time via Extender")
+        }
+
+        val preview = previewBuilder
             .build()
             .also { it.setSurfaceProvider(previewSurface.surfaceProvider) }
 
@@ -224,6 +248,7 @@ class CameraRuntimeController(
         imageCapture = capture
         boundLensFacing = desiredLensFacing
         boundResolution = desiredResolution
+        boundFocusMode = isManualFocus
 
         // Detect device capabilities from the bound camera
         applySessionState(latestState)
@@ -487,13 +512,23 @@ class CameraRuntimeController(
             } catch (_: Exception) { }
         }
 
-        // Apply ALL options atomically — single setCaptureRequestOptions replaces everything
+        // Clear previous options first, then apply new ones atomically
         try {
             val cam2Control = Camera2CameraControl.from(boundCamera.cameraControl)
-            cam2Control.captureRequestOptions = builder.build()
-            Log.d(TAG, "Camera2 options applied successfully")
+            cam2Control.clearCaptureRequestOptions()
+            val future = cam2Control.addCaptureRequestOptions(builder.build())
+            // Check the future result on a background thread
+            future.addListener({
+                try {
+                    future.get()
+                    Log.d(TAG, "Camera2 options CONFIRMED by HAL")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Camera2 options REJECTED by HAL: ${e.message}")
+                }
+            }, { it.run() })
+            Log.d(TAG, "Camera2 options submitted")
         } catch (e: Exception) {
-            Log.e(TAG, "Camera2 options FAILED", e)
+            Log.e(TAG, "Camera2 options FAILED to submit", e)
         }
     }
 
