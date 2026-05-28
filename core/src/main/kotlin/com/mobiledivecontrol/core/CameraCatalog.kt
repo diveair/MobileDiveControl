@@ -776,13 +776,14 @@ object CameraCatalog {
     }
 
     private fun evOptions(): List<String> = buildList {
-        // Matches typical Samsung flagship AE_COMPENSATION_RANGE [-20,20] at step 0.1
-        for (step in -20..20) {
-            val value = step / 10.0
+        // 4x finer granularity: 0.025 EV steps over ±2.0 range (161 options)
+        // applyExposure() rounds to nearest hardware compensation index
+        for (step in -80..80) {
+            val value = step / 40.0
             if (value == 0.0) {
                 add("0")
             } else {
-                add(String.format(Locale.US, "%+.1f", value))
+                add(String.format(Locale.US, "%+.2f", value))
             }
         }
     }

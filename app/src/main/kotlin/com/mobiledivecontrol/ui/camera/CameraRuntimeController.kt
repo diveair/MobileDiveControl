@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ContentValues
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.RggbChannelVector
@@ -50,10 +51,11 @@ class CameraRuntimeController(
     private var latestWaterPressureKpa: Double? = null
     private var latestAtmosphericPressureKpa: Double? = null
 
-    // Device capabilities detected at bind time
-    private var deviceMinFocusDistance: Float = 0f
+    // Device capabilities detected once at attach time via CameraManager
+    private var deviceMinFocusDistance: Float = 10f // Safe default — most phones have ~10 diopters
     private var deviceHasVendorHdr: Boolean = false
     private var deviceMaxSupportedResolution: Size? = null
+    private var capabilitiesDetected: Boolean = false
 
     fun attach(
         previewView: PreviewView,
@@ -69,6 +71,11 @@ class CameraRuntimeController(
         cameraProviderFuture.addListener(
             {
                 cameraProvider = cameraProviderFuture.get()
+                // Detect capabilities using CameraManager (works regardless of extensions)
+                if (!capabilitiesDetected) {
+                    detectDeviceCapabilitiesViaCameraManager()
+                    capabilitiesDetected = true
+                }
                 // Initialize extensions manager for vendor HDR
                 initExtensions {
                     bindCamera(force = true)
@@ -222,30 +229,33 @@ class CameraRuntimeController(
         boundHdrExtension = useVendorHdr
 
         // Detect device capabilities from the bound camera
-        detectDeviceCapabilities()
         applySessionState(latestState)
     }
 
-    private fun detectDeviceCapabilities() {
-        val boundCamera = camera ?: return
-        val camera2Info = Camera2CameraInfo.from(boundCamera.cameraInfo)
-
-        // Detect minimum focus distance (max diopters = closest focus)
-        deviceMinFocusDistance = camera2Info.getCameraCharacteristic(
-            CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
-        ) ?: 0f
-
-        // Detect max supported resolution for the current lens
+    private fun detectDeviceCapabilitiesViaCameraManager() {
         try {
-            val streamConfigMap = camera2Info.getCameraCharacteristic(
-                CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
-            )
-            if (streamConfigMap != null) {
-                val outputSizes = streamConfigMap.getOutputSizes(android.graphics.ImageFormat.JPEG)
-                deviceMaxSupportedResolution = outputSizes?.maxByOrNull { it.width * it.height }
+            val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            // Find the back-facing camera for capabilities
+            for (id in cameraManager.cameraIdList) {
+                val chars = cameraManager.getCameraCharacteristics(id)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    deviceMinFocusDistance = chars.get(
+                        CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
+                    ) ?: 10f
+
+                    val streamConfigMap = chars.get(
+                        CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
+                    )
+                    if (streamConfigMap != null) {
+                        val outputSizes = streamConfigMap.getOutputSizes(android.graphics.ImageFormat.JPEG)
+                        deviceMaxSupportedResolution = outputSizes?.maxByOrNull { it.width * it.height }
+                    }
+                    break
+                }
             }
         } catch (_: Exception) {
-            // Ignore
+            // Keep safe defaults
         }
     }
 

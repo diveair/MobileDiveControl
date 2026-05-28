@@ -250,9 +250,10 @@ class ControlCoreTest {
         assertEquals("0", evSelected.state.camera.settingValues["photo.exposure_compensation"])
 
         val adjusted = core.dispatch(CameraCommand.NavigateUp)
-        assertEquals("+0.1", adjusted.state.camera.settingValues["photo.exposure_compensation"])
+        // EV steps are 0.025 — first step from "0" is "+0.03" (0.025 formatted %.2f rounds up)
+        assertEquals("+0.03", adjusted.state.camera.settingValues["photo.exposure_compensation"])
         assertEquals(
-            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SetExposureCompensation(0.1))),
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SetExposureCompensation(0.03))),
             adjusted.effects,
         )
     }
