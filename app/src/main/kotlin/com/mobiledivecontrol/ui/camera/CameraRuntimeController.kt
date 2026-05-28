@@ -12,6 +12,7 @@ import android.hardware.camera2.params.TonemapCurve
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -38,6 +39,10 @@ import kotlin.math.roundToInt
 class CameraRuntimeController(
     private val context: Context,
 ) {
+    companion object {
+        private const val TAG = "DiveCameraCtrl"
+    }
+
     private var previewView: PreviewView? = null
     private var lifecycleOwner: LifecycleOwner? = null
     private var cameraProvider: ProcessCameraProvider? = null
@@ -125,22 +130,25 @@ class CameraRuntimeController(
         waterPressureKpa: Double?,
         atmosphericPressureKpa: Double?,
     ) {
+        val focusVal = cameraState.settingValues["photo.manual_focus"]
+        Log.d(TAG, "applyState called: focus=$focusVal")
         latestState = cameraState
         latestWaterPressureKpa = waterPressureKpa
         latestAtmosphericPressureKpa = atmosphericPressureKpa
         if (cameraProvider == null || previewView == null || lifecycleOwner == null) {
+            Log.d(TAG, "applyState: early return (provider/preview/lifecycle null)")
             return
         }
 
         val desiredLensFacing = desiredLensFacing(cameraState)
         val desiredResolution = desiredResolutionValue(cameraState)
-        val desiredHdr = resolvedHdrLogMode(cameraState) == "HDR" && deviceHasVendorHdr
         val needsRebind = desiredLensFacing != boundLensFacing ||
-                desiredResolution != boundResolution ||
-                desiredHdr != boundHdrExtension
+                desiredResolution != boundResolution
         if (needsRebind) {
+            Log.d(TAG, "applyState: rebinding camera")
             bindCamera(force = true)
         } else {
+            Log.d(TAG, "applyState: applying session state")
             applySessionState(cameraState)
         }
     }
@@ -167,29 +175,19 @@ class CameraRuntimeController(
         val previewSurface = previewView ?: return
         val desiredLensFacing = desiredLensFacing(latestState)
         val desiredResolution = desiredResolutionValue(latestState)
-        val useVendorHdr = resolvedHdrLogMode(latestState) == "HDR" && deviceHasVendorHdr
 
         if (!force && desiredLensFacing == boundLensFacing &&
-            desiredResolution == boundResolution && useVendorHdr == boundHdrExtension) {
+            desiredResolution == boundResolution) {
             applySessionState(latestState)
             return
         }
 
-        var selector = CameraSelector.Builder()
+        val selector = CameraSelector.Builder()
             .requireLensFacing(desiredLensFacing)
             .build()
-
-        // Use vendor HDR extension when available and requested
-        if (useVendorHdr) {
-            try {
-                val extManager = extensionsManager
-                if (extManager != null && extManager.isExtensionAvailable(selector, ExtensionMode.HDR)) {
-                    selector = extManager.getExtensionEnabledCameraSelector(selector, ExtensionMode.HDR)
-                }
-            } catch (_: Exception) {
-                // Fall through to standard camera
-            }
-        }
+        // Note: vendor HDR extension (ExtensionMode.HDR) is intentionally NOT used.
+        // It blocks Camera2 interop, preventing manual focus/ISO/shutter from working.
+        // HDR is applied via Camera2 SCENE_MODE_HDR in applyCamera2Options instead.
 
         val preview = Preview.Builder()
             .build()
@@ -226,7 +224,6 @@ class CameraRuntimeController(
         imageCapture = capture
         boundLensFacing = desiredLensFacing
         boundResolution = desiredResolution
-        boundHdrExtension = useVendorHdr
 
         // Detect device capabilities from the bound camera
         applySessionState(latestState)
@@ -344,74 +341,46 @@ class CameraRuntimeController(
     }
 
     private fun applyCamera2Options(cameraState: CameraState, boundCamera: Camera) {
-        applyManualFocus(cameraState, boundCamera)
-        applyCamera2AdvancedOptions(cameraState, boundCamera)
-    }
+        val builder = CaptureRequestOptions.Builder()
 
-    /**
-     * Apply manual focus SEPARATELY from other Camera2 options.
-     * CameraX manages its own autofocus pipeline, so we must:
-     * 1. Cancel CameraX's focus/metering to stop it from reasserting AF_MODE
-     * 2. Set AF_MODE_OFF + LENS_FOCUS_DISTANCE via Camera2 interop
-     */
-    private fun applyManualFocus(cameraState: CameraState, boundCamera: Camera) {
+        // --- Manual Focus ---
         val focusValue = currentValue(cameraState, ".manual_focus")
         val minimumFocusDistance = deviceMinFocusDistance
+        val isManualFocus = focusValue != null && focusValue != "AF" && minimumFocusDistance > 0f
 
-        if (focusValue == null || focusValue == "AF" || minimumFocusDistance <= 0f) {
-            // Restore CameraX autofocus
+        Log.d(TAG, "applyCamera2Options: focus=$focusValue, minDist=$minimumFocusDistance, manual=$isManualFocus, hdrExt=$boundHdrExtension")
+
+        if (isManualFocus) {
+            // Cancel CameraX autofocus BEFORE setting Camera2 options
             try {
-                val afOptions = CaptureRequestOptions.Builder()
-                    .setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AF_MODE,
-                        CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
-                    )
-                    .build()
-                Camera2CameraControl.from(boundCamera.cameraControl)
-                    .addCaptureRequestOptions(afOptions)
-            } catch (_: Exception) { }
-            return
+                boundCamera.cameraControl.cancelFocusAndMetering()
+            } catch (e: Exception) {
+                Log.w(TAG, "cancelFocusAndMetering failed", e)
+            }
+
+            val normalizedFocus = focusValue!!.toFloatOrNull()?.coerceIn(0f, 1f) ?: 0f
+            val focusDistance = (minimumFocusDistance * normalizedFocus).coerceIn(0f, minimumFocusDistance)
+            Log.d(TAG, "Manual focus: normalized=$normalizedFocus, distance=${focusDistance} diopters")
+
+            builder.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                CameraMetadata.CONTROL_AF_MODE_OFF,
+            )
+            builder.setCaptureRequestOption(
+                CaptureRequest.LENS_FOCUS_DISTANCE,
+                focusDistance,
+            )
+        } else {
+            builder.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+            )
         }
 
-        val normalizedFocus = focusValue.toFloatOrNull()?.coerceIn(0f, 1f) ?: 0f
-        val focusDistance = (minimumFocusDistance * normalizedFocus).coerceIn(0f, minimumFocusDistance)
-
-        // Step 1: Cancel CameraX's autofocus so it stops reasserting AF_MODE
-        try {
-            boundCamera.cameraControl.cancelFocusAndMetering()
-        } catch (_: Exception) { }
-
-        // Step 2: Set manual focus via Camera2 interop
-        try {
-            val focusOptions = CaptureRequestOptions.Builder()
-                .setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AF_MODE,
-                    CameraMetadata.CONTROL_AF_MODE_OFF,
-                )
-                .setCaptureRequestOption(
-                    CaptureRequest.LENS_FOCUS_DISTANCE,
-                    focusDistance,
-                )
-                .build()
-            Camera2CameraControl.from(boundCamera.cameraControl)
-                .addCaptureRequestOptions(focusOptions)
-        } catch (_: Exception) { }
-    }
-
-    /**
-     * Apply non-focus Camera2 options (HDR, LOG, white balance, ISO, shutter, filters).
-     * Separated from focus so a failure here doesn't block focus changes.
-     */
-    private fun applyCamera2AdvancedOptions(cameraState: CameraState, boundCamera: Camera) {
-        val builder = CaptureRequestOptions.Builder()
-        val filterProfile = underwaterFilterProfile(
-            value = currentValue(cameraState, ".filters"),
-            depthMeters = currentDepthMeters(),
-        )
+        // --- Effect mode ---
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_EFFECT_MODE, CameraMetadata.CONTROL_EFFECT_MODE_OFF)
 
         // --- HDR / LOG / Off ---
-        // When using vendor HDR extension, skip manual HDR scene mode
         if (!boundHdrExtension) {
             when (resolvedHdrLogMode(cameraState)) {
                 "HDR" -> {
@@ -422,10 +391,6 @@ class CameraRuntimeController(
                     builder.setCaptureRequestOption(
                         CaptureRequest.CONTROL_SCENE_MODE,
                         CameraMetadata.CONTROL_SCENE_MODE_HDR,
-                    )
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.TONEMAP_MODE,
-                        CameraMetadata.TONEMAP_MODE_HIGH_QUALITY,
                     )
                 }
                 "LOG" -> {
@@ -447,15 +412,15 @@ class CameraRuntimeController(
                         CaptureRequest.CONTROL_MODE,
                         CameraMetadata.CONTROL_MODE_AUTO,
                     )
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.TONEMAP_MODE,
-                        CameraMetadata.TONEMAP_MODE_FAST,
-                    )
                 }
             }
         }
 
         // --- White Balance & Color Correction ---
+        val filterProfile = underwaterFilterProfile(
+            value = currentValue(cameraState, ".filters"),
+            depthMeters = currentDepthMeters(),
+        )
         if (filterProfile == null) {
             val wbValue = currentValue(cameraState, ".white_balance")
             if (wbValue != null && wbValue != "Auto") {
@@ -477,10 +442,6 @@ class CameraRuntimeController(
                     CameraMetadata.CONTROL_AWB_MODE_AUTO,
                 )
             }
-            builder.setCaptureRequestOption(
-                CaptureRequest.COLOR_CORRECTION_MODE,
-                CameraMetadata.COLOR_CORRECTION_MODE_FAST,
-            )
         } else {
             builder.setCaptureRequestOption(
                 CaptureRequest.CONTROL_AWB_MODE,
@@ -503,38 +464,36 @@ class CameraRuntimeController(
                 val isoRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
                     .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 if (isoRange != null) {
-                    val clampedIso = isoValue.coerceIn(isoRange.lower, isoRange.upper)
-                    builder.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, clampedIso)
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AE_MODE,
-                        CameraMetadata.CONTROL_AE_MODE_OFF,
-                    )
+                    builder.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY,
+                        isoValue.coerceIn(isoRange.lower, isoRange.upper))
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE,
+                        CameraMetadata.CONTROL_AE_MODE_OFF)
                 }
             } catch (_: Exception) { }
         }
 
-        // --- Shutter Speed (manual exposure time) ---
+        // --- Shutter Speed ---
         val shutterNs = currentValue(cameraState, ".shutter_speed")?.let { parseShutterNs(it) }
         if (shutterNs != null) {
             try {
                 val exposureRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
                     .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
                 if (exposureRange != null) {
-                    val clampedNs = shutterNs.coerceIn(exposureRange.lower, exposureRange.upper)
-                    builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, clampedNs)
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AE_MODE,
-                        CameraMetadata.CONTROL_AE_MODE_OFF,
-                    )
+                    builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME,
+                        shutterNs.coerceIn(exposureRange.lower, exposureRange.upper))
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE,
+                        CameraMetadata.CONTROL_AE_MODE_OFF)
                 }
             } catch (_: Exception) { }
         }
 
+        // Apply ALL options atomically — single setCaptureRequestOptions replaces everything
         try {
-            Camera2CameraControl.from(boundCamera.cameraControl)
-                .addCaptureRequestOptions(builder.build())
-        } catch (_: Exception) {
-            // Some options may not be supported on all devices
+            val cam2Control = Camera2CameraControl.from(boundCamera.cameraControl)
+            cam2Control.captureRequestOptions = builder.build()
+            Log.d(TAG, "Camera2 options applied successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Camera2 options FAILED", e)
         }
     }
 
