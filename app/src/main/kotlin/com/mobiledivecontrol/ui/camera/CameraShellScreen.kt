@@ -730,58 +730,109 @@ private fun BottomBarChip(
     val textStyle = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodyMedium
     val valueStyle = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodyMedium
 
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .background(
-                color = if (selected) DiveColors.DiveCyan.copy(alpha = 0.2f) else DiveColors.SurfaceCard.copy(alpha = 0.54f),
-                shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
-            )
-            .border(
-                width = 1.dp,
-                color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.46f),
-                shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
-            )
-            .padding(horizontal = horizontalPadding, vertical = verticalPadding),
-    ) {
-        if (item is BottomBarItem.GalleryShortcut) {
-            GalleryChipPreview(
-                selected = selected,
-                size = iconSize,
-            )
-        } else {
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = if (selected) DiveColors.DiveCyan else DiveColors.TextMuted,
-                modifier = Modifier.size(iconSize),
-            )
-        }
-        if (!label.isNullOrBlank() || !value.isNullOrBlank()) {
-            Spacer(modifier = Modifier.width(if (compact) 6.dp else 8.dp))
-        }
-        if (!label.isNullOrBlank()) {
-            Text(
-                text = label,
-                color = if (selected) DiveColors.TextPrimary else DiveColors.TextSecondary,
-                style = textStyle,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        if (!value.isNullOrBlank()) {
-            if (!label.isNullOrBlank()) {
-                Spacer(modifier = Modifier.width(if (compact) 4.dp else 6.dp))
+    val shouldStackValue = !value.isNullOrBlank() && " + " in value
+
+    if (shouldStackValue) {
+        // Vertical layout for multi-part values like "RAW + JPEG"
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .background(
+                    color = if (selected) DiveColors.DiveCyan.copy(alpha = 0.2f) else DiveColors.SurfaceCard.copy(alpha = 0.54f),
+                    shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
+                )
+                .border(
+                    width = 1.dp,
+                    color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.46f),
+                    shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
+                )
+                .padding(horizontal = horizontalPadding, vertical = verticalPadding),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = if (selected) DiveColors.DiveCyan else DiveColors.TextMuted,
+                    modifier = Modifier.size(iconSize),
+                )
+                if (!label.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.width(if (compact) 4.dp else 6.dp))
+                    Text(
+                        text = label,
+                        color = if (selected) DiveColors.TextPrimary else DiveColors.TextSecondary,
+                        style = textStyle,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
-            Text(
-                text = value,
-                color = if (selected) DiveColors.DiveCyan else DiveColors.TextPrimary,
-                style = valueStyle,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            // Stack each part of the value vertically
+            value!!.split(" + ").forEach { part ->
+                Text(
+                    text = part.trim(),
+                    color = if (selected) DiveColors.DiveCyan else DiveColors.TextPrimary,
+                    style = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                )
+            }
+        }
+    } else {
+        // Standard horizontal layout
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .background(
+                    color = if (selected) DiveColors.DiveCyan.copy(alpha = 0.2f) else DiveColors.SurfaceCard.copy(alpha = 0.54f),
+                    shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
+                )
+                .border(
+                    width = 1.dp,
+                    color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.46f),
+                    shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
+                )
+                .padding(horizontal = horizontalPadding, vertical = verticalPadding),
+        ) {
+            if (item is BottomBarItem.GalleryShortcut) {
+                GalleryChipPreview(
+                    selected = selected,
+                    size = iconSize,
+                )
+            } else {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = if (selected) DiveColors.DiveCyan else DiveColors.TextMuted,
+                    modifier = Modifier.size(iconSize),
+                )
+            }
+            if (!label.isNullOrBlank() || !value.isNullOrBlank()) {
+                Spacer(modifier = Modifier.width(if (compact) 6.dp else 8.dp))
+            }
+            if (!label.isNullOrBlank()) {
+                Text(
+                    text = label,
+                    color = if (selected) DiveColors.TextPrimary else DiveColors.TextSecondary,
+                    style = textStyle,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (!value.isNullOrBlank()) {
+                if (!label.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.width(if (compact) 4.dp else 6.dp))
+                }
+                Text(
+                    text = value,
+                    color = if (selected) DiveColors.DiveCyan else DiveColors.TextPrimary,
+                    style = valueStyle,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }

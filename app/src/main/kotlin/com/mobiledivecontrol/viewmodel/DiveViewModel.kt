@@ -2,17 +2,22 @@ package com.mobiledivecontrol.viewmodel
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.BleSignal
 import com.mobiledivecontrol.core.ControlCommand
 import com.mobiledivecontrol.core.ControlCore
+import com.mobiledivecontrol.core.GalleryCommand
 import com.mobiledivecontrol.core.HousingButtonEvent
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.ProcessingOutcome
 import com.mobiledivecontrol.core.SensorUpdate
+import com.mobiledivecontrol.platform.GalleryRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 /**
  * Bridges the pure Kotlin [ControlCore] (BLE communication layer)
@@ -30,6 +35,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
     private val sessionStore = CameraSessionStore(application)
     private val controlCore = ControlCore(initialState = sessionStore.restoreAppState())
+    private val galleryRepository = GalleryRepository(application)
 
     private val _state = MutableStateFlow(controlCore.state)
     val state: StateFlow<AppState> = _state.asStateFlow()
@@ -105,6 +111,55 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         sessionStore.save(outcome.state)
         if (outcome.effects.isNotEmpty()) {
             _effects.value = outcome.effects
+            processGalleryEffects(outcome.effects)
+        }
+    }
+
+    private fun processGalleryEffects(effects: List<PlatformEffect>) {
+        viewModelScope.launch(Dispatchers.IO) {
+            for (effect in effects) {
+                when (effect) {
+                    is PlatformEffect.LoadGalleryItems -> {
+                        val gallery = controlCore.state.gallery
+                        val items = galleryRepository.loadItems(gallery.tab, gallery.currentFolder)
+                        launch(Dispatchers.Main) {
+                            dispatch(GalleryCommand.LoadItems(items))
+                        }
+                    }
+                    is PlatformEffect.LoadExifData -> {
+                        val lines = galleryRepository.loadExifData(effect.item)
+                        launch(Dispatchers.Main) {
+                            dispatch(GalleryCommand.SetExifLines(lines))
+                        }
+                    }
+                    is PlatformEffect.DeleteGalleryItem -> {
+                        galleryRepository.deleteItem(effect.item)
+                        val gallery = controlCore.state.gallery
+                        val items = galleryRepository.loadItems(gallery.tab, gallery.currentFolder)
+                        launch(Dispatchers.Main) {
+                            dispatch(GalleryCommand.LoadItems(items))
+                        }
+                    }
+                    is PlatformEffect.DeleteGalleryFolder -> {
+                        galleryRepository.deleteFolder(effect.path)
+                        val gallery = controlCore.state.gallery
+                        val items = galleryRepository.loadItems(gallery.tab, gallery.currentFolder)
+                        launch(Dispatchers.Main) {
+                            dispatch(GalleryCommand.LoadItems(items))
+                        }
+                    }
+                    is PlatformEffect.CreateGalleryFolder -> {
+                        galleryRepository.createFolder(effect.name)
+                        val gallery = controlCore.state.gallery
+                        val items = galleryRepository.loadItems(gallery.tab, gallery.currentFolder)
+                        launch(Dispatchers.Main) {
+                            dispatch(GalleryCommand.LoadItems(items))
+                        }
+                    }
+                    else -> { /* handled elsewhere */ }
+                }
+            }
         }
     }
 }
+

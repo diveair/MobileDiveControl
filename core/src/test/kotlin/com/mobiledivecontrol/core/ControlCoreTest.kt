@@ -274,4 +274,104 @@ class ControlCoreTest {
             galleryOutcome.effects,
         )
     }
+
+    @Test
+    fun `focus options span 0_00 to 1_00 with 0_01 steps`() {
+        // Get the focus setting from the Photo mode profile
+        val photoProfile = CameraCatalog.profile(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra)
+        val focusSpec = photoProfile.settings.first { it.id.endsWith(".manual_focus") }
+        val options = focusSpec.options
+        assertEquals("AF", options.first())
+        assertEquals("0.00", options[1])
+        assertEquals("0.01", options[2])
+        assertEquals("0.50", options[51])
+        assertEquals("1.00", options.last())
+        assertEquals(102, options.size) // AF + 101 numeric values (0.00 to 1.00)
+    }
+
+    @Test
+    fun `gallery navigation cycles through items`() {
+        val reducer = ControlReducer()
+        val items = listOf(
+            GalleryItem(id = 1, name = "photo1.jpg", path = "/photo1.jpg"),
+            GalleryItem(id = 2, name = "photo2.jpg", path = "/photo2.jpg"),
+            GalleryItem(id = 3, name = "photo3.jpg", path = "/photo3.jpg"),
+        )
+        val state = AppState(
+            mode = AppMode.Gallery,
+            gallery = GalleryState(items = items, selectedIndex = 0),
+        )
+
+        // Navigate down
+        val down1 = reducer.reduce(state, GalleryCommand.NavigateDown)
+        assertEquals(1, down1.state.gallery.selectedIndex)
+
+        val down2 = reducer.reduce(down1.state, GalleryCommand.NavigateDown)
+        assertEquals(2, down2.state.gallery.selectedIndex)
+
+        // Navigate down at end clamps to last index
+        val down3 = reducer.reduce(down2.state, GalleryCommand.NavigateDown)
+        assertEquals(2, down3.state.gallery.selectedIndex)
+
+        // Navigate up from 0 clamps at 0
+        val up1 = reducer.reduce(state, GalleryCommand.NavigateUp)
+        assertEquals(0, up1.state.gallery.selectedIndex)
+
+        // Navigate up from middle
+        val up2 = reducer.reduce(down1.state, GalleryCommand.NavigateUp)
+        assertEquals(0, up2.state.gallery.selectedIndex)
+    }
+
+    @Test
+    fun `gallery delete confirmation flow`() {
+        val reducer = ControlReducer()
+        val items = listOf(
+            GalleryItem(id = 1, name = "photo1.jpg", path = "/photo1.jpg"),
+        )
+        val state = AppState(
+            mode = AppMode.Gallery,
+            gallery = GalleryState(items = items, selectedIndex = 0),
+        )
+
+        // Initiate delete
+        val initDelete = reducer.reduce(state, GalleryCommand.InitiateDelete)
+        assertEquals(GalleryViewMode.ConfirmDelete, initDelete.state.gallery.viewMode)
+
+        // Cancel via Back
+        val cancel = reducer.reduce(initDelete.state, GalleryCommand.Back)
+        assertEquals(GalleryViewMode.Browser, cancel.state.gallery.viewMode)
+    }
+
+    @Test
+    fun `gallery back from browser returns to camera`() {
+        val reducer = ControlReducer()
+        val state = AppState(
+            mode = AppMode.Gallery,
+            gallery = GalleryState(),
+        )
+
+        val result = reducer.reduce(state, GalleryCommand.Back)
+        assertEquals(AppMode.CameraLive, result.state.mode)
+    }
+
+    @Test
+    fun `gallery left-right switches tabs`() {
+        val reducer = ControlReducer()
+        val state = AppState(
+            mode = AppMode.Gallery,
+            gallery = GalleryState(tab = GalleryTab.Photos),
+        )
+
+        // Right goes to Videos
+        val right1 = reducer.reduce(state, GalleryCommand.NavigateRight)
+        assertEquals(GalleryTab.Videos, right1.state.gallery.tab)
+
+        // Right again goes to Folders
+        val right2 = reducer.reduce(right1.state, GalleryCommand.NavigateRight)
+        assertEquals(GalleryTab.Folders, right2.state.gallery.tab)
+
+        // Left from Folders back to Videos
+        val left1 = reducer.reduce(right2.state, GalleryCommand.NavigateLeft)
+        assertEquals(GalleryTab.Videos, left1.state.gallery.tab)
+    }
 }
