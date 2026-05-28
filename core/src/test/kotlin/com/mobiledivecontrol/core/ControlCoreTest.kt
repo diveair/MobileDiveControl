@@ -1,0 +1,277 @@
+package com.mobiledivecontrol.core
+
+import java.time.Instant
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertTrue
+
+class ControlCoreTest {
+    @Test
+    fun `camera shutter emits capture effect when camera is permitted`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+
+        val outcome = core.handleNotificationPayload(HousingCharacteristic.ButtonEvents.shortHex, byteArrayOf(0x20.toByte()))
+
+        assertEquals(listOf(PlatformEffect.ExecuteCamera(CameraCommand.CapturePhoto)), outcome.effects)
+    }
+
+    @Test
+    fun `malformed packet records error without changing state`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        val initialState = core.state
+
+        val outcome = core.handleNotificationPayload(HousingCharacteristic.ButtonEvents.shortHex, byteArrayOf(0x10.toByte(), 0x20.toByte()))
+
+        assertEquals(initialState, outcome.state)
+        assertEquals(1, core.diagnosticsErrorCount())
+        assertTrue(outcome.notes.single().contains("Expected 1 byte"))
+    }
+
+    @Test
+    fun `permission revocation pushes phone mode into safe fallback`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Accessibility, true)
+        core.updatePermission(PermissionKind.Overlay, true)
+        core.forceMode(AppMode.PhoneCursor)
+
+        val outcome = core.updatePermission(PermissionKind.Accessibility, false, Instant.parse("2026-05-26T12:00:00Z"))
+
+        assertEquals(AppMode.Diagnostics, outcome.state.mode)
+        assertTrue(outcome.notes.contains("Accessibility Permission: Disabled"))
+    }
+
+    @Test
+    fun `cover notification uses vendor open closed mapping`() {
+        val core = ControlCore()
+
+        val outcome = core.handleNotificationPayload(HousingCharacteristic.CoverState.shortHex, byteArrayOf(0x00.toByte()))
+
+        assertEquals(true, outcome.state.safety.coverOpen)
+        assertEquals(SealState.CoverOpen, outcome.state.safety.sealState)
+    }
+
+    @Test
+    fun `device info notification updates housing metadata`() {
+        val core = ControlCore()
+
+        val outcome = core.handleNotificationPayload(HousingCharacteristic.SerialNumber.shortHex, "SN-42".encodeToByteArray())
+
+        assertEquals("SN-42", outcome.state.housing.serialNumber)
+    }
+
+    @Test
+    fun `camera navigation opens mode rail and settings drawer from hardware buttons`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+        val start = Instant.parse("2026-05-26T12:00:00Z")
+
+        val railOutcome = core.handleNotificationPayload(
+            HousingCharacteristic.ButtonEvents.shortHex,
+            byteArrayOf(0x10),
+            start,
+        )
+        assertEquals(CameraUiZone.ModeRail, railOutcome.state.camera.focusedZone)
+
+        val settingsOutcome = core.handleNotificationPayload(
+            HousingCharacteristic.ButtonEvents.shortHex,
+            byteArrayOf(0x10),
+            start.plusMillis(100),
+        )
+        assertEquals(CameraUiZone.SettingsPanel, settingsOutcome.state.camera.focusedZone)
+    }
+
+    @Test
+    fun `modes list loops when scrolling up from first or down from last`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+
+        // Focus ModeRail from LiveView by navigating Up or Down
+        // Initial primary index = 0 (Photo)
+        // Navigate Up: should wrap around to last index
+        val wrapUpOutcome = core.dispatch(CameraCommand.NavigateUp)
+        val lastIndex = CameraCatalog.primaryRailEntries.lastIndex
+        assertEquals(CameraUiZone.ModeRail, wrapUpOutcome.state.camera.focusedZone)
+        assertEquals(lastIndex, wrapUpOutcome.state.camera.highlightedPrimaryIndex)
+
+        // Navigate Down: should wrap back to 0
+        val wrapDownOutcome = core.dispatch(CameraCommand.NavigateDown)
+        assertEquals(0, wrapDownOutcome.state.camera.highlightedPrimaryIndex)
+    }
+
+    @Test
+    fun `settings tray cursor navigates horizontally and wraps`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+
+        // Activate settings panel (by clicking OK/Confirm from LiveView)
+        val settingsOutcome = core.dispatch(CameraCommand.Confirm)
+        assertEquals(CameraUiZone.SettingsPanel, settingsOutcome.state.camera.focusedZone)
+        assertEquals(
+            CameraCatalog.defaultSettingsCursor(
+                settingsOutcome.state.camera.activeMode,
+                settingsOutcome.state.camera.deviceVariant,
+                settingsOutcome.state.camera.showMoreSettings,
+            ),
+            settingsOutcome.state.camera.settingsCursor,
+        )
+
+        val totalItems = CameraCatalog.settingsBarItems(
+            settingsOutcome.state.camera.activeMode,
+            settingsOutcome.state.camera.deviceVariant,
+            settingsOutcome.state.camera.showMoreSettings
+        ).size
+
+        val startCursor = settingsOutcome.state.camera.settingsCursor
+
+        // Navigate left once: move from Modes to the item on its left.
+        val left1Outcome = core.dispatch(CameraCommand.NavigateLeft)
+        assertEquals((startCursor - 1 + totalItems) % totalItems, left1Outcome.state.camera.settingsCursor)
+
+        // Navigate left again: move one more item left.
+        val left2Outcome = core.dispatch(CameraCommand.NavigateLeft)
+        assertEquals((startCursor - 2 + totalItems) % totalItems, left2Outcome.state.camera.settingsCursor)
+
+        // Navigate right: return to the previous left result.
+        val rightOutcome = core.dispatch(CameraCommand.NavigateRight)
+        assertEquals(left1Outcome.state.camera.settingsCursor, rightOutcome.state.camera.settingsCursor)
+    }
+
+    @Test
+    fun `slider adjustments respect hold sensitivity rate limiting`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+
+        // Force mode to Pro and open settings panel
+        core.forceMode(AppMode.CameraLive)
+        core.dispatch(CameraCommand.NavigateDown) // Photo -> Expert RAW
+        core.dispatch(CameraCommand.NavigateDown) // Expert RAW -> Pro
+        val modeOutcome = core.dispatch(CameraCommand.Confirm)
+        assertEquals(CameraModeId.Pro, modeOutcome.state.camera.activeMode)
+        assertEquals(CameraUiZone.SettingsPanel, modeOutcome.state.camera.focusedZone)
+
+        // Navigate right from centered Modes to position the cursor on White Balance.
+        repeat(3) {
+            core.dispatch(CameraCommand.NavigateRight)
+        }
+
+        // Confirm edit (enters settingsEditing value mode)
+        val editOutcome = core.dispatch(CameraCommand.Confirm)
+        assertTrue(editOutcome.state.camera.settingsEditing)
+        assertEquals(SliderEditTarget.Value, editOutcome.state.camera.sliderEditTarget)
+
+        // Move right to the Sensitivity slider, then verify decrement works.
+        val targetOutcome = core.dispatch(CameraCommand.NavigateRight)
+        assertEquals(SliderEditTarget.Sensitivity, targetOutcome.state.camera.sliderEditTarget)
+
+        // Press down once: sensitivity goes from 50 (default) to 49
+        core.dispatch(CameraCommand.NavigateDown)
+        assertEquals(SliderSensitivity(49), core.state.camera.sliderSensitivities["pro.white_balance"])
+
+        // Move back left to the Value slider.
+        val exitSensOutcome = core.dispatch(CameraCommand.NavigateLeft)
+        assertEquals(SliderEditTarget.Value, exitSensOutcome.state.camera.sliderEditTarget)
+
+        // Set sensitivity to 1 directly for rate-limiting test
+        val stateWithLowSens = exitSensOutcome.state.copy(
+            camera = exitSensOutcome.state.camera.copy(
+                sliderSensitivities = exitSensOutcome.state.camera.sliderSensitivities + ("pro.white_balance" to SliderSensitivity(1)),
+            ),
+        )
+        val initialVal = stateWithLowSens.camera.settingValues["pro.white_balance"] ?: "5600K"
+
+        val reducer = ControlReducer()
+
+        // repeatCount = 1: ignored under sensitivity 1 (divisor = 100)
+        val red1 = reducer.reduce(stateWithLowSens.copy(
+            camera = stateWithLowSens.camera.copy(settingsEditing = true, sliderEditTarget = SliderEditTarget.Value)
+        ), CameraCommand.NavigateUp, repeatCount = 1)
+        assertEquals(initialVal, red1.state.camera.settingValues["pro.white_balance"])
+
+        // repeatCount = 100: applied under sensitivity 1 (100 % 100 == 0)
+        val red100 = reducer.reduce(stateWithLowSens.copy(
+            camera = stateWithLowSens.camera.copy(settingsEditing = true, sliderEditTarget = SliderEditTarget.Value)
+        ), CameraCommand.NavigateUp, repeatCount = 100)
+        assertTrue(red100.state.camera.settingValues["pro.white_balance"] != initialVal)
+    }
+
+    @Test
+    fun `separate up button taps each adjust white balance once`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+
+        core.forceMode(AppMode.CameraLive)
+        core.dispatch(CameraCommand.NavigateDown) // Photo -> Expert RAW
+        core.dispatch(CameraCommand.NavigateDown) // Expert RAW -> Pro
+        val modeOutcome = core.dispatch(CameraCommand.Confirm)
+        assertEquals(CameraModeId.Pro, modeOutcome.state.camera.activeMode)
+        assertEquals(CameraUiZone.SettingsPanel, modeOutcome.state.camera.focusedZone)
+
+        repeat(3) {
+            core.dispatch(CameraCommand.NavigateRight)
+        }
+
+        val editOutcome = core.dispatch(CameraCommand.Confirm)
+        assertTrue(editOutcome.state.camera.settingsEditing)
+        assertEquals("5600K", editOutcome.state.camera.settingValues["pro.white_balance"])
+
+        val firstPress = core.handleButtonPayload(
+            payload = byteArrayOf(0x30),
+            receivedAt = Instant.parse("2026-05-27T12:00:00Z"),
+        )
+        assertEquals("6500K", firstPress.state.camera.settingValues["pro.white_balance"])
+
+        val secondPress = core.handleButtonPayload(
+            payload = byteArrayOf(0x30),
+            receivedAt = Instant.parse("2026-05-27T12:00:00.250Z"),
+        )
+        assertEquals("7500K", secondPress.state.camera.settingValues["pro.white_balance"])
+    }
+
+    @Test
+    fun `up on a highlighted bottom bar setting changes its value and emits a camera effect`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+
+        val settingsOutcome = core.dispatch(CameraCommand.Confirm)
+        assertEquals(CameraUiZone.SettingsPanel, settingsOutcome.state.camera.focusedZone)
+
+        val evSelected = core.dispatch(CameraCommand.NavigateRight)
+        assertEquals("0", evSelected.state.camera.settingValues["photo.exposure_compensation"])
+
+        val adjusted = core.dispatch(CameraCommand.NavigateUp)
+        assertEquals("+0.1", adjusted.state.camera.settingValues["photo.exposure_compensation"])
+        assertEquals(
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SetExposureCompensation(0.1))),
+            adjusted.effects,
+        )
+    }
+
+    @Test
+    fun `confirm on gallery shortcut switches to gallery mode`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+
+        core.dispatch(CameraCommand.Confirm)
+        repeat(4) {
+            core.dispatch(CameraCommand.NavigateRight)
+        }
+
+        val galleryOutcome = core.dispatch(CameraCommand.Confirm)
+        assertEquals(AppMode.Gallery, galleryOutcome.state.mode)
+        assertEquals(
+            listOf(PlatformEffect.LoadGalleryItems),
+            galleryOutcome.effects,
+        )
+    }
+}

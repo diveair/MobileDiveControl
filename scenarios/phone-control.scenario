@@ -1,0 +1,9 @@
+# Transparent phone mode smoke test
+ble ready
+permission accessibility on
+permission overlay on
+mode phone-cursor
+button 0x10
+button 0x50
+button 0x60
+state

@@ -1,0 +1,10 @@
+# Vacuum path with a stable pass
+ble ready
+sensor cover open
+vacuum start
+sensor barometric 101.3
+sensor barometric 95.0
+sensor barometric 95.1
+sensor barometric 95.0
+sensor cover closed
+state

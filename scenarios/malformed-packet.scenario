@@ -1,0 +1,4 @@
+# Parser must not crash on malformed payload
+ble ready
+button malformed
+state

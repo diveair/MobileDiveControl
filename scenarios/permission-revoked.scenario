@@ -1,0 +1,7 @@
+# Permission revocation should fail visibly and safely
+ble ready
+permission accessibility on
+permission overlay on
+mode phone-cursor
+permission accessibility off
+state

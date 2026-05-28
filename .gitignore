@@ -1,0 +1,45 @@
+# Gradle
+.gradle/
+build/
+**/bin/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.project
+.classpath
+.settings/
+
+# Local properties (contains SDK path, signing keys, etc.)
+local.properties
+
+# Android
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Kotlin
+*.class
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE extras
+.vscode/
+
+# Office temp files
+~$*
+
+# Logs
+*.log
+
+# Keystore (never commit signing keys)
+*.jks
+*.keystore
+!debug.keystore

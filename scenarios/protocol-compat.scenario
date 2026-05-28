@@ -1,0 +1,17 @@
+# Vendor-spec raw protocol compatibility check
+ble ready
+permission bluetooth on
+mode safety
+
+# Cover open according to vendor byte mapping: 0x00 = open
+notify 0x1628 00
+
+# Vendor examples
+notify 0x1627 7F8A0100
+notify 0x1625 83270000
+notify 0x1626 580B0000
+notify-text 0x2A26 A4.0
+
+# Start the vacuum workflow and verify the encoded writes
+vacuum start
+state
