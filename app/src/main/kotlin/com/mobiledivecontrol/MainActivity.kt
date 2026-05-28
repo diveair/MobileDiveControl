@@ -64,6 +64,14 @@ class MainActivity : ComponentActivity() {
             val effects by viewModel.effects.collectAsState()
             val useMetric by viewModel.depthUnitMetric.collectAsState()
 
+            // Sync Android permission grants into the core state machine
+            androidx.compose.runtime.LaunchedEffect(cameraPermissionGranted) {
+                viewModel.updatePermission(
+                    com.mobiledivecontrol.core.PermissionKind.Camera,
+                    cameraPermissionGranted,
+                )
+            }
+
             DiveControlTheme {
                 Box(modifier = Modifier.fillMaxSize()) {
                     // Main UI

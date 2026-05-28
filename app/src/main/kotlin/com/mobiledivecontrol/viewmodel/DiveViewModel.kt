@@ -84,6 +84,11 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         _effects.value = emptyList()
     }
 
+    fun updatePermission(permission: com.mobiledivecontrol.core.PermissionKind, granted: Boolean) {
+        val outcome = controlCore.updatePermission(permission, granted)
+        emitOutcome(outcome)
+    }
+
     /**
      * Simulate a button press for UI testing without hardware.
      * Maps [HousingButtonEvent] to its wire byte and processes it.
