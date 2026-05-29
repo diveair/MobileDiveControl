@@ -3,9 +3,6 @@ package com.mobiledivecontrol.ui.camera
 import android.content.Context
 import android.content.Intent
 import android.content.ContentValues
-import android.graphics.Bitmap
-import android.graphics.Color
-import android.graphics.Matrix
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -28,12 +25,13 @@ import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -47,7 +45,6 @@ import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.CameraState
 import kotlin.math.abs
-import kotlin.math.max
 import kotlin.math.roundToInt
 import java.util.concurrent.Executors
 
@@ -117,20 +114,21 @@ class CameraRuntimeController(
     private var deviceMaxSupportedResolution: Size? = null
     private var capabilitiesDetected: Boolean = false
     private var focusAssistEnabled: Boolean = false
-    private var focusAssistOverlayCallback: ((Bitmap?) -> Unit)? = null
-    private var lastFocusAssistFrameAtMs: Long = 0L
     private var lastFocusResultLogAtMs: Long = 0L
     private var lastAppliedSessionSignature: SessionSignature? = null
     private val focusAssistExecutor = Executors.newSingleThreadExecutor()
+    // GPU-accelerated focus peaking via OpenGL shader in the CameraX preview pipeline.
+    // Replaces the old CPU bitmap overlay approach which caused jitter and drift.
+    private var focusPeakingProcessor: FocusPeakingSurfaceProcessor? = null
 
-    // Direct Camera2 session for manual focus — CameraX's Camera2CameraControl
-    // cannot reliably override AF on Samsung devices. The direct session approach
-    // is the only proven way to move the lens.
-    @Volatile private var capturedSession: CameraCaptureSession? = null
-    @Volatile private var capturedSurfaces: List<android.view.Surface>? = null
-    @Volatile private var directModeActive: Boolean = false
-    @Volatile private var pendingDirectFocusDiopters: Float = -1f
-    @Volatile private var lastDirectSubmitMs: Long = 0L
+    // ── Native Camera2 focus control ──────────────────────────────────────
+    // When manual focus is active we take FULL ownership of the Camera2
+    // CameraCaptureSession repeating request. CameraX is NOT called for any
+    // CameraControl operations while in direct mode, so it never fights back.
+    // When auto focus is active, CameraX gets full control back.
+    @Volatile private var cam2Session: CameraCaptureSession? = null
+    @Volatile private var cam2Surfaces: List<android.view.Surface> = emptyList()
+    @Volatile private var nativeFocusActive: Boolean = false
 
     private val sessionCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
@@ -139,40 +137,33 @@ class CameraRuntimeController(
             result: TotalCaptureResult,
         ) {
             super.onCaptureCompleted(session, request, result)
-            // Capture session + surfaces on first callback (or new session)
-            if (capturedSession !== session) {
-                capturedSession = session
-                capturedSurfaces = try {
-                    val method = CaptureRequest::class.java.getDeclaredMethod("getTargets")
-                    method.isAccessible = true
+            // Capture session + surfaces on first callback or session change
+            if (cam2Session !== session) {
+                cam2Session = session
+                try {
+                    val m = CaptureRequest::class.java.getDeclaredMethod("getTargets")
+                    m.isAccessible = true
                     @Suppress("UNCHECKED_CAST")
-                    (method.invoke(request) as? Collection<android.view.Surface>)?.toList()
-                } catch (_: Exception) { null }
-                Log.d(TAG, "Captured session + ${capturedSurfaces?.size ?: 0} surfaces")
-            }
-
-            // If direct mode: immediately correct if CameraX overrode our focus.
-            // Rate-limit to max once per 100ms to avoid tight re-submission loops.
-            if (directModeActive && pendingDirectFocusDiopters >= 0f) {
-                val actualDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
-                if (kotlin.math.abs(actualDistance - pendingDirectFocusDiopters) > 0.05f) {
-                    val now = SystemClock.elapsedRealtime()
-                    if (now - lastDirectSubmitMs > 100L) {
-                        submitDirectRepeatingRequest(session)
-                    }
+                    cam2Surfaces = (m.invoke(request) as? Collection<android.view.Surface>)?.toList() ?: emptyList()
+                    Log.d(TAG, "Native: captured session + ${cam2Surfaces.size} surfaces")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Native: cannot capture surfaces: ${e.message}")
                 }
+                // Session is now available — re-apply the current state so that
+                // manual focus (which requires the native session) takes effect.
+                // This fixes the startup race where applySessionState runs before
+                // the session exists.
+                lastAppliedSessionSignature = null
+                applySessionState(latestState, force = true)
             }
-
-            // Periodic logging
+            // Periodic diagnostic logging
             val now = SystemClock.elapsedRealtime()
-            if (now - lastFocusResultLogAtMs < 300L) return
+            if (now - lastFocusResultLogAtMs < 500L) return
             lastFocusResultLogAtMs = now
             val fd = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
-            val ls = result.get(CaptureResult.LENS_STATE)
             val af = result.get(CaptureResult.CONTROL_AF_MODE)
-            val phys = runningPhysicalCameraId(result)
             val lp = samsungFocusLensPosition(result)
-            Log.d(TAG, "CaptureResult fd=$fd af=$af ls=$ls phys=$phys lp=$lp target=${pendingDirectFocusDiopters.takeIf { directModeActive }}")
+            Log.d(TAG, "CaptureResult fd=$fd af=$af lp=$lp native=$nativeFocusActive")
         }
     }
 
@@ -181,13 +172,11 @@ class CameraRuntimeController(
         lifecycleOwner: LifecycleOwner,
         initialState: CameraState,
         onReady: (Boolean) -> Unit,
-        onFocusAssistOverlay: (Bitmap?) -> Unit = {},
     ) {
         this.previewView = previewView
         this.lifecycleOwner = lifecycleOwner
         latestState = initialState
         focusAssistEnabled = isFocusAssistEnabled(initialState)
-        focusAssistOverlayCallback = onFocusAssistOverlay
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener(
@@ -242,10 +231,13 @@ class CameraRuntimeController(
         boundResolution = null
         boundHdrExtension = false
         boundFocusMode = false
+        cam2Session = null
+        cam2Surfaces = emptyList()
+        nativeFocusActive = false
         focusAssistEnabled = false
         lastAppliedSessionSignature = null
-        dispatchFocusAssistOverlay(null)
-        focusAssistOverlayCallback = null
+        focusPeakingProcessor?.release()
+        focusPeakingProcessor = null
     }
 
     fun applyState(
@@ -257,9 +249,9 @@ class CameraRuntimeController(
         latestWaterPressureKpa = waterPressureKpa
         latestAtmosphericPressureKpa = atmosphericPressureKpa
         focusAssistEnabled = isFocusAssistEnabled(cameraState)
-        if (!focusAssistEnabled) {
-            dispatchFocusAssistOverlay(null)
-        }
+        // Toggle GPU shader peaking — no camera rebinding needed.
+        // Peaking works in both AF and manual focus modes.
+        focusPeakingProcessor?.peakingEnabled = focusAssistEnabled
         if (cameraProvider == null || previewView == null || lifecycleOwner == null) {
             Log.d(TAG, "applyState: early return (provider/preview/lifecycle null)")
             return
@@ -267,15 +259,14 @@ class CameraRuntimeController(
 
         val desiredLensFacing = desiredLensFacing(cameraState)
         val desiredResolution = desiredResolutionValue(cameraState)
-        val desiredManualFocus = effectiveManualFocusNormalized(cameraState) != null
+        // Focus mode changes (AF ↔ manual) are handled at runtime via the direct
+        // Camera2 session approach — no rebind needed. Only rebind for lens/resolution.
         val needsRebind = desiredLensFacing != boundLensFacing ||
-                desiredResolution != boundResolution ||
-                desiredManualFocus != boundFocusMode
+                desiredResolution != boundResolution
         if (needsRebind) {
             Log.d(TAG, "applyState: rebinding camera")
             bindCamera(force = true)
         } else {
-            Log.d(TAG, "applyState: applying session state")
             applySessionState(cameraState)
         }
     }
@@ -405,17 +396,33 @@ class CameraRuntimeController(
         }
 
         val capture = imageCaptureBuilder.build()
-        val analysis = analysisBuilder
+        val analysis = analysisBuilder.build()
+
+        // GPU focus peaking effect — sits in the preview pipeline as a CameraEffect.
+        // The shader runs on every preview frame; when peaking is off it's a trivial
+        // pass-through (one texture fetch per pixel, negligible cost).
+        val processor = FocusPeakingSurfaceProcessor(ContextCompat.getMainExecutor(context))
+        processor.peakingEnabled = focusAssistEnabled
+        focusPeakingProcessor?.release()
+        focusPeakingProcessor = processor
+
+        val effect = object : CameraEffect(
+            PREVIEW,
+            focusAssistExecutor,
+            processor,
+            { error -> Log.e(TAG, "Focus peaking effect error", error) },
+        ) {}
+
+        val useCaseGroup = UseCaseGroup.Builder()
+            .addUseCase(preview)
+            .addUseCase(capture)
+            .addUseCase(analysis)
+            .addEffect(effect)
             .build()
-            .also { useCase ->
-                useCase.setAnalyzer(focusAssistExecutor) { image ->
-                    analyzeFocusAssistFrame(image)
-                }
-            }
 
         provider.unbindAll()
         camera = try {
-            provider.bindToLifecycle(owner, selector, preview, capture, analysis)
+            provider.bindToLifecycle(owner, selector, useCaseGroup)
         } catch (error: IllegalArgumentException) {
             val triedDirectPhysicalCamera = desiredLensFacing == CameraSelector.LENS_FACING_BACK &&
                 allowDirectPhysicalCameraBinding &&
@@ -438,116 +445,9 @@ class CameraRuntimeController(
         camera?.let { refreshBoundCameraCapabilities(it) }
         boundLensFacing = desiredLensFacing
         boundResolution = desiredResolution
-        boundFocusMode = isManualFocus
-        capturedSession = null
-        capturedSurfaces = null
-        directModeActive = false
-        pendingDirectFocusDiopters = -1f
 
-        // Apply session state immediately — focus is set at bind-time via Extender,
-        // and the direct session will take over once the first callback fires.
+        // Detect device capabilities from the bound camera
         applySessionState(latestState, force = true)
-    }
-
-    /**
-     * Submit a repeating request directly on the Camera2 CameraCaptureSession,
-     * bypassing CameraX entirely. This is the ONLY reliable way to control
-     * LENS_FOCUS_DISTANCE on Samsung devices — CameraX's Camera2CameraControl
-     * options are overridden by CameraX's internal 3A management.
-     */
-    private fun submitDirectRepeatingRequest(session: CameraCaptureSession) {
-        val surfaces = capturedSurfaces
-        if (surfaces.isNullOrEmpty()) {
-            Log.w(TAG, "Direct submit: no surfaces")
-            return
-        }
-        try {
-            val builder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            surfaces.forEach { builder.addTarget(it) }
-            builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-            buildDirectCamera2Settings(builder)
-            session.setRepeatingRequest(builder.build(), sessionCaptureCallback, null)
-            lastDirectSubmitMs = SystemClock.elapsedRealtime()
-            Log.d(TAG, "Direct request submitted: focus=${pendingDirectFocusDiopters}")
-        } catch (e: Exception) {
-            Log.e(TAG, "Direct request FAILED: ${e.message}", e)
-        }
-    }
-
-    /**
-     * Build ALL Camera2 settings for the direct repeating request.
-     * Mirrors applyCamera2Options but writes to a CaptureRequest.Builder.
-     */
-    private fun buildDirectCamera2Settings(builder: CaptureRequest.Builder) {
-        val state = latestState
-        val boundCamera = camera ?: return
-
-        // Focus
-        builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-        builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, pendingDirectFocusDiopters.coerceAtLeast(0f))
-
-        // HDR / LOG
-        when (resolvedHdrLogMode(state)) {
-            "HDR" -> {
-                builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
-                builder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
-            }
-            "LOG" -> {
-                builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                builder.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
-                builder.set(CaptureRequest.TONEMAP_CURVE, flatLogCurve())
-            }
-            else -> builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-        }
-
-        // White Balance
-        val filterProfile = underwaterFilterProfile(
-            value = currentValue(state, ".filters"),
-            depthMeters = currentDepthMeters(),
-        )
-        if (filterProfile == null) {
-            val wbValue = currentValue(state, ".white_balance")
-            if (wbValue != null && wbValue != "Auto") {
-                val kelvin = wbValue.removeSuffix("K").toIntOrNull()
-                builder.set(CaptureRequest.CONTROL_AWB_MODE,
-                    if (kelvin != null) CameraMetadata.CONTROL_AWB_MODE_OFF
-                    else CameraMetadata.CONTROL_AWB_MODE_AUTO)
-            } else {
-                builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-            }
-        } else {
-            builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
-            builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, filterProfile)
-        }
-
-        // ISO
-        val isoValue = currentValue(state, ".iso")?.toIntOrNull()
-        if (isoValue != null) {
-            try {
-                val isoRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
-                    .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-                if (isoRange != null) {
-                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, isoValue.coerceIn(isoRange.lower, isoRange.upper))
-                    builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                }
-            } catch (_: Exception) { }
-        } else {
-            builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
-        }
-
-        // Shutter Speed
-        val shutterNs = currentValue(state, ".shutter_speed")?.let { parseShutterNs(it) }
-        if (shutterNs != null) {
-            try {
-                val exposureRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
-                    .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-                if (exposureRange != null) {
-                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, shutterNs.coerceIn(exposureRange.lower, exposureRange.upper))
-                    builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                }
-            } catch (_: Exception) { }
-        }
     }
 
 
@@ -676,24 +576,145 @@ class CameraRuntimeController(
             return
         }
 
-        val prev = lastAppliedSessionSignature
-        // When direct mode is active, only call CameraX CameraControl methods
-        // (flash, exposure, zoom) if their values actually changed. Otherwise
-        // CameraX re-submits its managed repeating request, overriding our direct
-        // Camera2 request and causing jitter.
-        val cameraXChanged = force || prev == null ||
-            prev.flash != signature.flash ||
-            prev.exposure != signature.exposure ||
-            prev.lens != signature.lens
+        val manualFocus = effectiveManualFocusNormalized(cameraState)
+        val isManualFocus = manualFocus != null && deviceMinFocusDistance > 0f
 
-        if (cameraXChanged) {
+        if (isManualFocus) {
+            // ── NATIVE MODE ──────────────────────────────────────────────
+            // Take full ownership of the Camera2 session. Do NOT call any
+            // CameraX CameraControl methods — that would trigger CameraX to
+            // rebuild its repeating request, fighting our native one.
+            nativeFocusActive = true
+            submitNativeRepeatingRequest(cameraState, boundCamera)
+        } else {
+            // ── CAMERAX MODE ─────────────────────────────────────────────
+            // Give CameraX full control back.
+            if (nativeFocusActive) {
+                // Our native setRepeatingRequest replaced CameraX's managed one.
+                // Force CameraX to re-establish by cancelling focus metering,
+                // which triggers an internal request rebuild.
+                nativeFocusActive = false
+                boundCamera.cameraControl.cancelFocusAndMetering()
+                Log.d(TAG, "Returning to CameraX control — forced re-establish")
+            }
             applyFlash(cameraState)
             applyExposure(cameraState, boundCamera)
             applyZoom(cameraState, boundCamera)
+            applyCamera2Options(cameraState, boundCamera)
         }
-
-        applyCamera2Options(cameraState, boundCamera)
         lastAppliedSessionSignature = signature
+    }
+
+    /**
+     * Submit a repeating request directly on the Camera2 CameraCaptureSession.
+     * Includes ALL camera settings (focus, AE, AWB, ISO, shutter, HDR).
+     * CameraX is completely bypassed — no CameraControl calls while this is active.
+     */
+    private fun submitNativeRepeatingRequest(cameraState: CameraState, boundCamera: Camera) {
+        val session = cam2Session
+        val surfaces = cam2Surfaces
+        if (session == null || surfaces.isEmpty()) {
+            Log.w(TAG, "Native focus: no session/surfaces yet, falling back to Camera2CameraControl")
+            // Fallback: use CameraX until the session is captured
+            applyCamera2Options(cameraState, boundCamera)
+            return
+        }
+        try {
+            val builder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            surfaces.forEach { builder.addTarget(it) }
+            builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
+
+            // ── Focus ──
+            val manualFocus = effectiveManualFocusNormalized(cameraState)!!
+            val focusDiopters = focusDistanceFor(manualFocus)
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
+
+            // ── HDR / LOG ──
+            when (resolvedHdrLogMode(cameraState)) {
+                "HDR" -> {
+                    builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
+                    builder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
+                }
+                "LOG" -> {
+                    builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                    builder.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
+                    builder.set(CaptureRequest.TONEMAP_CURVE, flatLogCurve())
+                }
+                else -> builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+            }
+
+            // ── White Balance ──
+            val filterProfile = underwaterFilterProfile(
+                value = currentValue(cameraState, ".filters"),
+                depthMeters = currentDepthMeters(),
+            )
+            if (filterProfile != null) {
+                builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+                builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+                builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, filterProfile)
+            } else {
+                val wbValue = currentValue(cameraState, ".white_balance")
+                val kelvin = wbValue?.removeSuffix("K")?.toIntOrNull()
+                if (wbValue != null && wbValue != "Auto" && kelvin != null) {
+                    builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+                } else {
+                    builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+                }
+            }
+
+            // ── AE / ISO / Shutter ──
+            var aeOff = false
+            val isoValue = currentValue(cameraState, ".iso")?.toIntOrNull()
+            if (isoValue != null) {
+                val isoRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
+                    .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                if (isoRange != null) {
+                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, isoValue.coerceIn(isoRange.lower, isoRange.upper))
+                    aeOff = true
+                }
+            }
+            val shutterNs = currentValue(cameraState, ".shutter_speed")?.let { parseShutterNs(it) }
+            if (shutterNs != null) {
+                val range = Camera2CameraInfo.from(boundCamera.cameraInfo)
+                    .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                if (range != null) {
+                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, shutterNs.coerceIn(range.lower, range.upper))
+                    aeOff = true
+                }
+            }
+            builder.set(CaptureRequest.CONTROL_AE_MODE,
+                if (aeOff) CameraMetadata.CONTROL_AE_MODE_OFF else CameraMetadata.CONTROL_AE_MODE_ON)
+
+            // ── Exposure Compensation (pass through when AE is ON) ──
+            if (!aeOff) {
+                val ev = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
+                    ?.replace("+", "")?.toDoubleOrNull()
+                if (ev != null) {
+                    val exposureState = boundCamera.cameraInfo.exposureState
+                    val step = exposureState.exposureCompensationStep.toFloat().takeIf { it > 0f } ?: 0.1f
+                    val idx = (ev / step).roundToInt().coerceIn(
+                        exposureState.exposureCompensationRange.lower,
+                        exposureState.exposureCompensationRange.upper,
+                    )
+                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, idx)
+                }
+            }
+
+            // ── Flash ──
+            val flashValue = currentValue(cameraState, ".flash")
+            if (flashValue == "On" || flashValue == "Torch") {
+                builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_TORCH)
+            } else {
+                builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+            }
+
+            session.setRepeatingRequest(builder.build(), sessionCaptureCallback, null)
+            Log.d(TAG, "Native focus applied: ${focusDiopters} diopters (norm=$manualFocus)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Native focus FAILED: ${e.message}", e)
+        }
     }
 
     private fun refreshBoundCameraCapabilities(boundCamera: Camera) {
@@ -772,45 +793,12 @@ class CameraRuntimeController(
     }
 
     private fun applyCamera2Options(cameraState: CameraState, boundCamera: Camera) {
-        val minimumFocusDistance = deviceMinFocusDistance
-        val manualFocus = effectiveManualFocusNormalized(cameraState)
-        val isManualFocus = manualFocus != null && minimumFocusDistance > 0f
-
-        Log.d(TAG, "applyCamera2Options: focus=$manualFocus, minDist=$minimumFocusDistance, manual=$isManualFocus")
-
-        if (isManualFocus) {
-            // Direct mode: bypass CameraX's Camera2CameraControl entirely.
-            // Store desired focus and submit via the direct Camera2 session.
-            val focusDistance = focusDistanceFor(manualFocus!!)
-            Log.d(TAG, "Direct focus: normalized=$manualFocus, distance=$focusDistance diopters")
-            pendingDirectFocusDiopters = focusDistance
-            directModeActive = true
-
-            // Submit immediately if session is available
-            val session = capturedSession
-            if (session != null) {
-                submitDirectRepeatingRequest(session)
-            }
-            return
-        }
-
-        // Auto-focus mode: use CameraX's Camera2CameraControl normally
-        directModeActive = false
-        pendingDirectFocusDiopters = -1f
-
+        // This method is only called in CameraX mode (auto focus).
+        // When nativeFocusActive is true, submitNativeRepeatingRequest handles everything.
         val builder = CaptureRequestOptions.Builder()
-        builder.setCaptureRequestOption(
-            CaptureRequest.CONTROL_MODE,
-            CameraMetadata.CONTROL_MODE_AUTO,
-        )
-        builder.setCaptureRequestOption(
-            CaptureRequest.CONTROL_AF_MODE,
-            CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
-        )
-        builder.setCaptureRequestOption(
-            CaptureRequest.LENS_FOCUS_DISTANCE,
-            0f,
-        )
+
+        builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0f)
 
         // --- Effect mode ---
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_EFFECT_MODE, CameraMetadata.CONTROL_EFFECT_MODE_OFF)
@@ -819,39 +807,21 @@ class CameraRuntimeController(
         if (!boundHdrExtension) {
             when (resolvedHdrLogMode(cameraState)) {
                 "HDR" -> {
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_MODE,
-                        CameraMetadata.CONTROL_MODE_USE_SCENE_MODE,
-                    )
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_SCENE_MODE,
-                        CameraMetadata.CONTROL_SCENE_MODE_HDR,
-                    )
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
                 }
                 "LOG" -> {
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_MODE,
-                        CameraMetadata.CONTROL_MODE_AUTO,
-                    )
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.TONEMAP_MODE,
-                        CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE,
-                    )
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.TONEMAP_CURVE,
-                        flatLogCurve(),
-                    )
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                    builder.setCaptureRequestOption(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
+                    builder.setCaptureRequestOption(CaptureRequest.TONEMAP_CURVE, flatLogCurve())
                 }
                 else -> {
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_MODE,
-                        CameraMetadata.CONTROL_MODE_AUTO,
-                    )
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                 }
             }
         }
 
-        // --- White Balance & Color Correction ---
+        // --- White Balance ---
         val filterProfile = underwaterFilterProfile(
             value = currentValue(cameraState, ".filters"),
             depthMeters = currentDepthMeters(),
@@ -861,48 +831,28 @@ class CameraRuntimeController(
             if (wbValue != null && wbValue != "Auto") {
                 val kelvin = wbValue.removeSuffix("K").toIntOrNull()
                 if (kelvin != null) {
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AWB_MODE,
-                        CameraMetadata.CONTROL_AWB_MODE_OFF,
-                    )
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
                 } else {
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AWB_MODE,
-                        CameraMetadata.CONTROL_AWB_MODE_AUTO,
-                    )
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
                 }
             } else {
-                builder.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AWB_MODE,
-                    CameraMetadata.CONTROL_AWB_MODE_AUTO,
-                )
+                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
             }
         } else {
-            builder.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AWB_MODE,
-                CameraMetadata.CONTROL_AWB_MODE_OFF,
-            )
-            builder.setCaptureRequestOption(
-                CaptureRequest.COLOR_CORRECTION_MODE,
-                CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX,
-            )
-            builder.setCaptureRequestOption(
-                CaptureRequest.COLOR_CORRECTION_GAINS,
-                filterProfile,
-            )
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_GAINS, filterProfile)
         }
 
-        // --- ISO (manual sensitivity) ---
+        // --- ISO ---
         val isoValue = currentValue(cameraState, ".iso")?.toIntOrNull()
         if (isoValue != null) {
             try {
                 val isoRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
                     .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 if (isoRange != null) {
-                    builder.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY,
-                        isoValue.coerceIn(isoRange.lower, isoRange.upper))
-                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE,
-                        CameraMetadata.CONTROL_AE_MODE_OFF)
+                    builder.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, isoValue.coerceIn(isoRange.lower, isoRange.upper))
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                 }
             } catch (_: Exception) { }
         }
@@ -914,10 +864,8 @@ class CameraRuntimeController(
                 val exposureRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
                     .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
                 if (exposureRange != null) {
-                    builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME,
-                        shutterNs.coerceIn(exposureRange.lower, exposureRange.upper))
-                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE,
-                        CameraMetadata.CONTROL_AE_MODE_OFF)
+                    builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, shutterNs.coerceIn(exposureRange.lower, exposureRange.upper))
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                 }
             } catch (_: Exception) { }
         }
@@ -925,7 +873,6 @@ class CameraRuntimeController(
         try {
             val cam2Control = Camera2CameraControl.from(boundCamera.cameraControl)
             cam2Control.setCaptureRequestOptions(builder.build())
-            Log.d(TAG, "Camera2 options submitted (manual=$isManualFocus)")
         } catch (e: Exception) {
             Log.e(TAG, "Camera2 options FAILED", e)
         }
@@ -1132,7 +1079,9 @@ class CameraRuntimeController(
     }
 
     private fun focusDistanceFor(normalizedFocus: Double): Float {
-        return (deviceMinFocusDistance * normalizedFocus.coerceIn(0.0, 1.0).toFloat())
+        // 0 = close (macro, max diopters), 1 = far (infinity, 0 diopters)
+        val inverted = 1.0 - normalizedFocus.coerceIn(0.0, 1.0)
+        return (deviceMinFocusDistance * inverted.toFloat())
             .coerceIn(0f, deviceMinFocusDistance)
     }
 
@@ -1140,134 +1089,8 @@ class CameraRuntimeController(
         return currentValue(cameraState, ".focus_peaking") == "On"
     }
 
-    private fun analyzeFocusAssistFrame(image: ImageProxy) {
-        try {
-            if (!focusAssistEnabled || effectiveManualFocusNormalized(latestState) == null) {
-                return
-            }
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastFocusAssistFrameAtMs < 120L) {
-                return
-            }
-            lastFocusAssistFrameAtMs = now
-            dispatchFocusAssistOverlay(createFocusAssistBitmap(image))
-        } finally {
-            image.close()
-        }
-    }
-
-    /**
-     * Professional focus peaking: Sobel edge detection with bright green outlines.
-     * Sharp in-focus edges in the camera image are highlighted with opaque green
-     * to show the user exactly which areas are in focus, like a cinema camera.
-     */
-    private fun createFocusAssistBitmap(image: ImageProxy): Bitmap? {
-        val lumaPlane = image.planes.firstOrNull() ?: return null
-        val buffer = lumaPlane.buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-
-        val width = image.width
-        val height = image.height
-        // Sample at half resolution for performance while keeping quality
-        val step = 2
-        val outW = (width / step).coerceAtLeast(1)
-        val outH = (height / step).coerceAtLeast(1)
-        val rowStride = lumaPlane.rowStride
-        val pixelStride = lumaPlane.pixelStride
-        val gradients = IntArray(outW * outH)
-        val pixels = IntArray(outW * outH)
-
-        var gradientSum = 0L
-        var gradientCount = 0
-        var maxGradient = 0
-
-        // Sobel edge detection on the luminance channel
-        for (y in 1 until outH - 1) {
-            for (x in 1 until outW - 1) {
-                val sx = x * step
-                val sy = y * step
-                // 3x3 Sobel kernels
-                val tl = lumaAt(bytes, rowStride, pixelStride, sx - step, sy - step)
-                val tc = lumaAt(bytes, rowStride, pixelStride, sx, sy - step)
-                val tr = lumaAt(bytes, rowStride, pixelStride, sx + step, sy - step)
-                val ml = lumaAt(bytes, rowStride, pixelStride, sx - step, sy)
-                val mr = lumaAt(bytes, rowStride, pixelStride, sx + step, sy)
-                val bl = lumaAt(bytes, rowStride, pixelStride, sx - step, sy + step)
-                val bc = lumaAt(bytes, rowStride, pixelStride, sx, sy + step)
-                val br = lumaAt(bytes, rowStride, pixelStride, sx + step, sy + step)
-                // Gx = (-tl + tr - 2*ml + 2*mr - bl + br)
-                val gx = -tl + tr - 2 * ml + 2 * mr - bl + br
-                // Gy = (-tl - 2*tc - tr + bl + 2*bc + br)
-                val gy = -tl - 2 * tc - tr + bl + 2 * bc + br
-                val mag = kotlin.math.abs(gx) + kotlin.math.abs(gy) // L1 norm (fast)
-                gradients[y * outW + x] = mag
-                gradientSum += mag.toLong()
-                gradientCount++
-                maxGradient = max(maxGradient, mag)
-            }
-        }
-
-        if (gradientCount == 0 || maxGradient <= 0) return null
-
-        // Adaptive threshold: edges must be well above average to qualify
-        val avgGradient = gradientSum.toDouble() / gradientCount
-        val threshold = max(80, (avgGradient * 2.0).roundToInt())
-        val range = (maxGradient - threshold).coerceAtLeast(1)
-        val peakingColor = 0x00FF40 // Bright green (RGB)
-
-        for (y in 1 until outH - 1) {
-            for (x in 1 until outW - 1) {
-                val idx = y * outW + x
-                val mag = gradients[idx]
-                if (mag <= threshold) continue
-
-                // Intensity-proportional alpha for professional look
-                val normalized = ((mag - threshold).toFloat() / range).coerceIn(0f, 1f)
-                val alpha = (180 + normalized * 75f).roundToInt().coerceIn(180, 255)
-                pixels[idx] = (alpha shl 24) or peakingColor
-
-                // Thicken edges: mark adjacent pixels for 2px-wide outlines
-                if (x + 1 < outW - 1 && pixels[idx + 1] == 0) {
-                    pixels[idx + 1] = ((alpha * 2 / 3) shl 24) or peakingColor
-                }
-                if (y + 1 < outH - 1 && pixels[idx + outW] == 0) {
-                    pixels[idx + outW] = ((alpha * 2 / 3) shl 24) or peakingColor
-                }
-            }
-        }
-
-        val bitmap = Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888)
-        val rotationDegrees = image.imageInfo.rotationDegrees
-        if (rotationDegrees == 0) {
-            return bitmap
-        }
-        val matrix = Matrix().apply {
-            postRotate(rotationDegrees.toFloat())
-        }
-        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-    }
-
-    private fun lumaAt(
-        bytes: ByteArray,
-        rowStride: Int,
-        pixelStride: Int,
-        x: Int,
-        y: Int,
-    ): Int {
-        val index = y * rowStride + x * pixelStride
-        if (index < 0 || index >= bytes.size) {
-            return 0
-        }
-        return bytes[index].toInt() and 0xFF
-    }
-
-    private fun dispatchFocusAssistOverlay(bitmap: Bitmap?) {
-        val callback = focusAssistOverlayCallback ?: return
-        ContextCompat.getMainExecutor(context).execute {
-            callback(bitmap)
-        }
-    }
+    // Focus peaking is now handled entirely by FocusPeakingSurfaceProcessor
+    // (GPU shader in the CameraX preview pipeline). No CPU bitmap overlay needed.
 
     private fun ByteArray.decodeAsciiId(): String {
         val endIndex = indexOf(0).let { if (it >= 0) it else size }
