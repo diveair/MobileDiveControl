@@ -131,6 +131,7 @@ class CameraRuntimeController(
     @Volatile private var capturedSurfaces: Collection<android.view.Surface>? = null
     @Volatile private var directModeActive: Boolean = false
     @Volatile private var pendingDirectFocusDiopters: Float = -1f
+    @Volatile private var directMismatchCount: Int = 0
 
     private val sessionCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
@@ -153,12 +154,19 @@ class CameraRuntimeController(
                 }
             }
 
-            // If direct mode is active, check if CameraX has overridden our focus
+            // If direct mode is active, check if CameraX has overridden our focus.
+            // Use a debounce: only re-submit after 3+ consecutive mismatched frames
+            // to avoid oscillation when CameraX fights our direct request.
             if (directModeActive && pendingDirectFocusDiopters >= 0f) {
                 val actualDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
                 if (kotlin.math.abs(actualDistance - pendingDirectFocusDiopters) > 0.05f) {
-                    // CameraX has overridden our request — resubmit
-                    submitDirectRepeatingRequest(session)
+                    directMismatchCount++
+                    if (directMismatchCount >= 3) {
+                        submitDirectRepeatingRequest(session)
+                        directMismatchCount = 0
+                    }
+                } else {
+                    directMismatchCount = 0
                 }
             }
 
@@ -1167,7 +1175,7 @@ class CameraRuntimeController(
                 return
             }
             val now = SystemClock.elapsedRealtime()
-            if (now - lastFocusAssistFrameAtMs < 80L) {
+            if (now - lastFocusAssistFrameAtMs < 120L) {
                 return
             }
             lastFocusAssistFrameAtMs = now
@@ -1178,9 +1186,9 @@ class CameraRuntimeController(
     }
 
     /**
-     * Create a focus peaking overlay bitmap.
-     * Uses Sobel edge detection on the luminance plane to find sharp edges,
-     * then draws them as bright green outlines (like professional focus assist).
+     * Professional focus peaking: Sobel edge detection with bright green outlines.
+     * Sharp in-focus edges in the camera image are highlighted with opaque green
+     * to show the user exactly which areas are in focus, like a cinema camera.
      */
     private fun createFocusAssistBitmap(image: ImageProxy): Bitmap? {
         val lumaPlane = image.planes.firstOrNull() ?: return null
@@ -1190,23 +1198,25 @@ class CameraRuntimeController(
 
         val width = image.width
         val height = image.height
+        // Sample at half resolution for performance while keeping quality
+        val step = 2
+        val outW = (width / step).coerceAtLeast(1)
+        val outH = (height / step).coerceAtLeast(1)
         val rowStride = lumaPlane.rowStride
         val pixelStride = lumaPlane.pixelStride
-
-        // Downsample for performance — every 2nd pixel
-        val step = 2
-        val outW = width / step
-        val outH = height / step
         val gradients = IntArray(outW * outH)
         val pixels = IntArray(outW * outH)
-        var maxGrad = 0
 
-        // Compute Sobel gradient magnitude at each downsampled pixel
-        for (oy in 1 until outH - 1) {
-            for (ox in 1 until outW - 1) {
-                val sx = ox * step
-                val sy = oy * step
-                // 3x3 Sobel kernel for horizontal and vertical
+        var gradientSum = 0L
+        var gradientCount = 0
+        var maxGradient = 0
+
+        // Sobel edge detection on the luminance channel
+        for (y in 1 until outH - 1) {
+            for (x in 1 until outW - 1) {
+                val sx = x * step
+                val sy = y * step
+                // 3x3 Sobel kernels
                 val tl = lumaAt(bytes, rowStride, pixelStride, sx - step, sy - step)
                 val tc = lumaAt(bytes, rowStride, pixelStride, sx, sy - step)
                 val tr = lumaAt(bytes, rowStride, pixelStride, sx + step, sy - step)
@@ -1215,40 +1225,43 @@ class CameraRuntimeController(
                 val bl = lumaAt(bytes, rowStride, pixelStride, sx - step, sy + step)
                 val bc = lumaAt(bytes, rowStride, pixelStride, sx, sy + step)
                 val br = lumaAt(bytes, rowStride, pixelStride, sx + step, sy + step)
-
-                val gx = (-tl - 2 * ml - bl) + (tr + 2 * mr + br)
-                val gy = (-tl - 2 * tc - tr) + (bl + 2 * bc + br)
-                val mag = kotlin.math.abs(gx) + kotlin.math.abs(gy)
-                gradients[oy * outW + ox] = mag
-                if (mag > maxGrad) maxGrad = mag
+                // Gx = (-tl + tr - 2*ml + 2*mr - bl + br)
+                val gx = -tl + tr - 2 * ml + 2 * mr - bl + br
+                // Gy = (-tl - 2*tc - tr + bl + 2*bc + br)
+                val gy = -tl - 2 * tc - tr + bl + 2 * bc + br
+                val mag = kotlin.math.abs(gx) + kotlin.math.abs(gy) // L1 norm (fast)
+                gradients[y * outW + x] = mag
+                gradientSum += mag.toLong()
+                gradientCount++
+                maxGradient = max(maxGradient, mag)
             }
         }
 
-        // Adaptive threshold: edges must be significantly above the noise floor
-        // Use a fixed lower threshold that catches real edges but not noise
-        val threshold = max(40, maxGrad / 5)
-        val peakColor = Color.argb(200, 0, 255, 0)       // Bright green, high alpha
-        val midColor = Color.argb(140, 0, 230, 40)        // Slightly dimmer green
+        if (gradientCount == 0 || maxGradient <= 0) return null
 
-        for (oy in 1 until outH - 1) {
-            for (ox in 1 until outW - 1) {
-                val idx = oy * outW + ox
+        // Adaptive threshold: edges must be well above average to qualify
+        val avgGradient = gradientSum.toDouble() / gradientCount
+        val threshold = max(80, (avgGradient * 2.0).roundToInt())
+        val range = (maxGradient - threshold).coerceAtLeast(1)
+        val peakingColor = 0x00FF40 // Bright green (RGB)
+
+        for (y in 1 until outH - 1) {
+            for (x in 1 until outW - 1) {
+                val idx = y * outW + x
                 val mag = gradients[idx]
                 if (mag <= threshold) continue
 
-                // Compute a brightness factor based on edge strength
-                val strength = ((mag - threshold).toFloat() / (maxGrad - threshold).coerceAtLeast(1)).coerceIn(0f, 1f)
+                // Intensity-proportional alpha for professional look
+                val normalized = ((mag - threshold).toFloat() / range).coerceIn(0f, 1f)
+                val alpha = (180 + normalized * 75f).roundToInt().coerceIn(180, 255)
+                pixels[idx] = (alpha shl 24) or peakingColor
 
-                if (strength > 0.3f) {
-                    // Strong edge — bright green
-                    pixels[idx] = peakColor
-                    // Thicken: also color adjacent pixels for visibility
-                    if (ox + 1 < outW) pixels[idx + 1] = midColor
-                    if (oy + 1 < outH) pixels[idx + outW] = midColor
-                } else {
-                    // Moderate edge — dimmer
-                    val alpha = (60 + strength * 140).toInt().coerceIn(60, 200)
-                    pixels[idx] = Color.argb(alpha, 0, 220, 30)
+                // Thicken edges: mark adjacent pixels for 2px-wide outlines
+                if (x + 1 < outW - 1 && pixels[idx + 1] == 0) {
+                    pixels[idx + 1] = ((alpha * 2 / 3) shl 24) or peakingColor
+                }
+                if (y + 1 < outH - 1 && pixels[idx + outW] == 0) {
+                    pixels[idx + outW] = ((alpha * 2 / 3) shl 24) or peakingColor
                 }
             }
         }
