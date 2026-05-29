@@ -8,7 +8,6 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
@@ -123,16 +122,6 @@ class CameraRuntimeController(
     private var lastAppliedSessionSignature: SessionSignature? = null
     private val focusAssistExecutor = Executors.newSingleThreadExecutor()
 
-    // Direct Camera2 session access — needed because CameraX overrides LENS_FOCUS_DISTANCE.
-    // When manual focus is active, we completely bypass Camera2CameraControl and submit
-    // our own repeating request with ALL camera2 settings (focus, ISO, WB, shutter, HDR).
-    // This prevents CameraX from fighting us by re-submitting its managed request.
-    @Volatile private var capturedSession: CameraCaptureSession? = null
-    @Volatile private var capturedSurfaces: Collection<android.view.Surface>? = null
-    @Volatile private var directModeActive: Boolean = false
-    @Volatile private var pendingDirectFocusDiopters: Float = -1f
-    @Volatile private var directMismatchCount: Int = 0
-
     private val sessionCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
             session: CameraCaptureSession,
@@ -140,37 +129,7 @@ class CameraRuntimeController(
             result: TotalCaptureResult,
         ) {
             super.onCaptureCompleted(session, request, result)
-            // Capture session reference and output surfaces on first callback
-            if (capturedSession !== session) {
-                capturedSession = session
-                try {
-                    val method = CaptureRequest::class.java.getDeclaredMethod("getTargets")
-                    method.isAccessible = true
-                    @Suppress("UNCHECKED_CAST")
-                    capturedSurfaces = method.invoke(request) as? Collection<android.view.Surface>
-                    Log.d(TAG, "Captured session + ${capturedSurfaces?.size ?: 0} surfaces")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Cannot extract surfaces: ${e.message}")
-                }
-            }
-
-            // If direct mode is active, check if CameraX has overridden our focus.
-            // Use a debounce: only re-submit after 3+ consecutive mismatched frames
-            // to avoid oscillation when CameraX fights our direct request.
-            if (directModeActive && pendingDirectFocusDiopters >= 0f) {
-                val actualDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
-                if (kotlin.math.abs(actualDistance - pendingDirectFocusDiopters) > 0.05f) {
-                    directMismatchCount++
-                    if (directMismatchCount >= 3) {
-                        submitDirectRepeatingRequest(session)
-                        directMismatchCount = 0
-                    }
-                } else {
-                    directMismatchCount = 0
-                }
-            }
-
-            // Periodic logging
+            // Periodic logging for diagnostics
             val now = SystemClock.elapsedRealtime()
             if (now - lastFocusResultLogAtMs < 300L) {
                 return
@@ -183,7 +142,7 @@ class CameraRuntimeController(
             val vendorLensPos = samsungFocusLensPosition(result)
             Log.d(
                 TAG,
-                "CaptureResult focusDistance=$actualFocusDistance afMode=$afMode lensState=$lensState physical=$runningPhysicalId lensPos=$vendorLensPos requested=${pendingDirectFocusDiopters.takeIf { directModeActive }}",
+                "CaptureResult focusDistance=$actualFocusDistance afMode=$afMode lensState=$lensState physical=$runningPhysicalId lensPos=$vendorLensPos",
             )
         }
     }
@@ -254,10 +213,6 @@ class CameraRuntimeController(
         boundResolution = null
         boundHdrExtension = false
         boundFocusMode = false
-        capturedSession = null
-        capturedSurfaces = null
-        directModeActive = false
-        pendingDirectFocusDiopters = -1f
         focusAssistEnabled = false
         lastAppliedSessionSignature = null
         dispatchFocusAssistOverlay(null)
@@ -455,123 +410,22 @@ class CameraRuntimeController(
         boundLensFacing = desiredLensFacing
         boundResolution = desiredResolution
         boundFocusMode = isManualFocus
-        capturedSession = null // Reset — new session will be captured in callback
-        capturedSurfaces = null
-        directModeActive = false
-        pendingDirectFocusDiopters = -1f
 
-        // Detect device capabilities from the bound camera
-        applySessionState(latestState, force = true)
-    }
-
-    /**
-     * Submit a repeating request directly on the Camera2 CameraCaptureSession,
-     * bypassing CameraX entirely. Uses stored settings from applyCamera2Options.
-     */
-    private fun submitDirectRepeatingRequest(session: CameraCaptureSession) {
-        val surfaces = capturedSurfaces
-        if (surfaces.isNullOrEmpty()) {
-            Log.w(TAG, "Direct mode: no surfaces available")
-            return
-        }
-        try {
-            val builder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            // Add all CameraX surfaces so preview + analysis keep working
-            surfaces.forEach { builder.addTarget(it) }
-            builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-
-            // Apply ALL camera2 settings from the latest state
-            buildDirectCamera2Settings(builder)
-
-            session.setRepeatingRequest(builder.build(), sessionCaptureCallback, null)
-            Log.d(TAG, "Direct repeating request submitted: focus=${pendingDirectFocusDiopters}")
-        } catch (e: Exception) {
-            Log.e(TAG, "Direct repeating request FAILED: ${e.message}", e)
+        // Apply session state once camera is active. Camera2CameraControl rejects
+        // options submitted before the camera is fully active ("Camera is not active").
+        val boundCamera = camera
+        if (boundCamera != null) {
+            boundCamera.cameraInfo.cameraState.observeForever(object : androidx.lifecycle.Observer<androidx.camera.core.CameraState> {
+                override fun onChanged(state: androidx.camera.core.CameraState) {
+                    if (state.type == androidx.camera.core.CameraState.Type.OPEN) {
+                        boundCamera.cameraInfo.cameraState.removeObserver(this)
+                        applySessionState(latestState, force = true)
+                    }
+                }
+            })
         }
     }
 
-    /**
-     * Build ALL Camera2 settings into a CaptureRequest.Builder for direct mode.
-     * This mirrors applyCamera2Options but writes to a CaptureRequest.Builder
-     * instead of CaptureRequestOptions.
-     */
-    private fun buildDirectCamera2Settings(builder: CaptureRequest.Builder) {
-        val state = latestState
-        val boundCamera = camera ?: return
-
-        // --- Focus ---
-        builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-        builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, pendingDirectFocusDiopters.coerceAtLeast(0f))
-
-        // --- HDR / LOG / Off ---
-        when (resolvedHdrLogMode(state)) {
-            "HDR" -> {
-                builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
-                builder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
-            }
-            "LOG" -> {
-                builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                builder.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
-                builder.set(CaptureRequest.TONEMAP_CURVE, flatLogCurve())
-            }
-            else -> {
-                builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-            }
-        }
-
-        // --- White Balance ---
-        val filterProfile = underwaterFilterProfile(
-            value = currentValue(state, ".filters"),
-            depthMeters = currentDepthMeters(),
-        )
-        if (filterProfile == null) {
-            val wbValue = currentValue(state, ".white_balance")
-            if (wbValue != null && wbValue != "Auto") {
-                val kelvin = wbValue.removeSuffix("K").toIntOrNull()
-                if (kelvin != null) {
-                    builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
-                } else {
-                    builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-                }
-            } else {
-                builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-            }
-        } else {
-            builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
-            builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, filterProfile)
-        }
-
-        // --- ISO ---
-        val isoValue = currentValue(state, ".iso")?.toIntOrNull()
-        if (isoValue != null) {
-            try {
-                val isoRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
-                    .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-                if (isoRange != null) {
-                    builder.set(CaptureRequest.SENSOR_SENSITIVITY,
-                        isoValue.coerceIn(isoRange.lower, isoRange.upper))
-                    builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                }
-            } catch (_: Exception) { }
-        } else {
-            builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
-        }
-
-        // --- Shutter Speed ---
-        val shutterNs = currentValue(state, ".shutter_speed")?.let { parseShutterNs(it) }
-        if (shutterNs != null) {
-            try {
-                val exposureRange = Camera2CameraInfo.from(boundCamera.cameraInfo)
-                    .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-                if (exposureRange != null) {
-                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME,
-                        shutterNs.coerceIn(exposureRange.lower, exposureRange.upper))
-                    builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                }
-            } catch (_: Exception) { }
-        }
-    }
 
     private fun detectDeviceCapabilitiesViaCameraManager() {
         try {
@@ -698,21 +552,9 @@ class CameraRuntimeController(
             return
         }
 
-        val prev = lastAppliedSessionSignature
-        // When in direct mode, only call CameraX CameraControl methods if their
-        // specific values changed. Otherwise CameraX re-submits its managed repeating
-        // request, overriding our direct Camera2 request and causing focus jitter.
-        val cameraXChanged = force || prev == null ||
-            prev.flash != signature.flash ||
-            prev.exposure != signature.exposure ||
-            prev.lens != signature.lens
-
-        if (cameraXChanged) {
-            applyFlash(cameraState)
-            applyExposure(cameraState, boundCamera)
-            applyZoom(cameraState, boundCamera)
-        }
-
+        applyFlash(cameraState)
+        applyExposure(cameraState, boundCamera)
+        applyZoom(cameraState, boundCamera)
         applyCamera2Options(cameraState, boundCamera)
         lastAppliedSessionSignature = signature
     }
@@ -799,47 +641,38 @@ class CameraRuntimeController(
 
         Log.d(TAG, "applyCamera2Options: focus=$manualFocus, minDist=$minimumFocusDistance, manual=$isManualFocus")
 
-        if (isManualFocus) {
-            // ------------------------------------------------------------------
-            // DIRECT MODE: bypass CameraX entirely for ALL camera2 settings.
-            // CameraX's FocusMeteringControl overrides LENS_FOCUS_DISTANCE in
-            // its managed repeating request. To prevent CameraX from fighting
-            // us, we do NOT call Camera2CameraControl here. Instead, we store
-            // the desired focus and let the sessionCaptureCallback submit a
-            // direct repeating request on the Camera2 session.
-            // ------------------------------------------------------------------
-            val focusDistance = focusDistanceFor(manualFocus!!)
-            Log.d(TAG, "Direct mode: normalized=$manualFocus, distance=$focusDistance diopters")
-            pendingDirectFocusDiopters = focusDistance
-            directModeActive = true
-
-            // Kick off the direct request immediately if we have a session
-            val session = capturedSession
-            if (session != null) {
-                submitDirectRepeatingRequest(session)
-            }
-            return
-        }
-
-        // ------------------------------------------------------------------
-        // CameraX MODE: use Camera2CameraControl for all settings (AF on)
-        // ------------------------------------------------------------------
-        directModeActive = false
-        pendingDirectFocusDiopters = -1f
-
         val builder = CaptureRequestOptions.Builder()
-        builder.setCaptureRequestOption(
-            CaptureRequest.CONTROL_MODE,
-            CameraMetadata.CONTROL_MODE_AUTO,
-        )
-        builder.setCaptureRequestOption(
-            CaptureRequest.CONTROL_AF_MODE,
-            CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
-        )
-        builder.setCaptureRequestOption(
-            CaptureRequest.LENS_FOCUS_DISTANCE,
-            0f,
-        )
+
+        if (isManualFocus) {
+            // AF_MODE_OFF is already set at bind time via Camera2Interop.Extender
+            // (see bindCamera). Here we only update LENS_FOCUS_DISTANCE dynamically.
+            // Do NOT call cancelFocusAndMetering() — it can trigger CameraX to
+            // restart its focus pipeline and override the Extender setting.
+            val focusDistance = focusDistanceFor(manualFocus!!)
+            Log.d(TAG, "Manual focus: normalized=$manualFocus, distance=$focusDistance diopters")
+
+            builder.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                CameraMetadata.CONTROL_AF_MODE_OFF,
+            )
+            builder.setCaptureRequestOption(
+                CaptureRequest.LENS_FOCUS_DISTANCE,
+                focusDistance,
+            )
+        } else {
+            builder.setCaptureRequestOption(
+                CaptureRequest.CONTROL_MODE,
+                CameraMetadata.CONTROL_MODE_AUTO,
+            )
+            builder.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+            )
+            builder.setCaptureRequestOption(
+                CaptureRequest.LENS_FOCUS_DISTANCE,
+                0f,
+            )
+        }
 
         // --- Effect mode ---
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_EFFECT_MODE, CameraMetadata.CONTROL_EFFECT_MODE_OFF)
@@ -954,9 +787,9 @@ class CameraRuntimeController(
         try {
             val cam2Control = Camera2CameraControl.from(boundCamera.cameraControl)
             cam2Control.setCaptureRequestOptions(builder.build())
-            Log.d(TAG, "CameraX Camera2 options submitted (AF mode)")
+            Log.d(TAG, "Camera2 options submitted (manual=$isManualFocus)")
         } catch (e: Exception) {
-            Log.e(TAG, "CameraX Camera2 options FAILED", e)
+            Log.e(TAG, "Camera2 options FAILED", e)
         }
     }
 
