@@ -614,9 +614,23 @@ class CameraRuntimeController(
         val session = cam2Session
         val surfaces = cam2Surfaces
         if (session == null || surfaces.isEmpty()) {
-            Log.w(TAG, "Native focus: no session/surfaces yet, falling back to Camera2CameraControl")
-            // Fallback: use CameraX until the session is captured
-            applyCamera2Options(cameraState, boundCamera)
+            Log.w(TAG, "Native focus: no session yet, applying via Camera2CameraControl")
+            // Session not ready — use CameraX's Camera2CameraControl to set
+            // AF_MODE_OFF + focus distance. This goes through CameraX's own
+            // pipeline so it won't be overridden.
+            try {
+                val manualFocus = effectiveManualFocusNormalized(cameraState)!!
+                val focusDiopters = focusDistanceFor(manualFocus)
+                val builder = CaptureRequestOptions.Builder()
+                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
+                val cam2Control = Camera2CameraControl.from(boundCamera.cameraControl)
+                cam2Control.setCaptureRequestOptions(builder.build())
+                Log.d(TAG, "Camera2CameraControl fallback: AF_OFF focus=$focusDiopters")
+            } catch (e: Exception) {
+                Log.e(TAG, "Camera2CameraControl fallback failed", e)
+            }
             return
         }
         try {
