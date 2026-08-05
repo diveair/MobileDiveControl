@@ -46,7 +46,10 @@ varying vec2 vTex;
 uniform mat4 uSTM;
 void main() {
     gl_Position = aPos;
-    vTex = (uSTM * vec4(aTex, 0.0, 1.0)).xy;
+    vec2 tex = (uSTM * vec4(aTex, 0.0, 1.0)).xy;
+    // Device preview is arriving rotated clockwise in the shader path.
+    // Rotate sampled texture 90 deg counter-clockwise to match landscape UI.
+    vTex = vec2(1.0 - tex.y, tex.x);
 }
 """
 
@@ -123,7 +126,6 @@ void main() {
     private var vb: FloatBuffer? = null
     private var tb: FloatBuffer? = null
     private val stm = FloatArray(16)       // raw SurfaceTexture transform
-    private val correctedStm = FloatArray(16) // after SurfaceOutput rotation fix
 
     // ──────────────────────────────────────────────────────────────────
     override fun onInputSurface(request: SurfaceRequest) {
@@ -168,12 +170,10 @@ void main() {
     private fun draw() {
         val st = inST ?: return
         if (outEgl == EGL14.EGL_NO_SURFACE) return
-        val so = outSO ?: return
+        outSO ?: return
         try {
             st.updateTexImage()
             st.getTransformMatrix(stm)
-            // Apply CameraX rotation/mirroring correction
-            so.updateTransformMatrix(correctedStm, stm)
 
             EGL14.eglMakeCurrent(dpy, outEgl, outEgl, ctx)
             GLES20.glViewport(0, 0, outW, outH)
@@ -184,7 +184,10 @@ void main() {
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inTex)
             GLES20.glUniform1i(lSamp, 0)
 
-            GLES20.glUniformMatrix4fv(lSTM, 1, false, correctedStm, 0)
+            // Use the SurfaceTexture transform directly. Applying the
+            // SurfaceOutput transform here rotated the preview an extra 90 deg
+            // on device because PreviewView already handles display orientation.
+            GLES20.glUniformMatrix4fv(lSTM, 1, false, stm, 0)
             GLES20.glUniform2f(lStep, 1f / outW, 1f / outH)
             GLES20.glUniform1f(lOn, if (peakingEnabled) 1f else 0f)
             GLES20.glUniform1f(lThr, peakingThreshold)

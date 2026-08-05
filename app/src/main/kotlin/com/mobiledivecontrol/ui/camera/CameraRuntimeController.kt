@@ -3,6 +3,7 @@ package com.mobiledivecontrol.ui.camera
 import android.content.Context
 import android.content.Intent
 import android.content.ContentValues
+import android.graphics.Rect
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -15,6 +16,8 @@ import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.TonemapCurve
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
@@ -44,8 +47,11 @@ import androidx.lifecycle.LifecycleOwner
 import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.CameraState
+import com.mobiledivecontrol.core.FocusCurveMode
 import kotlin.math.abs
+import kotlin.math.ln
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 import java.util.concurrent.Executors
 
 class CameraRuntimeController(
@@ -76,10 +82,44 @@ class CameraRuntimeController(
         val facing: Int,
         val focalLengthMm: Float,
         val minFocusDistance: Float,
+        val afModes: Set<Int>,
+        val vendorFocusLensRange: IntRange?,
+        val vendorFocusCalibration: List<Int>,
     ) {
         val supportsManualFocus: Boolean
             get() = minFocusDistance > 0f
     }
+
+    private enum class ManualFocusTransport {
+        Fixed,
+        PublicDiopter,
+        SamsungLensPosition,
+        Hybrid,
+    }
+
+    private data class LensFocusCapabilityProfile(
+        val lensValue: String,
+        val transport: ManualFocusTransport,
+        val minFocusDistance: Float,
+        val vendorFocusLensRange: IntRange? = null,
+    ) {
+        val supportsManualFocus: Boolean
+            get() = transport != ManualFocusTransport.Fixed
+
+        val usesPublicDiopters: Boolean
+            get() = transport == ManualFocusTransport.PublicDiopter || transport == ManualFocusTransport.Hybrid
+
+        val usesVendorLensPosition: Boolean
+            get() = transport == ManualFocusTransport.SamsungLensPosition || transport == ManualFocusTransport.Hybrid
+    }
+
+    private data class ManualFocusRequest(
+        val normalizedFocus: Double,
+        val transport: ManualFocusTransport,
+        val diopters: Float? = null,
+        val vendorLensPosition: Int? = null,
+        val vendorFocusValue: Float? = null,
+    )
 
     private data class BackCameraProfile(
         val logicalCameraId: String,
@@ -96,6 +136,7 @@ class CameraRuntimeController(
     private var imageCapture: ImageCapture? = null
     private var imageAnalysis: ImageAnalysis? = null
     private var boundLensFacing: Int? = null
+    private var boundLensValue: String? = null
     private var boundResolution: String? = null
     private var boundHdrExtension: Boolean = false
     private var boundFocusMode: Boolean = false // true = manual focus, false = AF
@@ -103,10 +144,13 @@ class CameraRuntimeController(
     private var latestWaterPressureKpa: Double? = null
     private var latestAtmosphericPressureKpa: Double? = null
     private var frontCameraId: String? = null
+    private var frontCameraMinFocusDistance: Float = 0f
     private var backCameraProfile: BackCameraProfile? = null
     private var backLensAssignments: Map<String, PhysicalLensProfile> = emptyMap()
+    private var lensFocusCapabilities: Map<String, LensFocusCapabilityProfile> = emptyMap()
     private var activeLensProfile: PhysicalLensProfile? = null
-    private var allowDirectPhysicalCameraBinding: Boolean = true
+    private val failedDirectPhysicalCameraIds = mutableSetOf<String>()
+    private val unsupportedPhysicalRequestTargets = mutableSetOf<String>()
 
     // Device capabilities detected once at attach time via CameraManager
     private var deviceMinFocusDistance: Float = 10f // Safe default — most phones have ~10 diopters
@@ -117,9 +161,12 @@ class CameraRuntimeController(
     private var lastFocusResultLogAtMs: Long = 0L
     private var lastAppliedSessionSignature: SessionSignature? = null
     private val focusAssistExecutor = Executors.newSingleThreadExecutor()
+    // Callback to report detected lenses back to the ViewModel/state
+    private var onDetectedLenses: ((List<String>) -> Unit)? = null
     // GPU-accelerated focus peaking via OpenGL shader in the CameraX preview pipeline.
     // Replaces the old CPU bitmap overlay approach which caused jitter and drift.
     private var focusPeakingProcessor: FocusPeakingSurfaceProcessor? = null
+    private val cameraRequestHandler = Handler(Looper.getMainLooper())
 
     // ── Native Camera2 focus control ──────────────────────────────────────
     // When manual focus is active we take FULL ownership of the Camera2
@@ -163,7 +210,8 @@ class CameraRuntimeController(
             val fd = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
             val af = result.get(CaptureResult.CONTROL_AF_MODE)
             val lp = samsungFocusLensPosition(result)
-            Log.d(TAG, "CaptureResult fd=$fd af=$af lp=$lp native=$nativeFocusActive")
+            val physicalId = runningPhysicalCameraId(result)
+            Log.d(TAG, "CaptureResult fd=$fd af=$af lp=$lp physical=$physicalId native=$nativeFocusActive")
         }
     }
 
@@ -172,9 +220,11 @@ class CameraRuntimeController(
         lifecycleOwner: LifecycleOwner,
         initialState: CameraState,
         onReady: (Boolean) -> Unit,
+        onDetectedLenses: ((List<String>) -> Unit)? = null,
     ) {
         this.previewView = previewView
         this.lifecycleOwner = lifecycleOwner
+        this.onDetectedLenses = onDetectedLenses
         latestState = initialState
         focusAssistEnabled = isFocusAssistEnabled(initialState)
 
@@ -228,6 +278,7 @@ class CameraRuntimeController(
         previewView = null
         lifecycleOwner = null
         boundLensFacing = null
+        boundLensValue = null
         boundResolution = null
         boundHdrExtension = false
         boundFocusMode = false
@@ -259,10 +310,11 @@ class CameraRuntimeController(
 
         val desiredLensFacing = desiredLensFacing(cameraState)
         val desiredResolution = desiredResolutionValue(cameraState)
-        // Focus mode changes (AF ↔ manual) are handled at runtime via the direct
-        // Camera2 session approach — no rebind needed. Only rebind for lens/resolution.
+        val desiredLens = selectedLensValue(cameraState)
+        // Rebind when lens facing, physical lens, or resolution changes.
         val needsRebind = desiredLensFacing != boundLensFacing ||
-                desiredResolution != boundResolution
+                desiredResolution != boundResolution ||
+                desiredLens != boundLensValue
         if (needsRebind) {
             Log.d(TAG, "applyState: rebinding camera")
             bindCamera(force = true)
@@ -287,14 +339,17 @@ class CameraRuntimeController(
         val desiredLensFacing = desiredLensFacing(latestState)
         val desiredResolution = desiredResolutionValue(latestState)
         activeLensProfile = selectedLensProfile(latestState)
+        val focusCapability = selectedFocusCapability(latestState)
+        val manualFocusRequest = manualFocusRequestFor(latestState)
         if (desiredLensFacing == CameraSelector.LENS_FACING_BACK) {
-            deviceMinFocusDistance = activeLensProfile?.minFocusDistance ?: 0f
+            deviceMinFocusDistance = focusCapability?.minFocusDistance ?: activeLensProfile?.minFocusDistance ?: 0f
         } else {
-            deviceMinFocusDistance = 0f
+            deviceMinFocusDistance = focusCapability?.minFocusDistance ?: frontCameraMinFocusDistance
         }
 
         if (!force && desiredLensFacing == boundLensFacing &&
-            desiredResolution == boundResolution) {
+            desiredResolution == boundResolution &&
+            selectedLensValue(latestState) == boundLensValue) {
             applySessionState(latestState)
             return
         }
@@ -315,8 +370,7 @@ class CameraRuntimeController(
         // HDR is applied via Camera2 SCENE_MODE_HDR in applyCamera2Options instead.
 
         // Check if manual focus is active — if so, disable AF at bind time via Camera2Interop
-        val manualFocus = effectiveManualFocusNormalized(latestState)
-        val isManualFocus = manualFocus != null && deviceMinFocusDistance > 0f
+        val isManualFocus = manualFocusRequest != null
         val physicalCameraId = if (
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
             desiredLensFacing == CameraSelector.LENS_FACING_BACK &&
@@ -328,7 +382,7 @@ class CameraRuntimeController(
         }
         Log.d(
             TAG,
-            "bindCamera: lens=${selectedLensValue(latestState)} cameraId=$selectedCameraId physical=$physicalCameraId minFocus=$deviceMinFocusDistance manual=$isManualFocus",
+            "bindCamera: lens=${selectedLensValue(latestState)} cameraId=$selectedCameraId physical=$physicalCameraId minFocus=$deviceMinFocusDistance manual=$isManualFocus transport=${manualFocusRequest?.transport}",
         )
 
         val previewBuilder = Preview.Builder()
@@ -354,19 +408,33 @@ class CameraRuntimeController(
         }
         if (isManualFocus) {
             // Set AF_MODE_OFF in the repeating request template at bind time.
-            // This is the only reliable way to disable Samsung's AF pipeline —
+            // This is the only reliable way to disable Samsung's AF pipeline -
             // runtime Camera2 interop is accepted but Samsung HAL ignores AF_MODE changes.
-            val focusDistance = focusDistanceFor(manualFocus!!)
             Camera2Interop.Extender(previewBuilder)
                 .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
             Camera2Interop.Extender(imageCaptureBuilder)
                 .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
             Camera2Interop.Extender(analysisBuilder)
                 .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
-            Log.d(TAG, "bindCamera: AF_MODE_OFF + focus=$focusDistance set at bind time via Extender")
+            manualFocusRequest?.diopters?.let { focusDistance ->
+                Camera2Interop.Extender(previewBuilder)
+                    .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+                Camera2Interop.Extender(imageCaptureBuilder)
+                    .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+                Camera2Interop.Extender(analysisBuilder)
+                    .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+            }
+            manualFocusRequest?.vendorLensPosition?.let { lensPosition ->
+                vendorFocusLensPositionKey()?.let { key ->
+                    Camera2Interop.Extender(previewBuilder).setCaptureRequestOption(key, lensPosition)
+                    Camera2Interop.Extender(imageCaptureBuilder).setCaptureRequestOption(key, lensPosition)
+                    Camera2Interop.Extender(analysisBuilder).setCaptureRequestOption(key, lensPosition)
+                }
+            }
+            Log.d(
+                TAG,
+                "bindCamera: AF_MODE_OFF + diopters=${manualFocusRequest?.diopters} vendorLensPos=${manualFocusRequest?.vendorLensPosition} set at bind time via Extender",
+            )
         }
         Camera2Interop.Extender(previewBuilder)
             .setSessionCaptureCallback(sessionCaptureCallback)
@@ -420,12 +488,19 @@ class CameraRuntimeController(
             .addEffect(effect)
             .build()
 
+        // Reset native session state before rebinding. A stale nativeFocusActive
+        // from a previous lens would trigger cancelFocusAndMetering() on the new
+        // camera, causing CameraX to switch physical cameras.
+        nativeFocusActive = false
+        cam2Session = null
+        cam2Surfaces = emptyList()
+        lastAppliedSessionSignature = null
         provider.unbindAll()
         camera = try {
             provider.bindToLifecycle(owner, selector, useCaseGroup)
         } catch (error: IllegalArgumentException) {
             val triedDirectPhysicalCamera = desiredLensFacing == CameraSelector.LENS_FACING_BACK &&
-                allowDirectPhysicalCameraBinding &&
+                selectedCameraId != null &&
                 selectedCameraId == activeLensProfile?.physicalCameraId &&
                 selectedCameraId != backCameraProfile?.logicalCameraId
             if (!triedDirectPhysicalCamera) {
@@ -436,7 +511,7 @@ class CameraRuntimeController(
                 "Direct physical camera binding failed for cameraId=$selectedCameraId, falling back to logical multi-camera binding.",
                 error,
             )
-            allowDirectPhysicalCameraBinding = false
+            selectedCameraId?.let { failedDirectPhysicalCameraIds += it }
             bindCamera(force = true)
             return
         }
@@ -444,9 +519,15 @@ class CameraRuntimeController(
         imageAnalysis = analysis
         camera?.let { refreshBoundCameraCapabilities(it) }
         boundLensFacing = desiredLensFacing
+        boundLensValue = selectedLensValue(latestState)
         boundResolution = desiredResolution
 
         // Detect device capabilities from the bound camera
+
+        // Apply zoom once at bind time. setZoomRatio on a logical multi-camera
+        // can switch the active physical camera, so we must NOT call it from
+        // applySessionState (which runs on every settings change).
+        camera?.let { applyZoom(latestState, it) }
         applySessionState(latestState, force = true)
     }
 
@@ -457,6 +538,11 @@ class CameraRuntimeController(
             frontCameraId = cameraManager.cameraIdList.firstOrNull { cameraId ->
                 cameraManager.getCameraCharacteristics(cameraId)
                     .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+            }
+            frontCameraId?.let { fId ->
+                frontCameraMinFocusDistance = cameraManager.getCameraCharacteristics(fId)
+                    .get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+                Log.d(TAG, "Front camera $fId minFocusDistance=$frontCameraMinFocusDistance")
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -488,6 +574,11 @@ class CameraRuntimeController(
                                 minFocusDistance = physicalChars.get(
                                     CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
                                 ) ?: 0f,
+                                afModes = physicalChars.get(
+                                    CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES,
+                                )?.toSet().orEmpty(),
+                                vendorFocusLensRange = vendorFocusLensRange(physicalChars),
+                                vendorFocusCalibration = vendorFocusCalibration(physicalChars),
                             )
                         }.distinctBy { it.physicalCameraId }
                         if (physicalLenses.isEmpty()) {
@@ -515,6 +606,7 @@ class CameraRuntimeController(
             }
 
             backLensAssignments = backCameraProfile?.let(::assignBackLensLabels).orEmpty()
+            lensFocusCapabilities = buildLensFocusCapabilities(backLensAssignments)
             backCameraProfile?.let { profile ->
                 deviceMaxSupportedResolution = profile.maxSupportedResolution
                 deviceMinFocusDistance = (backLensAssignments["1x"] ?: profile.physicalLenses.maxByOrNull { lens ->
@@ -528,6 +620,42 @@ class CameraRuntimeController(
                         }
                     }",
                 )
+                // ── Detailed diagnostics for each physical lens ──
+                for ((label, lens) in backLensAssignments) {
+                    try {
+                        val camId = lens.physicalCameraId ?: lens.logicalCameraId
+                        val chars = cameraManager.getCameraCharacteristics(camId)
+                        val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+                        val minFd = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+                        val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                        val hwLevel = chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
+                        Log.d(
+                            TAG,
+                            "DIAG [$label] camId=$camId focal=${focalLengths?.toList()} minFocusDist=$minFd afModes=${afModes?.toList()} hwLevel=$hwLevel vendorRange=${lens.vendorFocusLensRange} transport=${lensFocusCapabilities[label]?.transport}",
+                        )
+                    } catch (e: Exception) {
+                        Log.w(TAG, "DIAG [$label] failed: ${e.message}")
+                    }
+                }
+                // Also check the logical camera's AF/focus capabilities
+                try {
+                    val logicalChars = cameraManager.getCameraCharacteristics(profile.logicalCameraId)
+                    val afModes = logicalChars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+                    val minFd = logicalChars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+                    Log.d(TAG, "DIAG [logical] camId=${profile.logicalCameraId} minFocusDist=$minFd afModes=${afModes?.toList()}")
+                } catch (_: Exception) {}
+                // Front camera diagnostics
+                frontCameraId?.let { fId ->
+                    try {
+                        val fChars = cameraManager.getCameraCharacteristics(fId)
+                        val afModes = fChars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+                        val minFd = fChars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+                        val focalLengths = fChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                        Log.d(TAG, "DIAG [front] camId=$fId focal=${ focalLengths?.toList() } minFocusDist=$minFd afModes=${afModes?.toList()}")
+                    } catch (_: Exception) {}
+                }
+                // ── Report detected lenses back to the UI state ──
+                reportDetectedLenses()
                 return
             }
 
@@ -550,9 +678,31 @@ class CameraRuntimeController(
                     break
                 }
             }
+            // Report even for fallback devices
+            reportDetectedLenses()
         } catch (_: Exception) {
             // Keep safe defaults
         }
+    }
+
+    /**
+     * Build the dynamic lens list from detected hardware and report it via callback.
+     * This list includes "Auto" as the first option, then all detected physical lenses,
+     * plus "2x" (digital crop on main) if a main lens exists, and "front" if detected.
+     */
+    private fun reportDetectedLenses() {
+        val lenses = mutableListOf("Auto")
+        // Add in optical order: 0.6x, 1x, 2x (digital), 3x, 5x
+        if (backLensAssignments.containsKey("0.6x")) lenses.add("0.6x")
+        if (backLensAssignments.containsKey("1x")) {
+            lenses.add("1x")
+            lenses.add("2x") // Digital crop on main lens
+        }
+        if (backLensAssignments.containsKey("3x")) lenses.add("3x")
+        if (backLensAssignments.containsKey("5x")) lenses.add("5x")
+        if (frontCameraId != null) lenses.add("front")
+        Log.d(TAG, "Detected lenses for UI: $lenses")
+        onDetectedLenses?.invoke(lenses)
     }
 
     private fun applySessionState(cameraState: CameraState, force: Boolean = false) {
@@ -576,8 +726,8 @@ class CameraRuntimeController(
             return
         }
 
-        val manualFocus = effectiveManualFocusNormalized(cameraState)
-        val isManualFocus = manualFocus != null && deviceMinFocusDistance > 0f
+        val manualFocusRequest = manualFocusRequestFor(cameraState)
+        val isManualFocus = manualFocusRequest != null
 
         if (isManualFocus) {
             // ── NATIVE MODE ──────────────────────────────────────────────
@@ -599,7 +749,6 @@ class CameraRuntimeController(
             }
             applyFlash(cameraState)
             applyExposure(cameraState, boundCamera)
-            applyZoom(cameraState, boundCamera)
             applyCamera2Options(cameraState, boundCamera)
         }
         lastAppliedSessionSignature = signature
@@ -619,15 +768,35 @@ class CameraRuntimeController(
             // AF_MODE_OFF + focus distance. This goes through CameraX's own
             // pipeline so it won't be overridden.
             try {
-                val manualFocus = effectiveManualFocusNormalized(cameraState)!!
-                val focusDiopters = focusDistanceFor(manualFocus)
+                val manualFocusRequest = manualFocusRequestFor(cameraState) ?: return
                 val builder = CaptureRequestOptions.Builder()
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
-                builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
+                applyNativeZoom(builder, cameraState, boundCamera)
+                manualFocusRequest.diopters?.let { focusDiopters ->
+                    builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
+                }
+                manualFocusRequest.vendorLensPosition?.let { lensPosition ->
+                    vendorFocusLensPositionKey()?.let { key ->
+                        builder.setCaptureRequestOption(key, lensPosition)
+                    }
+                }
+                manualFocusRequest.vendorFocusValue?.let { focusValue ->
+                    vendorFocusValueKey()?.let { key ->
+                        builder.setCaptureRequestOption(key, focusValue)
+                    }
+                }
+                manualFocusRequest.vendorLensPosition?.let {
+                    vendorFocusMapEnabledKey()?.let { key ->
+                        builder.setCaptureRequestOption(key, 1.toByte())
+                    }
+                }
                 val cam2Control = Camera2CameraControl.from(boundCamera.cameraControl)
                 cam2Control.setCaptureRequestOptions(builder.build())
-                Log.d(TAG, "Camera2CameraControl fallback: AF_OFF focus=$focusDiopters")
+                Log.d(
+                    TAG,
+                    "Camera2CameraControl fallback: zoom=${nativeZoomRatio(cameraState, boundCamera)} diopters=${manualFocusRequest.diopters} vendorLensPos=${manualFocusRequest.vendorLensPosition} vendorFocus=${manualFocusRequest.vendorFocusValue}",
+                )
             } catch (e: Exception) {
                 Log.e(TAG, "Camera2CameraControl fallback failed", e)
             }
@@ -639,11 +808,11 @@ class CameraRuntimeController(
             builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
 
             // ── Focus ──
-            val manualFocus = effectiveManualFocusNormalized(cameraState)!!
-            val focusDiopters = focusDistanceFor(manualFocus)
+            val manualFocusRequest = manualFocusRequestFor(cameraState) ?: return
             builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
-            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
+            applyNativeZoom(builder, cameraState, boundCamera)
+            applyNativeFocusRequest(builder, cameraState, manualFocusRequest, session.device.id)
 
             // ── HDR / LOG ──
             when (resolvedHdrLogMode(cameraState)) {
@@ -724,16 +893,20 @@ class CameraRuntimeController(
                 builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
             }
 
-            session.setRepeatingRequest(builder.build(), sessionCaptureCallback, null)
-            Log.d(TAG, "Native focus applied: ${focusDiopters} diopters (norm=$manualFocus)")
+            session.setRepeatingRequest(builder.build(), sessionCaptureCallback, cameraRequestHandler)
+            val capability = selectedFocusCapability(cameraState)
+            Log.d(
+                TAG,
+                "Native focus applied: lens=${selectedLensValue(cameraState)} sessionCameraId=${session.device.id} zoom=${nativeZoomRatio(cameraState, boundCamera)} diopters=${manualFocusRequest.diopters} minFocusDist=${capability?.minFocusDistance} transport=${capability?.transport} vendorLensPos=${manualFocusRequest.vendorLensPosition} vendorFocus=${manualFocusRequest.vendorFocusValue} (norm=${manualFocusRequest.normalizedFocus})",
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Native focus FAILED: ${e.message}", e)
         }
     }
 
     private fun refreshBoundCameraCapabilities(boundCamera: Camera) {
-        activeLensProfile?.let { profile ->
-            deviceMinFocusDistance = profile.minFocusDistance
+        selectedFocusCapability(latestState)?.let { capability ->
+            deviceMinFocusDistance = capability.minFocusDistance
             return
         }
         val cameraInfo = Camera2CameraInfo.from(boundCamera.cameraInfo)
@@ -811,7 +984,15 @@ class CameraRuntimeController(
         // When nativeFocusActive is true, submitNativeRepeatingRequest handles everything.
         val builder = CaptureRequestOptions.Builder()
 
-        builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        // Use AF_MODE_OFF for fixed-focus lenses (e.g. 0.6x ultrawide) that only
+        // support mode 0. Setting CONTINUOUS_PICTURE on these can cause CameraX to
+        // internally switch physical cameras.
+        val isFixedFocus = selectedFocusCapability(cameraState)?.supportsManualFocus == false
+        if (isFixedFocus) {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+        } else {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        }
         builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0f)
 
         // --- Effect mode ---
@@ -976,9 +1157,14 @@ class CameraRuntimeController(
         val mainLens = sortedLenses.minByOrNull { lens ->
             abs(lens.focalLengthMm - profile.logicalFocalLengthMm) + if (lens.supportsManualFocus) 0f else 100f
         } ?: sortedLenses.first()
-        val assignments = linkedMapOf("1x" to mainLens)
-        sortedLenses.firstOrNull()
-            ?.takeIf { lens -> lens != mainLens }
+        val assignments = linkedMapOf<String, PhysicalLensProfile>()
+        assignments["1x"] = mainLens
+        // 2x is a digital crop on the main lens sensor — same physical camera
+        assignments["2x"] = mainLens
+
+        sortedLenses
+            .filter { lens -> lens.focalLengthMm < mainLens.focalLengthMm - 0.1f }
+            .minByOrNull { lens -> lens.focalLengthMm }
             ?.let { ultraWideLens -> assignments["0.6x"] = ultraWideLens }
 
         val teleLenses = sortedLenses.filter { lens -> lens.focalLengthMm > mainLens.focalLengthMm + 0.25f }
@@ -991,6 +1177,150 @@ class CameraRuntimeController(
             }
         }
         return assignments
+    }
+
+    private fun buildLensFocusCapabilities(
+        assignments: Map<String, PhysicalLensProfile>,
+    ): Map<String, LensFocusCapabilityProfile> {
+        return assignments.mapValues { (lensValue, profile) ->
+            LensFocusCapabilityProfile(
+                lensValue = lensValue,
+                transport = resolveManualFocusTransport(lensValue, profile),
+                minFocusDistance = profile.minFocusDistance,
+                vendorFocusLensRange = profile.vendorFocusLensRange,
+            )
+        }
+    }
+
+    private fun resolveManualFocusTransport(
+        lensValue: String,
+        profile: PhysicalLensProfile,
+    ): ManualFocusTransport {
+        val hasVendorRange = profile.vendorFocusLensRange?.let { it.last > it.first } == true
+        val hasAutofocusMotor = profile.afModes.any { mode ->
+            mode == CameraMetadata.CONTROL_AF_MODE_AUTO ||
+                mode == CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE ||
+                mode == CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO ||
+                mode == CameraMetadata.CONTROL_AF_MODE_MACRO
+        }
+        return when {
+            // Main lens and its 2x digital crop: always use standard diopter API
+            lensValue == "1x" && profile.minFocusDistance > 0f -> ManualFocusTransport.PublicDiopter
+            lensValue == "2x" && isMainLensProfile(profile) && profile.minFocusDistance > 0f -> ManualFocusTransport.PublicDiopter
+            // Telephoto lenses: Samsung HAL requires BOTH diopter + vendor lens position
+            // to reliably control the full focus range. PublicDiopter alone is ignored/clamped
+            // by the HAL, causing blurry images at close focus distances.
+            lensValue in setOf("3x", "5x") && profile.minFocusDistance > 0f && hasVendorRange -> ManualFocusTransport.Hybrid
+            lensValue in setOf("3x", "5x") && profile.minFocusDistance > 0f -> ManualFocusTransport.PublicDiopter
+            lensValue in setOf("3x", "5x") && hasVendorRange -> ManualFocusTransport.SamsungLensPosition
+            // Other lenses: use diopter when available
+            profile.minFocusDistance > 0f -> ManualFocusTransport.PublicDiopter
+            hasVendorRange && hasAutofocusMotor -> ManualFocusTransport.SamsungLensPosition
+            else -> ManualFocusTransport.Fixed
+        }
+    }
+
+    private fun isMainLensProfile(profile: PhysicalLensProfile): Boolean {
+        val mainLens = backLensAssignments["1x"] ?: return false
+        return (profile.physicalCameraId ?: profile.logicalCameraId) ==
+            (mainLens.physicalCameraId ?: mainLens.logicalCameraId)
+    }
+
+    private fun selectedFocusCapability(cameraState: CameraState): LensFocusCapabilityProfile? {
+        val lensValue = selectedLensValue(cameraState)
+        if (lensValue == "front") {
+            return LensFocusCapabilityProfile(
+                lensValue = lensValue,
+                transport = if (frontCameraMinFocusDistance > 0f) {
+                    ManualFocusTransport.PublicDiopter
+                } else {
+                    ManualFocusTransport.Fixed
+                },
+                minFocusDistance = frontCameraMinFocusDistance,
+            )
+        }
+        if (lensValue == "Auto") {
+            // Auto mode uses the logical camera — focus through logical camera's capabilities
+            if (backCameraProfile == null) return null
+            val logicalMinFocus = backLensAssignments["1x"]?.minFocusDistance ?: deviceMinFocusDistance
+            return LensFocusCapabilityProfile(
+                lensValue = "Auto",
+                transport = if (logicalMinFocus > 0f) ManualFocusTransport.PublicDiopter else ManualFocusTransport.Fixed,
+                minFocusDistance = logicalMinFocus,
+            )
+        }
+        return lensFocusCapabilities[lensValue]
+            ?: selectedLensProfile(cameraState)?.let { profile ->
+                LensFocusCapabilityProfile(
+                    lensValue = lensValue,
+                    transport = resolveManualFocusTransport(lensValue, profile),
+                    minFocusDistance = profile.minFocusDistance,
+                    vendorFocusLensRange = profile.vendorFocusLensRange,
+                )
+            }
+    }
+
+    private fun manualFocusRequestFor(cameraState: CameraState): ManualFocusRequest? {
+        val normalizedFocus = manualFocusNormalized(cameraState) ?: return null
+        val capability = selectedFocusCapability(cameraState) ?: return null
+        if (!capability.supportsManualFocus) {
+            return null
+        }
+        val diopters = if (capability.usesPublicDiopters && capability.minFocusDistance > 0f) {
+            focusDistanceFor(normalizedFocus, capability.minFocusDistance)
+        } else {
+            null
+        }
+        val vendorLensPosition = if (capability.usesVendorLensPosition) {
+            capability.vendorFocusLensRange?.let { range ->
+                vendorLensPositionFor(normalizedFocus, range)
+            }
+        } else {
+            null
+        }
+        val vendorFocusValue = if (capability.usesVendorLensPosition) {
+            vendorFocusValueFor(normalizedFocus)
+        } else {
+            null
+        }
+        if (diopters == null && vendorLensPosition == null) {
+            return null
+        }
+        return ManualFocusRequest(
+            normalizedFocus = normalizedFocus,
+            transport = capability.transport,
+            diopters = diopters,
+            vendorLensPosition = vendorLensPosition,
+            vendorFocusValue = vendorFocusValue,
+        )
+    }
+
+    private fun vendorFocusLensInfoKey(): CameraCharacteristics.Key<IntArray>? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return null
+        }
+        return CameraCharacteristics.Key("samsung.android.lens.info.focusLensInfo", IntArray::class.java)
+    }
+
+    private fun vendorFocusCalibrationKey(): CameraCharacteristics.Key<IntArray>? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return null
+        }
+        return CameraCharacteristics.Key("samsung.android.lens.info.focusCalibration", IntArray::class.java)
+    }
+
+    private fun vendorFocusLensRange(characteristics: CameraCharacteristics): IntRange? {
+        val info = vendorFocusLensInfoKey()?.let(characteristics::get) ?: return null
+        if (info.size < 2) {
+            return null
+        }
+        val start = info[0]
+        val end = info[1]
+        return if (end > start) start..end else null
+    }
+
+    private fun vendorFocusCalibration(characteristics: CameraCharacteristics): List<Int> {
+        return vendorFocusCalibrationKey()?.let(characteristics::get)?.toList().orEmpty()
     }
 
     private fun vendorFocusValueKey(): CaptureRequest.Key<Float>? {
@@ -1037,51 +1367,106 @@ class CameraRuntimeController(
         if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
             return frontCameraId
         }
+        val lensValue = selectedLensValue(cameraState)
+        // "Auto" mode uses the logical camera — let Samsung's HAL manage lens switching
+        if (lensValue == "Auto") {
+            return backCameraProfile?.logicalCameraId
+        }
         val physicalCameraId = selectedLensProfile(cameraState)?.physicalCameraId
-        return if (allowDirectPhysicalCameraBinding) {
-            physicalCameraId ?: backCameraProfile?.logicalCameraId
+        return if (physicalCameraId != null && physicalCameraId !in failedDirectPhysicalCameraIds) {
+            physicalCameraId
         } else {
             backCameraProfile?.logicalCameraId
         }
     }
 
     private fun selectedLensValue(cameraState: CameraState): String {
-        return currentValue(cameraState, ".lens") ?: "1x"
+        return currentValue(cameraState, ".lens") ?: "Auto"
     }
 
     private fun selectedLensProfile(cameraState: CameraState): PhysicalLensProfile? {
-        if (selectedLensValue(cameraState) == "front") {
+        val lensValue = selectedLensValue(cameraState)
+        if (lensValue == "front") {
             return null
         }
-        return when (selectedLensValue(cameraState)) {
+        // "Auto" mode: use no specific physical lens — let the logical camera manage it
+        if (lensValue == "Auto") {
+            return null
+        }
+        return when (lensValue) {
             "0.6x" -> backLensAssignments["0.6x"] ?: backLensAssignments["1x"]
-            "1x", "2x" -> backLensAssignments["1x"] ?: backLensAssignments["3x"] ?: backLensAssignments["0.6x"]
-            "3x" -> backLensAssignments["3x"] ?: backLensAssignments["1x"]
-            "5x" -> backLensAssignments["5x"] ?: backLensAssignments["3x"] ?: backLensAssignments["1x"]
+            "1x" -> backLensAssignments["1x"] ?: backLensAssignments["2x"] ?: backLensAssignments["3x"] ?: backLensAssignments["0.6x"]
+            "2x" -> backLensAssignments["2x"] ?: backLensAssignments["1x"] ?: backLensAssignments["3x"]
+            "3x" -> backLensAssignments["3x"] ?: backLensAssignments["2x"] ?: backLensAssignments["1x"]
+            "5x" -> backLensAssignments["5x"] ?: backLensAssignments["3x"] ?: backLensAssignments["2x"] ?: backLensAssignments["1x"]
             else -> backLensAssignments["1x"] ?: backLensAssignments.values.firstOrNull()
         }
     }
 
     private fun effectiveManualFocusNormalized(cameraState: CameraState): Double? {
-        if (selectedLensValue(cameraState) == "front") {
-            return null
-        }
-        val normalizedFocus = manualFocusNormalized(cameraState) ?: return null
-        val selectedLens = selectedLensProfile(cameraState)
-        if (selectedLens != null && !selectedLens.supportsManualFocus) {
-            return null
-        }
-        return normalizedFocus
+        return manualFocusRequestFor(cameraState)?.normalizedFocus
     }
 
     private fun requestedZoomRatio(lensValue: String): Double {
         if (lensValue == "front") {
             return 1.0
         }
+        // When binding to the logical camera with setPhysicalCameraId, Samsung's HAL
+        // still needs CONTROL_ZOOM_RATIO to match the physical sensor so that
+        // LENS_FOCUS_DISTANCE and AF commands are routed to the correct sensor.
+        // Without this, focus commands go to the 1x wide sensor even when viewing 3x.
         return when (lensValue) {
-            "0.6x", "1x", "3x", "5x" -> 1.0
-            "2x" -> 2.0
+            "0.6x" -> 1.0  // ultrawide: fixed focus, CameraX manages routing via physicalCameraId
+            "1x" -> 1.0
+            "2x" -> 2.0    // digital crop on main sensor
+            "3x" -> 3.0    // telephoto: must match so HAL routes focus to telephoto sensor
+            "5x" -> 5.0    // periscope: must match so HAL routes focus to periscope sensor
+            "Auto" -> 1.0  // Auto mode: HAL manages lens switching, start at 1x
             else -> 1.0
+        }
+    }
+
+    private fun nativeZoomRatio(cameraState: CameraState, boundCamera: Camera): Float {
+        val requestedZoom = requestedZoomRatio(selectedLensValue(cameraState))
+        val zoomState = boundCamera.cameraInfo.zoomState.value
+        val minZoom = zoomState?.minZoomRatio?.toDouble() ?: 1.0
+        val maxZoom = zoomState?.maxZoomRatio?.toDouble() ?: 8.0
+        return requestedZoom.coerceIn(minZoom, maxZoom).toFloat()
+    }
+
+    private fun applyNativeZoom(
+        builder: CaptureRequestOptions.Builder,
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ) {
+        val zoomRatio = nativeZoomRatio(cameraState, boundCamera)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
+            return
+        }
+        cameraActiveArrayRect(boundCamera)?.let { activeArray ->
+            builder.setCaptureRequestOption(
+                CaptureRequest.SCALER_CROP_REGION,
+                cropRegionForZoom(activeArray, zoomRatio),
+            )
+        }
+    }
+
+    private fun applyNativeZoom(
+        builder: CaptureRequest.Builder,
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ) {
+        val zoomRatio = nativeZoomRatio(cameraState, boundCamera)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
+            return
+        }
+        cameraActiveArrayRect(boundCamera)?.let { activeArray ->
+            builder.set(
+                CaptureRequest.SCALER_CROP_REGION,
+                cropRegionForZoom(activeArray, zoomRatio),
+            )
         }
     }
 
@@ -1092,11 +1477,202 @@ class CameraRuntimeController(
             ?.coerceIn(0.0, 1.0)
     }
 
-    private fun focusDistanceFor(normalizedFocus: Double): Float {
+    /**
+     * Map normalized focus (0=close/macro, 1=far/infinity) to diopter value.
+     * Applies the user-selected focus curve (Linear, SquareRoot, or Logarithmic)
+     * for perceptually smooth control.
+     */
+    private fun focusDistanceFor(
+        normalizedFocus: Double,
+        minFocusDistance: Float = deviceMinFocusDistance,
+        curveMode: FocusCurveMode = currentFocusCurveMode(),
+    ): Float {
+        val clamped = normalizedFocus.coerceIn(0.0, 1.0)
         // 0 = close (macro, max diopters), 1 = far (infinity, 0 diopters)
-        val inverted = 1.0 - normalizedFocus.coerceIn(0.0, 1.0)
-        return (deviceMinFocusDistance * inverted.toFloat())
-            .coerceIn(0f, deviceMinFocusDistance)
+        val t = 1.0 - clamped
+        val curved = when (curveMode) {
+            FocusCurveMode.Linear -> t
+            FocusCurveMode.SquareRoot -> sqrt(t)
+            FocusCurveMode.Logarithmic -> {
+                // ln(1 + t*e) / ln(1+e) maps [0,1] -> [0,1] with more range near macro
+                val e = Math.E
+                ln(1.0 + t * e) / ln(1.0 + e)
+            }
+        }
+        return (minFocusDistance * curved.toFloat())
+            .coerceIn(0f, minFocusDistance)
+    }
+
+    /**
+     * Read the current focus curve mode from the latest camera state.
+     */
+    private fun currentFocusCurveMode(): FocusCurveMode {
+        val focusCurveSettingId = when (latestState.activeMode) {
+            com.mobiledivecontrol.core.CameraModeId.Photo -> "photo.focus_curve"
+            com.mobiledivecontrol.core.CameraModeId.Pro -> "pro.focus_curve"
+            com.mobiledivecontrol.core.CameraModeId.ExpertRaw -> "expert.focus_curve"
+            com.mobiledivecontrol.core.CameraModeId.ProVideo -> "pro_video.focus_curve"
+            else -> return FocusCurveMode.SquareRoot
+        }
+        val curveValue = latestState.settingValues[focusCurveSettingId] ?: "SquareRoot"
+        return when (curveValue) {
+            "Linear" -> FocusCurveMode.Linear
+            "SquareRoot" -> FocusCurveMode.SquareRoot
+            "Logarithmic" -> FocusCurveMode.Logarithmic
+            else -> FocusCurveMode.SquareRoot
+        }
+    }
+
+    private fun vendorLensPositionFor(normalizedFocus: Double, lensRange: IntRange): Int {
+        val clamped = normalizedFocus.coerceIn(0.0, 1.0)
+        val span = lensRange.last - lensRange.first
+        val nearPosition = lensRange.last.toDouble()
+        return (nearPosition - (span * clamped))
+            .roundToInt()
+            .coerceIn(lensRange.first, lensRange.last)
+    }
+
+    private fun vendorFocusValueFor(normalizedFocus: Double): Float {
+        val clamped = normalizedFocus.coerceIn(0.0, 1.0)
+        return (1.0 - clamped).toFloat()
+    }
+
+    private fun applyNativeFocusRequest(
+        builder: CaptureRequest.Builder,
+        cameraState: CameraState,
+        request: ManualFocusRequest,
+        sessionDeviceId: String?,
+    ) {
+        val physicalCameraId = physicalFocusCameraId(cameraState)
+        var usePhysicalKeys = canUsePhysicalRequestKeys(sessionDeviceId, physicalCameraId)
+
+        request.diopters?.let { focusDiopters ->
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
+            if (usePhysicalKeys) {
+                usePhysicalKeys = trySetPhysicalCameraKey(
+                    builder = builder,
+                    key = CaptureRequest.LENS_FOCUS_DISTANCE,
+                    value = focusDiopters,
+                    sessionDeviceId = sessionDeviceId,
+                    physicalCameraId = physicalCameraId!!,
+                )
+            }
+        }
+        request.vendorLensPosition?.let { lensPosition ->
+            vendorFocusLensPositionKey()?.let { key ->
+                builder.set(key, lensPosition)
+                if (usePhysicalKeys) {
+                    usePhysicalKeys = trySetPhysicalCameraKey(
+                        builder = builder,
+                        key = key,
+                        value = lensPosition,
+                        sessionDeviceId = sessionDeviceId,
+                        physicalCameraId = physicalCameraId!!,
+                    )
+                }
+            }
+        }
+        request.vendorFocusValue?.let { focusValue ->
+            vendorFocusValueKey()?.let { key ->
+                builder.set(key, focusValue)
+                if (usePhysicalKeys) {
+                    usePhysicalKeys = trySetPhysicalCameraKey(
+                        builder = builder,
+                        key = key,
+                        value = focusValue,
+                        sessionDeviceId = sessionDeviceId,
+                        physicalCameraId = physicalCameraId!!,
+                    )
+                }
+            }
+        }
+        request.vendorLensPosition?.let {
+            vendorFocusMapEnabledKey()?.let { key ->
+                builder.set(key, 1.toByte())
+                if (usePhysicalKeys) {
+                    usePhysicalKeys = trySetPhysicalCameraKey(
+                        builder = builder,
+                        key = key,
+                        value = 1.toByte(),
+                        sessionDeviceId = sessionDeviceId,
+                        physicalCameraId = physicalCameraId!!,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun canUsePhysicalRequestKeys(
+        sessionDeviceId: String?,
+        physicalCameraId: String?,
+    ): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || sessionDeviceId == null || physicalCameraId == null) {
+            return false
+        }
+        if (sessionDeviceId == physicalCameraId) {
+            return false
+        }
+        return physicalRequestTargetKey(sessionDeviceId, physicalCameraId) !in unsupportedPhysicalRequestTargets
+    }
+
+    private fun physicalRequestTargetKey(sessionDeviceId: String, physicalCameraId: String): String {
+        return "$sessionDeviceId->$physicalCameraId"
+    }
+
+    private fun <T> trySetPhysicalCameraKey(
+        builder: CaptureRequest.Builder,
+        key: CaptureRequest.Key<T>,
+        value: T,
+        sessionDeviceId: String?,
+        physicalCameraId: String,
+    ): Boolean {
+        val deviceId = sessionDeviceId ?: return false
+        val targetKey = physicalRequestTargetKey(deviceId, physicalCameraId)
+        if (targetKey in unsupportedPhysicalRequestTargets) {
+            return false
+        }
+        return try {
+            builder.setPhysicalCameraKey(key, value, physicalCameraId)
+            true
+        } catch (error: IllegalArgumentException) {
+            unsupportedPhysicalRequestTargets += targetKey
+            Log.w(
+                TAG,
+                "Physical request keys disabled for sessionCameraId=$deviceId physicalCameraId=$physicalCameraId: ${error.message}",
+            )
+            false
+        }
+    }
+
+    private fun physicalFocusCameraId(cameraState: CameraState): String? {
+        if (selectedLensValue(cameraState) == "front") {
+            return null
+        }
+        val profile = selectedLensProfile(cameraState) ?: return null
+        if (isMainLensProfile(profile)) {
+            return null
+        }
+        return profile.physicalCameraId
+    }
+
+    private fun cameraActiveArrayRect(boundCamera: Camera): Rect? {
+        return Camera2CameraInfo.from(boundCamera.cameraInfo)
+            .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+    }
+
+    private fun cropRegionForZoom(activeArray: Rect, zoomRatio: Float): Rect {
+        if (zoomRatio <= 1f) {
+            return Rect(activeArray)
+        }
+        val centerX = activeArray.centerX()
+        val centerY = activeArray.centerY()
+        val cropWidth = (activeArray.width() / zoomRatio).roundToInt().coerceAtLeast(1)
+        val cropHeight = (activeArray.height() / zoomRatio).roundToInt().coerceAtLeast(1)
+        val left = (centerX - cropWidth / 2).coerceAtLeast(activeArray.left)
+        val top = (centerY - cropHeight / 2).coerceAtLeast(activeArray.top)
+        val right = (left + cropWidth).coerceAtMost(activeArray.right)
+        val bottom = (top + cropHeight).coerceAtMost(activeArray.bottom)
+        return Rect(left, top, right, bottom)
     }
 
     private fun isFocusAssistEnabled(cameraState: CameraState): Boolean {

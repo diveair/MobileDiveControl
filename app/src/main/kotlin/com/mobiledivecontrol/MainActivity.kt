@@ -82,6 +82,11 @@ class MainActivity : ComponentActivity() {
                         useMetric = useMetric,
                         effects = effects,
                         onEffectsConsumed = viewModel::clearEffects,
+                        onDetectedLenses = { lenses ->
+                            viewModel.dispatch(
+                                com.mobiledivecontrol.core.CameraCommand.UpdateDetectedLenses(lenses)
+                            )
+                        },
                     )
 
                     // Debug simulation panel (tap 🐛 on the right edge)

@@ -73,6 +73,7 @@ import com.mobiledivecontrol.core.CameraSettingKind
 import com.mobiledivecontrol.core.CameraSettingSpec
 import com.mobiledivecontrol.core.CameraState
 import com.mobiledivecontrol.core.CameraUiZone
+import com.mobiledivecontrol.core.FocusCurveMode
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.core.SliderEditTarget
@@ -92,6 +93,7 @@ fun CameraShellScreen(
     lifecycleOwner: androidx.lifecycle.LifecycleOwner? = null,
     effects: List<PlatformEffect> = emptyList(),
     onEffectsConsumed: () -> Unit = {},
+    onDetectedLenses: ((List<String>) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val profile = CameraCatalog.profile(cameraState.activeMode, cameraState.deviceVariant)
@@ -107,6 +109,7 @@ fun CameraShellScreen(
                 safetyState = safetyState,
                 effects = effects,
                 onEffectsConsumed = onEffectsConsumed,
+                onDetectedLenses = onDetectedLenses,
             )
         } else {
             CameraPreviewPlaceholder()
@@ -430,7 +433,8 @@ private fun BottomSettingsTrayLegacy(
             val items = CameraCatalog.settingsBarItems(
                 cameraState.activeMode,
                 cameraState.deviceVariant,
-                cameraState.showMoreSettings
+                cameraState.showMoreSettings,
+                detectedLenses = cameraState.detectedLenses,
             )
             val listState = rememberLazyListState()
 
@@ -551,6 +555,10 @@ private fun BottomSettingsTray(
                 val focusAssistValue = focusAssistSpec?.let { assistSpec ->
                     displaySettingValue(cameraState, assistSpec, CameraCatalog.currentValue(cameraState, assistSpec))
                 }
+                val focusCurveSpec = focusCurveSpec(cameraState, spec)
+                val focusCurveValue = focusCurveSpec?.let { curveSpec ->
+                    CameraCatalog.currentValue(cameraState, curveSpec)
+                }
 
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -596,9 +604,24 @@ private fun BottomSettingsTray(
                                 selected = cameraState.sliderEditTarget == SliderEditTarget.FocusAssist,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
-                                SliderMeterAdjuster(
-                                    spec = focusAssistSpec,
-                                    value = CameraCatalog.currentValue(cameraState, focusAssistSpec),
+                                ToggleOptionDisplay(
+                                    currentValue = focusAssistValue,
+                                    options = focusAssistSpec.options,
+                                )
+                            }
+                        }
+
+                        if (focusCurveSpec != null && focusCurveValue != null) {
+                            BottomEditCard(
+                                title = "Focus Curve",
+                                value = focusCurveDisplayName(focusCurveValue),
+                                selected = cameraState.sliderEditTarget == SliderEditTarget.FocusCurve,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                ToggleOptionDisplay(
+                                    currentValue = focusCurveValue,
+                                    options = focusCurveSpec.options,
+                                    displayTransform = ::focusCurveDisplayName,
                                 )
                             }
                         }
@@ -617,6 +640,7 @@ private fun BottomSettingsTray(
                 cameraState.activeMode,
                 cameraState.deviceVariant,
                 cameraState.showMoreSettings,
+                detectedLenses = cameraState.detectedLenses,
             )
             CenteredModesBar(
                 items = items,
@@ -948,6 +972,22 @@ private fun focusAssistSpec(
         .firstOrNull { it.id == assistSettingId }
 }
 
+private fun focusCurveSpec(
+    cameraState: CameraState,
+    focusSpec: CameraSettingSpec,
+): CameraSettingSpec? {
+    val curveSettingId = CameraCatalog.focusCurveSettingId(focusSpec.id) ?: return null
+    return CameraCatalog.settingsFor(cameraState.activeMode, cameraState.deviceVariant)
+        .firstOrNull { it.id == curveSettingId }
+}
+
+private fun focusCurveDisplayName(value: String): String = when (value) {
+    "Linear" -> "Linear"
+    "SquareRoot" -> "Sq Root"
+    "Logarithmic" -> "Log"
+    else -> value
+}
+
 @Composable
 private fun GalleryChipPreview(
     selected: Boolean,
@@ -1183,6 +1223,54 @@ private fun SliderMeterAdjuster(
                         fontWeight = if (optIndex == index) FontWeight.Bold else FontWeight.Normal,
                     )
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Toggle-style option display for binary/tri-state settings.
+ * Shows all options as pills, with the selected one highlighted.
+ * Used for Focus Assist (On/Off) and Focus Curve (Linear/SqRoot/Log).
+ */
+@Composable
+private fun ToggleOptionDisplay(
+    currentValue: String,
+    options: List<String>,
+    displayTransform: (String) -> String = { it },
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier.fillMaxWidth().padding(vertical = 2.dp),
+    ) {
+        options.forEach { option ->
+            val isSelected = option == currentValue
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(
+                        if (isSelected) DiveColors.DiveCyan.copy(alpha = 0.85f)
+                        else DiveColors.DeepBlack.copy(alpha = 0.5f)
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (isSelected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.4f),
+                        shape = RoundedCornerShape(8.dp),
+                    )
+                    .padding(vertical = 6.dp, horizontal = 4.dp),
+            ) {
+                Text(
+                    text = displayTransform(option),
+                    color = if (isSelected) DiveColors.DeepBlack else DiveColors.TextMuted,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }

@@ -74,6 +74,11 @@ object CameraCatalog {
             .filter { it.supportsSensitivity }
             .associate { it.id to SliderSensitivity.DEFAULT }
     }
+    val defaultFocusCurveModes: Map<String, FocusCurveMode> by lazy {
+        allModeSettings
+            .filter { it.id.endsWith(".manual_focus") }
+            .associate { it.id to FocusCurveMode.SquareRoot }
+    }
 
     fun profile(mode: CameraModeId, variant: GalaxyDeviceVariant): CameraModeProfile = when (mode) {
         CameraModeId.Photo -> photoProfile(variant)
@@ -101,6 +106,26 @@ object CameraCatalog {
 
     fun settingsFor(mode: CameraModeId, variant: GalaxyDeviceVariant): List<CameraSettingSpec> {
         return profile(mode, variant).settings
+    }
+
+    /**
+     * Returns settings with lens options overridden by dynamically detected lenses
+     * from the device hardware. Used by the UI to show only available lenses.
+     */
+    fun settingsFor(
+        mode: CameraModeId,
+        variant: GalaxyDeviceVariant,
+        detectedLenses: List<String>,
+    ): List<CameraSettingSpec> {
+        val baseSettings = settingsFor(mode, variant)
+        if (detectedLenses.isEmpty()) return baseSettings
+        return baseSettings.map { spec ->
+            if (spec.id.endsWith(".lens")) {
+                spec.copy(options = detectedLenses)
+            } else {
+                spec
+            }
+        }
     }
 
     fun primaryIndexForMode(mode: CameraModeId): Int {
@@ -149,7 +174,9 @@ object CameraCatalog {
         deviceVariant: GalaxyDeviceVariant = GalaxyDeviceVariant.S26Ultra,
         settingValues: Map<String, String> = defaultSettingValues,
         sliderSensitivities: Map<String, SliderSensitivity> = defaultSliderSensitivities,
+        focusCurveModes: Map<String, FocusCurveMode> = defaultFocusCurveModes,
         showMoreSettings: Boolean = false,
+        detectedLenses: List<String> = emptyList(),
     ): CameraState {
         return CameraState(
             activeMode = activeMode,
@@ -163,6 +190,8 @@ object CameraCatalog {
             sliderEditTarget = SliderEditTarget.Value,
             settingValues = settingValues,
             sliderSensitivities = sliderSensitivities,
+            focusCurveModes = focusCurveModes,
+            detectedLenses = detectedLenses,
             deviceVariant = deviceVariant,
             showMoreSettings = showMoreSettings,
         )
@@ -171,9 +200,10 @@ object CameraCatalog {
     fun settingsBarItems(
         mode: CameraModeId,
         variant: GalaxyDeviceVariant,
-        showMore: Boolean
+        showMore: Boolean,
+        detectedLenses: List<String> = emptyList(),
     ): List<BottomBarItem> {
-        val allSettings = settingsFor(mode, variant)
+        val allSettings = settingsFor(mode, variant, detectedLenses)
 
         val itemsWithoutModes = when {
             // PRO MODES
@@ -220,7 +250,7 @@ object CameraCatalog {
                 val flash = allSettings.find { it.id.endsWith(".flash") }
                 if (flash != null) items.add(BottomBarItem.Setting(flash))
 
-                val lenses = photoLenses(variant).filter { it != "front" }
+                val lenses = (if (detectedLenses.isNotEmpty()) detectedLenses else photoLenses(variant)).filter { it != "front" }
                 lenses.forEach { lensVal ->
                     items.add(BottomBarItem.LensShortcut(lensVal))
                 }
@@ -324,6 +354,27 @@ object CameraCatalog {
         else -> null
     }
 
+    fun focusCurveSettingId(focusSettingId: String): String? = when (focusSettingId) {
+        "photo.manual_focus" -> "photo.focus_curve"
+        "expert.manual_focus" -> "expert.focus_curve"
+        "pro.manual_focus" -> "pro.focus_curve"
+        "pro_video.manual_focus" -> "pro_video.focus_curve"
+        else -> null
+    }
+
+    /**
+     * Returns the effective lens list for a given camera state.
+     * Uses dynamically detected lenses when available, otherwise falls back to
+     * variant-based defaults. This ensures the app works on any phone model.
+     */
+    fun effectiveLenses(camera: CameraState): List<String> {
+        return if (camera.detectedLenses.isNotEmpty()) {
+            camera.detectedLenses
+        } else {
+            photoLenses(camera.deviceVariant)
+        }
+    }
+
     private fun choice(
         id: String,
         label: String,
@@ -404,9 +455,10 @@ object CameraCatalog {
                 choice("photo.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Auto"),
                 choice("photo.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
                 choice("photo.save_format", "RAW / JPEG", "Core", listOf("JPEG", "RAW", "RAW + JPEG"), "JPEG"),
-                choice("photo.lens", "Lens", "Core", lenses, "1x"),
+                choice("photo.lens", "Lens", "Core", lenses, "Auto"),
                 slider("photo.manual_focus", "Focus", "Core", focusOptions(), "AF"),
                 toggle("photo.focus_peaking", "Focus Assist", "Assist"),
+                choice("photo.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("photo.exposure_compensation", "EV", "Core", evOptions(), "0"),
                 choice("photo.hdr_log", "HDR / LOG", "Assist", listOf("HDR", "LOG", "Off"), "HDR"),
                 choice("photo.filters", "Filters", "Core", underwaterFilterOptions(), "Off"),
@@ -430,11 +482,12 @@ object CameraCatalog {
                 choice("expert.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
                 choice("expert.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
                 choice("expert.save_format", "RAW / JPEG", "Core", listOf("RAW", "JPEG", "RAW + JPEG"), "RAW + JPEG"),
-                choice("expert.lens", "Lens", "Core", lenses, "1x"),
+                choice("expert.lens", "Lens", "Core", lenses, "Auto"),
                 slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions(), "5600K"),
                 slider("expert.iso", "ISO", "Manual", isoOptions(), "100"),
                 slider("expert.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
                 toggle("expert.focus_peaking", "Focus Assist", "Assist"),
+                choice("expert.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("expert.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
                 slider("expert.exposure_value", "Exposure Value", "Manual", evOptions(), "0"),
                 toggle("expert.exposure_monitor", "Exposure monitor", "Assist"),
@@ -460,10 +513,11 @@ object CameraCatalog {
                 slider("pro.iso", "ISO", "Manual", isoOptions(), "100"),
                 slider("pro.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
                 toggle("pro.focus_peaking", "Focus Assist", "Assist"),
+                choice("pro.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("pro.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
                 slider("pro.exposure_value", "Exposure Value", "Manual", evOptions(), "0"),
                 choice("pro.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
-                choice("pro.lens", "Lens", "Core", lenses, "1x"),
+                choice("pro.lens", "Lens", "Core", lenses, "Auto"),
                 toggle("pro.exposure_monitor", "Exposure monitor", "Assist"),
                 choice("pro.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
                 choice("pro.grid", "Grid", "Assist", gridOptions(), "3x3"),
@@ -614,11 +668,12 @@ object CameraCatalog {
                 slider("pro_video.iso", "ISO", "Manual", isoOptions(), "100"),
                 slider("pro_video.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
                 toggle("pro_video.focus_peaking", "Focus Assist", "Assist"),
+                choice("pro_video.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("pro_video.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
                 slider("pro_video.exposure_value", "Exposure Value", "Manual", evOptions(), "0"),
                 slider("pro_video.frame_rate", "Frame rate", "Manual", frameRates, "30fps"),
                 choice("pro_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
-                choice("pro_video.lens", "Lens", "Core", lenses, "1x"),
+                choice("pro_video.lens", "Lens", "Core", lenses, "auto"),
                 choice("pro_video.microphone_source", "Microphone", "Audio", microphoneSources(), "Auto"),
                 slider("pro_video.microphone_gain", "Microphone gain", "Audio", microphoneGainOptions(), "0dB"),
                 toggle("pro_video.exposure_monitor", "Exposure monitor", "Assist"),
@@ -724,8 +779,8 @@ object CameraCatalog {
 
     private fun photoLenses(variant: GalaxyDeviceVariant): List<String> = when (variant) {
         GalaxyDeviceVariant.S26,
-        GalaxyDeviceVariant.S26Plus -> listOf("0.6x", "1x", "2x", "3x", "front")
-        GalaxyDeviceVariant.S26Ultra -> listOf("0.6x", "1x", "2x", "3x", "5x", "front")
+        GalaxyDeviceVariant.S26Plus -> listOf("Auto", "0.6x", "1x", "2x", "3x", "front")
+        GalaxyDeviceVariant.S26Ultra -> listOf("Auto", "0.6x", "1x", "2x", "3x", "5x", "front")
     }
 
     private fun photoMegapixels(variant: GalaxyDeviceVariant): List<String> = when (variant) {
@@ -799,6 +854,8 @@ object CameraCatalog {
             }
         }
     }
+
+    private fun focusCurveOptions(): List<String> = listOf("Linear", "SquareRoot", "Logarithmic")
 }
 
 val CameraState.primaryHighlightedEntry: CameraRailEntry

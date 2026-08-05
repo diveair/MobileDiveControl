@@ -271,6 +271,10 @@ class ControlReducer(
         CameraCommand.ToggleGrid,
         CameraCommand.ToggleFocusPeaking,
         CameraCommand.RestartCamera -> emitCameraEffect(state, command)
+        is CameraCommand.UpdateDetectedLenses -> {
+            val nextCamera = state.camera.copy(detectedLenses = command.lenses)
+            Reduction(state = state.copy(camera = nextCamera))
+        }
     }
 
     private fun reducePhoneControl(state: AppState, command: PhoneControlCommand): Reduction {
@@ -742,23 +746,14 @@ class ControlReducer(
         }
 
         val nextIndex = (state.camera.settingsCursor + delta + totalItems) % totalItems
-        val movedState = state.copy(
-            camera = state.camera.copy(
-                settingsCursor = nextIndex,
-                settingsEditing = false,
-                sliderEditTarget = SliderEditTarget.Value,
-            ),
-        )
-        val highlightedItem = items.getOrNull(nextIndex)
-        val preparation = if (highlightedItem is BottomBarItem.Setting &&
-            highlightedItem.spec.id.endsWith(".manual_focus")) {
-            prepareStateForManualFocus(movedState, highlightedItem.spec)
-        } else {
-            ManualFocusPreparation(movedState)
-        }
         return Reduction(
-            state = preparation.state,
-            effects = preparation.effects,
+            state = state.copy(
+            camera = state.camera.copy(
+                    settingsCursor = nextIndex,
+                    settingsEditing = false,
+                    sliderEditTarget = SliderEditTarget.Value,
+                ),
+            ),
         )
     }
 
@@ -931,6 +926,9 @@ class ControlReducer(
         val adjustingFocusAssist = preparedCamera.settingsEditing &&
                 spec.id.endsWith(".manual_focus") &&
                 editTarget == SliderEditTarget.FocusAssist
+        val adjustingFocusCurve = preparedCamera.settingsEditing &&
+                spec.id.endsWith(".manual_focus") &&
+                editTarget == SliderEditTarget.FocusCurve
 
         return if (adjustingSensitivity) {
             if (repeatCount > 0 && repeatCount % 4 != 0) {
@@ -957,11 +955,30 @@ class ControlReducer(
                 currentValue = currentValue,
                 options = assistSpec.options,
                 step = step,
-                wrap = false,
+                wrap = true,
             )
             Reduction(
                 state = preparedState.copy(
                     camera = applySettingValue(preparedCamera, assistSpec.id, nextValue),
+                ),
+                effects = manualFocusPreparation.effects,
+            )
+        } else if (adjustingFocusCurve) {
+            if (!supportsManualFocusForSelectedLens(preparedCamera, spec)) {
+                return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
+            }
+            val curveSpec = focusCurveSpec(preparedCamera, spec)
+                ?: return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
+            val currentValue = preparedCamera.settingValues[curveSpec.id] ?: curveSpec.defaultValue
+            val nextValue = advanceOption(
+                currentValue = currentValue,
+                options = curveSpec.options,
+                step = step,
+                wrap = true,
+            )
+            Reduction(
+                state = preparedState.copy(
+                    camera = applySettingValue(preparedCamera, curveSpec.id, nextValue),
                 ),
                 effects = manualFocusPreparation.effects,
             )
@@ -978,12 +995,19 @@ class ControlReducer(
                 }
                 val currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue
                 val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
-                // During hold (repeatCount > 0), don't cross into AF (index 0).
-                // AF is only reachable on a fresh press (repeatCount == 0).
-                val minIndex = if (repeatCount > 0 && currentIndex > 0) 1 else 0
-                val rawNext = currentIndex + step
-                val clampedIndex = rawNext.coerceIn(minIndex, spec.options.lastIndex)
-                val nextValue = spec.options[clampedIndex]
+                val nextIndex = if (repeatCount > 0) {
+                    // During hold, don't cross into AF. AF remains reachable only
+                    // on a fresh press so long-holds stay in manual focus space.
+                    val minIndex = if (currentIndex > 0) 1 else 0
+                    (currentIndex + step).coerceIn(minIndex, spec.options.lastIndex)
+                } else {
+                    when {
+                        currentIndex + step < 0 -> spec.options.lastIndex
+                        currentIndex + step > spec.options.lastIndex -> 0
+                        else -> currentIndex + step
+                    }
+                }
+                val nextValue = spec.options[nextIndex]
                 val nextCamera = applySettingValue(preparedCamera, spec.id, nextValue)
                 val effect = cameraEffectForSetting(spec.id, nextValue)
                 Reduction(
@@ -1022,34 +1046,10 @@ class ControlReducer(
     private fun prepareStateForManualFocus(
         state: AppState,
         focusSpec: CameraSettingSpec,
-    ): ManualFocusPreparation {
-        if (supportsManualFocusForSelectedLens(state.camera, focusSpec)) {
-            return ManualFocusPreparation(state)
-        }
-        val lensSettingId = focusSpec.id.substringBeforeLast(".") + ".lens"
-        val fallbackLens = fallbackManualFocusLens(state.camera, focusSpec)
-            ?: return ManualFocusPreparation(state)
-        val currentLens = state.camera.settingValues[lensSettingId]
-        if (fallbackLens == currentLens) {
-            return ManualFocusPreparation(state)
-        }
-        val nextCamera = applySettingValue(state.camera, lensSettingId, fallbackLens)
-        return ManualFocusPreparation(
-            state = state.copy(camera = nextCamera),
-            effects = listOf(PlatformEffect.ExecuteCamera(CameraCommand.SwitchLens(fallbackLens))),
-        )
-    }
+    ): ManualFocusPreparation = ManualFocusPreparation(state)
 
     private fun applySettingValue(camera: CameraState, settingId: String, value: String): CameraState {
-        val updatedValues = if (settingId.endsWith(".lens") && value == "0.6x") {
-            val baseId = settingId.removeSuffix(".lens")
-            camera.settingValues +
-                    (settingId to value) +
-                    ("$baseId.manual_focus" to "AF") +
-                    ("$baseId.focus_peaking" to "Off")
-        } else {
-            camera.settingValues + (settingId to value)
-        }
+        val updatedValues = camera.settingValues + (settingId to value)
         return if (settingId == "photo.zoom_level" || settingId == "video.zoom") {
             camera.copy(
                 zoomFactor = parseZoom(value) ?: camera.zoomFactor,
@@ -1085,6 +1085,9 @@ class ControlReducer(
         if (focusAssistSpec(camera, spec) != null) {
             targets += SliderEditTarget.FocusAssist
         }
+        if (focusCurveSpec(camera, spec) != null) {
+            targets += SliderEditTarget.FocusCurve
+        }
         return targets
     }
 
@@ -1094,19 +1097,30 @@ class ControlReducer(
             .firstOrNull { it.id == assistSettingId }
     }
 
-    private fun supportsManualFocusForSelectedLens(camera: CameraState, focusSpec: CameraSettingSpec): Boolean {
-        val lensSettingId = focusSpec.id.substringBeforeLast(".") + ".lens"
-        val lensValue = camera.settingValues[lensSettingId]
-        return lensValue != null && lensValue != "0.6x" && lensValue != "front"
+    private fun focusCurveSpec(camera: CameraState, focusSpec: CameraSettingSpec): CameraSettingSpec? {
+        val curveSettingId = CameraCatalog.focusCurveSettingId(focusSpec.id) ?: return null
+        return CameraCatalog.settingsFor(camera.activeMode, camera.deviceVariant)
+            .firstOrNull { it.id == curveSettingId }
     }
 
-    private fun fallbackManualFocusLens(camera: CameraState, focusSpec: CameraSettingSpec): String? {
-        val lensSettingId = focusSpec.id.substringBeforeLast(".") + ".lens"
-        val lensSpec = CameraCatalog.settingsFor(camera.activeMode, camera.deviceVariant)
-            .firstOrNull { it.id == lensSettingId }
-            ?: return null
-        val candidates = lensSpec.options.filter { it != "0.6x" && it != "front" }
-        return listOf("1x", "2x", "3x", "5x").firstOrNull { it in candidates } ?: candidates.firstOrNull()
+    private fun supportsManualFocusForSelectedLens(
+        camera: CameraState,
+        @Suppress("UNUSED_PARAMETER") focusSpec: CameraSettingSpec,
+    ): Boolean {
+        // Determine the current lens from state
+        val lensSettingId = when (camera.activeMode) {
+            CameraModeId.Photo -> "photo.lens"
+            CameraModeId.Pro -> "pro.lens"
+            CameraModeId.ExpertRaw -> "expert.lens"
+            CameraModeId.ProVideo -> "pro_video.lens"
+            else -> return true
+        }
+        val currentLens = camera.settingValues[lensSettingId] ?: "Auto"
+        // "Auto" mode always supports focus (hardware decides)
+        // "0.6x" on most phones is fixed focus — let the runtime controller handle
+        // the actual check via the detected focus capabilities
+        // For the core reducer, we allow all lenses but "fixed" won't produce focus commands
+        return currentLens != "fixed"
     }
 
     private fun shouldApplyFocusRepeat(
@@ -1178,6 +1192,10 @@ class ControlReducer(
         "expert.focus_peaking",
         "pro.focus_peaking",
         "pro_video.focus_peaking" -> CameraCommand.ToggleFocusPeaking
+        "photo.focus_curve",
+        "expert.focus_curve",
+        "pro.focus_curve",
+        "pro_video.focus_curve" -> null // Focus curve is handled locally in the app, no camera command needed
         "photo.hdr_log" -> CameraCommand.SetHdrLogMode(value)
         "video.hdr",
         "night_video.hdr" -> CameraCommand.SetHdrLogMode(if (value == "On") "HDR" else "Off")

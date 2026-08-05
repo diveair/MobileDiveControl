@@ -110,6 +110,13 @@ enum class SliderEditTarget {
     Value,
     Sensitivity,
     FocusAssist,
+    FocusCurve,
+}
+
+enum class FocusCurveMode {
+    Linear,
+    SquareRoot,
+    Logarithmic,
 }
 
 enum class GalaxyDeviceVariant {
@@ -215,6 +222,8 @@ data class CameraState(
     val sliderEditTarget: SliderEditTarget = SliderEditTarget.Value,
     val settingValues: Map<String, String> = CameraCatalog.defaultSettingValues,
     val sliderSensitivities: Map<String, SliderSensitivity> = CameraCatalog.defaultSliderSensitivities,
+    val focusCurveModes: Map<String, FocusCurveMode> = CameraCatalog.defaultFocusCurveModes,
+    val detectedLenses: List<String> = emptyList(),
     val supportedControls: List<CameraControl> = listOf(
         CameraControl.Photo,
         CameraControl.Video,
@@ -337,6 +346,7 @@ sealed interface CameraCommand : ControlCommand {
     data class SetCaptureFormat(val value: String) : CameraCommand
     data class SetHdrLogMode(val value: String) : CameraCommand
     data class SetFilter(val value: String) : CameraCommand
+    data class UpdateDetectedLenses(val lenses: List<String>) : CameraCommand
     data object OpenGallery : CameraCommand
     data object ToggleGrid : CameraCommand
     data object ToggleFocusPeaking : CameraCommand

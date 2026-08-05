@@ -42,6 +42,7 @@ fun DiveControlScreen(
     useMetric: Boolean = true,
     effects: List<PlatformEffect> = emptyList(),
     onEffectsConsumed: () -> Unit = {},
+    onDetectedLenses: ((List<String>) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     CameraHudOverlay(
@@ -64,6 +65,7 @@ fun DiveControlScreen(
                     lifecycleOwner = lifecycleOwner,
                     effects = effects,
                     onEffectsConsumed = onEffectsConsumed,
+                    onDetectedLenses = onDetectedLenses,
                 )
                 AppMode.CameraAdjust -> CameraShellScreen(
                     cameraState = state.camera,
@@ -72,6 +74,7 @@ fun DiveControlScreen(
                     lifecycleOwner = lifecycleOwner,
                     effects = effects,
                     onEffectsConsumed = onEffectsConsumed,
+                    onDetectedLenses = onDetectedLenses,
                 )
                 AppMode.Safety -> SafetyScreen(safety = state.safety)
                 AppMode.Diagnostics -> DiagnosticsScreen(state = state)

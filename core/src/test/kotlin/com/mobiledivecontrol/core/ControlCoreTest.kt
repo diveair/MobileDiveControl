@@ -351,7 +351,27 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `focus selection on fixed 0_6x lens switches to 1x before editing`() {
+    fun `fresh focus presses wrap through AF while hold repeat stays in manual range`() {
+        val reducer = ControlReducer()
+        val maxState = AppState(
+            camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
+                settingsCursor = 4,
+                settingValues = CameraCatalog.defaultSettingValues + ("photo.manual_focus" to "1.00"),
+            ),
+        )
+
+        val wrapToAf = reducer.reduce(maxState, CameraCommand.NavigateUp, repeatCount = 0)
+        assertEquals("AF", wrapToAf.state.camera.settingValues["photo.manual_focus"])
+
+        val afToZero = reducer.reduce(wrapToAf.state, CameraCommand.NavigateUp, repeatCount = 0)
+        assertEquals("0.00", afToZero.state.camera.settingValues["photo.manual_focus"])
+
+        val heldAtMax = reducer.reduce(maxState, CameraCommand.NavigateUp, repeatCount = 1)
+        assertEquals("1.00", heldAtMax.state.camera.settingValues["photo.manual_focus"])
+    }
+
+    @Test
+    fun `focus selection on 0_6x lens enters edit mode without switching lenses`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
             settingsCursor = 4,
@@ -361,15 +381,28 @@ class ControlCoreTest {
 
         val outcome = reducer.reduce(state, CameraCommand.Confirm)
         assertTrue(outcome.state.camera.settingsEditing)
-        assertEquals("1x", outcome.state.camera.settingValues["photo.lens"])
-        assertEquals(
-            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SwitchLens("1x"))),
-            outcome.effects,
-        )
+        assertEquals("0.6x", outcome.state.camera.settingValues["photo.lens"])
+        assertTrue(outcome.effects.isEmpty())
     }
 
     @Test
-    fun `focus adjustment on fixed 0_6x lens switches to 1x and applies the focus step`() {
+    fun `moving cursor from lens to focus on fixed 0_6x lens does not switch the lens`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
+            settingsCursor = 3,
+            settingValues = CameraCatalog.defaultSettingValues + ("photo.lens" to "0.6x"),
+        )
+        val state = AppState(camera = camera)
+
+        val outcome = reducer.reduce(state, CameraCommand.NavigateRight)
+        assertEquals(4, outcome.state.camera.settingsCursor)
+        assertEquals("0.6x", outcome.state.camera.settingValues["photo.lens"])
+        assertEquals("AF", outcome.state.camera.settingValues["photo.manual_focus"])
+        assertTrue(outcome.effects.isEmpty())
+    }
+
+    @Test
+    fun `focus adjustment on 0_6x lens keeps the selected lens and applies the focus step`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
             settingsCursor = 4,
@@ -378,13 +411,34 @@ class ControlCoreTest {
         val state = AppState(camera = camera)
 
         val outcome = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 0)
-        assertEquals("1x", outcome.state.camera.settingValues["photo.lens"])
+        assertEquals("0.6x", outcome.state.camera.settingValues["photo.lens"])
         assertEquals("0.00", outcome.state.camera.settingValues["photo.manual_focus"])
         assertEquals(
             listOf(
-                PlatformEffect.ExecuteCamera(CameraCommand.SwitchLens("1x")),
                 PlatformEffect.ExecuteCamera(CameraCommand.SetManualFocus(0.0)),
             ),
+            outcome.effects,
+        )
+    }
+
+    @Test
+    fun `switching to 0_6x lens does not reset focus or focus assist state`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
+            settingsCursor = 3,
+            settingValues = CameraCatalog.defaultSettingValues +
+                ("photo.lens" to "1x") +
+                ("photo.manual_focus" to "0.42") +
+                ("photo.focus_peaking" to "On"),
+        )
+        val state = AppState(camera = camera)
+
+        val outcome = reducer.reduce(state, CameraCommand.NavigateDown, repeatCount = 0)
+        assertEquals("0.6x", outcome.state.camera.settingValues["photo.lens"])
+        assertEquals("0.42", outcome.state.camera.settingValues["photo.manual_focus"])
+        assertEquals("On", outcome.state.camera.settingValues["photo.focus_peaking"])
+        assertEquals(
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SwitchLens("0.6x"))),
             outcome.effects,
         )
     }

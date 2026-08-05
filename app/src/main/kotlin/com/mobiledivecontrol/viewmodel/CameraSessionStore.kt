@@ -4,6 +4,7 @@ import android.content.Context
 import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.CameraModeId
+import com.mobiledivecontrol.core.FocusCurveMode
 import com.mobiledivecontrol.core.SliderSensitivity
 import org.json.JSONObject
 
@@ -19,12 +20,16 @@ class CameraSessionStore(context: Context) {
             CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES),
         )
         val sliderSensitivities = CameraCatalog.defaultSliderSensitivities + restoreSensitivityMap()
+        val focusCurveModes = CameraCatalog.defaultFocusCurveModes + restoreFocusCurveMap()
+        val detectedLenses = restoreDetectedLenses()
 
         return AppState(
             camera = CameraCatalog.launchCameraState(
                 activeMode = activeMode,
                 settingValues = settingValues,
                 sliderSensitivities = sliderSensitivities,
+                focusCurveModes = focusCurveModes,
+                detectedLenses = detectedLenses,
             ),
         )
     }
@@ -38,6 +43,16 @@ class CameraSessionStore(context: Context) {
                 JSONObject(
                     state.camera.sliderSensitivities.mapValues { (_, value) -> value.level.toString() },
                 ).toString(),
+            )
+            .putString(
+                KEY_FOCUS_CURVE_MODES,
+                JSONObject(
+                    state.camera.focusCurveModes.mapValues { (_, value) -> value.name },
+                ).toString(),
+            )
+            .putString(
+                KEY_DETECTED_LENSES,
+                state.camera.detectedLenses.joinToString(","),
             )
             .apply()
     }
@@ -56,22 +71,34 @@ class CameraSessionStore(context: Context) {
         }.toMap()
     }
 
+    private fun restoreFocusCurveMap(): Map<String, FocusCurveMode> {
+        return restoreStringMap(KEY_FOCUS_CURVE_MODES).mapNotNull { (key, value) ->
+            runCatching { FocusCurveMode.valueOf(value) }.getOrNull()?.let { mode -> key to mode }
+        }.toMap()
+    }
+
+    private fun restoreDetectedLenses(): List<String> {
+        val raw = preferences.getString(KEY_DETECTED_LENSES, null)
+        if (raw.isNullOrBlank()) return emptyList()
+        return raw.split(",").filter { it.isNotBlank() }
+    }
+
+    /**
+     * Validate restored setting values against known valid options.
+     * This prevents issues like a "5x" lens value persisted from an S26Ultra
+     * being applied on an S24 that doesn't have a 5x lens.
+     * Lens validation is deferred to runtime when detectedLenses are available.
+     */
     private fun normalizeRestoredSettingValues(values: Map<String, String>): Map<String, String> {
-        val normalized = values.toMutableMap()
-        values.forEach { (settingId, value) ->
-            if (settingId.endsWith(".lens") && value == "0.6x") {
-                val baseId = settingId.removeSuffix(".lens")
-                val manualFocusValue = values["$baseId.manual_focus"]
-                val focusPeakingValue = values["$baseId.focus_peaking"]
-                if ((manualFocusValue != null && manualFocusValue != "AF") || focusPeakingValue == "On") {
-                    normalized[settingId] = "1x"
-                } else {
-                    normalized["$baseId.manual_focus"] = "AF"
-                    normalized["$baseId.focus_peaking"] = "Off"
-                }
+        val result = values.toMutableMap()
+        // Validate focus curve values
+        listOf("photo.focus_curve", "expert.focus_curve", "pro.focus_curve", "pro_video.focus_curve").forEach { key ->
+            val value = result[key]
+            if (value != null && value !in listOf("Linear", "SquareRoot", "Logarithmic")) {
+                result[key] = "SquareRoot"
             }
         }
-        return normalized
+        return result
     }
 
     private companion object {
@@ -79,5 +106,7 @@ class CameraSessionStore(context: Context) {
         const val KEY_ACTIVE_MODE = "active_mode"
         const val KEY_SETTING_VALUES = "setting_values"
         const val KEY_SLIDER_SENSITIVITIES = "slider_sensitivities"
+        const val KEY_FOCUS_CURVE_MODES = "focus_curve_modes"
+        const val KEY_DETECTED_LENSES = "detected_lenses"
     }
 }
