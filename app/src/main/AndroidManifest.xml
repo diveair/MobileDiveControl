@@ -1,12 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- BLE communication with dive housing -->
-    <uses-permission android:name="android.permission.BLUETOOTH" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <!--
+        BLE communication with dive housing.
+        API 30 and below use the legacy trio; scanning there genuinely requires location even
+        though the app never uses it, hence the maxSdkVersion caps rather than an unconditional
+        location request. From API 31 the scan is declared as never deriving location.
+    -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
 
     <!-- Camera for underwater photography -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -39,6 +48,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:theme="@style/Theme.DiveControl"
             android:screenOrientation="landscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
@@ -48,5 +58,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Keeps the housing link alive and the process unfrozen for the whole dive -->
+        <service
+            android:name=".service.HousingLinkService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>

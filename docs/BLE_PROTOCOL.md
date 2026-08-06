@@ -13,7 +13,7 @@ This document is the app-developer-facing reference for the BLE protocol used by
 | Communication Distance | 100m | Vendor spec §2 |
 | Reception Sensitivity | -95 dBm | Vendor spec §2 |
 | Voltage | 1.8–3.6V | Vendor spec §2 |
-| Advertising Name | `DIVE IT` | Vendor spec §4.1 |
+| Advertising Name | doc says `DIVE IT`; **hardware advertises `DIVEIT`** (no space) | Vendor spec §4.1 / observed F3.08 |
 | Advertising Type | Connectable Undirected | Vendor spec §4.1 |
 | Advertising Interval | 200ms | Vendor spec §4.1 |
 | Advertising Duration | 180s | Vendor spec §4.1 |
@@ -68,8 +68,19 @@ This document is the app-developer-facing reference for the BLE protocol used by
 | Button Events | `0x1524` | Housing → App (read + notify) | Physical button press stream |
 | Flash Trigger | `0x1525` | App → Housing (write) | Trigger external flash once |
 
-> **Vendor Base UUID:** `23D1BCEA-5F78-2315-DEEF-1212xxxx-00000000`
-> Replace `xxxx` with the short UUID (e.g., `0x1523` → `23D1BCEA-5F78-2315-DEEF-1212-1523-00000000`)
+> **Vendor Base UUID (CORRECTED — confirmed against hardware, firmware F3.08, 2026-08-04):**
+> `0000xxxx-1212-EFDE-1523-785FEABCD123`
+> Replace `xxxx` with the short code, e.g. `0x1524` → `00001524-1212-EFDE-1523-785FEABCD123`.
+>
+> This is the Nordic nRF5 SDK's LED Button Service base. The vendor built on that example — the
+> 0x1523 service / 0x1524 button / 0x1525 LED triple is it verbatim — and the housing also exposes
+> Nordic's DFU service `0xFE59`.
+>
+> The vendor document states the base as `23D1BCEA-5F78-2315-DEEF-1212xxxx-00000000`. **That string
+> is not a UUID**: it has 36 hex digits where a UUID has 32. It is the SDK's little-endian byte
+> array `{0x23,0xD1,0xBC,0xEA,0x5F,0x78,0x23,0x15,0xDE,0xEF,0x12,0x12,0x23,0x15,0x00,0x00}`
+> transcribed forward, with dashes inserted by eye and four stray zeros appended. Reverse the array
+> to big-endian and you get the corrected base above.
 
 #### Housing Control & Sensor Service
 
@@ -84,7 +95,8 @@ This document is the app-developer-facing reference for the BLE protocol used by
 | Solenoid Valve | `0x1629` | App → Housing (write) | Open/stop solenoid valve |
 | IR Flashlight | `0x162A` | App → Housing (write) | Infrared remote control |
 
-> **Vendor Base UUID:** Same template — `23D1BCEA-5F78-2315-DEEF-1212xxxx-00000000`
+> **Vendor Base UUID:** Same template — `0000xxxx-1212-EFDE-1523-785FEABCD123`. Confirmed on
+> hardware: service `0x1623` and characteristics `0x1624`–`0x162A` all use it.
 
 ---
 

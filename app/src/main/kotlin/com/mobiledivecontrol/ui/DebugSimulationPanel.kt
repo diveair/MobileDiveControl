@@ -51,9 +51,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.mobiledivecontrol.core.BleSignal
 import com.mobiledivecontrol.core.HousingButtonEvent
-import com.mobiledivecontrol.core.SensorUpdate
 import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.viewmodel.DiveViewModel
 import kotlin.math.roundToInt
@@ -62,10 +60,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * Debug simulation panel with the housing button layout.
+ * Debug panel with the housing button layout.
  *
  * The launcher and the expanded panel move as one floating unit so the
  * interface can be positioned anywhere on screen during device testing.
+ *
+ * These buttons emit real wire bytes through the same entry point the radio uses, so what they
+ * exercise is the actual decode-and-route path rather than a parallel one. There is deliberately
+ * no simulated *connection*: the app must never show a link it does not have, and a fake session
+ * fought the real radio the moment hardware was attached.
  */
 @Composable
 fun DebugSimulationPanel(
@@ -73,37 +76,8 @@ fun DebugSimulationPanel(
     modifier: Modifier = Modifier,
 ) {
     var panelVisible by remember { mutableStateOf(false) }
-    var initialized by remember { mutableStateOf(false) }
     var interfaceOffset by remember { mutableStateOf<Offset?>(null) }
     var floatingSize by remember { mutableStateOf(IntSize.Zero) }
-
-    LaunchedEffect(Unit) {
-        if (!initialized) {
-            initialized = true
-
-            viewModel.advanceBle(BleSignal.StartScan)
-            delay(300)
-            viewModel.advanceBle(BleSignal.Connect)
-            delay(200)
-            viewModel.advanceBle(BleSignal.DiscoverServices)
-            delay(200)
-            viewModel.advanceBle(BleSignal.Subscribe)
-            delay(200)
-            viewModel.advanceBle(BleSignal.Ready)
-
-            viewModel.onNotification("2A29", "UMEING".toByteArray())
-            viewModel.onNotification("2A26", "A4.0".toByteArray())
-            viewModel.onNotification("2A27", "V2.1".toByteArray())
-            viewModel.onNotification("2A28", "S1.3".toByteArray())
-            viewModel.onNotification("2A25", "DC-240526".toByteArray())
-
-            viewModel.updateBattery(85)
-            viewModel.updateSensor(SensorUpdate.WaterPressure(223.5))
-            viewModel.updateSensor(SensorUpdate.WaterTemperature(24.3))
-            viewModel.updateSensor(SensorUpdate.BarometricPressure(101.3))
-            viewModel.updateSensor(SensorUpdate.CoverState(false))
-        }
-    }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         val density = LocalDensity.current
@@ -189,9 +163,7 @@ fun DebugSimulationPanel(
 }
 
 @Composable
-private fun DebugButtonCluster(
-    viewModel: DiveViewModel,
-) {
+private fun DebugButtonCluster(viewModel: DiveViewModel) {
     Column(
         modifier = Modifier.width(150.dp),
         horizontalAlignment = Alignment.CenterHorizontally,

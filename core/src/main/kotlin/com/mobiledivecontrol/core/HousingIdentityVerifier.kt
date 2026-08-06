@@ -17,7 +17,7 @@ class HousingIdentityVerifier(
      * The vendor spec §1 shows version A4.0. Future firmware releases
      * should be added here after validation.
      */
-    private val supportedFirmwareVersions: Set<String> = setOf("A4.0"),
+    private val supportedFirmwareVersions: Set<String> = setOf("A4.0", "F3.08"),
 ) {
 
     /**
@@ -30,10 +30,13 @@ class HousingIdentityVerifier(
 
     /**
      * Validate the advertising name before connecting.
-     * Per vendor spec §4.1 Table 3: Advertising_Name = "DIVE IT"
+     *
+     * Per vendor spec §4.1 Table 3 the name is "DIVE IT", but shipping firmware advertises
+     * "DIVEIT". Case, spacing and punctuation are therefore ignored: the name is a coarse filter,
+     * and real identity comes from the services the device exposes once connected.
      */
     fun validateAdvertisingName(name: String): VerificationResult {
-        return if (name.trim().equals(EXPECTED_ADVERTISING_NAME, ignoreCase = true)) {
+        return if (name.normalizedName() == EXPECTED_ADVERTISING_NAME.normalizedName()) {
             VerificationResult.Verified
         } else {
             VerificationResult.Rejected(
@@ -41,6 +44,8 @@ class HousingIdentityVerifier(
             )
         }
     }
+
+    private fun String.normalizedName(): String = filter(Char::isLetterOrDigit).lowercase()
 
     /**
      * Validate that all required BLE service UUIDs are discovered.

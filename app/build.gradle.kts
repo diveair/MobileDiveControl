@@ -68,4 +68,12 @@ dependencies {
     // Coroutines
     implementation(libs.coroutines.core)
     implementation(libs.coroutines.android)
+
+    // Unit tests (JVM only — no Android framework classes)
+    testImplementation(libs.junit.jupiter)
+    testImplementation(libs.coroutines.test)
+}
+
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
 }

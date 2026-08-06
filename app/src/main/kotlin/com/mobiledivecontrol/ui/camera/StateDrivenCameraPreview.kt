@@ -80,6 +80,7 @@ fun StateDrivenCameraPreview(
             cameraState = cameraState,
             waterPressureKpa = safetyState.waterPressureKpa,
             atmosphericPressureKpa = safetyState.barometricPressureKpa,
+            surfaceAmbientKpa = safetyState.surfaceAmbientKpa,
         )
     }
 

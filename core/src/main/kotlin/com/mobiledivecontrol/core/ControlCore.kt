@@ -236,6 +236,51 @@ class ControlCore(
         )
     }
 
+    /**
+     * Phone battery level, 0..100. The housing battery strands the diver, but a dead phone
+     * ends the dive just as hard, so both are first-class state.
+     */
+    /**
+     * Primes the safety state with a persisted hard-verified vacuum reading at launch, so the
+     * next adoption decision can tell "the same hold, still strong" from "some vacuum".
+     */
+    fun primeVerifiedVacuum(
+        kpa: Double,
+        confidence: SealConfidence,
+        startedAtEpochMs: Long? = null,
+        recordedAtEpochMs: Long? = null,
+        receivedAt: Instant = clock.instant(),
+    ): ProcessingOutcome {
+        val startedNanos = System.nanoTime()
+        val previousState = state
+        val reduction = reducer.primeVerifiedVacuum(state, kpa, confidence, startedAtEpochMs, recordedAtEpochMs)
+        return commitReduction(
+            previousState = previousState,
+            reduction = reduction,
+            reason = "verifiedVacuum:%.1f".format(kpa),
+            path = "verified_vacuum_prime",
+            receivedAt = receivedAt,
+            startedNanos = startedNanos,
+        )
+    }
+
+    fun updatePhoneBattery(
+        percent: Int,
+        receivedAt: Instant = clock.instant(),
+    ): ProcessingOutcome {
+        val startedNanos = System.nanoTime()
+        val previousState = state
+        val reduction = reducer.updatePhoneBattery(state, percent)
+        return commitReduction(
+            previousState = previousState,
+            reduction = reduction,
+            reason = "phoneBattery:$percent",
+            path = "phone_battery_update",
+            receivedAt = receivedAt,
+            startedNanos = startedNanos,
+        )
+    }
+
     fun updateSensor(
         sensorUpdate: SensorUpdate,
         receivedAt: Instant = clock.instant(),

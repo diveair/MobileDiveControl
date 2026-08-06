@@ -48,6 +48,7 @@ import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.CameraState
 import com.mobiledivecontrol.core.FocusCurveMode
+import com.mobiledivecontrol.ui.components.STANDARD_ATMOSPHERE_KPA
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.roundToInt
@@ -143,6 +144,9 @@ class CameraRuntimeController(
     private var latestState: CameraState = CameraState()
     private var latestWaterPressureKpa: Double? = null
     private var latestAtmosphericPressureKpa: Double? = null
+
+    /** Barometric reading captured with the suction cover open. The only valid depth reference. */
+    private var latestSurfaceAmbientKpa: Double? = null
     private var frontCameraId: String? = null
     private var frontCameraMinFocusDistance: Float = 0f
     private var backCameraProfile: BackCameraProfile? = null
@@ -291,14 +295,23 @@ class CameraRuntimeController(
         focusPeakingProcessor = null
     }
 
+    /**
+     * @param atmosphericPressureKpa the live in-shell barometric reading. Used for the auto filter
+     *   only; it is not a depth reference once a vacuum has been pulled.
+     * @param surfaceAmbientKpa the baseline captured with the suction cover open. Depth is measured
+     *   against this. Defaulted so a caller that has no baseline yet falls back to the standard
+     *   atmosphere rather than silently reverting to the live reading.
+     */
     fun applyState(
         cameraState: CameraState,
         waterPressureKpa: Double?,
         atmosphericPressureKpa: Double?,
+        surfaceAmbientKpa: Double? = null,
     ) {
         latestState = cameraState
         latestWaterPressureKpa = waterPressureKpa
         latestAtmosphericPressureKpa = atmosphericPressureKpa
+        latestSurfaceAmbientKpa = surfaceAmbientKpa
         focusAssistEnabled = isFocusAssistEnabled(cameraState)
         // Toggle GPU shader peaking — no camera rebinding needed.
         // Peaking works in both AF and manual focus modes.
@@ -1725,14 +1738,22 @@ class CameraRuntimeController(
         return RggbChannelVector(redGain, greenGain, greenGain, blueGain)
     }
 
+    /**
+     * Depth from the water-pressure sensor, referenced to the captured surface baseline.
+     *
+     * Deliberately *not* the live barometric reading. That sensor is inside the shell, so once the
+     * vacuum check pulls 20 kPa out of it the reading drops to ~81 kPa and the subtraction reports
+     * about two metres of depth while the housing is still on the boat. That number feeds the
+     * underwater colour correction, which would then start compensating for a dive that has not
+     * happened. `surfaceAmbientKpa` is captured while the suction cover is open, when the shell is
+     * vented and the sensor really is reading atmosphere; with no capture yet, the standard
+     * atmosphere is wrong by altitude and weather but never by the whole vacuum.
+     */
     private fun currentDepthMeters(): Double? {
-        val water = latestWaterPressureKpa
-        val atmospheric = latestAtmosphericPressureKpa
-        return if (water != null && atmospheric != null) {
-            ((water - atmospheric).coerceAtLeast(0.0)) / 9.81
-        } else {
-            null
-        }
+        val water = latestWaterPressureKpa ?: return null
+        val surface = latestSurfaceAmbientKpa ?: STANDARD_ATMOSPHERE_KPA
+        // Salt-water density correction is tracked separately — do not fold it in here.
+        return (water - surface).coerceAtLeast(0.0) / 9.81
     }
 
     private fun flatLogCurve(): TonemapCurve {

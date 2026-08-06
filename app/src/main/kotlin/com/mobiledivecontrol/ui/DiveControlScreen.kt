@@ -23,16 +23,26 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.mobiledivecontrol.core.AppMode
 import com.mobiledivecontrol.core.AppState
+import com.mobiledivecontrol.core.BleConnectionState
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.ui.camera.CameraShellScreen
 import com.mobiledivecontrol.ui.diagnostics.DiagnosticsScreen
 import com.mobiledivecontrol.ui.safety.SafetyScreen
+import com.mobiledivecontrol.ui.tutorial.IntroCarouselScreen
+import com.mobiledivecontrol.ui.tutorial.SealCapPromptScreen
 
 /**
  * Root composable — routes to the active mode's screen
  * and wraps everything in the persistent HUD overlay.
+ *
+ * @param introVisible when true the intro carousel covers the whole screen. It is drawn over the
+ *   HUD rather than instead of it so the camera and its state survive underneath: the intro runs
+ *   until the diver presses something, and tearing the preview down for it would mean a cold camera
+ *   start at the exact moment they want to shoot.
+ * @param permissionsGranted everything the housing link and camera need. The intro reports what is
+ *   still missing rather than letting the diver arrive at a viewfinder that cannot see.
  */
 @Composable
 fun DiveControlScreen(
@@ -43,12 +53,59 @@ fun DiveControlScreen(
     effects: List<PlatformEffect> = emptyList(),
     onEffectsConsumed: () -> Unit = {},
     onDetectedLenses: ((List<String>) -> Unit)? = null,
+    introVisible: Boolean = false,
+    onIntroDismiss: () -> Unit = {},
+    permissionsGranted: Boolean = false,
+    missingPermissions: List<String> = emptyList(),
+    capPromptVisible: Boolean = false,
+    onCapPromptDismiss: () -> Unit = {},
     modifier: Modifier = Modifier,
+) {
+    Box(modifier = modifier.fillMaxSize()) {
+        DiveControlContent(
+            state = state,
+            cameraPermissionGranted = cameraPermissionGranted,
+            lifecycleOwner = lifecycleOwner,
+            useMetric = useMetric,
+            effects = effects,
+            onEffectsConsumed = onEffectsConsumed,
+            onDetectedLenses = onDetectedLenses,
+        )
+
+        // One screen for permissions, connection and the button map. It leaves composition the
+        // moment it is dismissed, which is what stops its animations running behind the camera.
+        if (introVisible) {
+            IntroCarouselScreen(
+                permissionsGranted = permissionsGranted,
+                bleState = state.bleConnectionState,
+                missingPermissions = missingPermissions,
+                onDismiss = onIntroDismiss,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else if (capPromptVisible) {
+            // The sealing hand-off follows the intro and never competes with it. The view model
+            // drops it on its own when the housing reports the cap off or a vacuum present.
+            SealCapPromptScreen(
+                onDismiss = onCapPromptDismiss,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun DiveControlContent(
+    state: AppState,
+    cameraPermissionGranted: Boolean,
+    lifecycleOwner: androidx.lifecycle.LifecycleOwner?,
+    useMetric: Boolean,
+    effects: List<PlatformEffect>,
+    onEffectsConsumed: () -> Unit,
+    onDetectedLenses: ((List<String>) -> Unit)?,
 ) {
     CameraHudOverlay(
         state = state,
         useMetric = useMetric,
-        modifier = modifier,
     ) {
         AnimatedContent(
             targetState = state.mode,
@@ -66,6 +123,7 @@ fun DiveControlScreen(
                     effects = effects,
                     onEffectsConsumed = onEffectsConsumed,
                     onDetectedLenses = onDetectedLenses,
+                    housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.CameraAdjust -> CameraShellScreen(
                     cameraState = state.camera,
@@ -75,6 +133,7 @@ fun DiveControlScreen(
                     effects = effects,
                     onEffectsConsumed = onEffectsConsumed,
                     onDetectedLenses = onDetectedLenses,
+                    housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.Safety -> SafetyScreen(safety = state.safety)
                 AppMode.Diagnostics -> DiagnosticsScreen(state = state)

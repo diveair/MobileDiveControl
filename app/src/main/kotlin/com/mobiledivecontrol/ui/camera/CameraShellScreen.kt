@@ -94,6 +94,8 @@ fun CameraShellScreen(
     effects: List<PlatformEffect> = emptyList(),
     onEffectsConsumed: () -> Unit = {},
     onDetectedLenses: ((List<String>) -> Unit)? = null,
+    /** True while the housing-link banner occupies the top strip, so the mode pill yields to it. */
+    housingLinkAlert: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val profile = CameraCatalog.profile(cameraState.activeMode, cameraState.deviceVariant)
@@ -129,9 +131,11 @@ fun CameraShellScreen(
             modifier = Modifier.align(Alignment.Center),
         )
 
-        // Top-right: active camera mode indicator (when ModeRail is closed)
+        // Top-right: active camera mode indicator (when ModeRail is closed). Hidden while the
+        // housing-link banner is up — the mode is already legible in the bottom bar, and a
+        // disconnected housing is the more urgent thing to read.
         AnimatedVisibility(
-            visible = cameraState.focusedZone != CameraUiZone.ModeRail,
+            visible = cameraState.focusedZone != CameraUiZone.ModeRail && !housingLinkAlert,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier

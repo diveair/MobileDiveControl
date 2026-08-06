@@ -6,40 +6,100 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Battery0Bar
-import androidx.compose.material.icons.rounded.Battery2Bar
-import androidx.compose.material.icons.rounded.Battery4Bar
-import androidx.compose.material.icons.rounded.Battery6Bar
-import androidx.compose.material.icons.rounded.BatteryFull
+import androidx.compose.material.icons.rounded.Inventory2
+import androidx.compose.material.icons.rounded.Smartphone
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.mobiledivecontrol.theme.DiveColors
 
+/**
+ * The two batteries that can end a dive, side by side.
+ *
+ * Housing sits on the left because it is the one that strands you: when it dies the buttons stop
+ * and the phone is sealed behind a port with no way to reach the screen. The phone dying is worse
+ * for the footage but at least it fails visibly.
+ *
+ * Two readouts of the same shape are easy to confuse at a glance through a flooded mask, so each
+ * carries two independent cues — a device glyph *and* a one-character `H`/`P` label. Either one
+ * alone would be a single point of failure for a diver who is cold, task-loaded and reading a
+ * 16 sp number in bad visibility.
+ */
 @Composable
-fun BatteryIndicator(
-    percent: Int,
+fun DualBatteryIndicator(
+    housingPercent: Int?,
+    phonePercent: Int?,
     modifier: Modifier = Modifier,
 ) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier,
+    ) {
+        BatteryIndicator(
+            percent = housingPercent,
+            glyph = Icons.Rounded.Inventory2,
+            label = "H",
+            deviceName = "Housing",
+        )
+        Spacer(modifier = Modifier.width(7.dp))
+        Box(
+            modifier = Modifier
+                .width(1.dp)
+                .height(16.dp)
+                .background(DiveColors.SurfaceBorder),
+        )
+        Spacer(modifier = Modifier.width(7.dp))
+        BatteryIndicator(
+            percent = phonePercent,
+            glyph = Icons.Rounded.Smartphone,
+            label = "P",
+            deviceName = "Phone",
+        )
+    }
+}
+
+/**
+ * One battery readout.
+ *
+ * [percent] is null until the device reports a level. That is deliberately not the same as zero:
+ * rendering an unknown battery as "0%" in critical red is a false alarm every time the app starts
+ * before the housing connects, and a diver who learns to ignore a red battery will ignore the real
+ * one too. Unknown renders muted `--%`.
+ */
+@Composable
+fun BatteryIndicator(
+    percent: Int?,
+    glyph: ImageVector,
+    label: String,
+    deviceName: String,
+    modifier: Modifier = Modifier,
+) {
+    val known = percent != null
     val color by animateColorAsState(
-        targetValue = DiveColors.batteryColor(percent),
+        targetValue = if (percent != null) DiveColors.batteryColor(percent) else DiveColors.TextMuted,
         animationSpec = tween(500),
-        label = "battery_color",
+        label = "battery_color_$label",
     )
 
-    // Pulse when critically low
-    val alpha = if (percent <= 10) {
-        val infiniteTransition = rememberInfiniteTransition(label = "battery_pulse")
+    // Pulse when critically low. An unknown level never pulses — motion is reserved for facts.
+    val alpha = if (percent != null && percent <= 10) {
+        val infiniteTransition = rememberInfiniteTransition(label = "battery_pulse_$label")
         val pulseAlpha by infiniteTransition.animateFloat(
             initialValue = 0.4f,
             targetValue = 1f,
@@ -47,19 +107,11 @@ fun BatteryIndicator(
                 animation = tween(800),
                 repeatMode = RepeatMode.Reverse,
             ),
-            label = "battery_pulse_alpha",
+            label = "battery_pulse_alpha_$label",
         )
         pulseAlpha
     } else {
         1f
-    }
-
-    val icon = when {
-        percent <= 10 -> Icons.Rounded.Battery0Bar
-        percent <= 30 -> Icons.Rounded.Battery2Bar
-        percent <= 55 -> Icons.Rounded.Battery4Bar
-        percent <= 80 -> Icons.Rounded.Battery6Bar
-        else -> Icons.Rounded.BatteryFull
     }
 
     Row(
@@ -67,16 +119,23 @@ fun BatteryIndicator(
         modifier = modifier.alpha(alpha),
     ) {
         Icon(
-            imageVector = icon,
-            contentDescription = "Battery $percent%",
+            imageVector = glyph,
+            contentDescription = if (known) "$deviceName battery $percent%" else "$deviceName battery unknown",
             tint = color,
-            modifier = Modifier.size(20.dp),
+            modifier = Modifier.size(17.dp),
         )
-        Spacer(modifier = Modifier.width(4.dp))
+        Spacer(modifier = Modifier.width(2.dp))
         Text(
-            text = "$percent%",
+            text = label,
+            color = DiveColors.TextSecondary,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+        )
+        Spacer(modifier = Modifier.width(3.dp))
+        Text(
+            text = if (percent != null) "$percent%" else "--%",
             color = color,
-            style = androidx.compose.material3.MaterialTheme.typography.titleMedium,
+            style = MaterialTheme.typography.titleMedium,
         )
     }
 }

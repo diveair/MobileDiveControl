@@ -79,7 +79,22 @@ private fun standardUuid(shortCode: UShort): String {
     return "0000${hex}-0000-1000-8000-00805F9B34FB"
 }
 
+/**
+ * Vendor 128-bit UUID for a 16-bit short code.
+ *
+ * Confirmed against hardware (firmware F3.08) on 2026-08-04: the housing exposes
+ * `00001524-1212-EFDE-1523-785FEABCD123` and friends. This is the Nordic nRF5 SDK's LED Button
+ * Service base, which the vendor built on — their 0x1523/0x1524/0x1525 triple is that example
+ * verbatim, and the device also advertises Nordic's DFU service 0xFE59.
+ *
+ * The protocol document's base (`23D1BCEA-5F78-2315-DEEF-1212xxxx-00000000`) is the SDK's
+ * little-endian byte array transcribed forward with dashes inserted by eye and four stray zeros
+ * added — which is why it has 36 hex digits instead of 32. It is not a UUID and never was.
+ *
+ * Nothing at runtime depends on this: `HousingUuidResolver` maps discovered UUIDs by their
+ * embedded short code, so the app survives another base appearing in a future firmware.
+ */
 private fun vendorUuid(shortCode: UShort): String {
     val hex = shortCode.toInt().toString(16).uppercase().padStart(4, '0')
-    return "23D1BCEA-5F78-2315-DEEF-1212${hex}0000"
+    return "0000$hex-1212-EFDE-1523-785FEABCD123"
 }

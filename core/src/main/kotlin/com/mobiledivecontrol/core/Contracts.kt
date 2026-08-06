@@ -243,16 +243,106 @@ data class PhoneControlState(
     val smartTargetAvailable: Boolean = true,
 )
 
+/**
+ * How much evidence stands behind a passed seal check.
+ *
+ * Published practice varies by a factor of six — this housing's maker says "more than 5
+ * minutes", Weefine asks 30 minutes for their own smartphone housing, and the common
+ * vacuum systems land near 10. Rather than pick one and call the rest wrong, the check keeps
+ * running and the confidence keeps climbing, so the diver can read how much evidence exists
+ * and decide when to get in the water.
+ */
+enum class SealConfidence {
+    Monitoring,
+    Provisional,
+    ManufacturerMinimum,
+    Recommended,
+    Conservative,
+}
+
 data class SafetyState(
     val sealState: SealState = SealState.Unknown,
+    val sealConfidence: SealConfidence = SealConfidence.Monitoring,
     val coverOpen: Boolean? = null,
     val barometricPressureKpa: Double? = null,
+    /**
+     * Atmospheric pressure captured while the suction cover was open.
+     *
+     * With the cover open the shell is vented, so the internal barometric sensor is reading
+     * true atmosphere — the only moment that reading can serve as a depth reference. Once a
+     * vacuum is pulled the live reading is ~20 kPa below ambient, and using it for depth would
+     * put the diver two metres under while still on the boat.
+     */
+    val surfaceAmbientKpa: Double? = null,
     val waterPressureKpa: Double? = null,
     val waterTemperatureC: Double? = null,
     val baselinePressureKpa: Double? = null,
     val stabilizationSamples: List<Double> = emptyList(),
     val motorStartedAtEpochMs: Long? = null,
     val leakMonitoringStartedAtEpochMs: Long? = null,
+    val leakMonitoringElapsedMs: Long = 0L,
+    /** Set when the diver dismisses the prompt; cleared whenever the cover opens again. */
+    val checkDismissed: Boolean = false,
+    /** Lowest pressure seen this pump run, for stall detection. Meaningful only while Vacuuming. */
+    val vacuumBestKpa: Double? = null,
+    /** When the pump last made real progress. Meaningful only while Vacuuming. */
+    val vacuumLastProgressAtMs: Long? = null,
+    /** Rolling rate-watch checkpoint (time and reading). Meaningful only while Vacuuming. */
+    val vacuumRateWindowStartMs: Long? = null,
+    val vacuumRateWindowStartKpa: Double? = null,
+    /**
+     * Adoption candidate awaiting its confirming sample. A held vacuum is FLAT; a shell mid-way
+     * through venting is moving — requiring two agreeing readings is what stops a draining
+     * shell's transient from being adopted as a fresh vacuum on its way to ambient.
+     */
+    val pendingAdoptionKpa: Double? = null,
+    /**
+     * A monitoring sample quarantined by the glitch gate: it jumped implausibly from the last
+     * accepted reading and waits for a second reading to agree before it can mean anything.
+     */
+    val pendingOutlierKpa: Double? = null,
+    /**
+     * The pressure a previous session recorded after its hold passed the hard verify, primed at
+     * launch from persistence. Consumed by the next adoption decision: a live reading that still
+     * matches it means the seal held strong across the reboot and deserves its earned trust back.
+     */
+    val verifiedVacuumKpa: Double? = null,
+    /** The confidence tier the persisted hold had earned; restored verbatim on a boot-time match. */
+    val verifiedVacuumConfidence: SealConfidence? = null,
+    /**
+     * Epoch millis the persisted hold originally began, so a restart restores the TRUE clock
+     * instead of backdating to the tier floor — a 25-minute hold must not restart as a
+     * 10-minute one and then wait 20 more real minutes for its next tier.
+     */
+    val verifiedVacuumStartedAtEpochMs: Long? = null,
+    /** Epoch millis the record was last written — the last moment the seal was known good. */
+    val verifiedVacuumRecordedAtEpochMs: Long? = null,
+    /**
+     * Set when a boot record's vacuum turned out lost or degraded on restart: minutes between
+     * the last known-good write and the reading that disproved it. Drives the
+     * "SEAL FAILED (TIME)" banner; null for every other failure.
+     */
+    val restartFailAgoMinutes: Long? = null,
+    /**
+     * True when a vacuum was adopted rather than pumped, until the diver answers the reminder.
+     * An adopted vacuum arrives with no evidence the blue cap was ever screwed back down, so the
+     * close-the-cap banner shows once on top of the monitoring that is already running.
+     */
+    val capCloseReminder: Boolean = false,
+    /**
+     * True while the current hold began as an ADOPTED vacuum — one the housing was already
+     * holding before this app was watching (fresh adoption or a verified reboot restore). A full
+     * vent of an adopted hold is always deliberate whatever this app's clock says, because the
+     * housing proved the seal long before the clock started. A hold pumped by this app never
+     * sets this, however its cap banner was raised.
+     */
+    val adoptedHold: Boolean = false,
+    /**
+     * True after a deliberate vacuum release at the surface, until the diver answers it. Drives
+     * the "VACUUM RELEASED" banner — cap already off, re-pump or open the housing — instead of
+     * the remove-the-cap doorway, which would be asking them to do what they just did.
+     */
+    val vacuumReleasedPrompt: Boolean = false,
     val warning: String? = null,
 )
 
@@ -302,6 +392,8 @@ data class AppState(
     val safety: SafetyState = SafetyState(),
     val gallery: GalleryState = GalleryState(),
     val permissions: PermissionsState = PermissionsState(),
+    /** Phone battery 0–100, or null when not yet read. Null must never render as 0. */
+    val phoneBatteryPercent: Int? = null,
     val controlsLocked: Boolean = false,
     val lastWarning: String? = null,
 )
@@ -376,6 +468,10 @@ sealed interface PhoneControlCommand : ControlCommand {
 sealed interface SafetyCommand : ControlCommand {
     data object StartVacuumCheck : SafetyCommand
     data object CancelVacuumCheck : SafetyCommand
+    /** Silences the pre-dive prompt without disabling the feature; cleared when the cover opens. */
+    data object DismissSealCheck : SafetyCommand
+    /** Ends leak monitoring early, keeping whatever confidence tier was reached. */
+    data object SkipToResult : SafetyCommand
     data object OpenSolenoid : SafetyCommand
     data object CloseSolenoid : SafetyCommand
     data object StartVacuumMotor : SafetyCommand

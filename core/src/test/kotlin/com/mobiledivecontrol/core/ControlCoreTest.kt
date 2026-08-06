@@ -3,6 +3,7 @@ package com.mobiledivecontrol.core
 import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ControlCoreTest {
@@ -517,6 +518,97 @@ class ControlCoreTest {
 
         val result = reducer.reduce(state, GalleryCommand.Back)
         assertEquals(AppMode.CameraLive, result.state.mode)
+    }
+
+    @Test
+    fun `phone battery is unknown until read and clamps to the valid range`() {
+        val core = ControlCore()
+        assertNull(core.state.phoneBatteryPercent, "Unknown must never render as 0%.")
+
+        assertEquals(42, core.updatePhoneBattery(42).state.phoneBatteryPercent)
+        assertEquals(100, core.updatePhoneBattery(140).state.phoneBatteryPercent)
+        assertEquals(0, core.updatePhoneBattery(-5).state.phoneBatteryPercent)
+    }
+
+    @Test
+    fun `ok on the housing starts the vacuum check while the cap is off`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+
+        // 0x00 on the cover characteristic means OPEN.
+        val coverOpen = core.handleNotificationPayload(
+            HousingCharacteristic.CoverState.shortHex,
+            byteArrayOf(0x00.toByte()),
+        )
+        assertEquals(SealState.CoverOpen, coverOpen.state.safety.sealState)
+
+        // 0x50 = OK. Borrowed by the seal check only in this window.
+        val start = core.handleNotificationPayload(
+            HousingCharacteristic.ButtonEvents.shortHex,
+            byteArrayOf(0x50.toByte()),
+            Instant.parse("2026-08-04T12:00:00Z"),
+        )
+
+        assertEquals(SealState.Vacuuming, start.state.safety.sealState)
+        assertEquals(
+            listOf(
+                PlatformEffect.ExecuteHousing(HousingCommand.SetSolenoidValve(open = true)),
+                PlatformEffect.ExecuteHousing(HousingCommand.SetVacuumMotor(enabled = true)),
+            ),
+            start.effects,
+        )
+    }
+
+    @Test
+    fun `shutter still captures while the seal prompt is showing`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+        core.handleNotificationPayload(HousingCharacteristic.CoverState.shortHex, byteArrayOf(0x00.toByte()))
+
+        // 0x20 = Shutter.
+        val outcome = core.handleNotificationPayload(
+            HousingCharacteristic.ButtonEvents.shortHex,
+            byteArrayOf(0x20.toByte()),
+            Instant.parse("2026-08-04T12:00:00Z"),
+        )
+
+        assertEquals(listOf(PlatformEffect.ExecuteCamera(CameraCommand.CapturePhoto)), outcome.effects)
+        assertEquals(SealState.CoverOpen, outcome.state.safety.sealState)
+    }
+
+    @Test
+    fun `a raw start vacuum motor command never reaches the housing`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+
+        val outcome = core.dispatch(SafetyCommand.StartVacuumMotor)
+
+        assertTrue(
+            outcome.effects.none { it is PlatformEffect.ExecuteHousing },
+            "Only SafetyStateMachine may start the pump.",
+        )
+        assertTrue(outcome.effects.any { it is PlatformEffect.EmitAlert })
+    }
+
+    @Test
+    fun `a raw housing motor-on command never reaches the housing`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+
+        val motorOn = core.dispatch(HousingCommand.SetVacuumMotor(enabled = true))
+        assertTrue(
+            motorOn.effects.none { it is PlatformEffect.ExecuteHousing },
+            "The generic housing passthrough must not arm the pump.",
+        )
+
+        // Motor-off stays a passthrough — an emergency stop must always get through.
+        val motorOff = core.dispatch(HousingCommand.SetVacuumMotor(enabled = false))
+        assertEquals(
+            listOf(PlatformEffect.ExecuteHousing(HousingCommand.SetVacuumMotor(enabled = false))),
+            motorOff.effects,
+        )
     }
 
     @Test

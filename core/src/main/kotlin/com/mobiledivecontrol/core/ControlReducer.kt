@@ -42,10 +42,7 @@ class ControlReducer(
         is CameraCommand -> reduceCamera(state, command, repeatCount)
         is PhoneControlCommand -> reducePhoneControl(state, command)
         is SafetyCommand -> reduceSafety(state, command)
-        is HousingCommand -> Reduction(
-            state = state,
-            effects = listOf(PlatformEffect.ExecuteHousing(command)),
-        )
+        is HousingCommand -> reduceHousing(state, command)
         is SystemCommand -> reduceSystem(state, command)
         is GalleryCommand -> reduceGallery(state, command)
     }
@@ -164,6 +161,38 @@ class ControlReducer(
             state = state.copy(
                 housing = state.housing.copy(batteryPercent = level),
             ),
+        )
+    }
+
+    /**
+     * Phone battery, clamped to 0..100.
+     *
+     * Null in [AppState.phoneBatteryPercent] means "not read yet" and must render as unknown;
+     * clamping here keeps an out-of-range platform reading from ever looking like a flat
+     * battery, which is the one reading a diver would act on.
+     */
+    fun primeVerifiedVacuum(
+        state: AppState,
+        kpa: Double,
+        confidence: SealConfidence,
+        startedAtEpochMs: Long?,
+        recordedAtEpochMs: Long?,
+    ): Reduction {
+        return Reduction(
+            state = state.copy(
+                safety = state.safety.copy(
+                    verifiedVacuumKpa = kpa,
+                    verifiedVacuumConfidence = confidence,
+                    verifiedVacuumStartedAtEpochMs = startedAtEpochMs,
+                    verifiedVacuumRecordedAtEpochMs = recordedAtEpochMs,
+                ),
+            ),
+        )
+    }
+
+    fun updatePhoneBattery(state: AppState, percent: Int): Reduction {
+        return Reduction(
+            state = state.copy(phoneBatteryPercent = percent.coerceIn(0, 100)),
         )
     }
 
@@ -344,6 +373,25 @@ class ControlReducer(
         }
     }
 
+    /**
+     * Housing commands pass straight through to the transport — with one exception.
+     *
+     * Starting the pump is the only command here that can damage hardware, and it is only
+     * safe as part of the workflow that confirmed the cover is open and armed a timeout.
+     * [SafetyStateMachine] emits its motor-on effect directly into [Reduction.effects] and
+     * never travels this path, so refusing it here costs the workflow nothing and leaves no
+     * dispatchable command that can start the motor.
+     */
+    private fun reduceHousing(state: AppState, command: HousingCommand): Reduction {
+        if (command is HousingCommand.SetVacuumMotor && command.enabled) {
+            return warning(state, "Vacuum motor starts only from the seal-check workflow.")
+        }
+        return Reduction(
+            state = state,
+            effects = listOf(PlatformEffect.ExecuteHousing(command)),
+        )
+    }
+
     private fun reduceSafety(state: AppState, command: SafetyCommand): Reduction = when (command) {
         SafetyCommand.StartVacuumCheck -> mergeSafetyResult(
             state = state,
@@ -357,6 +405,20 @@ class ControlReducer(
             result = safetyStateMachine.apply(
                 state = state.safety,
                 signal = SafetySignal.CancelVacuumCheckRequested,
+            ),
+        )
+        SafetyCommand.DismissSealCheck -> mergeSafetyResult(
+            state = state,
+            result = safetyStateMachine.apply(
+                state = state.safety,
+                signal = SafetySignal.DismissSealCheckRequested,
+            ),
+        )
+        SafetyCommand.SkipToResult -> mergeSafetyResult(
+            state = state,
+            result = safetyStateMachine.apply(
+                state = state.safety,
+                signal = SafetySignal.SkipToResultRequested,
             ),
         )
         SafetyCommand.ResetSealState -> mergeSafetyResult(
@@ -374,9 +436,13 @@ class ControlReducer(
             state = state,
             effects = listOf(PlatformEffect.ExecuteHousing(HousingCommand.SetSolenoidValve(open = false))),
         )
-        SafetyCommand.StartVacuumMotor -> Reduction(
-            state = state,
-            effects = listOf(PlatformEffect.ExecuteHousing(HousingCommand.SetVacuumMotor(enabled = true))),
+        // Deliberately NOT a passthrough. A motor-on effect may only originate inside
+        // SafetyStateMachine, which is the only place that has confirmed the cover is open,
+        // armed a timeout, and owns the stop condition. A raw start here would run the pump
+        // against a sealed shell with nothing to turn it off.
+        SafetyCommand.StartVacuumMotor -> warning(
+            state,
+            "Vacuum motor starts only from the seal-check workflow.",
         )
         SafetyCommand.StopVacuumMotor -> Reduction(
             state = state,
@@ -1244,9 +1310,16 @@ class ControlReducer(
     }
 
     private fun mergeSafetyResult(state: AppState, result: SafetyMachineResult): Reduction {
+        // When the machine clears its own warning, the banner that warning produced has to go
+        // with it — otherwise a resolved seal warning outlives the condition. Warnings from
+        // other subsystems (BLE, permissions) are left alone.
+        val safetyWarningCleared = state.safety.warning != null && result.state.warning == null
+        val carriedWarning = state.lastWarning
+            .takeUnless { safetyWarningCleared && it == state.safety.warning }
+
         val nextState = state.copy(
             safety = result.state,
-            lastWarning = result.note ?: result.state.warning ?: state.lastWarning,
+            lastWarning = result.note ?: result.state.warning ?: carriedWarning,
         )
         return Reduction(
             state = nextState,
