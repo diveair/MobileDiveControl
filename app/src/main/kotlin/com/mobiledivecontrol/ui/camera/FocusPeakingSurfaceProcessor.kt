@@ -10,6 +10,7 @@ import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import androidx.camera.core.SurfaceOutput
@@ -46,10 +47,11 @@ varying vec2 vTex;
 uniform mat4 uSTM;
 void main() {
     gl_Position = aPos;
-    vec2 tex = (uSTM * vec4(aTex, 0.0, 1.0)).xy;
-    // Device preview is arriving rotated clockwise in the shader path.
-    // Rotate sampled texture 90 deg counter-clockwise to match landscape UI.
-    vTex = vec2(1.0 - tex.y, tex.x);
+    // uSTM is the CameraX-adjusted transform (updateTransformMatrix), which already
+    // encodes every rotation/crop the OUTPUT surface expects — with or without
+    // stream sharing. No hand-tuned rotation may live here: it would be correct for
+    // exactly one pipeline shape and wrong the moment a use case is added.
+    vTex = (uSTM * vec4(aTex, 0.0, 1.0)).xy;
 }
 """
 
@@ -81,7 +83,33 @@ void main() {
     float gy = (bl + 2.0*bc + br) - (tl + 2.0*tc + tr);
     float edge = sqrt(gx*gx + gy*gy);
 
-    if (edge > uThr) {
+    // Contrast-normalized response: dividing by local mean luma makes the measure
+    // relative, so in-focus texture peaks equally in shadow and in light instead of
+    // only the brightest edges crossing a fixed threshold.
+    float mean = (tl + tc + tr + ml + mr + bl + bc + br) * 0.125;
+    float norm = edge / (mean + 0.05);
+
+    // Dual-scale sharpness ratio — the true focus discriminator. A genuinely sharp
+    // edge completes its transition within one pixel, so its fine-pitch gradient
+    // matches its coarse-pitch gradient (ratio near 1). A defocused edge is a ramp:
+    // the 1-px gradient sees only a fraction of the step the 2-px gradient sees
+    // (ratio near 0.5). Vendor sharpening halos and plain contrast cannot fake this.
+    float l2 = dot(texture2D(uSamp, vTex + uStep*vec2(-2.0, 0.0)).rgb, w);
+    float r2 = dot(texture2D(uSamp, vTex + uStep*vec2( 2.0, 0.0)).rgb, w);
+    float u2 = dot(texture2D(uSamp, vTex + uStep*vec2( 0.0,-2.0)).rgb, w);
+    float d2 = dot(texture2D(uSamp, vTex + uStep*vec2( 0.0, 2.0)).rgb, w);
+    float cgx = r2 - l2;
+    float cgy = d2 - u2;
+    float coarse = 4.0 * sqrt(cgx*cgx + cgy*cgy);
+    float ratio = edge / (coarse + 0.02);
+
+    // Blown highlights carry steep gradients whether or not they are in focus — a
+    // lamp halo peaks at any lens position. Never peak on or beside saturation.
+    float lc = dot(c.rgb, w);
+    // 0.55, not the theoretical ~0.9: the vendor ISP's noise reduction spreads even a
+    // perfectly focused edge across 2-3 pixels, which alone costs a third of the ratio.
+    // Genuine defocus sits near 0.3-0.4, so the margin holds.
+    if (norm > uThr && ratio > 0.55 && lc < 0.95 && mean < 0.95) {
         gl_FragColor = vec4(0.0, 0.9, 0.0, 1.0);
     } else {
         gl_FragColor = c;
@@ -95,7 +123,15 @@ void main() {
 
     // ── Public knobs ──────────────────────────────────────────────────
     @Volatile var peakingEnabled = false
-    @Volatile var peakingThreshold = 0.35f
+
+    /**
+     * Timestamp of the last frame that actually reached the display surface. This is the
+     * pipeline's true heartbeat: PreviewView's stream state only tracks the camera, so it
+     * stays STREAMING while this GL stage silently drops every frame (e.g. the SurfaceView
+     * surface was destroyed in background and eglSwapBuffers fails without throwing).
+     */
+    @Volatile var lastDrawSuccessAtMs = 0L
+    @Volatile var peakingThreshold = 0.9f
 
     // ── GL thread ─────────────────────────────────────────────────────
     private val glThread = HandlerThread("GL-FocusPeak").apply { start() }
@@ -117,6 +153,8 @@ void main() {
     private var outSO: SurfaceOutput? = null
     private var outW = 0
     private var outH = 0
+    private var inW = 0
+    private var inH = 0
 
     // ── Program ───────────────────────────────────────────────────────
     private var prog = 0
@@ -125,7 +163,9 @@ void main() {
     private var lStep = -1; private var lOn = -1; private var lThr = -1
     private var vb: FloatBuffer? = null
     private var tb: FloatBuffer? = null
+    private var lastSwapFailLogAtMs = 0L
     private val stm = FloatArray(16)       // raw SurfaceTexture transform
+    private val outStm = FloatArray(16)    // CameraX-adjusted transform for the output surface
 
     // ──────────────────────────────────────────────────────────────────
     override fun onInputSurface(request: SurfaceRequest) {
@@ -136,10 +176,27 @@ void main() {
                 progInit()
                 bufInit()
                 texInit(sz.width, sz.height)
-                request.provideSurface(inSurf!!, cbExecutor) {
-                    glH.post { releaseIn() }
+                // The release callback must free ONLY the surfaces of THIS request. On a
+                // rebind (camera eviction recovery, lifecycle stop/start) the previous
+                // request's callback fires AFTER the replacement input exists — a blind
+                // releaseIn() here destroyed the NEW SurfaceTexture and left the preview
+                // permanently black while camera frames kept flowing.
+                val st = inST!!
+                val surf = inSurf!!
+                val tex = inTex
+                request.provideSurface(surf, cbExecutor) {
+                    glH.post {
+                        st.release()
+                        surf.release()
+                        if (tex != 0) GLES20.glDeleteTextures(1, intArrayOf(tex), 0)
+                        if (inST === st) {
+                            inST = null
+                            inSurf = null
+                            inTex = 0
+                        }
+                    }
                 }
-                inST!!.setOnFrameAvailableListener({ glH.post { draw() } })
+                st.setOnFrameAvailableListener({ glH.post { draw() } })
             } catch (e: Exception) {
                 Log.e(TAG, "onInputSurface failed", e)
             }
@@ -174,6 +231,9 @@ void main() {
         try {
             st.updateTexImage()
             st.getTransformMatrix(stm)
+            // Ask CameraX what the output surface actually wants: it composes the input
+            // transform with whatever rotation/crop this pipeline shape introduces.
+            outSO?.updateTransformMatrix(outStm, stm)
 
             EGL14.eglMakeCurrent(dpy, outEgl, outEgl, ctx)
             GLES20.glViewport(0, 0, outW, outH)
@@ -184,11 +244,11 @@ void main() {
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inTex)
             GLES20.glUniform1i(lSamp, 0)
 
-            // Use the SurfaceTexture transform directly. Applying the
-            // SurfaceOutput transform here rotated the preview an extra 90 deg
-            // on device because PreviewView already handles display orientation.
-            GLES20.glUniformMatrix4fv(lSTM, 1, false, stm, 0)
-            GLES20.glUniform2f(lStep, 1f / outW, 1f / outH)
+            GLES20.glUniformMatrix4fv(lSTM, 1, false, outStm, 0)
+            // One INPUT pixel per tap: a blurred (out-of-focus) edge spreads its
+            // gradient across many sensor pixels, so at this pitch it reads soft and
+            // stays unpeaked, while the display scale can no longer skew the measure.
+            GLES20.glUniform2f(lStep, 1f / maxOf(inW, 1), 1f / maxOf(inH, 1))
             GLES20.glUniform1f(lOn, if (peakingEnabled) 1f else 0f)
             GLES20.glUniform1f(lThr, peakingThreshold)
 
@@ -200,7 +260,18 @@ void main() {
             GLES20.glEnableVertexAttribArray(lTex)
 
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-            EGL14.eglSwapBuffers(dpy, outEgl)
+            if (EGL14.eglSwapBuffers(dpy, outEgl)) {
+                lastDrawSuccessAtMs = SystemClock.elapsedRealtime()
+            } else {
+                // Swap failure does NOT throw — without this check a dead output surface
+                // (destroyed while backgrounded) looks like a healthy pipeline upstream.
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastSwapFailLogAtMs > 1000L) {
+                    lastSwapFailLogAtMs = now
+                    Log.w(TAG, "eglSwapBuffers failed — output surface dead? err=0x" +
+                        Integer.toHexString(EGL14.eglGetError()))
+                }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "draw error", e)
         }
@@ -259,7 +330,9 @@ void main() {
     }
 
     private fun texInit(w: Int, h: Int) {
-        releaseIn()
+        inST?.setOnFrameAvailableListener(null)
+        inW = w
+        inH = h
         val ids = IntArray(1)
         GLES20.glGenTextures(1, ids, 0)
         inTex = ids[0]

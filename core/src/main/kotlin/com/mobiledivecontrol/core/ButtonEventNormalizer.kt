@@ -11,6 +11,15 @@ data class AcceptedButtonEvent(
 class ButtonEventNormalizer(
     private val duplicateWindow: Duration = Duration.ofMillis(30),
     private val repeatContinuationWindow: Duration = Duration.ofMillis(90),
+    /**
+     * Events exempt from duplicate suppression. The knurled wheel emits one byte per physical
+     * detent; at a fast spin those arrive under 30 ms apart and the window was silently eating
+     * every second detent — half the diver's turn simply vanished (field-measured: a quarter
+     * turn landed half its distance). Detents are inputs, not switch bounce.
+     */
+    private val duplicateExempt: (HousingButtonEvent) -> Boolean = { event ->
+        event == HousingButtonEvent.ZoomIn || event == HousingButtonEvent.ZoomOut
+    },
 ) {
     private var lastEvent: HousingButtonEvent? = null
     private var lastAcceptedAt: Instant? = null
@@ -26,6 +35,7 @@ class ButtonEventNormalizer(
         if (
             previousEvent != null &&
             previousEvent == event &&
+            !duplicateExempt(event) &&
             elapsedSincePrevious != null &&
             elapsedSincePrevious < duplicateWindow
         ) {

@@ -190,6 +190,17 @@ private fun DebugButtonCluster(viewModel: DiveViewModel) {
             ) {
                 viewModel.simulateButton(HousingButtonEvent.ZoomIn)
             }
+            // Forces the link to Ready so the simulated buttons above are actually routed
+            // when no housing is attached.
+            HousingButton(
+                label = "LINK",
+                color = Color.Black,
+                width = 46.dp,
+                backgroundColor = Color.White,
+                borderColor = Color.Black,
+            ) {
+                viewModel.simulateHousingLink()
+            }
         }
         Spacer(modifier = Modifier.height(14.dp))
         Row(

@@ -4,6 +4,8 @@ import java.time.Duration
 
 class ControlReducer(
     private val safetyStateMachine: SafetyStateMachine = SafetyStateMachine(),
+    /** Injectable for tests; the AF rail gate needs wall-clock gaps between inputs. */
+    private val nowMs: () -> Long = { System.currentTimeMillis() },
 ) {
     private data class ManualFocusPreparation(
         val state: AppState,
@@ -250,21 +252,44 @@ class ControlReducer(
                 )
             }
         }
-        CameraCommand.ToggleVideoRecording -> Reduction(
+        // The router only sends Toggle/Start when nothing is recording, so both mean "begin".
+        CameraCommand.ToggleVideoRecording,
+        CameraCommand.StartVideoRecording -> Reduction(
             state = state.copy(
-                camera = state.camera.copy(recording = !state.camera.recording),
+                camera = state.camera.copy(
+                    recording = true,
+                    recordingPaused = false,
+                    recordingStopSelected = false,
+                ),
+            ),
+            effects = listOf(PlatformEffect.ExecuteCamera(CameraCommand.StartVideoRecording)),
+        )
+        CameraCommand.PauseVideoRecording -> Reduction(
+            state = state.copy(
+                camera = state.camera.copy(
+                    recordingPaused = true,
+                    // The chooser always opens on RESUME: the least destructive answer is the
+                    // default, and STOP is one deliberate press away.
+                    recordingStopSelected = false,
+                ),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(command)),
         )
-        CameraCommand.StartVideoRecording -> Reduction(
+        CameraCommand.ResumeVideoRecording -> Reduction(
             state = state.copy(
-                camera = state.camera.copy(recording = true),
+                camera = state.camera.copy(recordingPaused = false),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(command)),
         )
         CameraCommand.StopVideoRecording -> Reduction(
             state = state.copy(
-                camera = state.camera.copy(recording = false),
+                camera = state.camera.copy(
+                    recording = false,
+                    recordingPaused = false,
+                    recordingStopSelected = false,
+                    // Bumped so the gallery thumbnail refreshes with the finished video.
+                    captureCounter = state.camera.captureCounter + 1,
+                ),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(command)),
         )
@@ -274,10 +299,10 @@ class ControlReducer(
         CameraCommand.NavigateRight -> navigateCameraRight(state, repeatCount)
         CameraCommand.Confirm -> confirmCameraSelection(state)
         CameraCommand.Back -> backOutCameraUi(state)
-        CameraCommand.ZoomIn -> reduceCamera(state, CameraCommand.SetZoom(state.camera.zoomFactor + 0.1))
-        CameraCommand.ZoomOut -> reduceCamera(state, CameraCommand.SetZoom(state.camera.zoomFactor - 0.1))
+        CameraCommand.ZoomIn -> handleWheel(state, +1, repeatCount)
+        CameraCommand.ZoomOut -> handleWheel(state, -1, repeatCount)
         is CameraCommand.SetZoom -> {
-            val zoom = command.value.coerceIn(1.0, 8.0)
+            val zoom = command.value.coerceIn(1.0, state.camera.capabilities?.zoomMaxRatio ?: 8.0)
             Reduction(
                 state = state.copy(
                     camera = state.camera.copy(zoomFactor = zoom),
@@ -300,6 +325,37 @@ class ControlReducer(
         CameraCommand.ToggleGrid,
         CameraCommand.ToggleFocusPeaking,
         CameraCommand.RestartCamera -> emitCameraEffect(state, command)
+        is CameraCommand.NudgeSetting -> {
+            val spec = CameraCatalog.settingsFor(
+                state.camera.activeMode,
+                state.camera.deviceVariant,
+                state.camera.detectedLenses,
+                state.camera.capabilities,
+            ).firstOrNull { it.id == command.settingId }
+            if (spec == null) {
+                Reduction(state = state)
+            } else {
+                val currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue
+                val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
+                val minIndex = if (spec.id.endsWith(".manual_focus") && currentIndex > 0) 1 else 0
+                val nextIndex = (currentIndex + command.step).coerceIn(minIndex, spec.options.lastIndex)
+                if (nextIndex == currentIndex) {
+                    Reduction(state = state)
+                } else {
+                    val nextValue = spec.options[nextIndex]
+                    val effect = cameraEffectForSetting(spec.id, nextValue)
+                    Reduction(
+                        state = state.copy(camera = applySettingValue(state.camera, spec.id, nextValue)),
+                        effects = effect?.let { listOf(PlatformEffect.ExecuteCamera(it)) } ?: emptyList(),
+                    )
+                }
+            }
+        }
+        is CameraCommand.UpdateCameraCapabilities -> Reduction(
+            state = state.copy(
+                camera = state.camera.copy(capabilities = command.capabilities),
+            ),
+        )
         is CameraCommand.UpdateDetectedLenses -> {
             val nextCamera = state.camera.copy(detectedLenses = command.lenses)
             Reduction(state = state.copy(camera = nextCamera))
@@ -490,7 +546,62 @@ class ControlReducer(
         SystemCommand.UnlockControls -> Reduction(state = state.copy(controlsLocked = false))
     }
 
+    /**
+     * The physical wheel. What it adjusts follows the diver's attention:
+     *  - inside an open setting menu it edits whichever card UP/DOWN selected, same as
+     *    LEFT/RIGHT — value, sensitivity, focus assist, focus curve;
+     *  - with a setting tile selected in the bottom bar it edits that tile's value;
+     *  - everywhere else — live view, the mode rail, the mode token — it drives the setting
+     *    the diver assigned in the Slider tile (Focus by default; Zoom is the one assignment
+     *    with no spec behind it and keeps the classic ratio behaviour).
+     */
+    private fun handleWheel(state: AppState, step: Int, repeatCount: Int): Reduction {
+        val camera = state.camera
+        if (camera.recording && camera.recordingPaused) {
+            return Reduction(state = state)
+        }
+        if (camera.focusedZone == CameraUiZone.SettingsPanel && camera.settingsEditing) {
+            // Inverted inside an open menu, by field report: the edit cards lay their value
+            // rails out so that wheel-up should travel the same way as LEFT, not RIGHT. The
+            // diver's own Wheel Direction preference stacks on top when the focus VALUE is
+            // what the wheel is driving.
+            val selected = camera.selectedSetting
+            val menuStep = if (selected != null && camera.sliderEditTarget == SliderEditTarget.Value) {
+                focusAwareStep(camera, selected, -step)
+            } else {
+                -step
+            }
+            return adjustSelectedSetting(state, menuStep, repeatCount)
+        }
+        if (camera.focusedZone == CameraUiZone.SettingsPanel) {
+            val selected = camera.selectedSetting
+            if (selected != null && !selected.id.endsWith(CameraCatalog.SLIDER_ASSIGNMENT_SUFFIX)) {
+                return adjustSetting(state, selected, focusAwareStep(camera, selected, step), repeatCount)
+            }
+        }
+        val assigned = CameraCatalog.assignedSliderSpec(camera)
+        if (assigned != null) {
+            return adjustSetting(state, assigned, focusAwareStep(camera, assigned, step), repeatCount)
+        }
+        val maxZoom = camera.capabilities?.zoomMaxRatio ?: 8.0
+        val zoom = (camera.zoomFactor + step * 0.1).coerceIn(1.0, maxZoom)
+        return reduceCamera(state, CameraCommand.SetZoom(zoom))
+    }
+
+    /** While the paused RESUME/STOP chooser is up, LEFT/RIGHT move its selection and nothing else. */
+    private fun pausedChooserNavigation(state: AppState, horizontal: Boolean): Reduction? {
+        val camera = state.camera
+        if (!camera.recording || !camera.recordingPaused) return null
+        if (!horizontal) return Reduction(state = state)
+        return Reduction(
+            state = state.copy(
+                camera = camera.copy(recordingStopSelected = !camera.recordingStopSelected),
+            ),
+        )
+    }
+
     private fun navigateCameraUp(state: AppState, repeatCount: Int = 0): Reduction {
+        pausedChooserNavigation(state, horizontal = false)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
             CameraUiZone.LiveView -> {
@@ -523,6 +634,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraDown(state: AppState, repeatCount: Int = 0): Reduction {
+        pausedChooserNavigation(state, horizontal = false)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
             CameraUiZone.LiveView -> {
@@ -555,6 +667,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraLeft(state: AppState, repeatCount: Int = 0): Reduction {
+        pausedChooserNavigation(state, horizontal = true)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
             CameraUiZone.LiveView -> Reduction(state = state)
@@ -583,6 +696,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraRight(state: AppState, repeatCount: Int = 0): Reduction {
+        pausedChooserNavigation(state, horizontal = true)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
             CameraUiZone.LiveView -> Reduction(state = state.copy(camera = focusModeRail(camera)))
@@ -598,6 +712,15 @@ class ControlReducer(
     }
 
     private fun confirmCameraSelection(state: AppState): Reduction {
+        // OK mirrors the shutter while the paused chooser is up: confirm the selected side.
+        if (state.camera.recording && state.camera.recordingPaused) {
+            val command = if (state.camera.recordingStopSelected) {
+                CameraCommand.StopVideoRecording
+            } else {
+                CameraCommand.ResumeVideoRecording
+            }
+            return reduceCamera(state, command)
+        }
         val camera = state.camera
         return when (camera.focusedZone) {
             CameraUiZone.LiveView -> openSettingsPanel(state, camera.activeMode)
@@ -613,6 +736,10 @@ class ControlReducer(
     }
 
     private fun backOutCameraUi(state: AppState): Reduction {
+        // Back from the paused chooser is the safe answer: keep the recording, resume it.
+        if (state.camera.recording && state.camera.recordingPaused) {
+            return reduceCamera(state, CameraCommand.ResumeVideoRecording)
+        }
         val camera = state.camera
         return when {
             camera.focusedZone == CameraUiZone.SettingsPanel && camera.settingsEditing -> {
@@ -801,11 +928,7 @@ class ControlReducer(
     }
 
     private fun moveSettingsCursor(state: AppState, delta: Int): Reduction {
-        val items = CameraCatalog.settingsBarItems(
-            state.camera.activeMode,
-            state.camera.deviceVariant,
-            state.camera.showMoreSettings
-        )
+        val items = CameraCatalog.settingsBarItems(state.camera)
         val totalItems = items.size
         if (totalItems <= 1) {
             return Reduction(state = state)
@@ -850,11 +973,7 @@ class ControlReducer(
     }
 
     private fun activateHighlightedItem(state: AppState): Reduction {
-        val items = CameraCatalog.settingsBarItems(
-            state.camera.activeMode,
-            state.camera.deviceVariant,
-            state.camera.showMoreSettings
-        )
+        val items = CameraCatalog.settingsBarItems(state.camera)
         val item = items.getOrNull(state.camera.settingsCursor) ?: return Reduction(state = state)
         return when (item) {
             is BottomBarItem.ModesButton -> {
@@ -885,9 +1004,7 @@ class ControlReducer(
             is BottomBarItem.MoreSettings -> {
                 val nextShowMore = !state.camera.showMoreSettings
                 val nextItems = CameraCatalog.settingsBarItems(
-                    state.camera.activeMode,
-                    state.camera.deviceVariant,
-                    nextShowMore
+                    state.camera.copy(showMoreSettings = nextShowMore),
                 )
                 val nextCursor = state.camera.settingsCursor.coerceAtMost(nextItems.lastIndex)
                 val nextCamera = state.camera.copy(
@@ -916,11 +1033,7 @@ class ControlReducer(
     }
 
     private fun selectedBottomBarItem(camera: CameraState): BottomBarItem? {
-        val items = CameraCatalog.settingsBarItems(
-            camera.activeMode,
-            camera.deviceVariant,
-            camera.showMoreSettings,
-        )
+        val items = CameraCatalog.settingsBarItems(camera)
         if (items.isEmpty()) {
             return null
         }
@@ -977,6 +1090,11 @@ class ControlReducer(
 
     private fun adjustSelectedSetting(state: AppState, step: Int, repeatCount: Int = 0): Reduction {
         val spec = state.camera.selectedSetting ?: return Reduction(state = state)
+        return adjustSetting(state, spec, step, repeatCount)
+    }
+
+    /** [adjustSelectedSetting] with the spec chosen by the caller — the wheel resolves its own. */
+    private fun adjustSetting(state: AppState, spec: CameraSettingSpec, step: Int, repeatCount: Int = 0): Reduction {
         val manualFocusPreparation = if (spec.id.endsWith(".manual_focus")) {
             prepareStateForManualFocus(state, spec)
         } else {
@@ -995,6 +1113,9 @@ class ControlReducer(
         val adjustingFocusCurve = preparedCamera.settingsEditing &&
                 spec.id.endsWith(".manual_focus") &&
                 editTarget == SliderEditTarget.FocusCurve
+        val adjustingFocusDirection = preparedCamera.settingsEditing &&
+                spec.id.endsWith(".manual_focus") &&
+                editTarget == SliderEditTarget.FocusDirection
 
         return if (adjustingSensitivity) {
             if (repeatCount > 0 && repeatCount % 4 != 0) {
@@ -1048,6 +1169,21 @@ class ControlReducer(
                 ),
                 effects = manualFocusPreparation.effects,
             )
+        } else if (adjustingFocusDirection) {
+            val dirSpec = CameraCatalog.focusDirectionSpec(spec.id)
+            val currentValue = preparedCamera.settingValues[dirSpec.id] ?: dirSpec.defaultValue
+            val nextValue = advanceOption(
+                currentValue = currentValue,
+                options = dirSpec.options,
+                step = step,
+                wrap = true,
+            )
+            Reduction(
+                state = preparedState.copy(
+                    camera = applySettingValue(preparedCamera, dirSpec.id, nextValue),
+                ),
+                effects = manualFocusPreparation.effects,
+            )
         } else {
             val isFocusSetting = spec.id.endsWith(".manual_focus")
             val currentSensitivity = preparedCamera.sliderSensitivities[spec.id] ?: SliderSensitivity.DEFAULT
@@ -1056,41 +1192,137 @@ class ControlReducer(
                 if (!supportsManualFocusForSelectedLens(preparedCamera, spec)) {
                     return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
                 }
-                if (repeatCount > 0 && !shouldApplyFocusRepeat(currentSensitivity, repeatCount)) {
-                    return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
-                }
                 val currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue
                 val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
-                val nextIndex = if (repeatCount > 0) {
-                    // During hold, don't cross into AF. AF remains reachable only
-                    // on a fresh press so long-holds stay in manual focus space.
-                    val minIndex = if (currentIndex > 0) 1 else 0
-                    (currentIndex + step).coerceIn(minIndex, spec.options.lastIndex)
+                val now = nowMs()
+                val gapMs = now - preparedCamera.lastFocusInputAtMs
+                val usable = spec.options.size - 1 // the numeric scale, AF excluded
+                val motor = sliderMotorFor(usable, currentSensitivity, gapMs, held = repeatCount > 0)
+
+                // A HELD button deposits run-time, not an immediate jump: the motor walks the
+                // value tick by tick at this sensitivity's full rate for as long as repeats
+                // keep arriving, and the platform discards leftovers when they stop.
+                if (repeatCount > 0) {
+                    val stamped = preparedCamera.copy(lastFocusInputAtMs = now)
+                    return Reduction(
+                        state = preparedState.copy(camera = stamped),
+                        effects = manualFocusPreparation.effects + listOf(
+                            PlatformEffect.RampSetting(
+                                settingId = spec.id,
+                                steps = motor.creditTicks,
+                                step = step,
+                                intervalMs = motor.intervalMs,
+                                maxTicksPerInterval = motor.maxTicksPerInterval,
+                            ),
+                        ),
+                    )
+                }
+
+                // Fresh press: the state moves exactly ONE tick now — 0.01, 0.02, 0.03, every
+                // step really visited — and the rest of this detent's worth plays out through
+                // the motor at the sensitivity's rate.
+                val raw = currentIndex + step
+                // AF is behind a REAL stop at both rails: the wheel must rest before further
+                // travel may cross into auto. A spin that never pauses parks at the rail.
+                val restedAtRail = gapMs >= FOCUS_AF_PAUSE_MS
+                val nextIndex = when {
+                    // From AF a press enters the scale at whichever end it points to.
+                    currentIndex == 0 && step < 0 -> spec.options.lastIndex
+                    currentIndex == 0 -> 1
+                    // At 0.00 pressing outward: into AF only after the rest.
+                    raw == 0 -> if (restedAtRail) 0 else 1
+                    // At 1.00 pressing outward: same gate on the infinity side.
+                    raw > spec.options.lastIndex ->
+                        if (restedAtRail) 0 else spec.options.lastIndex
+                    else -> raw
+                }
+                val rampEffects = if (motor.creditTicks > 1 && nextIndex != currentIndex && nextIndex > 0) {
+                    // Velocity-matched pacing: this click's ticks are spread across the diver's
+                    // own clicking cadence, so slow turning is one continuous creep instead of
+                    // a full-rate lurch after every detent. The stop window stretches with the
+                    // cadence too — a slow clicker is still "turning" between clicks — while a
+                    // fast spin keeps the tight stop-on-stop feel.
+                    val paced = (gapMs / motor.creditTicks).coerceIn(motor.intervalMs, 120L)
+                    listOf(
+                        PlatformEffect.RampSetting(
+                            settingId = spec.id,
+                            steps = motor.creditTicks - 1,
+                            step = step,
+                            intervalMs = paced,
+                            maxTicksPerInterval = motor.maxTicksPerInterval,
+                            stopTimeoutMs = (gapMs * 3 / 2).coerceIn(250L, 750L),
+                        ),
+                    )
                 } else {
-                    when {
-                        currentIndex + step < 0 -> spec.options.lastIndex
-                        currentIndex + step > spec.options.lastIndex -> 0
-                        else -> currentIndex + step
-                    }
+                    emptyList()
                 }
                 val nextValue = spec.options[nextIndex]
                 val nextCamera = applySettingValue(preparedCamera, spec.id, nextValue)
+                    .copy(lastFocusInputAtMs = now)
                 val effect = cameraEffectForSetting(spec.id, nextValue)
                 Reduction(
                     state = preparedState.copy(camera = nextCamera),
                     effects = manualFocusPreparation.effects +
-                        (effect?.let { listOf(PlatformEffect.ExecuteCamera(it)) } ?: emptyList()),
+                        (effect?.let { listOf(PlatformEffect.ExecuteCamera(it)) } ?: emptyList()) +
+                        rampEffects,
+                )
+            } else if (spec.kind == CameraSettingKind.Slider) {
+                // Every slider rides the same motor as focus — ISO, shutter, white balance,
+                // exposure — scaled to its own ladder, per the generalisation rule.
+                val now = nowMs()
+                val gapMs = now - preparedCamera.lastFocusInputAtMs
+                val motor = sliderMotorFor(
+                    spec.options.size,
+                    currentSensitivity,
+                    gapMs,
+                    held = repeatCount > 0,
+                )
+                if (repeatCount > 0) {
+                    val stamped = preparedCamera.copy(lastFocusInputAtMs = now)
+                    return Reduction(
+                        state = preparedState.copy(camera = stamped),
+                        effects = manualFocusPreparation.effects + listOf(
+                            PlatformEffect.RampSetting(
+                                settingId = spec.id,
+                                steps = motor.creditTicks,
+                                step = step,
+                                intervalMs = motor.intervalMs,
+                                maxTicksPerInterval = motor.maxTicksPerInterval,
+                            ),
+                        ),
+                    )
+                }
+                val nextValue = advanceOption(
+                    currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue,
+                    options = spec.options,
+                    step = step,
+                    wrap = false,
+                )
+                val rampEffects = if (motor.creditTicks > 1) {
+                    val paced = (gapMs / motor.creditTicks).coerceIn(motor.intervalMs, 120L)
+                    listOf(
+                        PlatformEffect.RampSetting(
+                            settingId = spec.id,
+                            steps = motor.creditTicks - 1,
+                            step = step,
+                            intervalMs = paced,
+                            maxTicksPerInterval = motor.maxTicksPerInterval,
+                            stopTimeoutMs = (gapMs * 3 / 2).coerceIn(250L, 750L),
+                        ),
+                    )
+                } else {
+                    emptyList()
+                }
+                val nextCamera = applySettingValue(preparedCamera, spec.id, nextValue)
+                    .copy(lastFocusInputAtMs = now)
+                val effect = cameraEffectForSetting(spec.id, nextValue)
+                Reduction(
+                    state = preparedState.copy(camera = nextCamera),
+                    effects = manualFocusPreparation.effects +
+                        (effect?.let { listOf(PlatformEffect.ExecuteCamera(it)) } ?: emptyList()) +
+                        rampEffects,
                 )
             } else {
-                // Other sliders: sensitivity controls rate-limiting during holds
-                if (repeatCount > 0) {
-                    val skipInterval = ((100 - currentSensitivity.level) / 10).coerceAtLeast(1)
-                    val shouldApply = repeatCount % skipInterval == 0
-                    if (!shouldApply) {
-                        return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
-                    }
-                }
-
                 val shouldWrap = spec.kind != CameraSettingKind.Slider
                 val nextValue = advanceOption(
                     currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue,
@@ -1139,6 +1371,108 @@ class ControlReducer(
         return options[nextIndex]
     }
 
+    private companion object {
+        /** Fastest ramp cadence: one frame. Slower ladders stretch the interval instead. */
+        const val FOCUS_RAMP_TICK_MS = 16L
+
+        /** How long the wheel must rest at a rail before further travel may enter AF. */
+        const val FOCUS_AF_PAUSE_MS = 600L
+
+        /**
+         * Wheel events the housing delivers in a fast quarter turn — the calibration anchor
+         * for "quarter turn = full sweep at sensitivity 100". EMPIRICAL, not assumed: two
+         * field measurements triangulate it (42 ticks at 21/event pre-dedup-fix => 2 events
+         * of which half were dropped; 48 ticks at ~12/event post-fix => 4 events). The
+         * housing firmware paces wheel notifications, so this is events, not physical clicks.
+         */
+        const val QUARTER_TURN_DETENTS = 4.0
+
+        /** A held button tops the motor up with this much run-time per repeat event. */
+        const val HOLD_TOPUP_MS = 120L
+
+        /** Wheel rate at or below which a detent is worth its minimum (fine focus). */
+        const val VELOCITY_SLOW_DPS = 2.5
+
+        /** Wheel rate at which a detent carries its full sensitivity-scaled worth. */
+        const val VELOCITY_FAST_DPS = 12.0
+    }
+
+    private data class SliderMotor(
+        val creditTicks: Int,
+        val intervalMs: Long,
+        val maxTicksPerInterval: Int,
+    )
+
+    /**
+     * The one motor behind every slider-kind setting. Three inputs, per the field spec:
+     *
+     *  - **Wheel velocity**: a slow, deliberate click is always worth exactly one tick —
+     *    precision survives every sensitivity — and a click's worth grows with spin speed.
+     *  - **Sensitivity**: scales both a click's worth (quadratically, so below 100 the wheel
+     *    is more granular and the far end costs more turns) and the playback rate (the full
+     *    ladder plays in ~450 ms at 100, stretching toward ~2.4 s at the bottom).
+     *  - **The ladder itself**: everything is proportional to the setting's own option count,
+     *    so a quarter turn at sensitivity 100 sweeps ISO's nine rungs and focus's hundred and
+     *    one alike, end to end.
+     *
+     * Held buttons don't deposit distance per event; they top the motor up with enough ticks
+     * to run continuously until the next repeat arrives — smooth motion at the sensitivity's
+     * full rate, stopping when the button does.
+     */
+    private fun sliderMotorFor(
+        usableTicks: Int,
+        sensitivity: SliderSensitivity,
+        gapMs: Long,
+        held: Boolean,
+    ): SliderMotor {
+        // Re-centred by field calibration: the full-sweep-per-quarter-turn feel lives at the
+        // MIDPOINT (50), with real headroom above it — 100 plays the ladder in ~220 ms.
+        val sweepMs = (2400L - (sensitivity.level - 1) * 40L).coerceAtLeast(220L)
+        val perTickMs = (sweepMs / usableTicks.coerceAtLeast(1)).coerceAtLeast(1L)
+        val intervalMs: Long
+        val maxTicks: Int
+        if (perTickMs >= FOCUS_RAMP_TICK_MS) {
+            intervalMs = perTickMs
+            maxTicks = 1
+        } else {
+            intervalMs = FOCUS_RAMP_TICK_MS
+            maxTicks = ((FOCUS_RAMP_TICK_MS + perTickMs - 1) / perTickMs).toInt()
+        }
+        val credit = if (held) {
+            (((HOLD_TOPUP_MS + intervalMs - 1) / intervalMs).toInt() * maxTicks).coerceAtLeast(1)
+        } else {
+            // Turn RATE, as a smooth ramp rather than a staircase — this is the wheel's
+            // analogue of the native slider, where a faster drag traverses more of the
+            // ruler for the same gesture. Linear, not exponential: the diver must still be
+            // able to land on a value with gloves on.
+            val detentsPerSecond = if (gapMs <= 0L) VELOCITY_FAST_DPS else 1000.0 / gapMs
+            val velocity = ((detentsPerSecond - VELOCITY_SLOW_DPS) /
+                (VELOCITY_FAST_DPS - VELOCITY_SLOW_DPS)).coerceIn(0.0, 1.0)
+            // Above the midpoint the velocity gate progressively stands down: at 100 even a
+            // slow, deliberate click carries part of its full worth — the diver chose raw
+            // sensitivity over the one-tick precision guarantee, which remains absolute at
+            // and below 50.
+            val sensFloor = ((sensitivity.level - 50).coerceAtLeast(0) / 50.0)
+                .let { it * it } * 0.35
+            val effectiveVelocity = maxOf(velocity, sensFloor)
+            // Sensitivity 100 spends the WHOLE ladder in one quarter turn, and not a step
+            // more: perDetent = ladder / quarter-turn detents. Below that it falls away
+            // quadratically, so mid-scale is a full turn end to end and the low end is a
+            // fine-focus vernier — while the one-step-per-detent floor guarantees every
+            // 0.01 remains reachable at any sensitivity.
+            val sensFactor = (sensitivity.level / 100.0).let { it * it }
+            val perDetent = usableTicks / QUARTER_TURN_DETENTS * sensFactor * effectiveVelocity
+            // Round UP, so the quarter-turn guarantee is exact rather than one step short of
+            // the rail (a ladder rarely divides evenly by the quarter-turn detent count).
+            kotlin.math.ceil(kotlin.math.max(1.0, perDetent)).toInt()
+        }
+        return SliderMotor(credit, intervalMs, maxTicks)
+    }
+
+    /** The wheel's step over a focus scale, honouring the per-mode Wheel Direction choice. */
+    private fun focusAwareStep(camera: CameraState, spec: CameraSettingSpec, base: Int): Int =
+        if (spec.id.endsWith(".manual_focus") && CameraCatalog.focusWheelReversed(camera)) -base else base
+
     private fun cycleSensitivity(current: SliderSensitivity, step: Int): SliderSensitivity {
         return SliderSensitivity.of(current.level + step)
     }
@@ -1153,6 +1487,9 @@ class ControlReducer(
         }
         if (focusCurveSpec(camera, spec) != null) {
             targets += SliderEditTarget.FocusCurve
+        }
+        if (spec.id.endsWith(".manual_focus")) {
+            targets += SliderEditTarget.FocusDirection
         }
         return targets
     }
@@ -1189,16 +1526,7 @@ class ControlReducer(
         return currentLens != "fixed"
     }
 
-    private fun shouldApplyFocusRepeat(
-        sensitivity: SliderSensitivity,
-        repeatCount: Int,
-    ): Boolean {
-        if (repeatCount <= 0) {
-            return true
-        }
-        val repeatStride = 1 + ((SliderSensitivity.MAX.level - sensitivity.level) / 5)
-        return repeatCount % repeatStride == 0
-    }
+
 
     private fun cameraEffectForSetting(settingId: String, value: String): CameraCommand? = when (settingId) {
         "photo.flash",
@@ -1278,7 +1606,8 @@ class ControlReducer(
     }
 
     private fun parseExposureCompensation(value: String): Double? =
-        value.replace("+", "").toDoubleOrNull()
+        // "Auto" is the explicit zero-offset entry: auto-exposure with no compensation.
+        if (value == "Auto") 0.0 else value.replace("+", "").toDoubleOrNull()
 
     private fun parseShutterSpeedNs(value: String): Long? {
         if (value == "Auto") {

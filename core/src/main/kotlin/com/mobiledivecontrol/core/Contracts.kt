@@ -111,6 +111,7 @@ enum class SliderEditTarget {
     Sensitivity,
     FocusAssist,
     FocusCurve,
+    FocusDirection,
 }
 
 enum class FocusCurveMode {
@@ -208,6 +209,17 @@ data class HousingState(
 
 data class CameraState(
     val recording: Boolean = false,
+    /** True while an active recording is paused and the RESUME/STOP chooser owns the buttons. */
+    val recordingPaused: Boolean = false,
+    /** Which side of the paused chooser is selected: false = RESUME (default), true = STOP. */
+    val recordingStopSelected: Boolean = false,
+    /**
+     * What this phone's camera hardware actually offers, probed at bind time by the platform
+     * layer. Null until the probe reports (or forever, in the simulator) — the static catalog
+     * stands in. The catalog clips its option ladders to these ranges and drops controls the
+     * hardware cannot honour, per the product rule that a dead control must never render live.
+     */
+    val capabilities: CameraCapabilities? = null,
     val zoomFactor: Double = 1.0,
     val capabilityTier: String = "Samsung Galaxy S26 Camera Shell",
     val deviceVariant: GalaxyDeviceVariant = GalaxyDeviceVariant.S26Ultra,
@@ -232,6 +244,11 @@ data class CameraState(
     val selectedControlIndex: Int = 0,
     val showMoreSettings: Boolean = false,
     val captureCounter: Int = 0,
+    /**
+     * When focus last took a user input, for the AF gate: entering AF from either rail
+     * requires the wheel to STOP first — a genuine pause — and then travel again.
+     */
+    val lastFocusInputAtMs: Long = 0L,
 )
 
 val CameraState.selectedControl: CameraControl
@@ -418,6 +435,8 @@ sealed interface CameraCommand : ControlCommand {
     data object ToggleVideoRecording : CameraCommand
     data object StartVideoRecording : CameraCommand
     data object StopVideoRecording : CameraCommand
+    data object PauseVideoRecording : CameraCommand
+    data object ResumeVideoRecording : CameraCommand
     data object NavigateUp : CameraCommand
     data object NavigateDown : CameraCommand
     data object NavigateLeft : CameraCommand
@@ -438,7 +457,10 @@ sealed interface CameraCommand : ControlCommand {
     data class SetCaptureFormat(val value: String) : CameraCommand
     data class SetHdrLogMode(val value: String) : CameraCommand
     data class SetFilter(val value: String) : CameraCommand
+    /** One single tick of a slider setting — the ramp engine's unit of motion. */
+    data class NudgeSetting(val settingId: String, val step: Int) : CameraCommand
     data class UpdateDetectedLenses(val lenses: List<String>) : CameraCommand
+    data class UpdateCameraCapabilities(val capabilities: CameraCapabilities) : CameraCommand
     data object OpenGallery : CameraCommand
     data object ToggleGrid : CameraCommand
     data object ToggleFocusPeaking : CameraCommand
@@ -531,6 +553,22 @@ sealed interface PlatformEffect {
     data class EmitAlert(val priority: AlertPriority, val message: String) : PlatformEffect
     data class ScheduleReconnect(val attempt: Int, val delay: Duration) : PlatformEffect
     data object ExportDiagnostics : PlatformEffect
+
+    /**
+     * Asks the platform to feed [steps] further [CameraCommand.NudgeSetting] ticks back into
+     * the core, one every [intervalMs]. This is how a high-sensitivity wheel click traverses
+     * EVERY 0.01 focus step visibly instead of jumping: the state itself walks the ladder.
+     */
+    data class RampSetting(
+        val settingId: String,
+        val steps: Int,
+        val step: Int,
+        val intervalMs: Long,
+        /** Drain ceiling per interval — sensitivity's second job: the sweep RATE. */
+        val maxTicksPerInterval: Int = 3,
+        /** Wheel-silence window after which undrained ticks are discarded (stop-on-stop). */
+        val stopTimeoutMs: Long = 200L,
+    ) : PlatformEffect
     data object LoadGalleryItems : PlatformEffect
     data class DeleteGalleryItem(val item: GalleryItem) : PlatformEffect
     data class CreateGalleryFolder(val name: String) : PlatformEffect
@@ -565,6 +603,22 @@ data class ProcessingOutcome(
     val effects: List<PlatformEffect> = emptyList(),
     val notes: List<String> = emptyList(),
     val exportedFiles: Map<String, String> = emptyMap(),
+)
+
+/**
+ * Platform-neutral description of what the physical camera can do. Android fills this from
+ * Camera2 [android.hardware.camera2.CameraCharacteristics]; an iOS build would fill it from
+ * AVFoundation. The pure-Kotlin core never knows which.
+ */
+data class CameraCapabilities(
+    val isoMin: Int? = null,
+    val isoMax: Int? = null,
+    val exposureMinNs: Long? = null,
+    val exposureMaxNs: Long? = null,
+    val evMin: Double? = null,
+    val evMax: Double? = null,
+    val manualFocusSupported: Boolean? = null,
+    val zoomMaxRatio: Double? = null,
 )
 
 sealed interface BottomBarItem {

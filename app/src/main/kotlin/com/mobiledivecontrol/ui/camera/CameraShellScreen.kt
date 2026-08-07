@@ -94,6 +94,7 @@ fun CameraShellScreen(
     effects: List<PlatformEffect> = emptyList(),
     onEffectsConsumed: () -> Unit = {},
     onDetectedLenses: ((List<String>) -> Unit)? = null,
+    onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
     /** True while the housing-link banner occupies the top strip, so the mode pill yields to it. */
     housingLinkAlert: Boolean = false,
     modifier: Modifier = Modifier,
@@ -112,18 +113,28 @@ fun CameraShellScreen(
                 effects = effects,
                 onEffectsConsumed = onEffectsConsumed,
                 onDetectedLenses = onDetectedLenses,
+                onCapabilities = onCapabilities,
             )
         } else {
             CameraPreviewPlaceholder()
         }
 
-        // Top-left: recording badge
+        // Top-left: recording badge with the live elapsed clock
         RecordingBadge(
             visible = cameraState.recording,
+            paused = cameraState.recordingPaused,
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(start = 18.dp, top = 72.dp),
         )
+
+        // Centre: the paused chooser. LEFT/RIGHT move the selection, SHUTTER or OK confirms.
+        if (cameraState.recording && cameraState.recordingPaused) {
+            RecordingPausedChooser(
+                stopSelected = cameraState.recordingStopSelected,
+                modifier = Modifier.align(Alignment.Center),
+            )
+        }
 
         // Center: zoom overlay (fades after 1.4s)
         ZoomOverlay(
@@ -563,6 +574,14 @@ private fun BottomSettingsTray(
                 val focusCurveValue = focusCurveSpec?.let { curveSpec ->
                     CameraCatalog.currentValue(cameraState, curveSpec)
                 }
+                val focusDirectionSpec = if (spec.id.endsWith(".manual_focus")) {
+                    CameraCatalog.focusDirectionSpec(spec.id)
+                } else {
+                    null
+                }
+                val focusDirectionValue = focusDirectionSpec?.let { dirSpec ->
+                    CameraCatalog.currentValue(cameraState, dirSpec)
+                }
 
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -626,6 +645,20 @@ private fun BottomSettingsTray(
                                     currentValue = focusCurveValue,
                                     options = focusCurveSpec.options,
                                     displayTransform = ::focusCurveDisplayName,
+                                )
+                            }
+                        }
+
+                        if (focusDirectionSpec != null && focusDirectionValue != null) {
+                            BottomEditCard(
+                                title = "Wheel Direction",
+                                value = focusDirectionValue,
+                                selected = cameraState.sliderEditTarget == SliderEditTarget.FocusDirection,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                ToggleOptionDisplay(
+                                    currentValue = focusDirectionValue,
+                                    options = focusDirectionSpec.options,
                                 )
                             }
                         }
@@ -1283,29 +1316,91 @@ private fun ToggleOptionDisplay(
 @Composable
 private fun RecordingBadge(
     visible: Boolean,
+    paused: Boolean,
     modifier: Modifier = Modifier,
 ) {
     AnimatedVisibility(visible = visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
+        val durationMs by RecordingClock.durationMs
+        val seconds = durationMs / 1000
+        val clock = "%d:%02d".format(seconds / 60, seconds % 60)
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
-                .background(DiveColors.Critical.copy(alpha = 0.88f), RoundedCornerShape(16.dp))
+                .background(
+                    if (paused) DiveColors.Warning.copy(alpha = 0.92f)
+                    else DiveColors.Critical.copy(alpha = 0.88f),
+                    RoundedCornerShape(16.dp),
+                )
                 .padding(horizontal = 12.dp, vertical = 8.dp),
         ) {
             Icon(
                 imageVector = Icons.Rounded.FiberManualRecord,
                 contentDescription = null,
-                tint = DiveColors.TextPrimary,
+                tint = if (paused) DiveColors.DeepBlack else DiveColors.TextPrimary,
                 modifier = Modifier.size(12.dp),
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-                text = "REC",
-                color = DiveColors.TextPrimary,
+                text = if (paused) "PAUSED $clock" else "REC $clock",
+                color = if (paused) DiveColors.DeepBlack else DiveColors.TextPrimary,
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.Bold,
             )
         }
+    }
+}
+
+/**
+ * The paused recording's two futures, side by side. RESUME keeps writing the same file; STOP
+ * finalises it into the gallery. The selection is core state, so the housing's LEFT/RIGHT own
+ * it and this composable only paints.
+ */
+@Composable
+private fun RecordingPausedChooser(
+    stopSelected: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = modifier
+            .background(DiveColors.DeepBlack.copy(alpha = 0.88f), RoundedCornerShape(14.dp))
+            .padding(horizontal = 20.dp, vertical = 14.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            RecordingChoiceChip(label = "RESUME", selected = !stopSelected, critical = false)
+            Spacer(modifier = Modifier.width(14.dp))
+            RecordingChoiceChip(label = "STOP", selected = stopSelected, critical = true)
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "LEFT/RIGHT select · SHUTTER confirms",
+            color = DiveColors.TextSecondary,
+            style = MaterialTheme.typography.labelMedium,
+        )
+    }
+}
+
+@Composable
+private fun RecordingChoiceChip(label: String, selected: Boolean, critical: Boolean) {
+    val accent = if (critical) DiveColors.Critical else DiveColors.Success
+    Box(
+        modifier = Modifier
+            .background(
+                if (selected) accent else DiveColors.SurfaceElevated,
+                RoundedCornerShape(10.dp),
+            )
+            .padding(horizontal = 22.dp, vertical = 10.dp),
+    ) {
+        Text(
+            text = label,
+            color = if (selected) {
+                if (critical) DiveColors.TextPrimary else DiveColors.DeepBlack
+            } else {
+                DiveColors.TextSecondary
+            },
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+        )
     }
 }
 

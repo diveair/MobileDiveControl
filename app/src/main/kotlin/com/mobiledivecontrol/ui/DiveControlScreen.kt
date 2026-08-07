@@ -53,6 +53,7 @@ fun DiveControlScreen(
     effects: List<PlatformEffect> = emptyList(),
     onEffectsConsumed: () -> Unit = {},
     onDetectedLenses: ((List<String>) -> Unit)? = null,
+    onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
     introVisible: Boolean = false,
     onIntroDismiss: () -> Unit = {},
     permissionsGranted: Boolean = false,
@@ -70,6 +71,7 @@ fun DiveControlScreen(
             effects = effects,
             onEffectsConsumed = onEffectsConsumed,
             onDetectedLenses = onDetectedLenses,
+                    onCapabilities = onCapabilities,
         )
 
         // One screen for permissions, connection and the button map. It leaves composition the
@@ -102,6 +104,7 @@ private fun DiveControlContent(
     effects: List<PlatformEffect>,
     onEffectsConsumed: () -> Unit,
     onDetectedLenses: ((List<String>) -> Unit)?,
+    onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)?,
 ) {
     CameraHudOverlay(
         state = state,
@@ -123,6 +126,7 @@ private fun DiveControlContent(
                     effects = effects,
                     onEffectsConsumed = onEffectsConsumed,
                     onDetectedLenses = onDetectedLenses,
+                    onCapabilities = onCapabilities,
                     housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.CameraAdjust -> CameraShellScreen(
@@ -133,6 +137,7 @@ private fun DiveControlContent(
                     effects = effects,
                     onEffectsConsumed = onEffectsConsumed,
                     onDetectedLenses = onDetectedLenses,
+                    onCapabilities = onCapabilities,
                     housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.Safety -> SafetyScreen(safety = state.safety)

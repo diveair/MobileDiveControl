@@ -71,24 +71,8 @@ class CameraCatalogTest {
     }
 
     @Test
-    fun `settingsBarItems returns prioritized items for Pro, Photo, and Video modes`() {
-        // Pro Mode
-        val proItems = CameraCatalog.settingsBarItems(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra, showMore = false)
-        assertEquals(
-            CameraCatalog.defaultSettingsCursor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra),
-            proItems.indexOf(BottomBarItem.ModesButton),
-        )
-        val proSettingIds = proItems.filterIsInstance<BottomBarItem.Setting>().map { it.spec.id }
-        assertTrue(proSettingIds.contains("pro.iso"))
-        assertTrue(proSettingIds.contains("pro.shutter_speed"))
-        assertTrue(proSettingIds.contains("pro.exposure_value"))
-        assertTrue(proSettingIds.contains("pro.lens"))
-        assertTrue(proSettingIds.contains("pro.manual_focus"))
-        assertTrue(proSettingIds.contains("pro.white_balance"))
-
-        // Photo Mode
-        val photoItems = CameraCatalog.settingsBarItems(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra, showMore = false)
-        val photoOrder = photoItems.map { item ->
+    fun `settingsBarItems follows the universal template in every mode`() {
+        fun ids(items: List<BottomBarItem>): List<String> = items.map { item ->
             when (item) {
                 is BottomBarItem.ModesButton -> "modes"
                 is BottomBarItem.Setting -> item.spec.id
@@ -97,38 +81,82 @@ class CameraCatalogTest {
                 is BottomBarItem.MoreSettings -> "more"
             }
         }
+
+        // Pro: the full spine. More at far left, mode token anchored after ISO,
+        // Slider always immediately left of Gallery at the far right.
+        val proItems = CameraCatalog.settingsBarItems(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra, showMore = false)
         assertEquals(
             listOf(
-                "photo.flash",
-                "photo.megapixels",
-                "photo.save_format",
-                "photo.lens",
-                "photo.manual_focus",
+                "more",
+                "pro.lens",
+                "pro.exposure_value",
+                "pro.shutter_speed",
+                "pro.iso",
                 "modes",
-                "photo.exposure_compensation",
-                "photo.hdr_log",
-                "photo.filters",
+                "pro.manual_focus",
+                "pro.white_balance",
+                "pro.slider_assignment",
                 "gallery",
             ),
-            photoOrder,
+            ids(proItems),
         )
-        assertEquals(5, CameraCatalog.defaultSettingsCursor(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra))
-
-        // Video Mode
-        val videoItems = CameraCatalog.settingsBarItems(CameraModeId.Video, GalaxyDeviceVariant.S26Ultra, showMore = false)
         assertEquals(
-            CameraCatalog.defaultSettingsCursor(CameraModeId.Video, GalaxyDeviceVariant.S26Ultra),
-            videoItems.indexOf(BottomBarItem.ModesButton),
+            CameraCatalog.defaultSettingsCursor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra),
+            proItems.indexOf(BottomBarItem.ModesButton),
         )
-        val videoSettings = videoItems.filterIsInstance<BottomBarItem.Setting>().map { it.spec.id }
-        val videoLensShortcuts = videoItems.filterIsInstance<BottomBarItem.LensShortcut>().map { it.value }
-        assertTrue(videoSettings.contains("video.flash"))
-        assertTrue(videoSettings.contains("video.super_steady"))
-        assertTrue(videoSettings.contains("video.resolution"))
-        assertTrue(videoSettings.contains("video.frame_rate"))
-        assertTrue(videoLensShortcuts.contains("0.6x"))
-        assertTrue(videoLensShortcuts.contains("1x"))
-        assertTrue(videoLensShortcuts.contains("front"))
+
+        // Pro Video: identical shape.
+        val proVideoItems = CameraCatalog.settingsBarItems(CameraModeId.ProVideo, GalaxyDeviceVariant.S26Ultra, showMore = false)
+        assertEquals(
+            listOf(
+                "more",
+                "pro_video.lens",
+                "pro_video.exposure_value",
+                "pro_video.shutter_speed",
+                "pro_video.iso",
+                "modes",
+                "pro_video.manual_focus",
+                "pro_video.white_balance",
+                "pro_video.slider_assignment",
+                "gallery",
+            ),
+            ids(proVideoItems),
+        )
+
+        // Photo: missing spine tiles simply drop out; the template's shape holds.
+        val photoItems = CameraCatalog.settingsBarItems(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra, showMore = false)
+        assertEquals(
+            listOf(
+                "more",
+                "photo.lens",
+                "photo.exposure_compensation",
+                "modes",
+                "photo.manual_focus",
+                "photo.slider_assignment",
+                "gallery",
+            ),
+            ids(photoItems),
+        )
+        assertEquals(3, CameraCatalog.defaultSettingsCursor(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra))
+
+        // Video: no per-lens shortcut chips anywhere any more — one synthesized Lens tile
+        // instead — and the mode extras live behind More at the far left.
+        val videoItems = CameraCatalog.settingsBarItems(CameraModeId.Video, GalaxyDeviceVariant.S26Ultra, showMore = true)
+        val videoIds = ids(videoItems)
+        assertTrue(videoItems.none { it is BottomBarItem.LensShortcut })
+        assertTrue(videoIds.contains("video.lens"))
+        assertTrue(videoIds.contains("video.flash"))
+        assertTrue(videoIds.contains("video.super_steady"))
+        assertTrue(videoIds.contains("video.resolution"))
+        assertTrue(videoIds.contains("video.frame_rate"))
+        assertEquals("gallery", videoIds.last())
+        assertEquals("video.slider_assignment", videoIds[videoIds.size - 2])
+        assertEquals("more", videoIds.first())
+
+        // The wheel's default assignment is Focus wherever focus exists.
+        val slider = proItems.filterIsInstance<BottomBarItem.Setting>()
+            .first { it.spec.id.endsWith(CameraCatalog.SLIDER_ASSIGNMENT_SUFFIX) }
+        assertEquals("Focus", slider.spec.defaultValue)
     }
 }
 

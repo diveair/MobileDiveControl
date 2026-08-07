@@ -128,6 +128,139 @@ object CameraCatalog {
         }
     }
 
+    /**
+     * [settingsFor] additionally clipped to what the probed hardware can honour. The rule is the
+     * product's own: never render a dead control. Options outside a probed range are dropped;
+     * a control the hardware cannot drive at all disappears. With no probe (simulator, tests,
+     * pre-bind frames) the static catalog stands unchanged.
+     */
+    fun settingsFor(
+        mode: CameraModeId,
+        variant: GalaxyDeviceVariant,
+        detectedLenses: List<String>,
+        capabilities: CameraCapabilities?,
+    ): List<CameraSettingSpec> {
+        val base = settingsFor(mode, variant, detectedLenses)
+        if (capabilities == null) return base
+        return base.mapNotNull { spec -> applyCapabilities(spec, capabilities) }
+    }
+
+    private fun applyCapabilities(spec: CameraSettingSpec, caps: CameraCapabilities): CameraSettingSpec? {
+        fun clip(keep: (String) -> Boolean): CameraSettingSpec? {
+            val kept = spec.options.filter(keep)
+            if (kept.isEmpty()) return null
+            val default = if (spec.defaultValue in kept) spec.defaultValue else kept.first()
+            return spec.copy(options = kept, defaultValue = default)
+        }
+        return when {
+            spec.id.endsWith(".manual_focus") ->
+                if (caps.manualFocusSupported == false) null else spec
+            spec.id.endsWith(".iso") && caps.isoMin != null && caps.isoMax != null ->
+                clip { option ->
+                    val value = option.filter { it.isDigit() }.toIntOrNull()
+                    value == null || value in caps.isoMin..caps.isoMax
+                }
+            spec.id.endsWith(".shutter_speed") && caps.exposureMinNs != null && caps.exposureMaxNs != null ->
+                clip { option ->
+                    val ns = shutterOptionNanos(option)
+                    ns == null || ns in caps.exposureMinNs..caps.exposureMaxNs
+                }
+            (spec.id.endsWith(".exposure_value") || spec.id.endsWith(".exposure_compensation")) &&
+                caps.evMin != null && caps.evMax != null ->
+                clip { option ->
+                    val ev = option.replace("+", "").toDoubleOrNull()
+                    ev == null || ev in caps.evMin..caps.evMax
+                }
+            else -> spec
+        }
+    }
+
+    /** "1/8000" → 125000ns, "2\"" or "2s" → 2s in ns; null for AUTO and other words. */
+    private fun shutterOptionNanos(option: String): Long? {
+        val text = option.trim().removeSuffix("\"").removeSuffix("s")
+        return when {
+            text.startsWith("1/") -> text.drop(2).toDoubleOrNull()?.takeIf { it > 0 }
+                ?.let { (1_000_000_000L / it).toLong() }
+            else -> text.toDoubleOrNull()?.let { (it * 1_000_000_000L).toLong() }
+        }
+    }
+
+    // --- the wheel's assignment -----------------------------------------------------------
+
+    const val SLIDER_ASSIGNMENT_SUFFIX = ".slider_assignment"
+    const val SLIDER_TARGET_ZOOM = "Zoom"
+
+    /** Assignment label → the setting-id suffixes it drives, in lookup order. */
+    private val sliderTargetSuffixes: Map<String, List<String>> = mapOf(
+        "Focus" to listOf(".manual_focus"),
+        "ISO" to listOf(".iso"),
+        "Shutter" to listOf(".shutter_speed"),
+        "Exposure" to listOf(".exposure_value", ".exposure_compensation"),
+        "White balance" to listOf(".white_balance"),
+    )
+
+    /**
+     * The Slider tile: a per-mode pseudo-setting that never reaches the camera. Its choice list
+     * is only what this mode actually offers (plus Zoom, which needs no spec), and its value
+     * rides in [CameraState.settingValues] so it persists like everything else.
+     */
+    fun sliderAssignmentSpec(mode: CameraModeId, settings: List<CameraSettingSpec>): CameraSettingSpec {
+        val options = buildList {
+            sliderTargetSuffixes.forEach { (label, suffixes) ->
+                if (settings.any { spec -> suffixes.any { spec.id.endsWith(it) } }) add(label)
+            }
+            add(SLIDER_TARGET_ZOOM)
+        }
+        val ordered = if ("Focus" in options) listOf("Focus") + (options - "Focus") else options
+        return CameraSettingSpec(
+            id = modeKey(mode) + SLIDER_ASSIGNMENT_SUFFIX,
+            label = "Slider",
+            group = "Control",
+            kind = CameraSettingKind.Choice,
+            options = ordered,
+            defaultValue = ordered.first(),
+        )
+    }
+
+    /** The spec the wheel currently drives, or null when the assignment is Zoom. */
+    fun assignedSliderSpec(camera: CameraState): CameraSettingSpec? {
+        val settings = settingsFor(
+            camera.activeMode,
+            camera.deviceVariant,
+            camera.detectedLenses,
+            camera.capabilities,
+        )
+        val assignSpec = sliderAssignmentSpec(camera.activeMode, settings)
+        val choice = camera.settingValues[assignSpec.id] ?: assignSpec.defaultValue
+        val suffixes = sliderTargetSuffixes[choice] ?: return null
+        return settings.firstOrNull { spec -> suffixes.any { spec.id.endsWith(it) } }
+    }
+
+    /** Synthesized per-mode Choice that flips the wheel's travel over the focus scale. */
+    fun focusDirectionSpec(focusSettingId: String): CameraSettingSpec = CameraSettingSpec(
+        id = focusSettingId.removeSuffix(".manual_focus") + ".focus_direction",
+        label = "Wheel Direction",
+        group = "Focus",
+        kind = CameraSettingKind.Choice,
+        options = listOf("Normal", "Reversed"),
+        defaultValue = "Normal",
+    )
+
+    /** Whether the diver flipped the focus wheel for the active mode. */
+    fun focusWheelReversed(camera: CameraState): Boolean {
+        val focus = settingsFor(
+            camera.activeMode,
+            camera.deviceVariant,
+            camera.detectedLenses,
+            camera.capabilities,
+        ).firstOrNull { it.id.endsWith(".manual_focus") } ?: return false
+        val spec = focusDirectionSpec(focus.id)
+        return (camera.settingValues[spec.id] ?: spec.defaultValue) == "Reversed"
+    }
+
+    private fun modeKey(mode: CameraModeId): String =
+        primaryRailEntries.firstOrNull { it.mode == mode }?.key ?: mode.name.lowercase()
+
     fun primaryIndexForMode(mode: CameraModeId): Int {
         val direct = primaryRailEntries.indexOfFirst { it.mode == mode }
         return if (direct >= 0) direct else 0
@@ -150,7 +283,7 @@ object CameraCatalog {
     }
 
     fun selectedSetting(camera: CameraState): CameraSettingSpec? {
-        val items = settingsBarItems(camera.activeMode, camera.deviceVariant, camera.showMoreSettings)
+        val items = settingsBarItems(camera)
         if (items.isEmpty()) {
             return null
         }
@@ -197,149 +330,80 @@ object CameraCatalog {
         )
     }
 
+    /**
+     * The one bar template, identical for every mode:
+     *
+     *   [More] · extras… · Lens · Exposure · Shutter · ISO · [MODE] · Focus · WB · Slider · Gallery
+     *
+     * Mode-specific extras live at the far left behind the More toggle; the six-spec spine and
+     * the two shortcut tiles are fixed, and a mode that lacks a spine setting simply skips that
+     * tile. The mode token is anchored after ISO by construction — no midpoint arithmetic — so
+     * the diver's muscle memory holds across every mode.
+     */
     fun settingsBarItems(
         mode: CameraModeId,
         variant: GalaxyDeviceVariant,
         showMore: Boolean,
         detectedLenses: List<String> = emptyList(),
+        capabilities: CameraCapabilities? = null,
     ): List<BottomBarItem> {
-        val allSettings = settingsFor(mode, variant, detectedLenses)
+        val allSettings = settingsFor(mode, variant, detectedLenses, capabilities)
 
-        val itemsWithoutModes = when {
-            // PRO MODES
-            mode == CameraModeId.Pro || mode == CameraModeId.ProVideo || mode == CameraModeId.ExpertRaw -> {
-                val items = mutableListOf<BottomBarItem>()
-                val iso = allSettings.find { it.id.endsWith(".iso") }
-                val shutter = allSettings.find { it.id.endsWith(".shutter_speed") }
-                val ev = allSettings.find { it.id.endsWith(".exposure_value") }
-                val lens = allSettings.find { it.id.endsWith(".lens") }
-                val focus = allSettings.find { it.id.endsWith(".manual_focus") }
-                val wb = allSettings.find { it.id.endsWith(".white_balance") }
+        fun find(vararg suffixes: String): CameraSettingSpec? =
+            allSettings.firstOrNull { spec -> suffixes.any { spec.id.endsWith(it) } }
 
-                val prioritySpecs = listOfNotNull(iso, shutter, ev, lens, focus, wb)
-                prioritySpecs.forEach { items.add(BottomBarItem.Setting(it)) }
+        val lens = find(".lens") ?: synthesizedLensSpec(mode, variant, detectedLenses)
+        val ev = find(".exposure_value", ".exposure_compensation")
+        val shutter = find(".shutter_speed")
+        val iso = find(".iso")
+        val focus = find(".manual_focus")
+        val wb = find(".white_balance")
 
-                val otherSettings = allSettings.filter { it !in prioritySpecs }
-                if (showMore) {
-                    otherSettings.forEach { items.add(BottomBarItem.Setting(it)) }
-                }
+        val spine = listOfNotNull(lens, ev, shutter, iso, focus, wb)
+        val extras = allSettings.filter { it !in spine }
+        val slider = sliderAssignmentSpec(mode, allSettings)
 
-                if (otherSettings.isNotEmpty()) {
-                    items.add(BottomBarItem.MoreSettings)
-                }
-                items
+        return buildList {
+            if (extras.isNotEmpty()) {
+                add(BottomBarItem.MoreSettings)
+                if (showMore) extras.forEach { add(BottomBarItem.Setting(it)) }
             }
-            // CAMERA MODE (Photo)
-            mode == CameraModeId.Photo -> {
-                val items = mutableListOf<BottomBarItem>()
-                val flash = allSettings.find { it.id.endsWith(".flash") }
-                val megapixels = allSettings.find { it.id.endsWith(".megapixels") }
-                val saveFormat = allSettings.find { it.id.endsWith(".save_format") }
-                val lens = allSettings.find { it.id.endsWith(".lens") }
-                val focus = allSettings.find { it.id.endsWith(".manual_focus") }
-                val exposureValue = allSettings.find { it.id.endsWith(".exposure_compensation") }
-                val hdr = allSettings.find { it.id.endsWith(".hdr_log") }
-                val filters = allSettings.find { it.id.endsWith(".filters") }
-                listOfNotNull(flash, megapixels, saveFormat, lens, focus).forEach { items.add(BottomBarItem.Setting(it)) }
-                listOfNotNull(exposureValue, hdr, filters).forEach { items.add(BottomBarItem.Setting(it)) }
-                items.add(BottomBarItem.GalleryShortcut)
-                items
-            }
-            mode == CameraModeId.Portrait || mode == CameraModeId.Night || mode == CameraModeId.Burst -> {
-                val items = mutableListOf<BottomBarItem>()
-                val flash = allSettings.find { it.id.endsWith(".flash") }
-                if (flash != null) items.add(BottomBarItem.Setting(flash))
-
-                val lenses = (if (detectedLenses.isNotEmpty()) detectedLenses else photoLenses(variant)).filter { it != "front" }
-                lenses.forEach { lensVal ->
-                    items.add(BottomBarItem.LensShortcut(lensVal))
-                }
-
-                val megapixels = allSettings.find { it.id.endsWith(".megapixels") }
-                if (megapixels != null) items.add(BottomBarItem.Setting(megapixels))
-
-                val motionPhoto = allSettings.find { it.id.endsWith(".motion_photo") }
-                if (motionPhoto != null) items.add(BottomBarItem.Setting(motionPhoto))
-
-                val filters = allSettings.find { it.id.endsWith(".filters") }
-                if (filters != null) items.add(BottomBarItem.Setting(filters))
-
-                val prioritySpecs = listOfNotNull(flash, megapixels, motionPhoto, filters)
-                val otherSettings = allSettings.filter { it !in prioritySpecs && !it.id.endsWith(".lens") }
-                if (showMore) {
-                    otherSettings.forEach { items.add(BottomBarItem.Setting(it)) }
-                }
-
-                if (otherSettings.isNotEmpty()) {
-                    items.add(BottomBarItem.MoreSettings)
-                }
-                items
-            }
-            // VIDEO / NON-PRO VIDEO MODES
-            else -> {
-                val items = mutableListOf<BottomBarItem>()
-                val flash = allSettings.find { it.id.endsWith(".flash") }
-                if (flash != null) items.add(BottomBarItem.Setting(flash))
-
-                val superSteady = allSettings.find { it.id.endsWith(".super_steady") }
-                if (superSteady != null) items.add(BottomBarItem.Setting(superSteady))
-
-                val resolution = allSettings.find { it.id.endsWith(".resolution") }
-                if (resolution != null) items.add(BottomBarItem.Setting(resolution))
-
-                val frameRate = allSettings.find { it.id.endsWith(".frame_rate") }
-                if (frameRate != null) items.add(BottomBarItem.Setting(frameRate))
-
-                val hdr = allSettings.find { it.id.endsWith(".hdr") }
-                if (hdr != null) items.add(BottomBarItem.Setting(hdr))
-
-                val lenses = photoLenses(variant).filter { it != "front" }
-                lenses.forEach { lensVal ->
-                    items.add(BottomBarItem.LensShortcut(lensVal))
-                }
-                items.add(BottomBarItem.LensShortcut("front"))
-
-                val megapixels = allSettings.find { it.id.endsWith(".megapixels") }
-                if (megapixels != null) items.add(BottomBarItem.Setting(megapixels))
-
-                val motionPhoto = allSettings.find { it.id.endsWith(".motion_photo") }
-                if (motionPhoto != null) items.add(BottomBarItem.Setting(motionPhoto))
-
-                val filters = allSettings.find { it.id.endsWith(".filters") }
-                if (filters != null) items.add(BottomBarItem.Setting(filters))
-
-                val prioritySpecs = listOfNotNull(flash, superSteady, resolution, frameRate, hdr, megapixels, motionPhoto, filters)
-                val otherSettings = allSettings.filter { it !in prioritySpecs && !it.id.endsWith(".lens") }
-                if (showMore) {
-                    otherSettings.forEach { items.add(BottomBarItem.Setting(it)) }
-                }
-
-                if (otherSettings.isNotEmpty()) {
-                    items.add(BottomBarItem.MoreSettings)
-                }
-                items
-            }
+            listOfNotNull(lens, ev, shutter, iso).forEach { add(BottomBarItem.Setting(it)) }
+            add(BottomBarItem.ModesButton)
+            listOfNotNull(focus, wb).forEach { add(BottomBarItem.Setting(it)) }
+            add(BottomBarItem.Setting(slider))
+            add(BottomBarItem.GalleryShortcut)
         }
-
-        val insertAfterSettingId = when (mode) {
-            CameraModeId.Photo -> "photo.manual_focus"
-            else -> null
-        }
-        return withModesCentered(itemsWithoutModes, insertAfterSettingId)
     }
 
-    private fun withModesCentered(items: List<BottomBarItem>, insertAfterSettingId: String? = null): List<BottomBarItem> {
-        val preferredIndex = insertAfterSettingId?.let { settingId ->
-            items.indexOfFirst { item ->
-                item is BottomBarItem.Setting && item.spec.id == settingId
-            }.takeIf { it >= 0 }?.plus(1)
-        }
-        val centerIndex = preferredIndex ?: (items.size / 2)
-        return buildList(items.size + 1) {
-            addAll(items.take(centerIndex))
-            add(BottomBarItem.ModesButton)
-            addAll(items.drop(centerIndex))
-        }
+    /** The bar exactly as the reducer must see it: same lenses, same capabilities as the UI. */
+    fun settingsBarItems(camera: CameraState): List<BottomBarItem> = settingsBarItems(
+        mode = camera.activeMode,
+        variant = camera.deviceVariant,
+        showMore = camera.showMoreSettings,
+        detectedLenses = camera.detectedLenses,
+        capabilities = camera.capabilities,
+    )
+
+    /**
+     * Modes whose profile carries no `.lens` choice still get the Lens tile — built from the
+     * probed lenses, or the variant's stock list. One tile, one mechanism, every mode.
+     */
+    private fun synthesizedLensSpec(
+        mode: CameraModeId,
+        variant: GalaxyDeviceVariant,
+        detectedLenses: List<String>,
+    ): CameraSettingSpec? {
+        val options = (detectedLenses.ifEmpty { photoLenses(variant) })
+        if (options.isEmpty()) return null
+        return CameraSettingSpec(
+            id = modeKey(mode) + ".lens",
+            label = "Lens",
+            group = "Optics",
+            kind = CameraSettingKind.Choice,
+            options = options,
+            defaultValue = options.first(),
+        )
     }
 
     fun currentValue(camera: CameraState, spec: CameraSettingSpec): String {
@@ -459,7 +523,7 @@ object CameraCatalog {
                 slider("photo.manual_focus", "Focus", "Core", focusOptions(), "AF"),
                 toggle("photo.focus_peaking", "Focus Assist", "Assist"),
                 choice("photo.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
-                slider("photo.exposure_compensation", "EV", "Core", evOptions(), "0"),
+                slider("photo.exposure_compensation", "EV", "Core", evOptions(), "Auto"),
                 choice("photo.hdr_log", "HDR / LOG", "Assist", listOf("HDR", "LOG", "Off"), "HDR"),
                 choice("photo.filters", "Filters", "Core", underwaterFilterOptions(), "Off"),
             ),
@@ -483,13 +547,13 @@ object CameraCatalog {
                 choice("expert.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
                 choice("expert.save_format", "RAW / JPEG", "Core", listOf("RAW", "JPEG", "RAW + JPEG"), "RAW + JPEG"),
                 choice("expert.lens", "Lens", "Core", lenses, "Auto"),
-                slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions(), "5600K"),
+                slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions(), "Auto"),
                 slider("expert.iso", "ISO", "Manual", isoOptions(), "100"),
                 slider("expert.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
                 toggle("expert.focus_peaking", "Focus Assist", "Assist"),
                 choice("expert.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("expert.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
-                slider("expert.exposure_value", "Exposure Value", "Manual", evOptions(), "0"),
+                slider("expert.exposure_value", "Exposure Value", "Manual", evOptions(), "Auto"),
                 toggle("expert.exposure_monitor", "Exposure monitor", "Assist"),
                 choice("expert.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
                 choice("expert.grid", "Grid", "Assist", gridOptions(), "3x3"),
@@ -509,13 +573,13 @@ object CameraCatalog {
             availableExposureControls = listOf("White balance", "ISO", "Focus", "Shutter", "Exposure value"),
             availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid", "HDR"),
             settings = listOf(
-                slider("pro.white_balance", "White balance", "Manual", whiteBalanceOptions(), "5600K"),
+                slider("pro.white_balance", "White balance", "Manual", whiteBalanceOptions(), "Auto"),
                 slider("pro.iso", "ISO", "Manual", isoOptions(), "100"),
                 slider("pro.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
                 toggle("pro.focus_peaking", "Focus Assist", "Assist"),
                 choice("pro.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("pro.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
-                slider("pro.exposure_value", "Exposure Value", "Manual", evOptions(), "0"),
+                slider("pro.exposure_value", "Exposure Value", "Manual", evOptions(), "Auto"),
                 choice("pro.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
                 choice("pro.lens", "Lens", "Core", lenses, "Auto"),
                 toggle("pro.exposure_monitor", "Exposure monitor", "Assist"),
@@ -664,13 +728,13 @@ object CameraCatalog {
             availableAudioControls = listOf("Microphone", "Microphone gain"),
             availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid", "HDR", "LOG"),
             settings = listOf(
-                slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions(), "5600K"),
+                slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions(), "Auto"),
                 slider("pro_video.iso", "ISO", "Manual", isoOptions(), "100"),
                 slider("pro_video.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
                 toggle("pro_video.focus_peaking", "Focus Assist", "Assist"),
                 choice("pro_video.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("pro_video.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
-                slider("pro_video.exposure_value", "Exposure Value", "Manual", evOptions(), "0"),
+                slider("pro_video.exposure_value", "Exposure Value", "Manual", evOptions(), "Auto"),
                 slider("pro_video.frame_rate", "Frame rate", "Manual", frameRates, "30fps"),
                 choice("pro_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
                 choice("pro_video.lens", "Lens", "Core", lenses, "auto"),
@@ -679,8 +743,10 @@ object CameraCatalog {
                 toggle("pro_video.exposure_monitor", "Exposure monitor", "Assist"),
                 choice("pro_video.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
                 choice("pro_video.grid", "Grid", "Assist", gridOptions(), "3x3"),
-                choice("pro_video.hdr", "HDR", "Assist", listOf("Off", "On"), "On"),
-                choice("pro_video.log", "LOG", "Assist", listOf("Off", "On"), "On"),
+                // Both default OFF: LOG is a deliberate grading workflow, not a default look,
+                // and shipping it on silently cost the field ~2 stops of apparent brightness.
+                choice("pro_video.hdr", "HDR", "Assist", listOf("Off", "On"), "Off"),
+                choice("pro_video.log", "LOG", "Assist", listOf("Off", "On"), "Off"),
             ),
         )
     }
@@ -825,7 +891,8 @@ object CameraCatalog {
         "30\"",
     )
 
-    private fun whiteBalanceOptions(): List<String> = listOf("2300K", "2800K", "3200K", "4000K", "5600K", "6500K", "7500K", "8500K", "10000K")
+    private fun whiteBalanceOptions(): List<String> =
+        listOf("Auto", "2300K", "2800K", "3200K", "4000K", "5600K", "6500K", "7500K", "8500K", "10000K")
 
     private fun focusOptions(): List<String> = buildList {
         add("AF")
@@ -843,8 +910,11 @@ object CameraCatalog {
     }
 
     private fun evOptions(): List<String> = buildList {
-        // 4x finer granularity: 0.025 EV steps over ±2.0 range (161 options)
-        // applyExposure() rounds to nearest hardware compensation index
+        // "Auto" leads the ladder: auto-exposure with zero offset, the explicit hands-off
+        // choice the field asked for. Then 4x finer granularity: 0.025 EV steps over the
+        // +/-2.0 range (161 numeric options); applyExposure() rounds to the nearest
+        // hardware compensation index.
+        add("Auto")
         for (step in -80..80) {
             val value = step / 40.0
             if (value == 0.0) {

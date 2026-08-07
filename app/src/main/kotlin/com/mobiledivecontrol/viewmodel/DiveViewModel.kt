@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.mobiledivecontrol.DiveControlApp
 import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.BleSignal
+import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.ControlCommand
 import com.mobiledivecontrol.core.ControlCore
 import com.mobiledivecontrol.core.GalleryCommand
@@ -224,6 +225,18 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         if (interceptForIntro(HousingCharacteristic.ButtonEvents.shortHex, payload)) return
         if (interceptForCapPrompt(HousingCharacteristic.ButtonEvents.shortHex, payload)) return
         val outcome = controlCore.handleButtonPayload(payload)
+        // One line per housing press, carrying what the press did to focus: the whole
+        // input->value half of the control loop, readable live from logcat.
+        val camera = outcome.state.camera
+        val focusKey = camera.settingValues.keys.firstOrNull { it.endsWith(".manual_focus") }
+        android.util.Log.d(
+            "DiveInput",
+            "byte=0x%02X focus=%s routed=%s".format(
+                payload.firstOrNull() ?: 0,
+                focusKey?.let { camera.settingValues[it] } ?: "?",
+                outcome.notes.isEmpty(),
+            ),
+        )
         emitOutcome(outcome)
     }
 
@@ -235,6 +248,12 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun advanceBle(signal: BleSignal) {
+        if (benchLinkForced) {
+            // A bench link is latched: ignore the real radio's scan/reconnect churn, which
+            // would otherwise drop input back to disabled a few hundred ms after every
+            // simulated connect. Tapping LINK again hands control back to the real link.
+            return
+        }
         val outcome = controlCore.advanceBle(signal)
         emitOutcome(outcome)
     }
@@ -388,6 +407,63 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         emitOutcome(outcome)
     }
 
+    private class Ramp(var remaining: Int, val step: Int) {
+        var job: kotlinx.coroutines.Job? = null
+        var lastFedAtMs: Long = System.currentTimeMillis()
+    }
+
+    /**
+     * One live ramp per setting. Same-direction requests ADD to the ticks still owed — a fast
+     * wheel spin banks distance rather than cancelling its own momentum — while a direction
+     * change cancels outright. All touches happen on the main dispatcher.
+     */
+    private val ramps = mutableMapOf<String, Ramp>()
+
+    /**
+     * Drains a [PlatformEffect.RampSetting] as real single-tick commands, one per interval, so
+     * the focus value genuinely visits every step at the requested rate. Each tick re-enters
+     * the core as [CameraCommand.NudgeSetting] — state, readout and lens all walk together.
+     */
+    private fun processRampEffects(effects: List<PlatformEffect>) {
+        effects.filterIsInstance<PlatformEffect.RampSetting>().forEach { ramp ->
+            val existing = ramps[ramp.settingId]
+            if (existing != null && existing.step == ramp.step && existing.job?.isActive == true) {
+                existing.remaining += ramp.steps
+                existing.lastFedAtMs = System.currentTimeMillis()
+                return@forEach
+            }
+            existing?.job?.cancel()
+            val fresh = Ramp(ramp.steps, ramp.step)
+            ramps[ramp.settingId] = fresh
+            fresh.job = viewModelScope.launch {
+                while (fresh.remaining > 0) {
+                    kotlinx.coroutines.delay(ramp.intervalMs)
+                    // The hard rule: when the wheel stops, the value stops. Any ticks still
+                    // owed are DISCARDED the moment the wheel goes quiet — banked distance
+                    // must never keep the focus moving on its own.
+                    if (System.currentTimeMillis() - fresh.lastFedAtMs > ramp.stopTimeoutMs) {
+                        fresh.remaining = 0
+                        break
+                    }
+                    // Fast but bounded drain: at most 3 ticks a frame (~180 steps/s). Enough
+                    // that a quarter-turn at max sensitivity completes its full sweep inside
+                    // the spin plus the timeout window, yet every step is still individually
+                    // applied — an unbounded burst collapsed dozens of steps into one visible
+                    // jump, which defeated the whole traversal contract.
+                    var burst = minOf(fresh.remaining, ramp.maxTicksPerInterval)
+                    while (burst > 0 && fresh.remaining > 0) {
+                        fresh.remaining -= 1
+                        burst -= 1
+                        emitOutcome(
+                            controlCore.dispatch(CameraCommand.NudgeSetting(ramp.settingId, ramp.step)),
+                        )
+                    }
+                }
+                if (ramps[ramp.settingId] === fresh) ramps.remove(ramp.settingId)
+            }
+        }
+    }
+
     fun clearEffects() {
         _effects.value = emptyList()
     }
@@ -401,6 +477,34 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * Simulate a button press for UI testing without hardware.
      * Maps [HousingButtonEvent] to its wire byte and processes it.
      */
+    /**
+     * Bring the link to Ready without hardware, so the button simulator can actually drive the
+     * control loop. Without this the simulator is inert exactly when it is needed — with no
+     * housing attached, InputRouter refuses every simulated press ("Housing input is disabled"),
+     * which is right for the housing but wrong for the bench. Debug-panel only; the real link
+     * still governs itself through [advanceBle] from the BLE layer.
+     */
+    fun simulateHousingLink() {
+        if (benchLinkForced) {
+            benchLinkForced = false
+            android.util.Log.d("DiveControl", "simulateHousingLink: released; the real link governs again")
+            emitOutcome(controlCore.advanceBle(BleSignal.Disconnect))
+            return
+        }
+        benchLinkForced = true
+        listOf(
+            BleSignal.StartScan,
+            BleSignal.Connect,
+            BleSignal.DiscoverServices,
+            BleSignal.Subscribe,
+            BleSignal.Ready,
+        ).forEach { signal -> emitOutcome(controlCore.advanceBle(signal)) }
+        android.util.Log.d("DiveControl", "simulateHousingLink: link forced to Ready for bench testing")
+    }
+
+    /** Debug-panel latch: hold the simulated link up despite the real radio (see LINK button). */
+    private var benchLinkForced = false
+
     fun simulateButton(event: HousingButtonEvent) {
         android.util.Log.d("DiveControl", "simulateButton: event=$event")
         val wireByte = when (event) {
@@ -523,6 +627,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             _effects.value = outcome.effects
             processGalleryEffects(outcome.effects)
             processHousingEffects(outcome.effects)
+            processRampEffects(outcome.effects)
         }
     }
 
@@ -613,6 +718,8 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
         /** How long after launch a refuted boot record may still bring the intro back. */
         const val INTRO_REINSTATE_WINDOW_MS = 120_000L
+
+
 
         /** The wire byte for a short Up press — the cap doorway's own instruction. */
         const val DOWN_WIRE_BYTE = 0x61

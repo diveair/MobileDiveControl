@@ -41,4 +41,23 @@ class ButtonEventNormalizerTest {
         assertNotNull(normalizer.accept(HousingButtonEvent.Right, start))
         assertNull(normalizer.accept(HousingButtonEvent.Right, start.plusMillis(10)))
     }
+
+    @Test
+    fun `wheel detents are never dropped, whatever the spin rate`() {
+        val normalizer = ButtonEventNormalizer()
+        val start = Instant.parse("2026-05-27T12:00:00Z")
+
+        // 60 detents/sec: every byte is a physical click of the wheel and every one must
+        // land, with the repeat chain marking the continuous spin.
+        val first = assertNotNull(normalizer.accept(HousingButtonEvent.ZoomIn, start))
+        val second = assertNotNull(normalizer.accept(HousingButtonEvent.ZoomIn, start.plusMillis(16)))
+        val third = assertNotNull(normalizer.accept(HousingButtonEvent.ZoomIn, start.plusMillis(32)))
+        assertEquals(0, first.repeatCount)
+        assertEquals(1, second.repeatCount)
+        assertEquals(2, third.repeatCount)
+
+        // Pushbuttons keep their bounce suppression at the same cadence.
+        assertNotNull(normalizer.accept(HousingButtonEvent.Ok, start.plusMillis(200)))
+        assertNull(normalizer.accept(HousingButtonEvent.Ok, start.plusMillis(210)))
+    }
 }

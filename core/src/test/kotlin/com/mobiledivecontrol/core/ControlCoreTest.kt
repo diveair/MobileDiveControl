@@ -158,8 +158,8 @@ class ControlCoreTest {
         assertEquals(CameraModeId.Pro, modeOutcome.state.camera.activeMode)
         assertEquals(CameraUiZone.SettingsPanel, modeOutcome.state.camera.focusedZone)
 
-        // Navigate right from centered Modes to position the cursor on White Balance.
-        repeat(3) {
+        // Navigate right from the anchored Modes token: Focus, then White Balance.
+        repeat(2) {
             core.dispatch(CameraCommand.NavigateRight)
         }
 
@@ -190,17 +190,16 @@ class ControlCoreTest {
 
         val reducer = ControlReducer()
 
-        // repeatCount = 1: ignored under sensitivity 1 (skipInterval = 9)
-        val red1 = reducer.reduce(stateWithLowSens.copy(
+        // Held slider events feed the motor instead of moving the value directly: the state
+        // is untouched and a RampSetting effect carries the ticks, paced by sensitivity — at
+        // level 1 the interval stretches so the walk is slow and deliberate.
+        val held = reducer.reduce(stateWithLowSens.copy(
             camera = stateWithLowSens.camera.copy(settingsEditing = true, sliderEditTarget = SliderEditTarget.Value)
         ), CameraCommand.NavigateRight, repeatCount = 1)
-        assertEquals(initialVal, red1.state.camera.settingValues["pro.white_balance"])
-
-        // repeatCount = 9: applied under sensitivity 1 (9 % 9 == 0)
-        val red9 = reducer.reduce(stateWithLowSens.copy(
-            camera = stateWithLowSens.camera.copy(settingsEditing = true, sliderEditTarget = SliderEditTarget.Value)
-        ), CameraCommand.NavigateRight, repeatCount = 9)
-        assertTrue(red9.state.camera.settingValues["pro.white_balance"] != initialVal)
+        assertEquals(initialVal, held.state.camera.settingValues["pro.white_balance"])
+        val ramp = held.effects.filterIsInstance<PlatformEffect.RampSetting>().single()
+        assertEquals("pro.white_balance", ramp.settingId)
+        assertTrue(ramp.intervalMs > 100L, "sensitivity 1 must pace the walk slowly: ${ramp.intervalMs}ms")
     }
 
     @Test
@@ -216,26 +215,26 @@ class ControlCoreTest {
         assertEquals(CameraModeId.Pro, modeOutcome.state.camera.activeMode)
         assertEquals(CameraUiZone.SettingsPanel, modeOutcome.state.camera.focusedZone)
 
-        repeat(3) {
+        repeat(2) {
             core.dispatch(CameraCommand.NavigateRight)
         }
 
         val editOutcome = core.dispatch(CameraCommand.Confirm)
         assertTrue(editOutcome.state.camera.settingsEditing)
-        assertEquals("5600K", editOutcome.state.camera.settingValues["pro.white_balance"])
+        assertEquals("Auto", editOutcome.state.camera.settingValues["pro.white_balance"])
 
         // 0x10 = Right button (now adjusts value +1)
         val firstPress = core.handleButtonPayload(
             payload = byteArrayOf(0x10),
             receivedAt = Instant.parse("2026-05-27T12:00:00Z"),
         )
-        assertEquals("6500K", firstPress.state.camera.settingValues["pro.white_balance"])
+        assertEquals("2300K", firstPress.state.camera.settingValues["pro.white_balance"])
 
         val secondPress = core.handleButtonPayload(
             payload = byteArrayOf(0x10),
             receivedAt = Instant.parse("2026-05-27T12:00:00.250Z"),
         )
-        assertEquals("7500K", secondPress.state.camera.settingValues["pro.white_balance"])
+        assertEquals("2800K", secondPress.state.camera.settingValues["pro.white_balance"])
     }
 
     @Test
@@ -247,14 +246,14 @@ class ControlCoreTest {
         val settingsOutcome = core.dispatch(CameraCommand.Confirm)
         assertEquals(CameraUiZone.SettingsPanel, settingsOutcome.state.camera.focusedZone)
 
-        val evSelected = core.dispatch(CameraCommand.NavigateRight)
-        assertEquals("0", evSelected.state.camera.settingValues["photo.exposure_compensation"])
+        val evSelected = core.dispatch(CameraCommand.NavigateLeft)
+        assertEquals("Auto", evSelected.state.camera.settingValues["photo.exposure_compensation"])
 
         val adjusted = core.dispatch(CameraCommand.NavigateUp)
-        // EV steps are 0.025 — first step from "0" is "+0.03" (0.025 formatted %.2f rounds up)
-        assertEquals("+0.03", adjusted.state.camera.settingValues["photo.exposure_compensation"])
+        // "Auto" leads the ladder now; the first step off it enters the numeric scale.
+        assertEquals("-2.00", adjusted.state.camera.settingValues["photo.exposure_compensation"])
         assertEquals(
-            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SetExposureCompensation(0.03))),
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SetExposureCompensation(-2.0))),
             adjusted.effects,
         )
     }
@@ -266,7 +265,7 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
 
         core.dispatch(CameraCommand.Confirm)
-        repeat(4) {
+        repeat(3) {
             core.dispatch(CameraCommand.NavigateRight)
         }
 
@@ -299,7 +298,7 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
 
         core.dispatch(CameraCommand.Confirm)
-        val focusSelected = core.dispatch(CameraCommand.NavigateLeft)
+        val focusSelected = core.dispatch(CameraCommand.NavigateRight)
         assertEquals("AF", focusSelected.state.camera.settingValues["photo.manual_focus"])
 
         val editOutcome = core.dispatch(CameraCommand.Confirm)
@@ -335,11 +334,11 @@ class ControlCoreTest {
         val tap = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 0)
         assertEquals("0.51", tap.state.camera.settingValues["photo.manual_focus"])
 
-        val heldTooSoon = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 1)
-        assertEquals("0.50", heldTooSoon.state.camera.settingValues["photo.manual_focus"])
-
-        val heldAtStride = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 20)
-        assertEquals("0.51", heldAtStride.state.camera.settingValues["photo.manual_focus"])
+        // Held events never move the state directly: they top up the motor, which walks the
+        // value tick by tick at the sensitivity's own rate via RampSetting.
+        val held = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 1)
+        assertEquals("0.50", held.state.camera.settingValues["photo.manual_focus"])
+        assertTrue(held.effects.any { it is PlatformEffect.RampSetting })
 
         val editingState = state.copy(
             camera = state.camera.copy(
@@ -371,6 +370,162 @@ class ControlCoreTest {
         assertEquals("1.00", heldAtMax.state.camera.settingValues["photo.manual_focus"])
     }
 
+    // ── Native-parity focus contract ────────────────────────────────────────────
+    // Requirements the wheel must satisfy, locked down here so they cannot regress:
+    //  * a quarter turn at sensitivity 100 spends the WHOLE focus range,
+    //  * every 0.01 is walked on the way (no skipped values),
+    //  * lower sensitivity means proportionally finer travel per detent,
+    //  * faster turning traverses more per detent than slow turning,
+    //  * both rails are hard stops that only cross into AF after a deliberate pause.
+
+    /** Total dial steps a single detent is worth: the immediate tick plus its ramp. */
+    private fun detentTravel(outcome: Reduction): Int {
+        val ramped = outcome.effects
+            .filterIsInstance<PlatformEffect.RampSetting>()
+            .sumOf { ramp -> ramp.steps }
+        return 1 + ramped
+    }
+
+    private fun focusState(value: String, level: Int, lastInputAtMs: Long): AppState =
+        AppState(
+            camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
+                settingsCursor = 4,
+                settingValues = CameraCatalog.defaultSettingValues + ("photo.manual_focus" to value),
+                sliderSensitivities = CameraCatalog.defaultSliderSensitivities +
+                    ("photo.manual_focus" to SliderSensitivity(level)),
+                lastFocusInputAtMs = lastInputAtMs,
+            ),
+        )
+
+    @Test
+    fun `a quarter turn at max sensitivity spends the whole focus range`() {
+        val reducer = ControlReducer(nowMs = { 10_000L })
+        // A brisk quarter turn: the housing paces four wheel events into it.
+        val outcome = reducer.reduce(
+            focusState("0.00", level = 100, lastInputAtMs = 9_920L),
+            CameraCommand.NavigateUp,
+            repeatCount = 0,
+        )
+        val perDetent = detentTravel(outcome)
+        val ladder = CameraCatalog.launchCameraState(CameraModeId.Photo).let { launched ->
+            CameraCatalog.settingsFor(launched.activeMode, launched.deviceVariant)
+                .first { spec -> spec.id == "photo.manual_focus" }
+                .options.size - 1
+        }
+        val quarterTurn = perDetent * 4
+        assertTrue(quarterTurn >= ladder, "quarter turn covered $quarterTurn of $ladder")
+        // ...and not wildly more: a quarter turn is the whole range, not several of them.
+        assertTrue(quarterTurn <= ladder * 2, "quarter turn overshoots: $quarterTurn")
+    }
+
+    @Test
+    fun `every 0_01 is walked rather than skipped`() {
+        val reducer = ControlReducer(nowMs = { 10_000L })
+        val outcome = reducer.reduce(
+            focusState("0.50", level = 100, lastInputAtMs = 9_920L),
+            CameraCommand.NavigateUp,
+            repeatCount = 0,
+        )
+        // The state moves exactly one step now; the remainder is a ramp of single steps,
+        // so the value visits 0.51, 0.52, 0.53 ... rather than jumping.
+        assertEquals("0.51", outcome.state.camera.settingValues["photo.manual_focus"])
+        val ramp = outcome.effects.filterIsInstance<PlatformEffect.RampSetting>().single()
+        assertEquals(1, ramp.step)
+        assertTrue(ramp.steps > 1, "ramp should carry the rest of the detent")
+    }
+
+    @Test
+    fun `sensitivity scales travel per detent and keeps the 0_01 floor`() {
+        val reducer = ControlReducer(nowMs = { 10_000L })
+        fun travelAt(level: Int): Int = detentTravel(
+            reducer.reduce(
+                focusState("0.50", level = level, lastInputAtMs = 9_920L),
+                CameraCommand.NavigateUp,
+                repeatCount = 0,
+            ),
+        )
+        val full = travelAt(100)
+        val half = travelAt(50)
+        val low = travelAt(10)
+        assertTrue(full > half, "100 ($full) should out-travel 50 ($half)")
+        assertTrue(half > low, "50 ($half) should out-travel 10 ($low)")
+        // However slow the setting, a detent always advances the dial by one real step.
+        assertTrue(low >= 1, "every detent must still move at least 0.01")
+    }
+
+    @Test
+    fun `turning faster traverses more than turning slowly`() {
+        val reducer = ControlReducer(nowMs = { 10_000L })
+        val fast = detentTravel(
+            reducer.reduce(
+                focusState("0.50", level = 100, lastInputAtMs = 9_920L),
+                CameraCommand.NavigateUp,
+                repeatCount = 0,
+            ),
+        )
+        val slow = detentTravel(
+            reducer.reduce(
+                focusState("0.50", level = 100, lastInputAtMs = 9_400L),
+                CameraCommand.NavigateUp,
+                repeatCount = 0,
+            ),
+        )
+        assertTrue(fast > slow, "fast ($fast) should traverse more than slow ($slow)")
+    }
+
+    @Test
+    fun `both rails hold until a deliberate re-turn crosses into AF`() {
+        val reducer = ControlReducer(nowMs = { 10_000L })
+        // Still turning at the near rail: the wheel parks at 0.00 instead of falling into AF.
+        val spinningAtNear = reducer.reduce(
+            focusState("0.00", level = 50, lastInputAtMs = 9_900L),
+            CameraCommand.NavigateDown,
+            repeatCount = 0,
+        )
+        assertEquals("0.00", spinningAtNear.state.camera.settingValues["photo.manual_focus"])
+
+        // Rested, then turned again in the same direction: now it crosses.
+        val deliberateAtNear = reducer.reduce(
+            focusState("0.00", level = 50, lastInputAtMs = 9_000L),
+            CameraCommand.NavigateDown,
+            repeatCount = 0,
+        )
+        assertEquals("AF", deliberateAtNear.state.camera.settingValues["photo.manual_focus"])
+
+        // The far rail behaves identically.
+        val spinningAtFar = reducer.reduce(
+            focusState("1.00", level = 50, lastInputAtMs = 9_900L),
+            CameraCommand.NavigateUp,
+            repeatCount = 0,
+        )
+        assertEquals("1.00", spinningAtFar.state.camera.settingValues["photo.manual_focus"])
+
+        val deliberateAtFar = reducer.reduce(
+            focusState("1.00", level = 50, lastInputAtMs = 9_000L),
+            CameraCommand.NavigateUp,
+            repeatCount = 0,
+        )
+        assertEquals("AF", deliberateAtFar.state.camera.settingValues["photo.manual_focus"])
+    }
+
+    @Test
+    fun `AF exits to whichever end the wheel points at`() {
+        val reducer = ControlReducer(nowMs = { 10_000L })
+        val toNear = reducer.reduce(
+            focusState("AF", level = 50, lastInputAtMs = 9_000L),
+            CameraCommand.NavigateUp,
+            repeatCount = 0,
+        )
+        assertEquals("0.00", toNear.state.camera.settingValues["photo.manual_focus"])
+
+        val toFar = reducer.reduce(
+            focusState("AF", level = 50, lastInputAtMs = 9_000L),
+            CameraCommand.NavigateDown,
+            repeatCount = 0,
+        )
+        assertEquals("1.00", toFar.state.camera.settingValues["photo.manual_focus"])
+    }
+
     @Test
     fun `focus selection on 0_6x lens enters edit mode without switching lenses`() {
         val reducer = ControlReducer()
@@ -390,13 +545,13 @@ class ControlCoreTest {
     fun `moving cursor from lens to focus on fixed 0_6x lens does not switch the lens`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-            settingsCursor = 3,
+            settingsCursor = 1,
             settingValues = CameraCatalog.defaultSettingValues + ("photo.lens" to "0.6x"),
         )
         val state = AppState(camera = camera)
 
         val outcome = reducer.reduce(state, CameraCommand.NavigateRight)
-        assertEquals(4, outcome.state.camera.settingsCursor)
+        assertEquals(2, outcome.state.camera.settingsCursor)
         assertEquals("0.6x", outcome.state.camera.settingValues["photo.lens"])
         assertEquals("AF", outcome.state.camera.settingValues["photo.manual_focus"])
         assertTrue(outcome.effects.isEmpty())
@@ -426,7 +581,7 @@ class ControlCoreTest {
     fun `switching to 0_6x lens does not reset focus or focus assist state`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-            settingsCursor = 3,
+            settingsCursor = 1,
             settingValues = CameraCatalog.defaultSettingValues +
                 ("photo.lens" to "1x") +
                 ("photo.manual_focus" to "0.42") +

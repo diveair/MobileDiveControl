@@ -176,10 +176,17 @@ class InputRouter {
     }
 
     private fun cameraShutterCommand(cameraState: CameraState): CameraCommand {
-        return if (cameraState.activeMode.captureType == CameraCaptureType.Video) {
-            CameraCommand.ToggleVideoRecording
-        } else {
-            CameraCommand.CapturePhoto
+        if (cameraState.activeMode.captureType != CameraCaptureType.Video) {
+            return CameraCommand.CapturePhoto
+        }
+        // The whole recording lifecycle lives on the shutter: first press starts, second
+        // pauses, and while the paused RESUME/STOP chooser is up the same button confirms
+        // whichever side LEFT/RIGHT selected. STOP finalises the file; RESUME continues it.
+        return when {
+            !cameraState.recording -> CameraCommand.ToggleVideoRecording
+            !cameraState.recordingPaused -> CameraCommand.PauseVideoRecording
+            cameraState.recordingStopSelected -> CameraCommand.StopVideoRecording
+            else -> CameraCommand.ResumeVideoRecording
         }
     }
 

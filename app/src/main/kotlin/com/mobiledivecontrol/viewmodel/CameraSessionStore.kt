@@ -16,8 +16,10 @@ class CameraSessionStore(context: Context) {
             ?.let { stored -> runCatching { CameraModeId.valueOf(stored) }.getOrNull() }
             ?: CameraModeId.Photo
 
-        val settingValues = normalizeRestoredSettingValues(
-            CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES),
+        val settingValues = migrateLegacyAssistDefaults(
+            normalizeRestoredSettingValues(
+                CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES),
+            ),
         )
         val sliderSensitivities = CameraCatalog.defaultSliderSensitivities + restoreSensitivityMap()
         val focusCurveModes = CameraCatalog.defaultFocusCurveModes + restoreFocusCurveMap()
@@ -101,6 +103,23 @@ class CameraSessionStore(context: Context) {
         return result
     }
 
+    /**
+     * One-time reset of the assist-look toggles. Old builds shipped Pro Video with HDR and
+     * LOG "On" by default and persisted that silently; on Samsung, the LOG tonemap bypasses
+     * the vendor's adaptive tone mapping, so field phones kept rendering a dark, murky image
+     * long after the catalog defaults changed to "Off" — persisted values always override new
+     * defaults. Runs once; the user's future explicit choices persist normally.
+     */
+    private fun migrateLegacyAssistDefaults(values: Map<String, String>): Map<String, String> {
+        if (preferences.getBoolean(KEY_ASSIST_DEFAULTS_MIGRATED, false)) return values
+        preferences.edit().putBoolean(KEY_ASSIST_DEFAULTS_MIGRATED, true).apply()
+        val result = values.toMutableMap()
+        values.keys
+            .filter { it.endsWith(".hdr") || it.endsWith(".log") || it.endsWith(".hdr_log") }
+            .forEach { key -> result[key] = CameraCatalog.defaultSettingValues[key] ?: "Off" }
+        return result
+    }
+
     private companion object {
         const val PREFERENCES_NAME = "camera_session"
         const val KEY_ACTIVE_MODE = "active_mode"
@@ -108,5 +127,6 @@ class CameraSessionStore(context: Context) {
         const val KEY_SLIDER_SENSITIVITIES = "slider_sensitivities"
         const val KEY_FOCUS_CURVE_MODES = "focus_curve_modes"
         const val KEY_DETECTED_LENSES = "detected_lenses"
+        const val KEY_ASSIST_DEFAULTS_MIGRATED = "assist_defaults_migrated_v2"
     }
 }

@@ -123,6 +123,11 @@ class MainActivity : ComponentActivity() {
                                 com.mobiledivecontrol.core.CameraCommand.UpdateDetectedLenses(lenses)
                             )
                         },
+                        onCapabilities = { caps ->
+                            viewModel.dispatch(
+                                com.mobiledivecontrol.core.CameraCommand.UpdateCameraCapabilities(caps)
+                            )
+                        },
                         introVisible = introVisible,
                         onIntroDismiss = viewModel::dismissIntro,
                         // The intro is the app's only honest surface for "why can I not do
