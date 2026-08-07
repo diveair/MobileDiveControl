@@ -112,6 +112,8 @@ enum class SliderEditTarget {
     FocusAssist,
     FocusCurve,
     FocusDirection,
+    FocusRampIn,
+    FocusRampOut,
 }
 
 enum class FocusCurveMode {

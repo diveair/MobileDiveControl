@@ -246,6 +246,33 @@ object CameraCatalog {
         defaultValue = "Normal",
     )
 
+    /**
+     * How fast a focus PULL travels, 1 (slowest) to 100 (fastest), per direction.
+     *
+     * A pull is what runs when focus jumps rather than steps: leaving autofocus, restoring a
+     * session, or any move larger than a detent. The two directions are separately settable
+     * because they are not symmetrical in practice — racking outward to infinity and racking
+     * inward to a close subject want different pacing to read well on screen.
+     */
+    fun focusRampSpec(focusSettingId: String, inward: Boolean): CameraSettingSpec = CameraSettingSpec(
+        id = focusSettingId.removeSuffix(".manual_focus") +
+            if (inward) ".focus_ramp_in" else ".focus_ramp_out",
+        label = if (inward) "Inward Focus Ramp" else "Outward Focus Ramp",
+        group = "Focus",
+        kind = CameraSettingKind.Slider,
+        options = (1..100).map { it.toString() },
+        defaultValue = FOCUS_RAMP_DEFAULT,
+    )
+
+    /** Ramp rate 1..100 for the active mode's focus, per direction. */
+    fun focusRampLevel(camera: CameraState, focusSettingId: String, inward: Boolean): Int {
+        val spec = focusRampSpec(focusSettingId, inward)
+        return (camera.settingValues[spec.id] ?: spec.defaultValue).toIntOrNull()?.coerceIn(1, 100)
+            ?: FOCUS_RAMP_DEFAULT.toInt()
+    }
+
+    const val FOCUS_RAMP_DEFAULT = "60"
+
     /** Whether the diver flipped the focus wheel for the active mode. */
     fun focusWheelReversed(camera: CameraState): Boolean {
         val focus = settingsFor(

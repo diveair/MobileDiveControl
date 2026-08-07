@@ -1116,6 +1116,12 @@ class ControlReducer(
         val adjustingFocusDirection = preparedCamera.settingsEditing &&
                 spec.id.endsWith(".manual_focus") &&
                 editTarget == SliderEditTarget.FocusDirection
+        val adjustingRampIn = preparedCamera.settingsEditing &&
+                spec.id.endsWith(".manual_focus") &&
+                editTarget == SliderEditTarget.FocusRampIn
+        val adjustingRampOut = preparedCamera.settingsEditing &&
+                spec.id.endsWith(".manual_focus") &&
+                editTarget == SliderEditTarget.FocusRampOut
 
         return if (adjustingSensitivity) {
             if (repeatCount > 0 && repeatCount % 4 != 0) {
@@ -1166,6 +1172,21 @@ class ControlReducer(
             Reduction(
                 state = preparedState.copy(
                     camera = applySettingValue(preparedCamera, curveSpec.id, nextValue),
+                ),
+                effects = manualFocusPreparation.effects,
+            )
+        } else if (adjustingRampIn || adjustingRampOut) {
+            val rampSpec = CameraCatalog.focusRampSpec(spec.id, inward = adjustingRampIn)
+            val currentValue = preparedCamera.settingValues[rampSpec.id] ?: rampSpec.defaultValue
+            val nextValue = advanceOption(
+                currentValue = currentValue,
+                options = rampSpec.options,
+                step = step,
+                wrap = false,
+            )
+            Reduction(
+                state = preparedState.copy(
+                    camera = applySettingValue(preparedCamera, rampSpec.id, nextValue),
                 ),
                 effects = manualFocusPreparation.effects,
             )
@@ -1490,6 +1511,8 @@ class ControlReducer(
         }
         if (spec.id.endsWith(".manual_focus")) {
             targets += SliderEditTarget.FocusDirection
+            targets += SliderEditTarget.FocusRampIn
+            targets += SliderEditTarget.FocusRampOut
         }
         return targets
     }

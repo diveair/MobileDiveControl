@@ -527,6 +527,32 @@ class ControlCoreTest {
     }
 
     @Test
+    fun `focus ramp rates are per-direction and adjustable from the focus menu`() {
+        val reducer = ControlReducer(nowMs = { 10_000L })
+        val inSpec = CameraCatalog.focusRampSpec("photo.manual_focus", inward = true)
+        val outSpec = CameraCatalog.focusRampSpec("photo.manual_focus", inward = false)
+        assertEquals("photo.focus_ramp_in", inSpec.id)
+        assertEquals("photo.focus_ramp_out", outSpec.id)
+        assertEquals(100, inSpec.options.size)
+
+        val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
+            settingsCursor = 4,
+            settingsEditing = true,
+            sliderEditTarget = SliderEditTarget.FocusRampIn,
+        )
+        val faster = reducer.reduce(AppState(camera = camera), CameraCommand.NavigateRight, repeatCount = 0)
+        val inward = faster.state.camera.settingValues[inSpec.id]
+        assertEquals("61", inward)
+        // The other direction is untouched: the two rates are independent.
+        assertEquals(
+            CameraCatalog.FOCUS_RAMP_DEFAULT,
+            CameraCatalog.currentValue(faster.state.camera, outSpec),
+        )
+        assertEquals(61, CameraCatalog.focusRampLevel(faster.state.camera, "photo.manual_focus", inward = true))
+        assertEquals(60, CameraCatalog.focusRampLevel(faster.state.camera, "photo.manual_focus", inward = false))
+    }
+
+    @Test
     fun `focus selection on 0_6x lens enters edit mode without switching lenses`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(

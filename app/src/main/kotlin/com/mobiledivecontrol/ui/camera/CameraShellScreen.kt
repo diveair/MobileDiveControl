@@ -582,6 +582,18 @@ private fun BottomSettingsTray(
                 val focusDirectionValue = focusDirectionSpec?.let { dirSpec ->
                     CameraCatalog.currentValue(cameraState, dirSpec)
                 }
+                val rampInSpec = if (spec.id.endsWith(".manual_focus")) {
+                    CameraCatalog.focusRampSpec(spec.id, inward = true)
+                } else {
+                    null
+                }
+                val rampOutSpec = if (spec.id.endsWith(".manual_focus")) {
+                    CameraCatalog.focusRampSpec(spec.id, inward = false)
+                } else {
+                    null
+                }
+                val rampInValue = rampInSpec?.let { CameraCatalog.currentValue(cameraState, it) }
+                val rampOutValue = rampOutSpec?.let { CameraCatalog.currentValue(cameraState, it) }
 
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -593,10 +605,10 @@ private fun BottomSettingsTray(
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                     )
-                    Spacer(modifier = Modifier.height(6.dp))
+                    Spacer(modifier = Modifier.height(4.dp))
 
                     Column(
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(3.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.fillMaxWidth(0.7f),
                     ) {
@@ -660,6 +672,30 @@ private fun BottomSettingsTray(
                                     currentValue = focusDirectionValue,
                                     options = focusDirectionSpec.options,
                                 )
+                            }
+                        }
+
+                        // How quickly a focus PULL travels, per direction. Inward is far to
+                        // near, outward is near to far.
+                        if (rampInSpec != null && rampInValue != null) {
+                            BottomEditCard(
+                                title = "Inward Focus Ramp",
+                                value = rampInValue,
+                                selected = cameraState.sliderEditTarget == SliderEditTarget.FocusRampIn,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                SliderSensitivityMeter(current = SliderSensitivity.of(rampInValue.toIntOrNull() ?: 50))
+                            }
+                        }
+
+                        if (rampOutSpec != null && rampOutValue != null) {
+                            BottomEditCard(
+                                title = "Outward Focus Ramp",
+                                value = rampOutValue,
+                                selected = cameraState.sliderEditTarget == SliderEditTarget.FocusRampOut,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                SliderSensitivityMeter(current = SliderSensitivity.of(rampOutValue.toIntOrNull() ?: 50))
                             }
                         }
                     }
@@ -768,14 +804,14 @@ private fun BottomEditCard(
         modifier = modifier
             .background(
                 color = if (selected) DiveColors.DiveCyan.copy(alpha = 0.14f) else DiveColors.SurfaceCard.copy(alpha = 0.5f),
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(10.dp),
             )
             .border(
                 width = 1.dp,
                 color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.55f),
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(10.dp),
             )
-            .padding(horizontal = 8.dp, vertical = 6.dp),
+            .padding(horizontal = 8.dp, vertical = if (selected) 5.dp else 3.dp),
     ) {
         Row(
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -784,18 +820,23 @@ private fun BottomEditCard(
             Text(
                 text = title,
                 color = if (selected) DiveColors.TextPrimary else DiveColors.TextSecondary,
-                style = MaterialTheme.typography.labelMedium,
+                style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.Bold,
             )
             Text(
                 text = value,
                 color = if (selected) DiveColors.DiveCyan else DiveColors.TextMuted,
-                style = MaterialTheme.typography.labelMedium,
+                style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.Bold,
             )
         }
-        Spacer(modifier = Modifier.height(4.dp))
-        content()
+        // Only the card being edited spends vertical space on its meter. With seven cards in
+        // the focus menu, drawing them all would push the stack off screen — and a menu the
+        // diver has to scroll with gloves on is a menu they cannot use.
+        if (selected) {
+            Spacer(modifier = Modifier.height(3.dp))
+            content()
+        }
     }
 }
 

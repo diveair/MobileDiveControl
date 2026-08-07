@@ -76,19 +76,35 @@ class CameraRuntimeController(
         private const val RESUME_STREAM_CHECK_DELAY_MS = 2_500L
         private const val MACRO_STOP_REBIND_DEBOUNCE_MS = 450L
 
+        /** A beat on the landed plane before the HAL takes the lens, so the arrival reads. */
+        private const val AF_HANDOVER_DELAY_MS = 220L
+
+        /** How far the probe steps to decide which way the subject lies. */
+        private const val AF_PROBE_STEP = 0.05
+
+        /** Time for the lens and the analysis stream to catch up with the probe. */
+        private const val AF_PROBE_SETTLE_MS = 90L
+
+        /** Contrast must fall to this fraction of the best seen before the peak counts as passed. */
+        private const val AF_PEAK_DROP = 0.82
+
+        /** ...and it must stay fallen for this many frames, so noise cannot end a search. */
+        private const val AF_PEAK_CONFIRM = 4
+
+        /** Subsampling stride of the focus measure. */
+        private const val SHARPNESS_STRIDE = 4
+
         /** One focus tick per frame-ish: the glide reads as continuous motion, not steps. */
         private const val FOCUS_SLEW_TICK_MS = 16L
 
         /** Below this the move is a single dial step: apply it straight, no glide. */
         private const val GLIDE_MIN_JUMP = 0.015
 
-        /**
-         * A full near-to-infinity pull, in milliseconds. At the 16 ms tick this is ~56 steps of
-         * about 0.018 each — below the frame period, so every frame carries a new plane and the
-         * travel is continuous rather than stepped. Going slower reads as sluggish; going much
-         * faster stops being a pull and becomes the snap this exists to avoid.
-         */
-        private const val FULL_RACK_MS = 900L
+        /** Full-rack duration at ramp level 100 — as fast as a pull can be and still read as one. */
+        private const val RACK_FASTEST_MS = 250L
+
+        /** Full-rack duration at ramp level 1 — a slow, deliberate cinematic rack. */
+        private const val RACK_SLOWEST_MS = 6_000L
 
         /** Even the shortest pull gets this long, so small corrections still glide. */
         private const val MIN_RACK_MS = 160L
@@ -245,6 +261,12 @@ class CameraRuntimeController(
                 // the session exists.
                 lastAppliedSessionSignature = null
                 applySessionState(latestState, force = true)
+                // A session opening in auto has no diver-set plane to preserve, so give it one
+                // search; from then on only movement re-triggers.
+                if (manualFocusRequestFor(latestState) == null && afHoldDiopters == null) {
+                    // Nothing to inherit at session start: track once, then settle and hold.
+                    startAutofocusTracking("session start")
+                }
             }
             // Live pipe telemetry, sampled EVERY frame (cheap reads): the lens's true plane
             // seeds the AF-to-manual glide, the HAL's auto colour transform anchors manual
@@ -459,6 +481,233 @@ class CameraRuntimeController(
     /** The last lens position we asked for — the thing [lastObservedVendorLensPos] must converge to. */
     @Volatile private var lastCommandedLensPos: Int? = null
 
+    /**
+     * Autofocus that HOLDS.
+     *
+     * Continuous AF re-hunts on its own, which underwater reads as the camera second-guessing
+     * the diver: hand focus to auto and the plane you carefully set drifts away while nothing
+     * in front of the lens has changed. Instead auto means "keep this plane until the camera
+     * actually moves, then find the subject again" — the housing's own motion is the cue, taken
+     * from the gyroscope, because it is the one signal that is about the CAMERA rather than
+     * about the scene (fish swim past; that is not a reason to refocus).
+     */
+    /**
+     * The plane autofocus is holding, in diopters, or null while a search is in flight.
+     *
+     * Once a search converges we stop asking the HAL to autofocus and simply command the plane
+     * it found. That is what makes "auto" actually hold: a repeating request carrying AF_MODE
+     * AUTO gets rebuilt whenever anything else in the session changes — a depth reading, a
+     * battery tick — and each rebuild restarts the search, which walked the lens to infinity
+     * while the housing sat still. A commanded distance is immune to that.
+     */
+    @Volatile private var afHoldDiopters: Float? = null
+
+    /**
+     * True while the housing is being moved: focus tracks the subject continuously instead of
+     * holding. Continuous-video AF is the mode built for this — it damps its own travel and
+     * never sweeps the whole range looking for a peak, which is what made a one-shot search
+     * land with a thud every time the camera was repointed.
+     */
+    @Volatile private var afTracking = false
+
+    /**
+     * A capture request kept alive for the duration of a ramp, so a focus step costs one key
+     * write instead of rebuilding white balance, exposure, tonemap and zoom every frame. That
+     * rebuild measured ~45 ms per step, which stretched every 16 ms tick to ~60 ms and made
+     * every ramp run roughly three times slower than the rate the diver had chosen.
+     */
+    private var focusRampBuilder: CaptureRequest.Builder? = null
+    private var focusRampSession: CameraCaptureSession? = null
+
+    /** Command a focus plane cheaply, reusing the ramp builder. False if no session owns it. */
+    private fun commandFocusDistance(diopters: Float): Boolean {
+        val session = cam2Session ?: return false
+        if (focusRampBuilder == null || focusRampSession !== session) {
+            focusRampBuilder = runCatching {
+                session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).also { b ->
+                    cam2Surfaces.forEach { surface -> b.addTarget(surface) }
+                    b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                    b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                    b.set(
+                        CaptureRequest.CONTROL_CAPTURE_INTENT,
+                        CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW,
+                    )
+                    lastAeFpsRange?.let { r -> b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, r) }
+                    lastAntibandingMode?.let { m ->
+                        b.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, m)
+                    }
+                    camera?.let { cam -> applyNativeZoom(b, latestState, cam) }
+                }
+            }.getOrNull()
+            focusRampSession = session
+        }
+        val builder = focusRampBuilder ?: return false
+        return runCatching {
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, diopters)
+            session.setRepeatingRequest(builder.build(), sessionCaptureCallback, cameraRequestHandler)
+            true
+        }.getOrDefault(false)
+    }
+
+    /** Newest focus measure from the analysis stream: higher means more contrast, i.e. sharper. */
+    @Volatile private var latestSharpness: Double = 0.0
+
+    /**
+     * Contrast in the middle of the frame, from the luma plane only.
+     *
+     * Deliberately cheap: a horizontal gradient over a subsampled centre crop. It is not an
+     * image-quality metric, only a monotone "is this sharper than that" signal for finding the
+     * plane a subject sits on, so precision matters far less than costing nothing per frame.
+     */
+    private fun centreSharpness(image: androidx.camera.core.ImageProxy): Double {
+        return try {
+            val plane = image.planes.firstOrNull() ?: return latestSharpness
+            val buffer = plane.buffer
+            val rowStride = plane.rowStride
+            val x0 = image.width / 3
+            val x1 = image.width * 2 / 3
+            val y0 = image.height / 3
+            val y1 = image.height * 2 / 3
+            var sum = 0L
+            var count = 0
+            var y = y0
+            while (y < y1) {
+                val row = y * rowStride
+                var x = x0
+                while (x < x1 - SHARPNESS_STRIDE) {
+                    val a = buffer.get(row + x).toInt() and 0xFF
+                    val b = buffer.get(row + x + SHARPNESS_STRIDE).toInt() and 0xFF
+                    sum += kotlin.math.abs(a - b)
+                    count++
+                    x += SHARPNESS_STRIDE
+                }
+                y += SHARPNESS_STRIDE
+            }
+            if (count == 0) latestSharpness else sum.toDouble() / count
+        } catch (_: Exception) {
+            latestSharpness
+        }
+    }
+
+    /** Autofocus, at the diver's pace. */
+    private fun startAutofocusTracking(reason: String) {
+        if (manualFocusRequestFor(latestState) != null) return
+        Log.d(TAG, "Autofocus: searching ($reason)")
+        runRampedAutofocus(reason)
+    }
+
+    /** Generation counter so a new search or a manual input cancels one in flight. */
+    private var afSearchGen = 0
+
+    /**
+     * Autofocus that travels at the DIVER'S pace.
+     *
+     * The HAL's own search cannot be slowed — its speed keys are not exposed to us — and left to
+     * itself it snaps the lens onto the subject, which is exactly the jolt the ramp settings
+     * exist to prevent. So the decision stays with contrast (the same signal autofocus uses) but
+     * the travel is ours: the lens pulls at the Inward or Outward Focus Ramp rate, watching the
+     * centre of the frame sharpen, and stops on the peak. Overshooting slightly and settling
+     * back is what a focus puller does, and it reads far better than arriving abruptly.
+     */
+    private fun runRampedAutofocus(reason: String) {
+        val capability = selectedFocusCapability(latestState) ?: return
+        val maxD = reachableDiopters(capability)?.takeIf { it > 0f } ?: return
+        if (manualFocusRequestFor(latestState) != null) return
+        val startValue = dialValueForCurrentLens(capability)
+            ?: afHoldDiopters?.let { (1.0 - it / maxD).coerceIn(0.0, 1.0) }
+            ?: return
+
+        afSearchGen++
+        val gen = afSearchGen
+        afTracking = true
+
+        fun command(value: Double) {
+            val diopters = ((1.0 - value.coerceIn(0.0, 1.0)) * maxD).toFloat()
+            afHoldDiopters = diopters
+            if (!commandFocusDistance(diopters)) {
+                camera?.let { submitNativeRepeatingRequest(latestState, it) }
+            }
+        }
+
+        // Which way is the subject? A short probe outward, judged on contrast.
+        val probe = (startValue + AF_PROBE_STEP).coerceAtMost(1.0)
+        val baseline = latestSharpness
+        command(probe)
+        cameraRequestHandler.postDelayed({
+            if (gen != afSearchGen) return@postDelayed
+            val outward = latestSharpness >= baseline
+            val direction = if (outward) 1.0 else -1.0
+            val level = manualFocusSettingKey(latestState)?.let { key ->
+                CameraCatalog.focusRampLevel(latestState, key, inward = !outward)
+            } ?: 60
+            // Rate comes from the CLOCK, not from counting ticks. Each tick does real work
+            // (building and submitting a capture request), so a tick is never exactly 16 ms;
+            // accumulating a fixed step per tick therefore ran the pull slower than the setting
+            // asked for. Interpolating against elapsed time makes the travel rate exact, and
+            // identical to the rate the AF-to-rail pull already uses.
+            val durationMs = rampDurationForLevel(level).toDouble()
+            val startedAtMs = SystemClock.elapsedRealtime()
+
+            var best = latestSharpness
+            var bestValue = startValue
+            var falling = 0
+
+            fun step() {
+                if (gen != afSearchGen) return
+                val elapsed = (SystemClock.elapsedRealtime() - startedAtMs).toDouble()
+                val value = startValue + direction * (elapsed / durationMs)
+                if (value !in 0.0..1.0) {
+                    finishRampedAutofocus(gen, bestValue, maxD, reason)
+                    return
+                }
+                command(value)
+                val sharp = latestSharpness
+                if (sharp > best) {
+                    best = sharp
+                    bestValue = value
+                    falling = 0
+                } else if (sharp < best * AF_PEAK_DROP) {
+                    falling++
+                    if (falling >= AF_PEAK_CONFIRM) {
+                        finishRampedAutofocus(gen, bestValue, maxD, reason)
+                        return
+                    }
+                } else {
+                    falling = 0
+                }
+                cameraRequestHandler.postDelayed({ step() }, FOCUS_SLEW_TICK_MS)
+            }
+            step()
+        }, AF_PROBE_SETTLE_MS)
+    }
+
+    /**
+     * Land on the sharpest plane the pull found, then give the lens to the HAL.
+     *
+     * Our job was the TRAVEL — getting there at the diver's chosen rate instead of snapping.
+     * Keeping the lens afterwards would mean reimplementing autofocus badly: the HAL tracks a
+     * subject far better than a contrast walk can, and it picks up from wherever the lens is,
+     * so the handover itself moves nothing.
+     */
+    private fun finishRampedAutofocus(gen: Int, bestValue: Double, maxD: Float, reason: String) {
+        if (gen != afSearchGen) return
+        val landed = ((1.0 - bestValue.coerceIn(0.0, 1.0)) * maxD).toFloat()
+        afHoldDiopters = landed
+        camera?.let { submitNativeRepeatingRequest(latestState, it) }
+        Log.d(
+            TAG,
+            "Autofocus: landed at ${"%.2f".format(landed)} dpt (dial ${"%.2f".format(bestValue)}, $reason) — handing to HAL",
+        )
+        // One frame on the landed plane, then continuous AF takes over from exactly there.
+        cameraRequestHandler.postDelayed({
+            if (gen != afSearchGen) return@postDelayed
+            if (manualFocusRequestFor(latestState) != null) return@postDelayed
+            afHoldDiopters = null
+            afTracking = true
+            camera?.let { submitNativeRepeatingRequest(latestState, it) }
+        }, AF_HANDOVER_DELAY_MS)
+    }
+
     /** The value an in-flight glide is racking toward; null when no glide is running. */
     @Volatile private var focusSlewTarget: String? = null
 
@@ -535,34 +784,44 @@ class CameraRuntimeController(
         focusSlewTarget = target
         val gen = focusSlewGen
         // A focus PULL, not a jump: the lens walks from where it is to where it is going at a
-        // constant rate, one step per frame, through every plane in between. Even speed is the
-        // point — easing was tried and read as sluggish at the ends rather than cinematic — and
-        // the duration scales with distance so a short correction stays quick. Interruptible
-        // throughout: turning the wheel retargets the pull mid-flight.
+        // CONSTANT rate, one step per frame, through every plane in between. Even speed is the
+        // point — easing was tried and read as sluggish at the ends rather than cinematic.
+        //
+        // The pace is the diver's to choose, and separately per direction: Inward Focus Ramp
+        // governs far-to-near, Outward Focus Ramp near-to-far, each 1 (slowest) to 100
+        // (fastest). Interruptible throughout: turning the wheel retargets the pull mid-flight.
         val travel = kotlin.math.abs(toNum - fromNum)
-        val durationMs = (travel * FULL_RACK_MS).toLong().coerceIn(MIN_RACK_MS, FULL_RACK_MS)
-        val stepCount = (durationMs / FOCUS_SLEW_TICK_MS).toInt().coerceIn(2, MAX_RACK_TICKS)
-        val ticks = (1..stepCount).map { i ->
-            if (i == stepCount) target else "%.4f".format(fromNum + (toNum - fromNum) * i / stepCount)
-        }
+        val inward = toNum < fromNum
+        val level = CameraCatalog.focusRampLevel(cameraState, key, inward)
+        val fullRackMs = rampDurationForLevel(level)
+        val durationMs = (travel * fullRackMs).toLong().coerceIn(MIN_RACK_MS, fullRackMs)
+        // Paced by the CLOCK rather than by counting ticks: a tick's work is never free, so
+        // accumulating a fixed step per tick ran every ramp slower than the chosen rate.
+        val startedAtMs = SystemClock.elapsedRealtime()
+        val rampCapability = selectedFocusCapability(cameraState)
+        val rampMaxDiopters = rampCapability?.let { reachableDiopters(it) }?.takeIf { it > 0f }
 
-        fun stepAt(index: Int) {
+        fun stepAt() {
             if (gen != focusSlewGen) return
-            val value = ticks.getOrNull(index) ?: return
-            lensFocusApplied = value
-            // Apply against the newest state, not the snapshot this glide started from, so a
-            // setting changed mid-rack is not stalled behind the glide.
-            val base = latestState
-            applySessionState(
-                base.copy(settingValues = base.settingValues + (key to value)),
-            )
-            if (index + 1 < ticks.size) {
-                cameraRequestHandler.postDelayed({ stepAt(index + 1) }, FOCUS_SLEW_TICK_MS)
-            } else {
+            val elapsed = (SystemClock.elapsedRealtime() - startedAtMs).toDouble()
+            if (elapsed >= durationMs || rampMaxDiopters == null) {
+                lensFocusApplied = target
                 focusSlewTarget = null
+                val base = latestState
+                applySessionState(base.copy(settingValues = base.settingValues + (key to target)))
+                return
             }
+            val value = fromNum + (toNum - fromNum) * (elapsed / durationMs)
+            val label = String.format(java.util.Locale.US, "%.4f", value)
+            lensFocusApplied = label
+            val diopters = ((1.0 - value.coerceIn(0.0, 1.0)) * rampMaxDiopters).toFloat()
+            if (!commandFocusDistance(diopters)) {
+                val base = latestState
+                applySessionState(base.copy(settingValues = base.settingValues + (key to label)))
+            }
+            cameraRequestHandler.postDelayed({ stepAt() }, FOCUS_SLEW_TICK_MS)
         }
-        stepAt(0)
+        stepAt()
     }
 
     fun execute(command: CameraCommand) {
@@ -689,6 +948,7 @@ class CameraRuntimeController(
             boundMacroStop = false
             lastAppliedExposureIndex = null
             lastAppliedFlash = null
+            focusRampBuilder = null
             Log.d(
                 TAG,
                 "bindCamera: AF_MODE_OFF + diopters=${manualFocusRequest?.diopters} vendorLensPos=${manualFocusRequest?.vendorLensPosition} set at bind time via Extender",
@@ -741,7 +1001,10 @@ class CameraRuntimeController(
             // interop capture callback never fires. Active, it is the pipeline's per-frame
             // telemetry tap — the live lens position that seeds the AF handoff comes from
             // here. The frame itself is closed immediately; nothing is read or retained.
-            it.setAnalyzer(focusAssistExecutor) { image -> image.close() }
+            it.setAnalyzer(focusAssistExecutor) { image ->
+                latestSharpness = centreSharpness(image)
+                image.close()
+            }
         }
 
         // GPU focus peaking effect — sits in the preview pipeline as a CameraEffect.
@@ -1171,6 +1434,21 @@ class CameraRuntimeController(
 
         val manualFocusRequest = manualFocusRequestFor(cameraState)
         val isManualFocus = manualFocusRequest != null
+        if (isManualFocus) {
+            // Leaving auto: forget the held plane, the dial owns focus again.
+            afHoldDiopters = null
+            afTracking = false
+        } else if (afHoldDiopters == null && !afTracking && lensFocusApplied?.toDoubleOrNull() != null) {
+            // Entering auto from a plane the diver set: start the search THERE, so the pull runs
+            // from their plane to the subject at the ramp rate rather than jumping.
+            afHoldDiopters = manualFocusRequestFor(
+                cameraState.copy(
+                    settingValues = cameraState.settingValues +
+                        (manualFocusSettingKey(cameraState).orEmpty() to lensFocusApplied.orEmpty()),
+                ),
+            )?.diopters
+            cameraRequestHandler.post { startAutofocusTracking("entered auto") }
+        }
 
         if (isManualFocus) {
             // ── NATIVE MODE: one writer, and it must be this one ─────────
@@ -1302,11 +1580,22 @@ class CameraRuntimeController(
             val manualFocusRequest = manualFocusRequestFor(cameraState)
             applyNativeZoom(builder, cameraState, boundCamera)
             if (manualFocusRequest == null) {
-                builder.set(
-                    CaptureRequest.CONTROL_AF_MODE,
-                    CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
-                )
-                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                val held = afHoldDiopters
+                if (held != null) {
+                    // Auto, holding: the plane is commanded, so nothing that rebuilds this
+                    // request can disturb it. Only movement starts a new search.
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                    builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                    builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, held)
+                } else {
+                    // Auto, steady state: the HAL keeps the subject sharp. CONTINUOUS_VIDEO
+                    // damps its own travel and takes over from wherever our pull left the lens.
+                    builder.set(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+                    )
+                    builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                }
             } else {
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
                 builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
@@ -2159,6 +2448,19 @@ class CameraRuntimeController(
         return (1.0 / v.coerceAtLeast(1.0 / minFocusDistance))
             .toFloat()
             .coerceIn(0f, minFocusDistance)
+    }
+
+    /**
+     * Ramp level (1 slowest … 100 fastest) to a full-rack duration.
+     *
+     * Geometric rather than linear, so the slider's feel is even: each step changes the pace by
+     * the same PROPORTION. A linear map would spend most of its travel among durations the eye
+     * cannot tell apart and cram the interesting slow end into a few clicks.
+     */
+    private fun rampDurationForLevel(level: Int): Long {
+        val t = (level.coerceIn(1, 100) - 1) / 99.0
+        val ratio = RACK_FASTEST_MS.toDouble() / RACK_SLOWEST_MS.toDouble()
+        return (RACK_SLOWEST_MS * Math.pow(ratio, t)).toLong().coerceIn(RACK_FASTEST_MS, RACK_SLOWEST_MS)
     }
 
     /**
