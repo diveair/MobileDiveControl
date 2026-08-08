@@ -553,6 +553,15 @@ class CameraRuntimeController(
     @Volatile private var latestSharpness: Double = 0.0
 
     /**
+     * Whether a contrast pull is actually reading [latestSharpness] right now.
+     *
+     * The metric is cheap per frame but it ran on EVERY frame forever, and its value is read
+     * only while a pull is searching. Cheap-times-always is the shape that cost the most heat in
+     * this file already, so the analyzer skips the measurement entirely when nothing wants it.
+     */
+    @Volatile private var afPullActive = false
+
+    /**
      * Contrast in the middle of the frame, from the luma plane only.
      *
      * Deliberately cheap: a horizontal gradient over a subsampled centre crop. It is not an
@@ -618,6 +627,7 @@ class CameraRuntimeController(
             ?: return
 
         afSearchGen++
+        afPullActive = true
         val gen = afSearchGen
         afTracking = true
 
@@ -691,6 +701,8 @@ class CameraRuntimeController(
      */
     private fun finishRampedAutofocus(gen: Int, bestValue: Double, maxD: Float, reason: String) {
         if (gen != afSearchGen) return
+        // The search is over; stop measuring until the next one asks.
+        afPullActive = false
         val landed = ((1.0 - bestValue.coerceIn(0.0, 1.0)) * maxD).toFloat()
         afHoldDiopters = landed
         camera?.let { submitNativeRepeatingRequest(latestState, it) }
@@ -1016,7 +1028,7 @@ class CameraRuntimeController(
             // telemetry tap — the live lens position that seeds the AF handoff comes from
             // here. The frame itself is closed immediately; nothing is read or retained.
             it.setAnalyzer(focusAssistExecutor) { image ->
-                latestSharpness = centreSharpness(image)
+                if (afPullActive) latestSharpness = centreSharpness(image)
                 image.close()
             }
         }

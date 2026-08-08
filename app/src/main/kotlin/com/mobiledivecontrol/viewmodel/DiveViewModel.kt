@@ -502,6 +502,10 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         @Volatile var intervalMs: Long = 16L
         @Volatile var maxTicksPerInterval: Int = 1
         @Volatile var stopTimeoutMs: Long = 250L
+        /** Rungs per second, re-derived from the OUTSTANDING debt at every wheel event. */
+        @Volatile var rungsPerSecond: Double = 0.0
+        /** Fractional accumulator, so a sub-frame rate still advances rather than rounding away. */
+        var carry: Double = 0.0
         var job: kotlinx.coroutines.Job? = null
         var lastFedAtMs: Long = System.currentTimeMillis()
     }
@@ -528,6 +532,9 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                 existing.intervalMs = ramp.intervalMs
                 existing.maxTicksPerInterval = ramp.maxTicksPerInterval
                 existing.stopTimeoutMs = ramp.stopTimeoutMs
+                // From the DEBT, not from this detent alone: pacing on the newest credit
+                // under-delivers every gap, so a fast spin compounds a lag it never repays.
+                existing.rungsPerSecond = existing.remaining * 1000.0 / ramp.spanMs.coerceAtLeast(1L)
                 existing.lastFedAtMs = System.currentTimeMillis()
                 return@forEach
             }
@@ -536,6 +543,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             fresh.intervalMs = ramp.intervalMs
             fresh.maxTicksPerInterval = ramp.maxTicksPerInterval
             fresh.stopTimeoutMs = ramp.stopTimeoutMs
+            fresh.rungsPerSecond = fresh.remaining * 1000.0 / ramp.spanMs.coerceAtLeast(1L)
             ramps[ramp.settingId] = fresh
             fresh.job = viewModelScope.launch {
                 while (fresh.remaining > 0) {
@@ -552,7 +560,17 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                     // full sweep inside the spin plus the timeout window, yet every step is
                     // still individually applied — an unbounded burst collapsed dozens of steps
                     // into one visible jump, which defeated the whole traversal contract.
-                    var burst = minOf(fresh.remaining, fresh.maxTicksPerInterval)
+                    // Spend the debt at the derived rate, carrying the fraction so slow rates
+                    // still advance. One wake-up per frame keeps the SoC's idle time intact:
+                    // sub-frame delivery is invisible on a 60 Hz preview and only costs power.
+                    fresh.carry += fresh.rungsPerSecond * fresh.intervalMs / 1000.0
+                    var burst = minOf(
+                        fresh.remaining,
+                        fresh.carry.toInt(),
+                        MAX_RUNGS_PER_FRAME,
+                    )
+                    if (burst <= 0) continue
+                    fresh.carry -= burst
                     while (burst > 0 && fresh.remaining > 0) {
                         fresh.remaining -= 1
                         burst -= 1
@@ -814,6 +832,13 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
          * long enough that a 500 Hz dial spin collapses into two writes a second instead of 500.
          */
         const val SAVE_MIN_INTERVAL_MS = 400L
+
+        /**
+         * Ceiling on rungs delivered in one frame — the heat budget, mirroring the reducer's own
+         * cap. Eight per 16 ms is 500 core dispatches a second, which is what the catalog
+         * memoisation work was sized against.
+         */
+        const val MAX_RUNGS_PER_FRAME = 20
 
         /** Comfortably longer than any firmware auto-repeat interval, short enough to be unfelt. */
         const val INTRO_DISMISS_GUARD_MS = 350L

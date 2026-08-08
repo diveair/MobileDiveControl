@@ -570,6 +570,15 @@ sealed interface PlatformEffect {
         val maxTicksPerInterval: Int = 3,
         /** Wheel-silence window after which undrained ticks are discarded (stop-on-stop). */
         val stopTimeoutMs: Long = 200L,
+        /**
+         * Time constant for the OUTSTANDING distance, not a duration.
+         *
+         * The drain re-derives rate = remaining / spanMs at each wheel event. Pacing from the
+         * newest detent's credit alone under-delivers permanently — injection exceeds drain
+         * every detent and the lens falls progressively further behind on a fast spin. Pacing
+         * from the debt self-corrects: the debt grows until drain matches injection exactly.
+         */
+        val spanMs: Long = 250L,
     ) : PlatformEffect
     data object LoadGalleryItems : PlatformEffect
     data class DeleteGalleryItem(val item: GalleryItem) : PlatformEffect

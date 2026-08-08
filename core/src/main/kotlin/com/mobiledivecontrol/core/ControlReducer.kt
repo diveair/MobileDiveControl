@@ -1230,7 +1230,15 @@ class ControlReducer(
                 val currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue
                 val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
                 val now = nowMs()
-                val gapMs = now - preparedCamera.lastFocusInputAtMs
+                // CLAMPED. lastFocusInputAtMs starts at 0 while the clock is epoch millis, so an
+                // untouched dial reports a gap of ~1.8e12 ms and every pacing figure derived from
+                // it becomes nonsense — the first ramp slept for roughly two YEARS, never woke,
+                // and left its job permanently active so every later detent merged into it and
+                // moved a single rung. A rest of even 30 s was enough to reap a whole turn.
+                // Anything slower than one detent a second is a fresh press, not a turn in
+                // progress, so treating it as the slowest real cadence loses nothing.
+                val gapMs = (now - preparedCamera.lastFocusInputAtMs)
+                    .coerceIn(1L, MAX_WHEEL_GAP_MS)
                 val usable = spec.options.size - 1 // the numeric scale, AF excluded
                 val motor = sliderMotorFor(usable, currentSensitivity, gapMs, held = repeatCount > 0)
 
@@ -1286,6 +1294,9 @@ class ControlReducer(
                     // Rate first, then a (ticks, interval) pair that actually delivers it.
                     val rate = drainRatePerSecond(motor, gapMs.coerceAtLeast(1L))
                     val (spread, paced) = pacing(rate, motor)
+                    val span = kotlin.math.round(
+                        gapMs.coerceAtLeast(1L) * UNDER_RUN,
+                    ).toLong().coerceAtLeast(FOCUS_RAMP_TICK_MS)
                     listOf(
                         PlatformEffect.RampSetting(
                             settingId = spec.id,
@@ -1298,6 +1309,7 @@ class ControlReducer(
                             // second had its remaining distance discarded, which is what made
                             // slow turning feel impossible rather than merely slow.
                             stopTimeoutMs = (gapMs * 3 / 2).coerceIn(250L, 2_500L),
+                            spanMs = span,
                         ),
                     )
                 } else {
@@ -1317,7 +1329,15 @@ class ControlReducer(
                 // Every slider rides the same motor as focus — ISO, shutter, white balance,
                 // exposure — scaled to its own ladder, per the generalisation rule.
                 val now = nowMs()
-                val gapMs = now - preparedCamera.lastFocusInputAtMs
+                // CLAMPED. lastFocusInputAtMs starts at 0 while the clock is epoch millis, so an
+                // untouched dial reports a gap of ~1.8e12 ms and every pacing figure derived from
+                // it becomes nonsense — the first ramp slept for roughly two YEARS, never woke,
+                // and left its job permanently active so every later detent merged into it and
+                // moved a single rung. A rest of even 30 s was enough to reap a whole turn.
+                // Anything slower than one detent a second is a fresh press, not a turn in
+                // progress, so treating it as the slowest real cadence loses nothing.
+                val gapMs = (now - preparedCamera.lastFocusInputAtMs)
+                    .coerceIn(1L, MAX_WHEEL_GAP_MS)
                 val motor = sliderMotorFor(
                     spec.options.size,
                     currentSensitivity,
@@ -1349,6 +1369,9 @@ class ControlReducer(
                     // Rate first, then a (ticks, interval) pair that actually delivers it.
                     val rate = drainRatePerSecond(motor, gapMs.coerceAtLeast(1L))
                     val (spread, paced) = pacing(rate, motor)
+                    val span = kotlin.math.round(
+                        gapMs.coerceAtLeast(1L) * UNDER_RUN,
+                    ).toLong().coerceAtLeast(FOCUS_RAMP_TICK_MS)
                     listOf(
                         PlatformEffect.RampSetting(
                             settingId = spec.id,
@@ -1361,6 +1384,7 @@ class ControlReducer(
                             // second had its remaining distance discarded, which is what made
                             // slow turning feel impossible rather than merely slow.
                             stopTimeoutMs = (gapMs * 3 / 2).coerceIn(250L, 2_500L),
+                            spanMs = span,
                         ),
                     )
                 } else {
@@ -1437,7 +1461,7 @@ class ControlReducer(
          * because [ButtonEventNormalizer]'s repeat-continuation window floors the gap between
          * wheel events; shortening that window invalidates this cap.
          */
-        const val MAX_TICKS_PER_FRAME = 8
+        const val MAX_TICKS_PER_FRAME = 20
 
         /**
          * How much longer than the observed wheel cadence a detent's distance is spread over.
@@ -1446,14 +1470,21 @@ class ControlReducer(
          * arrives late, which is the stall. The cost is a tail — after the hand stops, the
          * remaining quarter-detent keeps arriving for about a quarter of a wheel period.
          */
-        const val UNDER_RUN = 1.7
+        const val UNDER_RUN = 1.15
+
+        /**
+         * Longest inter-detent gap treated as a continuous turn. Beyond this the diver has
+         * stopped and started again, so the next detent is paced as a fresh press rather than
+         * from a stale timestamp.
+         */
+        const val MAX_WHEEL_GAP_MS = 1_000L
 
         /**
          * Floor on the gap between deliveries. Below a frame the display cannot show it anyway,
          * but going finer than 16 ms lets a fast turn arrive as several small steps across the
          * frame instead of one visible lurch, at no extra dispatch cost.
          */
-        const val MIN_INTERVAL_MS = 4L
+        const val MIN_INTERVAL_MS = FOCUS_RAMP_TICK_MS
 
         /** How long the wheel must rest at a rail before further travel may enter AF. */
         const val FOCUS_AF_PAUSE_MS = 600L

@@ -109,11 +109,37 @@ void main() {
     // 0.55, not the theoretical ~0.9: the vendor ISP's noise reduction spreads even a
     // perfectly focused edge across 2-3 pixels, which alone costs a third of the ratio.
     // Genuine defocus sits near 0.3-0.4, so the margin holds.
-    if (norm > uThr && ratio > 0.55 && lc < 0.95 && mean < 0.95) {
-        gl_FragColor = vec4(0.0, 0.9, 0.0, 1.0);
-    } else {
-        gl_FragColor = c;
-    }
+    // Sensor noise is the dominant false positive underwater, where ISO runs into the
+    // thousands. It defeats the test above because it is spatially UNCORRELATED: a noisy
+    // pixel differs sharply from its immediate neighbours but carries no 2-px structure,
+    // so its fine gradient is large, its coarse gradient is near zero, and the ratio lands
+    // far ABOVE 1 — sailing through a one-sided "ratio > 0.55" test as if it were the
+    // sharpest thing in frame. A real edge cannot do that: whatever step it makes across
+    // 1 px it must also make across 2, which pins its ratio near 1.
+    //
+    // Two bounds close it, and neither costs a texture fetch:
+    //   - an UPPER ratio bound, rejecting the physically impossible "sharper than sharp"
+    //   - a floor on the coarse gradient, so a region must have real structure at 2 px
+    //     and not merely a noisy centre pixel
+    // SOFT, not binary. A hard threshold makes every pixel sitting near the boundary flip
+    // between painted and unpainted as noise nudges it across, frame after frame — which is
+    // seen as sparkle, and as isolated dots where single pixels cross alone. Grading the
+    // overlay instead means a marginal pixel settles at a marginal opacity and simply stops
+    // flickering. It also removes a divergent branch, so the wavefront no longer splits.
+    //
+    // Each factor is the same test as before, widened into a ramp:
+    //   edge     - contrast-normalised gradient clearing the user's threshold
+    //   focused  - the dual-scale ratio inside its band; the UPPER edge of the band is the
+    //              noise rejector, since uncorrelated noise scores far above a real edge
+    //   solid    - genuine 2-px structure, so a lone noisy pixel cannot light up
+    //   safe     - not on or beside saturation, where any lens position looks sharp
+    float edgeAmt  = smoothstep(uThr, uThr * 1.6, norm);
+    float focused  = smoothstep(0.45, 0.60, ratio) * (1.0 - smoothstep(1.7, 2.2, ratio));
+    float solid    = smoothstep(0.015, 0.030, coarse);
+    float safe     = (1.0 - smoothstep(0.92, 0.97, lc)) * (1.0 - smoothstep(0.92, 0.97, mean));
+    float amount   = edgeAmt * focused * solid * safe;
+
+    gl_FragColor = mix(c, vec4(0.0, 0.9, 0.0, 1.0), amount);
 }
 """
 
@@ -170,6 +196,10 @@ void main() {
     // ──────────────────────────────────────────────────────────────────
     override fun onInputSurface(request: SurfaceRequest) {
         val sz = request.resolution
+        // The single number that sizes every other GPU decision here: StreamSharing may hand
+        // this node a surface scaled for the UHD video child rather than for preview, which is
+        // 4x the per-frame bandwidth on a pass that runs whether Assist is on or off.
+        Log.i(TAG, "peaking input surface ${sz.width}x${sz.height}")
         glH.post {
             try {
                 eglInit()
@@ -214,6 +244,7 @@ void main() {
                 outSO = output
                 outW = output.size.width
                 outH = output.size.height
+                Log.i(TAG, "peaking output surface ${outW}x${outH}")
                 val surf = output.getSurface(cbExecutor) { }
                 outEgl = EGL14.eglCreateWindowSurface(dpy, cfg, surf,
                     intArrayOf(EGL14.EGL_NONE), 0)
