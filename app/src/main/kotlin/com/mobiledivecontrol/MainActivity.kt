@@ -66,10 +66,14 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val viewModel: DiveViewModel = viewModel()
+            // onResume runs outside the composition; keep a handle so a Bluetooth toggle made
+            // from quick settings is picked up the moment the diver returns to the app.
+            bluetoothStateRefresh = viewModel::refreshBluetoothState
             val state by viewModel.state.collectAsState()
             val effects by viewModel.effects.collectAsState()
             val useMetric by viewModel.depthUnitMetric.collectAsState()
             val introVisible by viewModel.introVisible.collectAsState()
+            val bluetoothEnabled by viewModel.bluetoothEnabled.collectAsState()
             val missingPermissions by viewModel.missingPermissions.collectAsState()
             val capPromptVisible by viewModel.capPromptVisible.collectAsState()
 
@@ -112,6 +116,7 @@ class MainActivity : ComponentActivity() {
                 Box(modifier = Modifier.fillMaxSize()) {
                     // Main UI
                     DiveControlScreen(
+                        bluetoothEnabled = bluetoothEnabled,
                         state = state,
                         cameraPermissionGranted = cameraPermissionGranted,
                         lifecycleOwner = this@MainActivity,
@@ -152,10 +157,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var bluetoothStateRefresh: (() -> Unit)? = null
+
     override fun onResume() {
         super.onResume()
         // Re-check permissions in case the user granted them from settings
         refreshPermissionState()
+        // The radio can be toggled from quick settings while we are backgrounded, and a stale
+        // "Bluetooth is off" banner is exactly as misleading as the housing fault it replaced.
+        bluetoothStateRefresh?.invoke()
     }
 
     private fun checkAndRequestPermissions() {

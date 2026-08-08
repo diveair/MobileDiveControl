@@ -45,6 +45,7 @@ fun CameraHudOverlay(
     state: AppState,
     useMetric: Boolean = true,
     modifier: Modifier = Modifier,
+    bluetoothEnabled: Boolean = true,
     content: @Composable () -> Unit,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
@@ -143,6 +144,7 @@ fun CameraHudOverlay(
             state.safety.verifiedVacuumKpa != null
         HousingLinkBanner(
             bleState = state.bleConnectionState,
+            bluetoothEnabled = bluetoothEnabled,
             modifier = if (vacuumEstablished) {
                 Modifier
                     .align(Alignment.Center)

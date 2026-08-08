@@ -80,7 +80,23 @@ object CameraCatalog {
             .associate { it.id to FocusCurveMode.SquareRoot }
     }
 
-    fun profile(mode: CameraModeId, variant: GalaxyDeviceVariant): CameraModeProfile = when (mode) {
+    /**
+     * Built profiles, keyed by everything they depend on.
+     *
+     * [profile] is a pure function of (mode, variant) returning immutable data — every consumer
+     * reads it or derives a new value with `copy()`, none mutate it — so a shared instance is
+     * indistinguishable from a freshly built one. Bounded by the key space itself — every
+     * [CameraModeId] (including the hidden legacy modes routed to `hiddenLegacyProfile`) times
+     * every [GalaxyDeviceVariant] — so there is nothing to evict. Concurrent because the reducer
+     * reaches this from the housing-BLE executor while the UI reaches it from the main thread.
+     */
+    private val profileCache =
+        java.util.concurrent.ConcurrentHashMap<Pair<CameraModeId, GalaxyDeviceVariant>, CameraModeProfile>()
+
+    fun profile(mode: CameraModeId, variant: GalaxyDeviceVariant): CameraModeProfile =
+        profileCache.getOrPut(mode to variant) { buildProfile(mode, variant) }
+
+    private fun buildProfile(mode: CameraModeId, variant: GalaxyDeviceVariant): CameraModeProfile = when (mode) {
         CameraModeId.Photo -> photoProfile(variant)
         CameraModeId.ExpertRaw -> expertRawProfile(variant)
         CameraModeId.Pro -> proProfile(variant)
@@ -108,6 +124,28 @@ object CameraCatalog {
         return profile(mode, variant).settings
     }
 
+    private data class SettingsKey(
+        val mode: CameraModeId,
+        val variant: GalaxyDeviceVariant,
+        val lenses: List<String>,
+        val capabilities: CameraCapabilities?,
+    )
+
+    /**
+     * Derived setting lists, keyed by every input that shapes them.
+     *
+     * All four key components are immutable value types with structural equality, and the result
+     * is rebuilt from them alone, so a cache hit is byte-identical to a rebuild. The size guard
+     * is a safety valve only: the real key space is a handful of entries (modes actually visited
+     * x one lens set x one capability probe per bind), and clearing merely costs a rebuild.
+     */
+    private val settingsCache = java.util.concurrent.ConcurrentHashMap<SettingsKey, List<CameraSettingSpec>>()
+
+    private fun cachedSettings(key: SettingsKey, build: () -> List<CameraSettingSpec>): List<CameraSettingSpec> {
+        if (settingsCache.size > 256) settingsCache.clear()
+        return settingsCache.getOrPut(key, build)
+    }
+
     /**
      * Returns settings with lens options overridden by dynamically detected lenses
      * from the device hardware. Used by the UI to show only available lenses.
@@ -116,14 +154,17 @@ object CameraCatalog {
         mode: CameraModeId,
         variant: GalaxyDeviceVariant,
         detectedLenses: List<String>,
-    ): List<CameraSettingSpec> {
+    ): List<CameraSettingSpec> = cachedSettings(SettingsKey(mode, variant, detectedLenses, null)) {
         val baseSettings = settingsFor(mode, variant)
-        if (detectedLenses.isEmpty()) return baseSettings
-        return baseSettings.map { spec ->
-            if (spec.id.endsWith(".lens")) {
-                spec.copy(options = detectedLenses)
-            } else {
-                spec
+        if (detectedLenses.isEmpty()) {
+            baseSettings
+        } else {
+            baseSettings.map { spec ->
+                if (spec.id.endsWith(".lens")) {
+                    spec.copy(options = detectedLenses)
+                } else {
+                    spec
+                }
             }
         }
     }
@@ -142,7 +183,11 @@ object CameraCatalog {
     ): List<CameraSettingSpec> {
         val base = settingsFor(mode, variant, detectedLenses)
         if (capabilities == null) return base
-        return base.mapNotNull { spec -> applyCapabilities(spec, capabilities) }
+        // This is the reducer's per-tick call. Uncached it re-filtered the 162-entry exposure
+        // ladder on every focus nudge, each option running a regex-screened parse.
+        return cachedSettings(SettingsKey(mode, variant, detectedLenses, capabilities)) {
+            base.mapNotNull { spec -> applyCapabilities(spec, capabilities) }
+        }
     }
 
     private fun applyCapabilities(spec: CameraSettingSpec, caps: CameraCapabilities): CameraSettingSpec? {
@@ -547,12 +592,12 @@ object CameraCatalog {
                 choice("photo.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
                 choice("photo.save_format", "RAW / JPEG", "Core", listOf("JPEG", "RAW", "RAW + JPEG"), "JPEG"),
                 choice("photo.lens", "Lens", "Core", lenses, "Auto"),
-                slider("photo.manual_focus", "Focus", "Core", focusOptions(), "AF"),
+                slider("photo.manual_focus", "Focus", "Core", focusOptions, "AF"),
                 toggle("photo.focus_peaking", "Focus Assist", "Assist"),
                 choice("photo.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
-                slider("photo.exposure_compensation", "EV", "Core", evOptions(), "Auto"),
+                slider("photo.exposure_compensation", "EV", "Core", evOptions, "Auto"),
                 choice("photo.hdr_log", "HDR / LOG", "Assist", listOf("HDR", "LOG", "Off"), "HDR"),
-                choice("photo.filters", "Filters", "Core", underwaterFilterOptions(), "Off"),
+                choice("photo.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
             ),
         )
     }
@@ -576,11 +621,11 @@ object CameraCatalog {
                 choice("expert.lens", "Lens", "Core", lenses, "Auto"),
                 slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions(), "Auto"),
                 slider("expert.iso", "ISO", "Manual", isoOptions(), "100"),
-                slider("expert.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
+                slider("expert.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("expert.focus_peaking", "Focus Assist", "Assist"),
                 choice("expert.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("expert.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
-                slider("expert.exposure_value", "Exposure Value", "Manual", evOptions(), "Auto"),
+                slider("expert.exposure_value", "Exposure Value", "Manual", evOptions, "Auto"),
                 toggle("expert.exposure_monitor", "Exposure monitor", "Assist"),
                 choice("expert.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
                 choice("expert.grid", "Grid", "Assist", gridOptions(), "3x3"),
@@ -602,11 +647,11 @@ object CameraCatalog {
             settings = listOf(
                 slider("pro.white_balance", "White balance", "Manual", whiteBalanceOptions(), "Auto"),
                 slider("pro.iso", "ISO", "Manual", isoOptions(), "100"),
-                slider("pro.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
+                slider("pro.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("pro.focus_peaking", "Focus Assist", "Assist"),
                 choice("pro.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("pro.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
-                slider("pro.exposure_value", "Exposure Value", "Manual", evOptions(), "Auto"),
+                slider("pro.exposure_value", "Exposure Value", "Manual", evOptions, "Auto"),
                 choice("pro.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
                 choice("pro.lens", "Lens", "Core", lenses, "Auto"),
                 toggle("pro.exposure_monitor", "Exposure monitor", "Assist"),
@@ -646,7 +691,7 @@ object CameraCatalog {
                 choice("night.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Auto"),
                 choice("night.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
                 choice("night.lens", "Lens", "Core", lenses, "1x"),
-                slider("night.exposure", "Exposure Value", "Core", evOptions(), "0", supportsSensitivity = false),
+                slider("night.exposure", "Exposure Value", "Core", evOptions, "0", supportsSensitivity = false),
                 choice("night.grid", "Grid", "Assist", gridOptions(), "3x3"),
             ),
         )
@@ -733,7 +778,7 @@ object CameraCatalog {
                 choice("video.hdr", "HDR", "Assist", listOf("Off", "On"), "On"),
                 choice("video.log", "LOG", "Assist", listOf("Off", "On"), "Off"),
                 toggle("video.super_steady", "Super Steady", "Core", "Off"),
-                choice("video.filters", "Filters", "Core", underwaterFilterOptions(), "Off"),
+                choice("video.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
                 choice("video.megapixels", "Video MP", "Core", listOf("Auto", "12MP", "24MP", "50MP"), "Auto"),
                 toggle("video.motion_photo", "Motion Photo", "Core", "Off"),
             ),
@@ -757,11 +802,11 @@ object CameraCatalog {
             settings = listOf(
                 slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions(), "Auto"),
                 slider("pro_video.iso", "ISO", "Manual", isoOptions(), "100"),
-                slider("pro_video.manual_focus", "Focus", "Manual", focusOptions(), "AF"),
+                slider("pro_video.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("pro_video.focus_peaking", "Focus Assist", "Assist"),
                 choice("pro_video.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("pro_video.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
-                slider("pro_video.exposure_value", "Exposure Value", "Manual", evOptions(), "Auto"),
+                slider("pro_video.exposure_value", "Exposure Value", "Manual", evOptions, "Auto"),
                 slider("pro_video.frame_rate", "Frame rate", "Manual", frameRates, "30fps"),
                 choice("pro_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
                 choice("pro_video.lens", "Lens", "Core", lenses, "auto"),
@@ -921,22 +966,43 @@ object CameraCatalog {
     private fun whiteBalanceOptions(): List<String> =
         listOf("Auto", "2300K", "2800K", "3200K", "4000K", "5600K", "6500K", "7500K", "8500K", "10000K")
 
-    private fun focusOptions(): List<String> = buildList {
-        add("AF")
-        for (step in 0..100) {
-            add(String.format(Locale.US, "%.2f", step / 100.0))
+    /**
+     * The option ladders are built ONCE, not per profile lookup.
+     *
+     * They are constants that happen to be spelled as loops: the same 101 focus rungs and the
+     * same 161 exposure rungs, formatted identically every time. Rebuilding them per call cost
+     * 261 [String.format] invocations, and a focus adjustment reaches [profile] about thirty
+     * times per state application at up to 500 applications per second — around a million
+     * formatter calls per second on the main thread, every one of them discarded.
+     *
+     * [lazy] defers the value, not the delegate: the backing `$delegate` field is still assigned
+     * in declaration order while this object is constructed, so it is a convenience here and not
+     * a safety net. The standing rule is that no EAGERLY initialised member of this object may
+     * call [profile] — such a call re-enters and reads either a not-yet-assigned ladder delegate
+     * or a null [profileCache]. Today none does: every profile-derived property
+     * ([allModeSettings], [defaultSettingValues], [defaultSliderSensitivities],
+     * [defaultFocusCurveModes]) is itself lazy.
+     */
+    private val focusOptions: List<String> by lazy {
+        buildList {
+            add("AF")
+            for (step in 0..100) {
+                add(String.format(Locale.US, "%.2f", step / 100.0))
+            }
         }
     }
 
-    private fun underwaterFilterOptions(): List<String> = buildList {
-        add("Off")
-        add("Auto")
-        for (depthMeters in 0..50 step 5) {
-            add("${depthMeters}m")
+    private val underwaterFilterOptions: List<String> by lazy {
+        buildList {
+            add("Off")
+            add("Auto")
+            for (depthMeters in 0..50 step 5) {
+                add("${depthMeters}m")
+            }
         }
     }
 
-    private fun evOptions(): List<String> = buildList {
+    private val evOptions: List<String> by lazy { buildList {
         // "Auto" leads the ladder: auto-exposure with zero offset, the explicit hands-off
         // choice the field asked for. Then 4x finer granularity: 0.025 EV steps over the
         // +/-2.0 range (161 numeric options); applyExposure() rounds to the nearest
@@ -950,7 +1016,7 @@ object CameraCatalog {
                 add(String.format(Locale.US, "%+.2f", value))
             }
         }
-    }
+    } }
 
     private fun focusCurveOptions(): List<String> = listOf("Linear", "SquareRoot", "Logarithmic")
 }

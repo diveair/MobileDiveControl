@@ -60,6 +60,7 @@ fun DiveControlScreen(
     missingPermissions: List<String> = emptyList(),
     capPromptVisible: Boolean = false,
     onCapPromptDismiss: () -> Unit = {},
+    bluetoothEnabled: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
@@ -71,7 +72,8 @@ fun DiveControlScreen(
             effects = effects,
             onEffectsConsumed = onEffectsConsumed,
             onDetectedLenses = onDetectedLenses,
-                    onCapabilities = onCapabilities,
+            onCapabilities = onCapabilities,
+            bluetoothEnabled = bluetoothEnabled,
         )
 
         // One screen for permissions, connection and the button map. It leaves composition the
@@ -105,10 +107,12 @@ private fun DiveControlContent(
     onEffectsConsumed: () -> Unit,
     onDetectedLenses: ((List<String>) -> Unit)?,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)?,
+    bluetoothEnabled: Boolean = true,
 ) {
     CameraHudOverlay(
         state = state,
         useMetric = useMetric,
+        bluetoothEnabled = bluetoothEnabled,
     ) {
         AnimatedContent(
             targetState = state.mode,

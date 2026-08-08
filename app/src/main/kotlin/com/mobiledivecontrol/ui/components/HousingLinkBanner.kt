@@ -36,8 +36,16 @@ import com.mobiledivecontrol.theme.DiveColors
 fun HousingLinkBanner(
     bleState: BleConnectionState,
     modifier: Modifier = Modifier,
+    bluetoothEnabled: Boolean = true,
 ) {
-    val alert = alertFor(bleState) ?: return
+    // A radio that is switched off says nothing about the housing, so it must never be reported as
+    // a housing fault. It also outranks every link state below it: no scan can succeed until it is
+    // fixed, and it is the diver's own two-tap fix.
+    val alert = if (!bluetoothEnabled) {
+        info("BLUETOOTH IS OFF", "Turn on Bluetooth to connect the housing")
+    } else {
+        alertFor(bleState) ?: return
+    }
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -104,6 +112,14 @@ private fun alertFor(bleState: BleConnectionState): LinkAlert? = when (bleState)
     BleConnectionState.Failed ->
         warning("HOUSING UNAVAILABLE", "Charge the housing, then hold SHUTTER to turn it on")
 }
+
+/** Blue, not amber or red: this is information and an easy fix, not a fault or a danger. */
+private fun info(headline: String, action: String?) = LinkAlert(
+    headline = headline,
+    action = action,
+    background = DiveColors.DiveCyanDim,
+    foreground = Color.White,
+)
 
 private fun caution(headline: String, action: String?) = LinkAlert(
     headline = headline,

@@ -45,6 +45,21 @@ import kotlinx.coroutines.launch
 class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
     private val sessionStore = CameraSessionStore(application)
+
+    /**
+     * The newest state awaiting persistence, or null when everything is written.
+     *
+     * Persisting used to happen inline on every dispatch — three [org.json.JSONObject] builds,
+     * one of them over the whole ~110-entry settings map, on the main thread, up to 500 times a
+     * second during a focus sweep. A [MutableStateFlow] conflates by nature, so a burst collapses
+     * to a single write of the final value.
+     *
+     * Declared HERE, above the init block, and not beside the coroutine that drains it: Kotlin
+     * initialises properties in declaration order, `init` reaches `emitOutcome`, and `emitOutcome`
+     * writes this field — declared any lower it is still null when the first state is emitted.
+     */
+    private val pendingSave = MutableStateFlow<AppState?>(null)
+
     private val controlCore = ControlCore(initialState = sessionStore.restoreAppState())
     private val galleryRepository = GalleryRepository(application)
     private val diveApp: DiveControlApp? = application as? DiveControlApp
@@ -128,11 +143,34 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         }
         collectHousingLink()
         collectPhoneBattery()
+        collectPendingSaves()
     }
 
     override fun onCleared() {
+        if (bluetoothReceiverRegistered) {
+            runCatching {
+                getApplication<android.app.Application>().unregisterReceiver(bluetoothStateReceiver)
+            }
+        }
+        // Whatever the rate limiter has not written yet goes to disk now, synchronously, so
+        // teardown can never lose a setting the diver changed.
+        pendingSave.value?.let { state -> runCatching { sessionStore.save(state) } }
         phoneBatteryMonitor.stop()
         super.onCleared()
+    }
+
+    private fun collectPendingSaves() {
+        viewModelScope.launch(Dispatchers.IO) {
+            // Rate-limited but always progressing: write, then hold off briefly while the flow
+            // conflates whatever arrives. Deliberately NOT a trailing debounce — a diver spinning
+            // the dial for thirty seconds would then persist nothing until they stopped.
+            pendingSave.collect { state ->
+                if (state == null) return@collect
+                runCatching { sessionStore.save(state) }
+                pendingSave.compareAndSet(state, null)
+                kotlinx.coroutines.delay(SAVE_MIN_INTERVAL_MS)
+            }
+        }
     }
 
     /**
@@ -219,6 +257,50 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         }
         val outcome = controlCore.dispatch(command)
         emitOutcome(outcome)
+    }
+
+    /**
+     * Whether the PHONE's Bluetooth radio is on.
+     *
+     * Without this the link layer cannot tell "the housing is dead" from "the radio is off", and it
+     * reported the former — telling a diver to charge a housing that is fine and sitting right
+     * there, while the actual fix was two taps away in quick settings. A scan that cannot run is
+     * not evidence about the housing.
+     */
+    private val bluetoothAdapter: android.bluetooth.BluetoothAdapter? =
+        (getApplication<android.app.Application>()
+            .getSystemService(android.content.Context.BLUETOOTH_SERVICE)
+                as? android.bluetooth.BluetoothManager)?.adapter
+
+    private val _bluetoothEnabled = MutableStateFlow(bluetoothAdapter?.isEnabled ?: false)
+    val bluetoothEnabled: StateFlow<Boolean> = _bluetoothEnabled.asStateFlow()
+
+    private val bluetoothStateReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
+            if (intent?.action == android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED) {
+                refreshBluetoothState()
+            }
+        }
+    }
+
+    /**
+     * Registered here rather than in an init block so it runs AFTER the receiver it registers.
+     * Android 14+ requires the export flag explicitly; without it registration throws and the
+     * banner silently never updates when the radio is toggled.
+     */
+    private val bluetoothReceiverRegistered: Boolean = run {
+        runCatching {
+            androidx.core.content.ContextCompat.registerReceiver(
+                getApplication(),
+                bluetoothStateReceiver,
+                android.content.IntentFilter(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED),
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+        }.isSuccess
+    }
+
+    fun refreshBluetoothState() {
+        _bluetoothEnabled.value = bluetoothAdapter?.isEnabled ?: false
     }
 
     fun onButtonPayload(payload: ByteArray) {
@@ -523,7 +605,11 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun emitOutcome(outcome: ProcessingOutcome) {
-        android.util.Log.d("DiveControl", "emitOutcome: mode=${outcome.state.mode} cameraMode=${outcome.state.camera.activeMode} focusedZone=${outcome.state.camera.focusedZone} settingsEditing=${outcome.state.camera.settingsEditing} sliderEditTarget=${outcome.state.camera.sliderEditTarget} notes=${outcome.notes}")
+        // Every dispatch reaches here — up to 500 a second during a focus sweep — and the
+        // interpolated string was being built even though nothing reads it in the field.
+        if (android.util.Log.isLoggable("DiveControl", android.util.Log.DEBUG)) {
+            android.util.Log.d("DiveControl", "emitOutcome: mode=${outcome.state.mode} cameraMode=${outcome.state.camera.activeMode} focusedZone=${outcome.state.camera.focusedZone} settingsEditing=${outcome.state.camera.settingsEditing} sliderEditTarget=${outcome.state.camera.sliderEditTarget} notes=${outcome.notes}")
+        }
         _state.value = outcome.state
         // The cap doorway's hardware exits: the cap visibly CAME OFF (a cover transition to open,
         // never the level — this housing latches stale "open" for whole sessions), or the shell
@@ -622,7 +708,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             lastPersistedTier = null
         }
         lastSealState = sealNow
-        sessionStore.save(outcome.state)
+        pendingSave.value = outcome.state
         if (outcome.effects.isNotEmpty()) {
             _effects.value = outcome.effects
             processGalleryEffects(outcome.effects)
@@ -703,6 +789,12 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private companion object {
+        /**
+         * Floor between persistence writes. Short enough that a crash loses at most this much,
+         * long enough that a 500 Hz dial spin collapses into two writes a second instead of 500.
+         */
+        const val SAVE_MIN_INTERVAL_MS = 400L
+
         /** Comfortably longer than any firmware auto-repeat interval, short enough to be unfelt. */
         const val INTRO_DISMISS_GUARD_MS = 350L
 

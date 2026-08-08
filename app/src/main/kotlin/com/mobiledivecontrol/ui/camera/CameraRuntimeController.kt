@@ -1690,11 +1690,17 @@ class CameraRuntimeController(
             }
 
             session.setRepeatingRequest(builder.build(), sessionCaptureCallback, cameraRequestHandler)
-            val capability = selectedFocusCapability(cameraState)
-            Log.d(
-                TAG,
-                "Native focus applied: af=${if (manualFocusRequest == null) "auto" else "manual"} lens=${selectedLensValue(cameraState)} sessionCameraId=${session.device.id} zoom=${nativeZoomRatio(cameraState, boundCamera)} diopters=${manualFocusRequest?.diopters} minFocusDist=${capability?.minFocusDistance} transport=${capability?.transport} vendorLensPos=${manualFocusRequest?.vendorLensPosition} (norm=${manualFocusRequest?.normalizedFocus})",
-            )
+            // Gated, and the capability lookup moved INSIDE the guard: composing this line cost
+            // three more full catalog builds (selectedFocusCapability, selectedLensValue,
+            // nativeZoomRatio) on a path that runs on every focus step. The arguments to a
+            // Log.d are evaluated whether or not the line is ever written.
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                val capability = selectedFocusCapability(cameraState)
+                Log.d(
+                    TAG,
+                    "Native focus applied: af=${if (manualFocusRequest == null) "auto" else "manual"} lens=${selectedLensValue(cameraState)} sessionCameraId=${session.device.id} zoom=${nativeZoomRatio(cameraState, boundCamera)} diopters=${manualFocusRequest?.diopters} minFocusDist=${capability?.minFocusDistance} transport=${capability?.transport} vendorLensPos=${manualFocusRequest?.vendorLensPosition} (norm=${manualFocusRequest?.normalizedFocus})",
+                )
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Native focus FAILED: ${e.message}", e)
             // A dead (evicted) session must not be held: clearing it routes the next apply

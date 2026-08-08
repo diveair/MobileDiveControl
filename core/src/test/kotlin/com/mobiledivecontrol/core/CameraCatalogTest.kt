@@ -158,6 +158,72 @@ class CameraCatalogTest {
             .first { it.spec.id.endsWith(CameraCatalog.SLIDER_ASSIGNMENT_SUFFIX) }
         assertEquals("Focus", slider.spec.defaultValue)
     }
+
+    /**
+     * The focus ladder is now built once and shared rather than rebuilt per lookup. These pin its
+     * exact shape, because the dial's feel is a function of the rung count: the reducer converts a
+     * nudge into an index into this list, so adding, removing or reformatting a rung silently
+     * changes how far one detent moves the lens.
+     */
+    @Test
+    fun `focus ladder keeps AF plus exactly 101 rungs from 0_00 to 1_00`() {
+        val focus = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
+            .first { it.id == "pro.manual_focus" }
+            .options
+
+        assertEquals(102, focus.size)
+        assertEquals("AF", focus[0])
+        assertEquals("0.00", focus[1])
+        assertEquals("1.00", focus.last())
+        assertEquals("0.50", focus[51])
+    }
+
+    @Test
+    fun `exposure ladder keeps Auto plus exactly 161 rungs`() {
+        val ev = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
+            .first { it.id == "pro.exposure_value" }
+            .options
+
+        assertEquals(162, ev.size)
+        assertEquals("Auto", ev[0])
+        assertEquals("-2.00", ev[1])
+        assertEquals("0", ev[81])
+        assertEquals("+2.00", ev.last())
+    }
+
+    /**
+     * Guards the memoisation itself: a cached profile must be indistinguishable from a fresh one.
+     * Sharing an instance is only safe while nothing downstream mutates it, so if a future change
+     * makes these lists mutable this test is the tripwire.
+     */
+    @Test
+    fun `repeated catalog lookups return equal profiles`() {
+        val first = CameraCatalog.profile(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
+        val second = CameraCatalog.profile(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
+
+        assertEquals(first, second)
+        assertEquals(first.settings.map { it.id }, second.settings.map { it.id })
+        assertEquals(
+            first.settings.map { it.options },
+            second.settings.map { it.options },
+        )
+    }
+
+    @Test
+    fun `capability clipping still applies after repeated lookups`() {
+        val caps = CameraCapabilities(isoMin = 100, isoMax = 800)
+        val lenses = listOf("0.6x", "1x")
+
+        val a = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra, lenses, caps)
+        val b = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra, lenses, caps)
+        val unclipped = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra, lenses, null)
+
+        assertEquals(a, b)
+        val clippedIso = a.first { it.id == "pro.iso" }.options
+        val fullIso = unclipped.first { it.id == "pro.iso" }.options
+        assertTrue(clippedIso.size < fullIso.size, "capability clipping must survive caching")
+        assertEquals(lenses, a.first { it.id.endsWith(".lens") }.options)
+    }
 }
 
 
