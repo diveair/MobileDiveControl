@@ -969,9 +969,9 @@ object CameraCatalog {
     /**
      * The option ladders are built ONCE, not per profile lookup.
      *
-     * They are constants that happen to be spelled as loops: the same 101 focus rungs and the
+     * They are constants that happen to be spelled as loops: the same 201 focus rungs and the
      * same 161 exposure rungs, formatted identically every time. Rebuilding them per call cost
-     * 261 [String.format] invocations, and a focus adjustment reaches [profile] about thirty
+     * 362 [String.format] invocations, and a focus adjustment reaches [profile] about thirty
      * times per state application at up to 500 applications per second — around a million
      * formatter calls per second on the main thread, every one of them discarded.
      *
@@ -983,11 +983,19 @@ object CameraCatalog {
      * ([allModeSettings], [defaultSettingValues], [defaultSliderSensitivities],
      * [defaultFocusCurveModes]) is itself lazy.
      */
+    /**
+     * 201 rungs at 0.005 spacing, matching the increment count the native camera offers.
+     *
+     * Three decimals is forced by the spacing: at two, 0.005 / 0.010 / 0.015 all render "0.01"
+     * and every other click looks dead. The rung COUNT is load-bearing beyond display — the
+     * reducer indexes into this list, so its length is literally how far one detent moves the
+     * lens, which is why [com.mobiledivecontrol.core.CameraCatalog] pins it in tests.
+     */
     private val focusOptions: List<String> by lazy {
         buildList {
             add("AF")
-            for (step in 0..100) {
-                add(String.format(Locale.US, "%.2f", step / 100.0))
+            for (step in 0..200) {
+                add(String.format(Locale.US, "%.3f", step / 200.0))
             }
         }
     }

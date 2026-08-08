@@ -1030,7 +1030,9 @@ private fun formatFocusValue(cameraState: CameraState?, spec: CameraSettingSpec,
         return value
     }
     val numeric = value.toDoubleOrNull() ?: return value
-    return String.format(Locale.US, "%.2f", numeric)
+    // Three decimals, matching the 0.005 ladder. At two, 0.005 / 0.010 / 0.015 all read "0.01"
+    // and every second click would look like it did nothing.
+    return String.format(Locale.US, "%.3f", numeric)
 }
 
 private fun focusLensValue(cameraState: CameraState?, spec: CameraSettingSpec): String? {

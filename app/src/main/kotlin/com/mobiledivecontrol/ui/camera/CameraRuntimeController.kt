@@ -708,6 +708,9 @@ class CameraRuntimeController(
         }, AF_HANDOVER_DELAY_MS)
     }
 
+    /** True while a cinematic AF<->manual pull is in flight, so the wheel may retarget it. */
+    @Volatile private var cinematicPull = false
+
     /** The value an in-flight glide is racking toward; null when no glide is running. */
     @Volatile private var focusSlewTarget: String? = null
 
@@ -771,17 +774,27 @@ class CameraRuntimeController(
             )
             return
         }
+        // PROVENANCE, NOT MAGNITUDE, decides whether to glide. The Inward/Outward Focus Ramp
+        // settings exist for AF<->rail transitions; a wheel-driven walk inside the manual scale
+        // must land on the glass as fast as it lands on the readout. With ticks aggregated per
+        // frame a fast spin moves further than GLIDE_MIN_JUMP each frame, so a magnitude test
+        // would rack every frame at the cinematic rate and leave the lens permanently trailing
+        // the diver's hand.
+        val fromAf = lensFocusApplied == null || lensFocusApplied == "AF"
+        val cinematic = (fromAf != (target == "AF")) || cinematicPull
         if (key == null || target == null || fromNum == null || toNum == null ||
-            kotlin.math.abs(toNum - fromNum) <= GLIDE_MIN_JUMP
+            !cinematic || kotlin.math.abs(toNum - fromNum) <= GLIDE_MIN_JUMP
         ) {
             focusSlewGen++
             focusSlewTarget = null
+            cinematicPull = false
             lensFocusApplied = target
             applySessionState(cameraState)
             return
         }
         focusSlewGen++
         focusSlewTarget = target
+        cinematicPull = true
         val gen = focusSlewGen
         // A focus PULL, not a jump: the lens walks from where it is to where it is going at a
         // CONSTANT rate, one step per frame, through every plane in between. Even speed is the
@@ -807,6 +820,7 @@ class CameraRuntimeController(
             if (elapsed >= durationMs || rampMaxDiopters == null) {
                 lensFocusApplied = target
                 focusSlewTarget = null
+                cinematicPull = false
                 val base = latestState
                 applySessionState(base.copy(settingValues = base.settingValues + (key to target)))
                 return
@@ -1430,6 +1444,35 @@ class CameraRuntimeController(
         )
         if (!force && signature == lastAppliedSessionSignature) {
             return
+        }
+
+        // WHEEL FAST PATH: the focus plane moved and nothing else did, from one manual value to
+        // another. Rebuilding the whole capture request for that — white balance, exposure,
+        // tonemap, zoom, colour correction — measured ~45 ms, far longer than the 16 ms cadence
+        // the wheel delivers, so continuous turning stalled and caught up in visible bursts.
+        // Write just the focus key through the cached ramp builder, exactly as the glide does.
+        //
+        // Requiring BOTH sides to be numeric keeps every AF transition on the full path, where
+        // the autofocus bookkeeping below lives.
+        val previous = lastAppliedSessionSignature
+        if (!force && previous != null &&
+            previous.manualFocus != signature.manualFocus &&
+            previous.manualFocus?.toDoubleOrNull() != null &&
+            signature.manualFocus?.toDoubleOrNull() != null &&
+            previous.copy(manualFocus = signature.manualFocus) == signature
+        ) {
+            val capability = selectedFocusCapability(cameraState)
+            val maxDiopters = capability?.let { reachableDioptersCached(it) }?.takeIf { it > 0f }
+            val dial = signature.manualFocus.toDouble().coerceIn(0.0, 1.0)
+            if (maxDiopters != null && commandFocusDistance(((1.0 - dial) * maxDiopters).toFloat())) {
+                lastAppliedSessionSignature = signature
+                lensFocusApplied = signature.manualFocus
+                if (Log.isLoggable(TAG, Log.DEBUG)) {
+                    Log.d(TAG, "wheelFocus ${signature.manualFocus}")
+                }
+                return
+            }
+            // No session to write to — fall through and rebuild properly.
         }
 
         val manualFocusRequest = manualFocusRequestFor(cameraState)
@@ -2508,6 +2551,24 @@ class CameraRuntimeController(
         val maxD = reachableDiopters(capability)?.takeIf { it > 0f } ?: return null
         val diopters = (pos - intercept) / slope
         return (1.0 - diopters / maxD).coerceIn(0.0, 1.0)
+    }
+
+    private var reachableCacheKey: LensFocusCapabilityProfile? = null
+    private var reachableCacheValue: Float? = null
+
+    /**
+     * [reachableDiopters] memoised for the per-frame path.
+     *
+     * It runs a least-squares fit over the lens calibration table, which is why the glide hoists
+     * it out of its step loop. The wheel path needs the same value every frame, and the lens
+     * capability only changes when the bound lens does.
+     */
+    private fun reachableDioptersCached(capability: LensFocusCapabilityProfile): Float? {
+        if (reachableCacheKey != capability) {
+            reachableCacheKey = capability
+            reachableCacheValue = reachableDiopters(capability)
+        }
+        return reachableCacheValue
     }
 
     private fun reachableDiopters(capability: LensFocusCapabilityProfile): Float? {

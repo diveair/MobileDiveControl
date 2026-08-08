@@ -489,7 +489,19 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         emitOutcome(outcome)
     }
 
+    /**
+     * Pacing lives on the ramp, not captured in its coroutine.
+     *
+     * The first detent of a spin comes from rest, so its velocity-matched interval is slack —
+     * and the coroutine used to close over that first effect and hold it for the whole quarter
+     * turn, draining at roughly a quarter of the intended rate. The lens then kept walking long
+     * after the diver's hand stopped. Refreshing these on every merge lets the events that
+     * follow re-pace the drain to the speed actually being turned.
+     */
     private class Ramp(var remaining: Int, val step: Int) {
+        @Volatile var intervalMs: Long = 16L
+        @Volatile var maxTicksPerInterval: Int = 1
+        @Volatile var stopTimeoutMs: Long = 250L
         var job: kotlinx.coroutines.Job? = null
         var lastFedAtMs: Long = System.currentTimeMillis()
     }
@@ -511,28 +523,36 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             val existing = ramps[ramp.settingId]
             if (existing != null && existing.step == ramp.step && existing.job?.isActive == true) {
                 existing.remaining += ramp.steps
+                // Adopt the newest pacing: the spin has a speed now, where the first detent
+                // only had a standing start.
+                existing.intervalMs = ramp.intervalMs
+                existing.maxTicksPerInterval = ramp.maxTicksPerInterval
+                existing.stopTimeoutMs = ramp.stopTimeoutMs
                 existing.lastFedAtMs = System.currentTimeMillis()
                 return@forEach
             }
             existing?.job?.cancel()
             val fresh = Ramp(ramp.steps, ramp.step)
+            fresh.intervalMs = ramp.intervalMs
+            fresh.maxTicksPerInterval = ramp.maxTicksPerInterval
+            fresh.stopTimeoutMs = ramp.stopTimeoutMs
             ramps[ramp.settingId] = fresh
             fresh.job = viewModelScope.launch {
                 while (fresh.remaining > 0) {
-                    kotlinx.coroutines.delay(ramp.intervalMs)
+                    kotlinx.coroutines.delay(fresh.intervalMs)
                     // The hard rule: when the wheel stops, the value stops. Any ticks still
                     // owed are DISCARDED the moment the wheel goes quiet — banked distance
                     // must never keep the focus moving on its own.
-                    if (System.currentTimeMillis() - fresh.lastFedAtMs > ramp.stopTimeoutMs) {
+                    if (System.currentTimeMillis() - fresh.lastFedAtMs > fresh.stopTimeoutMs) {
                         fresh.remaining = 0
                         break
                     }
-                    // Fast but bounded drain: at most 3 ticks a frame (~180 steps/s). Enough
-                    // that a quarter-turn at max sensitivity completes its full sweep inside
-                    // the spin plus the timeout window, yet every step is still individually
-                    // applied — an unbounded burst collapsed dozens of steps into one visible
-                    // jump, which defeated the whole traversal contract.
-                    var burst = minOf(fresh.remaining, ramp.maxTicksPerInterval)
+                    // Fast but bounded drain: at most MAX_TICKS_PER_FRAME ticks a frame,
+                    // ~500 steps/s. Enough that a quarter turn at max sensitivity completes its
+                    // full sweep inside the spin plus the timeout window, yet every step is
+                    // still individually applied — an unbounded burst collapsed dozens of steps
+                    // into one visible jump, which defeated the whole traversal contract.
+                    var burst = minOf(fresh.remaining, fresh.maxTicksPerInterval)
                     while (burst > 0 && fresh.remaining > 0) {
                         fresh.remaining -= 1
                         burst -= 1

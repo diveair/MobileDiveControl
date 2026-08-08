@@ -555,7 +555,21 @@ class ControlReducer(
      *    the diver assigned in the Slider tile (Focus by default; Zoom is the one assignment
      *    with no spec behind it and keeps the classic ratio behaviour).
      */
+    /**
+     * The wheel is never a "held button", whatever the normaliser says.
+     *
+     * [ButtonEventNormalizer] marks any event arriving inside its repeat window as a repeat, and
+     * a fast spin trips that on nearly every detent — so the faster the diver turned, the more of
+     * their input was routed to the hold branch, which mints a fixed run-time top-up and hands it
+     * to the drain UNPACED. That dumped its distance at the frame ceiling and then idled: a pause
+     * that no amount of pacing margin could reach, because the pacing code never ran.
+     *
+     * A wheel detent is a discrete displacement no matter how quickly the next one follows, so it
+     * always takes the fresh-press path and its gearing. D-pad callers keep their real repeat
+     * count, because a held button genuinely is a hold.
+     */
     private fun handleWheel(state: AppState, step: Int, repeatCount: Int): Reduction {
+        @Suppress("NAME_SHADOWING") val repeatCount = 0
         val camera = state.camera
         if (camera.recording && camera.recordingPaused) {
             return Reduction(state = state)
@@ -1257,21 +1271,33 @@ class ControlReducer(
                         if (restedAtRail) 0 else spec.options.lastIndex
                     else -> raw
                 }
-                val rampEffects = if (motor.creditTicks > 1 && nextIndex != currentIndex && nextIndex > 0) {
+                // `currentIndex > 0` keeps the AF exit exact. Leaving AF lands deliberately on a
+                // rail (see the branch at currentIndex == 0 above); banking this click's ticks on
+                // top of that landing would carry the lens straight back off it — at sensitivity
+                // 100 the 51-tick credit would finish at 0.750 instead of 1.000.
+                val rampEffects = if (motor.creditTicks > 1 && nextIndex != currentIndex &&
+                    nextIndex > 0 && currentIndex > 0
+                ) {
                     // Velocity-matched pacing: this click's ticks are spread across the diver's
                     // own clicking cadence, so slow turning is one continuous creep instead of
                     // a full-rate lurch after every detent. The stop window stretches with the
                     // cadence too — a slow clicker is still "turning" between clicks — while a
                     // fast spin keeps the tight stop-on-stop feel.
-                    val paced = (gapMs / motor.creditTicks).coerceIn(motor.intervalMs, 120L)
+                    // Rate first, then a (ticks, interval) pair that actually delivers it.
+                    val rate = drainRatePerSecond(motor, gapMs.coerceAtLeast(1L))
+                    val (spread, paced) = pacing(rate, motor)
                     listOf(
                         PlatformEffect.RampSetting(
                             settingId = spec.id,
                             steps = motor.creditTicks - 1,
                             step = step,
                             intervalMs = paced,
-                            maxTicksPerInterval = motor.maxTicksPerInterval,
-                            stopTimeoutMs = (gapMs * 3 / 2).coerceIn(250L, 750L),
+                            maxTicksPerInterval = spread,
+                            // Generous upper bound so a deliberately SLOW turn is not reaped mid-move: at
+                            // the old 750 ms ceiling, anything slower than roughly one detent a
+                            // second had its remaining distance discarded, which is what made
+                            // slow turning feel impossible rather than merely slow.
+                            stopTimeoutMs = (gapMs * 3 / 2).coerceIn(250L, 2_500L),
                         ),
                     )
                 } else {
@@ -1320,15 +1346,21 @@ class ControlReducer(
                     wrap = false,
                 )
                 val rampEffects = if (motor.creditTicks > 1) {
-                    val paced = (gapMs / motor.creditTicks).coerceIn(motor.intervalMs, 120L)
+                    // Rate first, then a (ticks, interval) pair that actually delivers it.
+                    val rate = drainRatePerSecond(motor, gapMs.coerceAtLeast(1L))
+                    val (spread, paced) = pacing(rate, motor)
                     listOf(
                         PlatformEffect.RampSetting(
                             settingId = spec.id,
                             steps = motor.creditTicks - 1,
                             step = step,
                             intervalMs = paced,
-                            maxTicksPerInterval = motor.maxTicksPerInterval,
-                            stopTimeoutMs = (gapMs * 3 / 2).coerceIn(250L, 750L),
+                            maxTicksPerInterval = spread,
+                            // Generous upper bound so a deliberately SLOW turn is not reaped mid-move: at
+                            // the old 750 ms ceiling, anything slower than roughly one detent a
+                            // second had its remaining distance discarded, which is what made
+                            // slow turning feel impossible rather than merely slow.
+                            stopTimeoutMs = (gapMs * 3 / 2).coerceIn(250L, 2_500L),
                         ),
                     )
                 } else {
@@ -1392,9 +1424,36 @@ class ControlReducer(
         return options[nextIndex]
     }
 
-    private companion object {
+    internal companion object {
         /** Fastest ramp cadence: one frame. Slower ladders stretch the interval instead. */
         const val FOCUS_RAMP_TICK_MS = 16L
+
+        /**
+         * Ceiling on ticks drained per frame — 8 per 16 ms is 500 core dispatches a second.
+         *
+         * That is exactly the peak the 101-rung ladder already reached, so doubling focus to 201
+         * rungs costs nothing per second; it also halves the app's true peak, since the 162-rung
+         * exposure ladder was running at 1000/s. Safe against truncating the tail of a spin only
+         * because [ButtonEventNormalizer]'s repeat-continuation window floors the gap between
+         * wheel events; shortening that window invalidates this cap.
+         */
+        const val MAX_TICKS_PER_FRAME = 8
+
+        /**
+         * How much longer than the observed wheel cadence a detent's distance is spread over.
+         *
+         * Pure margin against an irregular wheel: at 1.0 the drain runs dry the moment an event
+         * arrives late, which is the stall. The cost is a tail — after the hand stops, the
+         * remaining quarter-detent keeps arriving for about a quarter of a wheel period.
+         */
+        const val UNDER_RUN = 1.7
+
+        /**
+         * Floor on the gap between deliveries. Below a frame the display cannot show it anyway,
+         * but going finer than 16 ms lets a fast turn arrive as several small steps across the
+         * frame instead of one visible lurch, at no extra dispatch cost.
+         */
+        const val MIN_INTERVAL_MS = 4L
 
         /** How long the wheel must rest at a rail before further travel may enter AF. */
         const val FOCUS_AF_PAUSE_MS = 600L
@@ -1425,6 +1484,56 @@ class ControlReducer(
     )
 
     /**
+     * How many ticks a frame may spend so a detent's credit lasts until the next detent.
+     *
+     * The housing paces wheel notifications at only two or three a second. Draining a detent's
+     * credit at the motor's top rate spent it in ~160 ms and then stood still for the remaining
+     * ~300 ms, which reads as lurch-pause-lurch rather than a turn — the faster the sensitivity,
+     * the bigger the lurch, because the credit grows while the wheel's cadence does not.
+     * Consumption is therefore matched to production: spread the credit evenly over the gap the
+     * wheel is actually delivering, and the lens moves continuously for as long as the diver
+     * keeps turning. Capped by the motor's own ceiling so a genuinely fast spin still runs flat
+     * out, and floored at one so it always makes progress.
+     */
+    /**
+     * The pace a detent's distance should be delivered at, in rungs per second.
+     *
+     * UNDER-RUN: finishing exactly when the next detent is due leaves the pipe empty the moment
+     * the wheel is slightly irregular, and the lens stalls — measured at 15-49% of every turn
+     * spent stationary. Spreading over a longer window keeps distance owed when the next detent
+     * lands. Self-stabilising: each gap injects R and drains R/UNDER_RUN, so the debt settles at
+     * UNDER_RUN x R and the delivered rate at exactly R/gap — the gearing itself, unchanged.
+     */
+    private fun drainRatePerSecond(motor: SliderMotor, gapMs: Long): Double =
+        motor.creditTicks.toDouble() * 1000.0 / (gapMs * UNDER_RUN)
+
+    /**
+     * Split a rate into (ticks per interval, interval) WITHOUT rounding the rate away.
+     *
+     * A frame can only carry a whole number of ticks, and the previous code took
+     * `ceil(rate x frame)` — so a wanted 1.2 ticks/frame became 2, delivering 67% too fast,
+     * emptying the pipe early and recreating the exact stall the under-run was added to prevent.
+     * Raising the under-run could not help, because ceil ate the increase every time.
+     *
+     * The rate is what matters, so round the COUNT up and then stretch the INTERVAL to match:
+     * 75 rungs/s becomes 2 ticks per 27 ms (74/s) rather than 2 per 16 ms (125/s).
+     */
+    private fun pacing(ratePerSecond: Double, motor: SliderMotor): Pair<Int, Long> {
+        if (ratePerSecond <= 0.0) return 1 to FOCUS_RAMP_TICK_MS
+        // Smoothest delivery for a given rate is the SMALLEST batch that fits: one rung as often
+        // as needed, rather than eight rungs every 16 ms with a wait between. Same rungs per
+        // second and the same dispatch cost, but the lens moves in 0.005 steps instead of 0.04
+        // ones. Only widen the batch when the interval would fall below the floor.
+        var ticks = 1
+        var interval = kotlin.math.round(1000.0 / ratePerSecond).toLong()
+        while (interval < MIN_INTERVAL_MS && ticks < motor.maxTicksPerInterval) {
+            ticks++
+            interval = kotlin.math.round(ticks * 1000.0 / ratePerSecond).toLong()
+        }
+        return ticks to interval.coerceAtLeast(MIN_INTERVAL_MS)
+    }
+
+    /**
      * The one motor behind every slider-kind setting. Three inputs, per the field spec:
      *
      *  - **Wheel velocity**: a slow, deliberate click is always worth exactly one tick —
@@ -1433,8 +1542,8 @@ class ControlReducer(
      *    is more granular and the far end costs more turns) and the playback rate (the full
      *    ladder plays in ~450 ms at 100, stretching toward ~2.4 s at the bottom).
      *  - **The ladder itself**: everything is proportional to the setting's own option count,
-     *    so a quarter turn at sensitivity 100 sweeps ISO's nine rungs and focus's hundred and
-     *    one alike, end to end.
+     *    so a quarter turn at sensitivity 100 sweeps ISO's nine rungs and focus's two hundred
+     *    and one alike, end to end.
      *
      * Held buttons don't deposit distance per event; they top the motor up with enough ticks
      * to run continuously until the next repeat arrives — smooth motion at the sensitivity's
@@ -1449,15 +1558,25 @@ class ControlReducer(
         // Re-centred by field calibration: the full-sweep-per-quarter-turn feel lives at the
         // MIDPOINT (50), with real headroom above it — 100 plays the ladder in ~220 ms.
         val sweepMs = (2400L - (sensitivity.level - 1) * 40L).coerceAtLeast(220L)
-        val perTickMs = (sweepMs / usableTicks.coerceAtLeast(1)).coerceAtLeast(1L)
+        // Double, not integer, division. Truncating here made the pace depend on ladder length:
+        // once focus doubled to 201 rungs, level 1 played its sweep in 1608 ms instead of the
+        // nominal 2400 ms, because 2400/201 floored to 11 rather than 11.94.
+        val perTickMs = (sweepMs.toDouble() / usableTicks.coerceAtLeast(1)).coerceAtLeast(0.001)
         val intervalMs: Long
         val maxTicks: Int
         if (perTickMs >= FOCUS_RAMP_TICK_MS) {
-            intervalMs = perTickMs
+            intervalMs = perTickMs.toLong()
             maxTicks = 1
         } else {
-            intervalMs = FOCUS_RAMP_TICK_MS
-            maxTicks = ((FOCUS_RAMP_TICK_MS + perTickMs - 1) / perTickMs).toInt()
+            maxTicks = kotlin.math.ceil(FOCUS_RAMP_TICK_MS / perTickMs).toInt()
+                .coerceIn(1, MAX_TICKS_PER_FRAME)
+            // Stretch the interval so the ladder still plays in sweepMs. Where the burst is
+            // capped the 16 ms floor takes over and the sweep runs a little longer than
+            // nominal — that is the deliberate trade for holding the dispatch rate down.
+            intervalMs = kotlin.math.max(
+                FOCUS_RAMP_TICK_MS,
+                kotlin.math.round(maxTicks * perTickMs).toLong(),
+            )
         }
         val credit = if (held) {
             (((HOLD_TOPUP_MS + intervalMs - 1) / intervalMs).toInt() * maxTicks).coerceAtLeast(1)
@@ -1469,12 +1588,14 @@ class ControlReducer(
             val detentsPerSecond = if (gapMs <= 0L) VELOCITY_FAST_DPS else 1000.0 / gapMs
             val velocity = ((detentsPerSecond - VELOCITY_SLOW_DPS) /
                 (VELOCITY_FAST_DPS - VELOCITY_SLOW_DPS)).coerceIn(0.0, 1.0)
-            // Above the midpoint the velocity gate progressively stands down: at 100 even a
-            // slow, deliberate click carries part of its full worth — the diver chose raw
-            // sensitivity over the one-tick precision guarantee, which remains absolute at
-            // and below 50.
+            // Above the midpoint the velocity gate progressively stands down, and at 100 it
+            // stands down COMPLETELY: a quarter turn spends the whole ladder however slowly the
+            // diver turns. Previously this floor topped out at 0.35, so an unhurried quarter
+            // turn carried only ~58% of nominal worth and stalled around the middle of the
+            // scale — the diver chose raw sensitivity, and gets it. The one-tick precision
+            // guarantee remains absolute at and below 50, where the floor is still zero.
             val sensFloor = ((sensitivity.level - 50).coerceAtLeast(0) / 50.0)
-                .let { it * it } * 0.35
+                .let { it * it }
             val effectiveVelocity = maxOf(velocity, sensFloor)
             // Sensitivity 100 spends the WHOLE ladder in one quarter turn, and not a step
             // more: perDetent = ladder / quarter-turn detents. Below that it falls away

@@ -8,6 +8,38 @@ import com.mobiledivecontrol.core.FocusCurveMode
 import com.mobiledivecontrol.core.SliderSensitivity
 import org.json.JSONObject
 
+/**
+ * Re-spells saved focus values onto the current 0.005 ladder.
+ *
+ * A focus saved by an older build reads "0.42", which matches no rung once the ladder carries
+ * three decimals. Left alone the reducer's `indexOf(...).coerceAtLeast(0)` resolves the miss to
+ * index 0 — which is "AF" — so the HUD would keep showing 0.42 while the diver's very first
+ * wheel click silently threw focus to autofocus. Snapping to the nearest real rung loses nothing:
+ * every old 0.01 rung is exactly a 0.005 rung.
+ *
+ * Idempotent, so it needs no one-shot migration flag and survives a downgrade/upgrade cycle.
+ * Kept free of Android types so it can be tested directly.
+ */
+internal fun snapFocusValuesToLadder(values: Map<String, String>): Map<String, String> {
+    val result = values.toMutableMap()
+    listOf("photo.manual_focus", "expert.manual_focus", "pro.manual_focus", "pro_video.manual_focus")
+        .forEach { key ->
+            val value = result[key] ?: return@forEach
+            if (value == "AF") return@forEach
+            val numeric = value.toDoubleOrNull()
+            if (numeric == null || numeric !in 0.0..1.0) {
+                // Unreadable: drop it so the catalog default applies deliberately, rather than
+                // the app arriving at AF by accident on the diver's next detent.
+                result.remove(key)
+                return@forEach
+            }
+            result[key] = String.format(
+                java.util.Locale.US, "%.3f", Math.round(numeric * 200.0) / 200.0,
+            )
+        }
+    return result
+}
+
 class CameraSessionStore(context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
 
@@ -91,7 +123,7 @@ class CameraSessionStore(context: Context) {
      * being applied on an S24 that doesn't have a 5x lens.
      * Lens validation is deferred to runtime when detectedLenses are available.
      */
-    private fun normalizeRestoredSettingValues(values: Map<String, String>): Map<String, String> {
+    internal fun normalizeRestoredSettingValues(values: Map<String, String>): Map<String, String> {
         val result = values.toMutableMap()
         // Validate focus curve values
         listOf("photo.focus_curve", "expert.focus_curve", "pro.focus_curve", "pro_video.focus_curve").forEach { key ->
@@ -100,7 +132,7 @@ class CameraSessionStore(context: Context) {
                 result[key] = "SquareRoot"
             }
         }
-        return result
+        return snapFocusValuesToLadder(result)
     }
 
     /**

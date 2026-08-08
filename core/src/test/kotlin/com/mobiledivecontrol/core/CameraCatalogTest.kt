@@ -166,16 +166,17 @@ class CameraCatalogTest {
      * changes how far one detent moves the lens.
      */
     @Test
-    fun `focus ladder keeps AF plus exactly 101 rungs from 0_00 to 1_00`() {
+    fun `focus ladder keeps AF plus exactly 201 rungs from 0_000 to 1_000`() {
         val focus = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "pro.manual_focus" }
             .options
 
-        assertEquals(102, focus.size)
+        assertEquals(202, focus.size)
         assertEquals("AF", focus[0])
-        assertEquals("0.00", focus[1])
-        assertEquals("1.00", focus.last())
-        assertEquals("0.50", focus[51])
+        assertEquals("0.000", focus[1])
+        assertEquals("1.000", focus.last())
+        assertEquals("0.500", focus[101])
+        assertEquals("0.005", focus[2])
     }
 
     @Test
