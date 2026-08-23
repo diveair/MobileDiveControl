@@ -1,0 +1,225 @@
+{
+  "generated_at": "2026-08-23T19:05:54.050752+00:00",
+  "nodes": {
+    "app_src_main_kotlin_com_mobiledivecontrol_platform_galleryrepository_galleryrepository": {
+      "code_fingerprint": "b79588c0724f3b2fe44befe8796c98a671b4ddad777123ea79f0297b76502689",
+      "label": "GalleryRepository",
+      "last": "2026-08-23T18:13:16.706467+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T18:13:16.706467+00:00",
+          "outcome": "useful",
+          "q": "How should the paused recording controls and Save To album chooser work?"
+        },
+        {
+          "date": "2026-08-23T17:07:14.272588+00:00",
+          "outcome": "useful",
+          "q": "The top and bottom chevrons are far too large. The Back button must remain the same thickness vertically as Delete Album is now. Album Grid and Inside an Album Photo/Video Grid. The delete button should not exist in the bottom bar. Instead clicking on an album should give you the option to 1) Preview the album by default selected, 2) Delete the selected album, or go back when a selected album is clicked"
+        },
+        {
+          "date": "2026-08-23T16:59:20.875135+00:00",
+          "outcome": "useful",
+          "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
+        },
+        {
+          "date": "2026-08-23T14:22:59.005558+00:00",
+          "outcome": "useful",
+          "q": "lets work on the gallery menu: albums grid, navigable media grid, full-screen preview controls, move, rename, and delete"
+        }
+      ],
+      "score": 3.990696247,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/platform/GalleryRepository.kt",
+      "status": "preferred",
+      "uses": 4
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_cameraruntimecontroller_cameraruntimecontroller": {
+      "code_fingerprint": "79c797fae28e1cdb0be02551b46aee8c42d562f5e4cd18c96b67468a96dd4097",
+      "label": "CameraRuntimeController",
+      "last": "2026-08-23T18:13:16.706467+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T18:13:16.706467+00:00",
+          "outcome": "useful",
+          "q": "How should the paused recording controls and Save To album chooser work?"
+        }
+      ],
+      "score": 0.999156026,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_gallery_galleryscreen": {
+      "code_fingerprint": "f55c4e59f2b08dfa0195e3f26ecca5003e318b7cd786f4be8a0083ea219bad93",
+      "label": "GalleryScreen.kt",
+      "last": "2026-08-23T17:26:31.635427+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T17:26:31.635427+00:00",
+          "outcome": "useful",
+          "q": "Implement gallery Back-row navigation with Create Album as the intermediate Right target, add the compact Back arrow and TOP/BOTTOM chevrons, and prevent video autoplay on preview or Next/Previous"
+        },
+        {
+          "date": "2026-08-23T17:13:17.767057+00:00",
+          "outcome": "useful",
+          "q": "The gap above the back button is too large, the gap below the back button is too large, reduce both by 75%"
+        },
+        {
+          "date": "2026-08-23T17:07:14.272588+00:00",
+          "outcome": "useful",
+          "q": "The top and bottom chevrons are far too large. The Back button must remain the same thickness vertically as Delete Album is now. Album Grid and Inside an Album Photo/Video Grid. The delete button should not exist in the bottom bar. Instead clicking on an album should give you the option to 1) Preview the album by default selected, 2) Delete the selected album, or go back when a selected album is clicked"
+        },
+        {
+          "date": "2026-08-23T16:15:10.349333+00:00",
+          "outcome": "useful",
+          "q": "move back to where delete is and delete where back is"
+        },
+        {
+          "date": "2026-08-23T14:54:26.242203+00:00",
+          "outcome": "useful",
+          "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
+        }
+      ],
+      "score": 5.983408184,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/gallery/GalleryScreen.kt",
+      "status": "preferred",
+      "uses": 6
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts": {
+      "code_fingerprint": "9d5eaa1eee2c2d76c5e7a9b73721696fe36d7d2cf23f560482605de9a23699bf",
+      "label": "Contracts.kt",
+      "last": "2026-08-23T17:07:14.272588+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T17:07:14.272588+00:00",
+          "outcome": "useful",
+          "q": "The top and bottom chevrons are far too large. The Back button must remain the same thickness vertically as Delete Album is now. Album Grid and Inside an Album Photo/Video Grid. The delete button should not exist in the bottom bar. Instead clicking on an album should give you the option to 1) Preview the album by default selected, 2) Delete the selected album, or go back when a selected album is clicked"
+        },
+        {
+          "date": "2026-08-23T16:59:20.875135+00:00",
+          "outcome": "useful",
+          "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
+        },
+        {
+          "date": "2026-08-23T16:15:10.349333+00:00",
+          "outcome": "useful",
+          "q": "move back to where delete is and delete where back is"
+        }
+      ],
+      "score": 2.993333764,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "preferred",
+      "uses": 3
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_gallerycommand": {
+      "code_fingerprint": "9d5eaa1eee2c2d76c5e7a9b73721696fe36d7d2cf23f560482605de9a23699bf",
+      "label": "GalleryCommand",
+      "last": "2026-08-23T17:07:14.272588+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T17:07:14.272588+00:00",
+          "outcome": "useful",
+          "q": "The top and bottom chevrons are far too large. The Back button must remain the same thickness vertically as Delete Album is now. Album Grid and Inside an Album Photo/Video Grid. The delete button should not exist in the bottom bar. Instead clicking on an album should give you the option to 1) Preview the album by default selected, 2) Delete the selected album, or go back when a selected album is clicked"
+        },
+        {
+          "date": "2026-08-23T16:59:20.875135+00:00",
+          "outcome": "useful",
+          "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
+        }
+      ],
+      "score": 1.996069364,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "preferred",
+      "uses": 2
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_gallerystate": {
+      "code_fingerprint": "9d5eaa1eee2c2d76c5e7a9b73721696fe36d7d2cf23f560482605de9a23699bf",
+      "label": "GalleryState",
+      "last": "2026-08-23T17:26:31.635427+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T17:26:31.635427+00:00",
+          "outcome": "useful",
+          "q": "Implement gallery Back-row navigation with Create Album as the intermediate Right target, add the compact Back arrow and TOP/BOTTOM chevrons, and prevent video autoplay on preview or Next/Previous"
+        },
+        {
+          "date": "2026-08-23T14:54:26.242203+00:00",
+          "outcome": "useful",
+          "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
+        }
+      ],
+      "score": 1.994380193,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "preferred",
+      "uses": 2
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_controlreducer_controlreducer": {
+      "code_fingerprint": "74527cb944f78030fd6b0bcbe8187f76ad98cf69f8ff6247740f9d56d645fbfa",
+      "label": "ControlReducer",
+      "last": "2026-08-23T18:13:16.706467+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T18:13:16.706467+00:00",
+          "outcome": "useful",
+          "q": "How should the paused recording controls and Save To album chooser work?"
+        },
+        {
+          "date": "2026-08-23T17:26:31.635427+00:00",
+          "outcome": "useful",
+          "q": "Implement gallery Back-row navigation with Create Album as the intermediate Right target, add the compact Back arrow and TOP/BOTTOM chevrons, and prevent video autoplay on preview or Next/Previous"
+        },
+        {
+          "date": "2026-08-23T17:07:14.272588+00:00",
+          "outcome": "useful",
+          "q": "The top and bottom chevrons are far too large. The Back button must remain the same thickness vertically as Delete Album is now. Album Grid and Inside an Album Photo/Video Grid. The delete button should not exist in the bottom bar. Instead clicking on an album should give you the option to 1) Preview the album by default selected, 2) Delete the selected album, or go back when a selected album is clicked"
+        },
+        {
+          "date": "2026-08-23T16:59:20.875135+00:00",
+          "outcome": "useful",
+          "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
+        },
+        {
+          "date": "2026-08-23T16:15:10.349333+00:00",
+          "outcome": "useful",
+          "q": "move back to where delete is and delete where back is"
+        }
+      ],
+      "score": 6.982340839,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/ControlReducer.kt",
+      "status": "preferred",
+      "uses": 7
+    },
+    "core_src_test_kotlin_com_mobiledivecontrol_core_inputroutertest_inputroutertest": {
+      "code_fingerprint": "88324eff173ff6d9332984a58a07d960d41562a622f54a0276a9f359e73cc8b7",
+      "label": "InputRouterTest",
+      "last": "2026-08-23T14:22:59.005558+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T14:22:59.005558+00:00",
+          "outcome": "useful",
+          "q": "lets work on the gallery menu: albums grid, navigable media grid, full-screen preview controls, move, rename, and delete"
+        }
+      ],
+      "score": 0.995470857,
+      "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/InputRouterTest.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "surfacetexture": {
+      "code_fingerprint": "",
+      "label": "SurfaceTexture",
+      "last": "2026-08-23T14:54:26.242203+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T14:54:26.242203+00:00",
+          "outcome": "useful",
+          "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
+        }
+      ],
+      "score": 0.995973379,
+      "source_file": "",
+      "status": "tentative",
+      "uses": 1
+    }
+  },
+  "version": 1
+}

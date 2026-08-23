@@ -44,7 +44,7 @@ import androidx.camera.extensions.ExtensionMode
 import androidx.camera.extensions.ExtensionsManager
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
-import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
@@ -66,6 +66,7 @@ import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import java.io.File
 import java.util.concurrent.Executors
 
 class CameraRuntimeController(
@@ -119,6 +120,8 @@ class CameraRuntimeController(
 
         /** How long WB must have been continuously auto before its results are trusted as AWB truth. */
         private const val WB_AUTO_SETTLE_MS = 1_500L
+        /** Never lose a shutter press if a device fails to acknowledge AWB lock promptly. */
+        private const val WB_SHUTTER_LOCK_TIMEOUT_MS = 600L
         private const val MACRO_STOP_REBIND_DEBOUNCE_MS = 450L
 
         /** A beat on the landed plane before the HAL takes the lens, so the arrival reads. */
@@ -242,6 +245,20 @@ class CameraRuntimeController(
     private var imageAnalysis: ImageAnalysis? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
+    /** Duration is cumulative across continuation clips within one logical recording session. */
+    private var completedRecordingDurationMs = 0L
+    private var currentRecordingSegmentDurationMs = 0L
+    private var recordingSegmentFinalizingForReview = false
+    private var recordingSessionActive = false
+    private var recordingSegmentStartGeneration = 0
+    private var recordingSessionDirectory: File? = null
+    private var recordingSessionDisplayName: String? = null
+    private val recordingSegmentFiles = mutableListOf<File>()
+    private var activeRecordingSegmentFile: File? = null
+    private var recordingReviewFile: File? = null
+    private val recordingFinalizeExecutor = Executors.newSingleThreadExecutor()
+    /** Resume/Stop/Delete pressed before CameraX returns the finalised segment URI. */
+    private var pendingRecordingAction: CameraCommand? = null
     private var onCapabilities: ((CameraCapabilities) -> Unit)? = null
     private var onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null
 
@@ -269,6 +286,14 @@ class CameraRuntimeController(
     private var boundHdrExtension: Boolean = false
     private var boundFocusMode: Boolean = false // true = manual focus, false = AF
     private var latestState: CameraState = CameraState()
+    /**
+     * Transient capture state, deliberately outside persisted [CameraState]. Auto Shutter meters
+     * exactly like continuous AWB until the physical shutter is pressed, then this bit is applied
+     * to repeating and single capture requests until the photo completes or recording finalizes.
+     */
+    @Volatile private var shutterAwbLockActive = false
+    private var shutterAwbLockInFlight = false
+    private var shutterAwbLockGeneration = 0
     private var latestWaterPressureKpa: Double? = null
     private var latestAtmosphericPressureKpa: Double? = null
 
@@ -558,6 +583,9 @@ class CameraRuntimeController(
         cam2Session = null
         cam2Surfaces = emptyList()
         nativeFocusActive = false
+        shutterAwbLockGeneration++
+        shutterAwbLockInFlight = false
+        shutterAwbLockActive = false
         focusAssistEnabled = false
         lastAppliedSessionSignature = null
         focusPeakingProcessor?.release()
@@ -578,6 +606,13 @@ class CameraRuntimeController(
         surfaceAmbientKpa: Double? = null,
     ) {
         latestState = cameraState
+        if ((shutterAwbLockActive || shutterAwbLockInFlight) &&
+            !CameraCatalog.isWhiteBalanceAutoShutter(currentValue(cameraState, ".white_balance"))
+        ) {
+            // Turning the WB ring away from Auto Shutter is an explicit unlock, including while
+            // recording; no stale capture-only lock may survive a visible mode change.
+            releaseShutterWhiteBalance()
+        }
         latestWaterPressureKpa = waterPressureKpa
         latestAtmosphericPressureKpa = atmosphericPressureKpa
         latestSurfaceAmbientKpa = surfaceAmbientKpa
@@ -1314,6 +1349,10 @@ class CameraRuntimeController(
             CameraCommand.PauseVideoRecording -> pauseVideoRecording()
             CameraCommand.ResumeVideoRecording -> resumeVideoRecording()
             CameraCommand.StopVideoRecording -> stopVideoRecording()
+            CameraCommand.DeleteVideoRecording -> deleteVideoRecording()
+            // Preview visibility is reducer state. The URI arrives through RecordingClock when
+            // CameraX finalises the segment, so no imperative camera call is required here.
+            CameraCommand.PreviewVideoRecording -> Unit
             is CameraCommand.SetZoom -> applyLiveZoom(command.value)
             else -> Unit
         }
@@ -1591,27 +1630,75 @@ class CameraRuntimeController(
     // ── Video recording ──────────────────────────────────────────────────────────────
 
     private fun startVideoRecording() {
+        if (activeRecording != null || recordingSegmentFinalizingForReview) return
+        val startedAt = System.currentTimeMillis()
+        val sessionDirectory = File(
+            context.cacheDir,
+            "recording-segments/session-$startedAt-${System.nanoTime()}",
+        )
+        if (!sessionDirectory.mkdirs() && !sessionDirectory.isDirectory) {
+            Log.e(TAG, "Could not create private recording workspace: $sessionDirectory")
+            return
+        }
+        recordingSessionDirectory = sessionDirectory
+        recordingSessionDisplayName = "DiveControl_$startedAt.mp4"
+        recordingSegmentFiles.clear()
+        activeRecordingSegmentFile = null
+        recordingReviewFile = null
+        recordingSessionActive = true
+        completedRecordingDurationMs = 0L
+        currentRecordingSegmentDurationMs = 0L
+        pendingRecordingAction = null
+        RecordingClock.durationMs.value = 0L
+        RecordingClock.paused.value = false
+        RecordingClock.reviewUri.value = null
+        RecordingClock.reviewFinalizing.value = false
+        startRecordingSegment()
+    }
+
+    /**
+     * A paused CameraX MP4 is not guaranteed to be playable until Finalize writes its index. Each
+     * review pause is therefore a private segment boundary. The segments are losslessly remuxed
+     * for cumulative preview, then Stop publishes one continuous MediaStore video.
+     */
+    private fun startRecordingSegment() {
+        if (activeRecording != null || recordingSegmentFinalizingForReview) return
+        currentRecordingSegmentDurationMs = 0L
+        RecordingClock.reviewUri.value = null
+        RecordingClock.reviewFinalizing.value = false
+        val generation = ++recordingSegmentStartGeneration
+        withShutterWhiteBalance {
+            if (generation == recordingSegmentStartGeneration &&
+                recordingSessionActive &&
+                !RecordingClock.paused.value
+            ) {
+                startRecordingSegmentNow()
+            } else {
+                releaseShutterWhiteBalance()
+            }
+        }
+    }
+
+    private fun startRecordingSegmentNow() {
         if (activeRecording != null) return
         val capture = videoCapture ?: run {
             Log.w(TAG, "Record requested but VideoCapture is not bound — rebinding.")
             bindCamera(force = true)
             videoCapture
-        } ?: return
-        val name = "DiveControl_${System.currentTimeMillis()}.mp4"
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(
-                    MediaStore.Video.Media.RELATIVE_PATH,
-                    Environment.DIRECTORY_MOVIES + "/Mobile DiveControl",
-                )
-            }
+        } ?: run {
+            releaseShutterWhiteBalance()
+            return
         }
-        val options = MediaStoreOutputOptions.Builder(
-            context.contentResolver,
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-        ).setContentValues(values).build()
+        val sessionDirectory = recordingSessionDirectory ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+        val segmentFile = File(
+            sessionDirectory,
+            "segment-${(recordingSegmentFiles.size + 1).toString().padStart(4, '0')}.mp4",
+        )
+        activeRecordingSegmentFile = segmentFile
+        val options = FileOutputOptions.Builder(segmentFile).build()
         val hasAudio = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.RECORD_AUDIO,
@@ -1622,38 +1709,223 @@ class CameraRuntimeController(
         activeRecording = pending.start(ContextCompat.getMainExecutor(context)) { event ->
             when (event) {
                 is VideoRecordEvent.Status -> {
-                    RecordingClock.durationMs.value =
+                    currentRecordingSegmentDurationMs =
                         event.recordingStats.recordedDurationNanos / 1_000_000L
+                    RecordingClock.durationMs.value =
+                        completedRecordingDurationMs + currentRecordingSegmentDurationMs
                 }
                 is VideoRecordEvent.Finalize -> {
+                    val reviewBoundary = recordingSegmentFinalizingForReview
+                    activeRecording = null
+                    if (activeRecordingSegmentFile == segmentFile) {
+                        activeRecordingSegmentFile = null
+                    }
                     if (event.hasError()) {
                         Log.e(TAG, "Recording finalize error ${event.error}", event.cause)
+                        runCatching { segmentFile.delete() }
+                        RecordingClock.reviewUri.value = null
                     } else {
-                        Log.i(TAG, "Recording saved: ${event.outputResults.outputUri}")
+                        val finalizedDurationMs = maxOf(
+                            currentRecordingSegmentDurationMs,
+                            event.recordingStats.recordedDurationNanos / 1_000_000L,
+                        )
+                        completedRecordingDurationMs += finalizedDurationMs
+                        RecordingClock.durationMs.value = completedRecordingDurationMs
+                        if (segmentFile.isFile && segmentFile.length() > 0L) {
+                            recordingSegmentFiles += segmentFile
+                        }
+                        Log.i(TAG, "Recording review segment finalized: $segmentFile")
                     }
-                    activeRecording = null
-                    RecordingClock.durationMs.value = 0L
-                    RecordingClock.paused.value = false
+                    currentRecordingSegmentDurationMs = 0L
+                    releaseShutterWhiteBalance()
+                    if (reviewBoundary) {
+                        if (recordingSegmentFiles.isEmpty()) {
+                            recordingSegmentFinalizingForReview = false
+                            RecordingClock.reviewFinalizing.value = false
+                            runPendingRecordingAction()
+                        } else {
+                            buildCumulativeRecordingReview()
+                        }
+                    } else {
+                        // An unsolicited finalisation ends the logical session too; leaving a
+                        // stale URI/clock behind would imply that Resume can still append.
+                        recordingSegmentFinalizingForReview = false
+                        finishRecordingSession(deleteLatest = false)
+                    }
                 }
                 else -> Unit
             }
         }
         RecordingClock.paused.value = false
-        Log.i(TAG, "Recording started -> Movies/Mobile DiveControl/$name audio=$hasAudio")
+        Log.i(TAG, "Private recording segment started: $segmentFile audio=$hasAudio")
+    }
+
+    private fun buildCumulativeRecordingReview() {
+        val sessionDirectory = recordingSessionDirectory ?: run {
+            recordingSegmentFinalizingForReview = false
+            RecordingClock.reviewFinalizing.value = false
+            runPendingRecordingAction()
+            return
+        }
+        val segments = recordingSegmentFiles.toList()
+        val reviewFile = File(sessionDirectory, "review.mp4")
+        RecordingClock.reviewUri.value = null
+        RecordingClock.reviewFinalizing.value = true
+        recordingFinalizeExecutor.execute {
+            val result = RecordingSessionMuxer.buildReview(segments, reviewFile)
+            ContextCompat.getMainExecutor(context).execute completion@{
+                if (recordingSessionDirectory != sessionDirectory || !recordingSessionActive) {
+                    return@completion
+                }
+                result
+                    .onSuccess { uri ->
+                        recordingReviewFile = reviewFile
+                        RecordingClock.reviewUri.value = uri
+                        Log.i(TAG, "Cumulative recording preview ready: $uri")
+                    }
+                    .onFailure { error ->
+                        recordingReviewFile = null
+                        RecordingClock.reviewUri.value = null
+                        Log.e(TAG, "Could not build cumulative recording preview", error)
+                    }
+                recordingSegmentFinalizingForReview = false
+                RecordingClock.reviewFinalizing.value = false
+                runPendingRecordingAction()
+            }
+        }
     }
 
     private fun pauseVideoRecording() {
-        activeRecording?.pause()
+        recordingSegmentStartGeneration++
         RecordingClock.paused.value = true
+        RecordingClock.reviewUri.value = null
+        RecordingClock.reviewFinalizing.value = true
+        pendingRecordingAction = null
+        val recording = activeRecording
+        if (recording == null) {
+            RecordingClock.reviewFinalizing.value = false
+            releaseShutterWhiteBalance()
+            return
+        }
+        recordingSegmentFinalizingForReview = true
+        // stop(), rather than pause(), is load-bearing: it writes the MP4 index and yields the
+        // output URI required by both preview and deletion.
+        recording.stop()
     }
 
     private fun resumeVideoRecording() {
-        activeRecording?.resume()
         RecordingClock.paused.value = false
+        if (recordingSegmentFinalizingForReview) {
+            pendingRecordingAction = CameraCommand.ResumeVideoRecording
+            return
+        }
+        pendingRecordingAction = null
+        if (!recordingSessionActive) recordingSessionActive = true
+        startRecordingSegment()
+    }
+
+    private fun runPendingRecordingAction() {
+        val action = pendingRecordingAction
+        pendingRecordingAction = null
+        when (action) {
+            CameraCommand.ResumeVideoRecording -> resumeVideoRecording()
+            CameraCommand.StopVideoRecording -> finishRecordingSession(deleteLatest = false)
+            CameraCommand.DeleteVideoRecording -> finishRecordingSession(deleteLatest = true)
+            else -> Unit
+        }
     }
 
     private fun stopVideoRecording() {
-        activeRecording?.stop()
+        if (recordingSegmentFinalizingForReview) {
+            pendingRecordingAction = CameraCommand.StopVideoRecording
+            return
+        }
+        val recording = activeRecording
+        if (recording != null) {
+            pendingRecordingAction = CameraCommand.StopVideoRecording
+            recordingSegmentFinalizingForReview = true
+            RecordingClock.reviewFinalizing.value = true
+            recording.stop()
+            return
+        }
+        finishRecordingSession(deleteLatest = false)
+    }
+
+    private fun deleteVideoRecording() {
+        if (recordingSegmentFinalizingForReview) {
+            pendingRecordingAction = CameraCommand.DeleteVideoRecording
+            return
+        }
+        finishRecordingSession(deleteLatest = true)
+    }
+
+    private fun finishRecordingSession(deleteLatest: Boolean) {
+        recordingSegmentStartGeneration++
+        val sessionDirectory = recordingSessionDirectory
+        val segments = recordingSegmentFiles.toList()
+        val preparedReview = recordingReviewFile
+        val displayName = recordingSessionDisplayName
+            ?: "DiveControl_${System.currentTimeMillis()}.mp4"
+        val saveLocation = latestState.recordingSaveLocation
+        recordingSessionActive = false
+        pendingRecordingAction = null
+        recordingSegmentFinalizingForReview = false
+        recordingSessionDirectory = null
+        recordingSessionDisplayName = null
+        recordingSegmentFiles.clear()
+        activeRecordingSegmentFile = null
+        recordingReviewFile = null
+        completedRecordingDurationMs = 0L
+        currentRecordingSegmentDurationMs = 0L
+        RecordingClock.durationMs.value = 0L
+        RecordingClock.paused.value = false
+        RecordingClock.reviewUri.value = null
+        RecordingClock.reviewFinalizing.value = false
+        releaseShutterWhiteBalance()
+
+        if (deleteLatest) {
+            sessionDirectory?.let { directory ->
+                runCatching { directory.deleteRecursively() }
+                    .onSuccess { Log.i(TAG, "Deleted private recording session: $directory") }
+                    .onFailure { error -> Log.e(TAG, "Could not delete recording session", error) }
+            }
+            return
+        }
+        if (segments.isEmpty()) {
+            Log.w(TAG, "Stop requested but the recording session has no valid segments")
+            sessionDirectory?.deleteRecursively()
+            return
+        }
+
+        recordingFinalizeExecutor.execute {
+            val result = if (preparedReview?.isFile == true && preparedReview.length() > 0L) {
+                RecordingSessionMuxer.publishPreparedFile(
+                    context = context,
+                    preparedFile = preparedReview,
+                    displayName = displayName,
+                    location = saveLocation,
+                )
+            } else {
+                RecordingSessionMuxer.publish(
+                    context = context,
+                    segmentFiles = segments,
+                    displayName = displayName,
+                    location = saveLocation,
+                )
+            }
+            result
+                .onSuccess { uri ->
+                    sessionDirectory?.deleteRecursively()
+                    Log.i(TAG, "Recording session published to ${saveLocation.relativePath}: $uri")
+                }
+                .onFailure { error ->
+                    Log.e(
+                        TAG,
+                        "Could not publish recording; private recovery files retained at $sessionDirectory",
+                        error,
+                    )
+                }
+        }
     }
 
     /**
@@ -2105,6 +2377,7 @@ class CameraRuntimeController(
             depthMeters = currentDepthMeters(),
         )
         if (filterProfile != null) {
+            builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
             builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
             builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
             builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, filterProfile)
@@ -2112,7 +2385,8 @@ class CameraRuntimeController(
         } else {
             val wbValue = currentValue(cameraState, ".white_balance")
             val kelvin = wbValue?.removeSuffix("K")?.toIntOrNull()
-            if (wbValue != null && wbValue != "Auto" && kelvin != null) {
+            if (kelvin != null) {
+                builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
                 val colour = manualWbColour(kelvin)
                 builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
                 builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
@@ -2120,6 +2394,10 @@ class CameraRuntimeController(
                 colour.second?.let { builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
             } else {
                 builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+                builder.set(
+                    CaptureRequest.CONTROL_AWB_LOCK,
+                    shutterAwbLockActive && CameraCatalog.isWhiteBalanceAutoShutter(wbValue),
+                )
             }
         }
 
@@ -2302,8 +2580,107 @@ class CameraRuntimeController(
         ) ?: 0f
     }
 
+    /**
+     * Auto Shutter is a one-touch neutral-slate calibration: Samsung AWB keeps metering during
+     * preview, the physical shutter locks its converged solution, and CameraX carries that lock
+     * on both repeating and single capture requests. Auto Continuous bypasses this entirely.
+     */
+    private fun withShutterWhiteBalance(action: () -> Unit) {
+        val wbValue = currentValue(latestState, ".white_balance")
+        if (!CameraCatalog.isWhiteBalanceAutoShutter(wbValue)) {
+            action()
+            return
+        }
+        val boundCamera = camera
+        if (boundCamera == null) {
+            action()
+            return
+        }
+        val lockAvailable = runCatching {
+            Camera2CameraInfo.from(boundCamera.cameraInfo).getCameraCharacteristic(
+                CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE,
+            ) == true
+        }.getOrDefault(false)
+        if (!lockAvailable) {
+            // Honest fallback: capture with continuous Samsung AWB. Inventing a manual gain
+            // from an unsupported lock would imply a calibration the hardware never confirmed.
+            Log.w(TAG, "Auto Shutter requested, but CONTROL_AWB_LOCK is unavailable")
+            action()
+            return
+        }
+        // A second physical event while the first lock is being acknowledged must not create a
+        // second photo/recording start. The original event completes or times out exactly once.
+        if (shutterAwbLockInFlight) return
+
+        val generation = ++shutterAwbLockGeneration
+        shutterAwbLockInFlight = true
+        shutterAwbLockActive = true
+        // Direct-session users get the lock now; Camera2CameraControl below makes the same key
+        // part of every CameraX repeating AND one-shot request, including ImageCapture.
+        lastAppliedSessionSignature = null
+        applySessionState(latestState, force = true)
+
+        fun continueOnce(source: String) {
+            if (generation != shutterAwbLockGeneration || !shutterAwbLockInFlight) return
+            shutterAwbLockInFlight = false
+            Log.d(TAG, "Auto Shutter AWB locked ($source)")
+            action()
+        }
+
+        try {
+            val options = CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
+                .build()
+            val future = Camera2CameraControl.from(boundCamera.cameraControl)
+                .addCaptureRequestOptions(options)
+            future.addListener(
+                {
+                    val source = runCatching { future.get(); "result" }
+                        .getOrElse { error ->
+                            Log.w(TAG, "AWB lock acknowledgement failed: ${error.message}")
+                            "fallback"
+                        }
+                    continueOnce(source)
+                },
+                ContextCompat.getMainExecutor(context),
+            )
+        } catch (error: Exception) {
+            Log.w(TAG, "AWB lock request failed: ${error.message}")
+            continueOnce("fallback")
+        }
+        cameraRequestHandler.postDelayed(
+            { continueOnce("timeout") },
+            WB_SHUTTER_LOCK_TIMEOUT_MS,
+        )
+    }
+
+    private fun releaseShutterWhiteBalance() {
+        if (!shutterAwbLockActive && !shutterAwbLockInFlight) return
+        shutterAwbLockGeneration++
+        shutterAwbLockInFlight = false
+        shutterAwbLockActive = false
+        val boundCamera = camera ?: return
+        try {
+            val options = CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, false)
+                .build()
+            Camera2CameraControl.from(boundCamera.cameraControl).addCaptureRequestOptions(options)
+        } catch (error: Exception) {
+            Log.w(TAG, "AWB unlock request failed: ${error.message}")
+        }
+        lastAppliedSessionSignature = null
+        applySessionState(latestState, force = true)
+    }
+
     private fun capturePhoto() {
-        val capture = imageCapture ?: return
+        withShutterWhiteBalance(::capturePhotoNow)
+    }
+
+    private fun capturePhotoNow() {
+        val capture = imageCapture ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
         val name = "DiveControl_${System.currentTimeMillis()}.jpg"
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
@@ -2324,8 +2701,14 @@ class CameraRuntimeController(
             output,
             ContextCompat.getMainExecutor(context),
             object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) = Unit
-                override fun onError(exception: ImageCaptureException) = Unit
+                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                    releaseShutterWhiteBalance()
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    Log.e(TAG, "Photo capture failed", exception)
+                    releaseShutterWhiteBalance()
+                }
             },
         )
     }
@@ -2424,7 +2807,8 @@ class CameraRuntimeController(
         if (filterProfile == null) {
             val wbValue = currentValue(cameraState, ".white_balance")
             val kelvin = wbValue?.removeSuffix("K")?.toIntOrNull()
-            if (wbValue != null && wbValue != "Auto" && kelvin != null) {
+            if (kelvin != null) {
+                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, false)
                 val colour = manualWbColour(kelvin)
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
                 builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
@@ -2434,8 +2818,13 @@ class CameraRuntimeController(
                 }
             } else {
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+                builder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AWB_LOCK,
+                    shutterAwbLockActive && CameraCatalog.isWhiteBalanceAutoShutter(wbValue),
+                )
             }
         } else {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, false)
             builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
             builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
             builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_GAINS, filterProfile)
@@ -3516,7 +3905,7 @@ class CameraRuntimeController(
     /** The mode's manual kelvin, or null when white balance sits on Auto (or has no dial). */
     private fun manualWbKelvin(cameraState: CameraState): Int? {
         val wb = currentValue(cameraState, ".white_balance") ?: return null
-        if (wb == "Auto") return null
+        if (CameraCatalog.isWhiteBalanceAuto(wb)) return null
         return wb.removeSuffix("K").toIntOrNull()
     }
 
@@ -3524,7 +3913,8 @@ class CameraRuntimeController(
     private fun wbIsAuto(cameraState: CameraState): Boolean {
         val filters = currentValue(cameraState, ".filters")
         if (filters != null && filters != "Off") return false
-        return manualWbKelvin(cameraState) == null
+        val wb = currentValue(cameraState, ".white_balance")
+        return wb == null || CameraCatalog.isWhiteBalanceAuto(wb)
     }
 
     /**

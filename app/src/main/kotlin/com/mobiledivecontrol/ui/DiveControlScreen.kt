@@ -55,6 +55,8 @@ fun DiveControlScreen(
     onDetectedLenses: ((List<String>) -> Unit)? = null,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
+    onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit = {},
+    onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit = {},
     introVisible: Boolean = false,
     onIntroDismiss: () -> Unit = {},
     permissionsGranted: Boolean = false,
@@ -75,6 +77,8 @@ fun DiveControlScreen(
             onDetectedLenses = onDetectedLenses,
             onCapabilities = onCapabilities,
             onMeteredExposure = onMeteredExposure,
+            onCameraCommand = onCameraCommand,
+            onGalleryCommand = onGalleryCommand,
             bluetoothEnabled = bluetoothEnabled,
         )
 
@@ -110,6 +114,8 @@ private fun DiveControlContent(
     onDetectedLenses: ((List<String>) -> Unit)?,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)?,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
+    onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit,
+    onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit,
     bluetoothEnabled: Boolean = true,
 ) {
     CameraHudOverlay(
@@ -135,6 +141,7 @@ private fun DiveControlContent(
                     onDetectedLenses = onDetectedLenses,
                     onCapabilities = onCapabilities,
                     onMeteredExposure = onMeteredExposure,
+                    onCameraCommand = onCameraCommand,
                     housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.CameraAdjust -> CameraShellScreen(
@@ -147,12 +154,16 @@ private fun DiveControlContent(
                     onDetectedLenses = onDetectedLenses,
                     onCapabilities = onCapabilities,
                     onMeteredExposure = onMeteredExposure,
+                    onCameraCommand = onCameraCommand,
                     housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.Safety -> SafetyScreen(safety = state.safety)
                 AppMode.Diagnostics -> DiagnosticsScreen(state = state)
                 AppMode.PhoneCursor, AppMode.PhoneTarget -> PhoneControlPlaceholder(mode = mode)
-                AppMode.Gallery -> com.mobiledivecontrol.ui.gallery.GalleryScreen(galleryState = state.gallery)
+                AppMode.Gallery -> com.mobiledivecontrol.ui.gallery.GalleryScreen(
+                    galleryState = state.gallery,
+                    onCommand = onGalleryCommand,
+                )
             }
         }
     }

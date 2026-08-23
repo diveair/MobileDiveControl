@@ -209,12 +209,41 @@ data class HousingState(
     val lastRawButton: UByte? = null,
 )
 
+/** Ordered exactly as the paused-recording chooser is painted and traversed. */
+enum class RecordingPausedAction {
+    Resume,
+    Preview,
+    Stop,
+    Delete,
+}
+
+data class RecordingSaveLocation(
+    val name: String,
+    val relativePath: String,
+) {
+    companion object {
+        val Default = RecordingSaveLocation(
+            name = "Mobile DiveControl",
+            relativePath = "Movies/Mobile DiveControl/",
+        )
+    }
+}
+
 data class CameraState(
     val recording: Boolean = false,
-    /** True while an active recording is paused and the RESUME/STOP chooser owns the buttons. */
+    /** True while the cumulative recording is finalising/reviewable and its action chooser owns input. */
     val recordingPaused: Boolean = false,
-    /** Which side of the paused chooser is selected: false = RESUME (default), true = STOP. */
-    val recordingStopSelected: Boolean = false,
+    /** The selected action in the paused recording chooser. */
+    val recordingPausedAction: RecordingPausedAction = RecordingPausedAction.Resume,
+    /** True while all footage recorded in this session is shown over the live camera preview. */
+    val recordingPreviewVisible: Boolean = false,
+    /** True while the save-location button above the paused action rail owns focus. */
+    val recordingLocationFocused: Boolean = false,
+    /** True while the housing-navigable destination list is open. */
+    val recordingLocationChooserVisible: Boolean = false,
+    val recordingSaveLocation: RecordingSaveLocation = RecordingSaveLocation.Default,
+    val recordingSaveLocations: List<RecordingSaveLocation> = listOf(RecordingSaveLocation.Default),
+    val recordingSaveLocationIndex: Int = 0,
     /**
      * What this phone's camera hardware actually offers, probed at bind time by the platform
      * layer. Null until the probe reports (or forever, in the simulator) — the static catalog
@@ -399,20 +428,101 @@ enum class GalleryTab {
     Folders,
 }
 
+const val GALLERY_ALBUM_COLUMNS = 4
+const val GALLERY_MEDIA_COLUMNS = 6
+
 enum class GalleryViewMode {
     Browser,
+    AlbumActions,
+    MediaActions,
     Preview,
+    Options,
+    Move,
+    Rename,
     ConfirmDelete,
     ConfirmFolderDelete,
     CreateFolder,
+}
+
+enum class GalleryPreviewAction {
+    Delete,
+    Back,
+    Options,
+    Previous,
+    PlayPause,
+    Next,
+    Details,
+}
+
+enum class GalleryBrowserAction {
+    Back,
+    CreateAlbum,
+}
+
+fun galleryBrowserActions(showingAlbums: Boolean): List<GalleryBrowserAction> = buildList {
+    add(GalleryBrowserAction.Back)
+    if (showingAlbums) add(GalleryBrowserAction.CreateAlbum)
+}
+
+enum class GalleryAlbumAction {
+    Back,
+    Preview,
+    Delete,
+}
+
+enum class GalleryMediaAction {
+    Back,
+    Preview,
+    Delete,
+}
+
+/**
+ * Single preview rail. Videos center Play/Pause between Previous and Next and
+ * place Delete at the far right. Photos omit Play so Previous and Next remain
+ * adjacent, but keep the same Details → Delete ending.
+ */
+fun galleryPreviewRailActions(isVideo: Boolean): List<GalleryPreviewAction> = buildList {
+    if (isVideo) {
+        add(GalleryPreviewAction.Back)
+        add(GalleryPreviewAction.Options)
+        add(GalleryPreviewAction.Previous)
+        add(GalleryPreviewAction.PlayPause)
+        add(GalleryPreviewAction.Next)
+        add(GalleryPreviewAction.Details)
+        add(GalleryPreviewAction.Delete)
+    } else {
+        add(GalleryPreviewAction.Back)
+        add(GalleryPreviewAction.Options)
+        add(GalleryPreviewAction.Previous)
+        add(GalleryPreviewAction.Next)
+        add(GalleryPreviewAction.Details)
+        add(GalleryPreviewAction.Delete)
+    }
+}
+
+enum class GalleryMutation {
+    Delete,
+    Move,
+    Rename,
+    CreateAlbum,
 }
 
 data class GalleryItem(
     val id: Long,
     val name: String,
     val path: String,
+    /** Stable MediaStore URI. Album cards carry their cover item's URI here. */
+    val contentUri: String = "",
+    /** MediaStore BUCKET_ID. Album cards store the same value in [path]. */
+    val albumId: String? = null,
+    /** BUCKET_DISPLAY_NAME carried by media rows and shown by their album card. */
+    val folderDisplayName: String = "",
+    /** MediaStore RELATIVE_PATH, used as the safe destination for a move operation. */
+    val relativePath: String? = null,
     val isVideo: Boolean = false,
     val isFolder: Boolean = false,
+    /** Non-zero only for album cards. */
+    val mediaCount: Int = 0,
     val sizeBytes: Long = 0,
     val dateAdded: Long = 0,
     val width: Int = 0,
@@ -420,13 +530,37 @@ data class GalleryItem(
 )
 
 data class GalleryState(
-    val tab: GalleryTab = GalleryTab.Photos,
+    val tab: GalleryTab = GalleryTab.Folders,
     val viewMode: GalleryViewMode = GalleryViewMode.Browser,
     val items: List<GalleryItem> = emptyList(),
     val selectedIndex: Int = 0,
+    /** Null shows the album grid; otherwise this is the selected MediaStore BUCKET_ID. */
     val currentFolder: String? = null,
+    val currentFolderName: String? = null,
     val folderName: String = "",
     val previewExifLines: List<String> = emptyList(),
+    /** Metadata is opt-in so the recorded image/video owns the preview screen by default. */
+    val detailsVisible: Boolean = false,
+    /** Selected preview action; photo rails omit PlayPause while video rails include it. */
+    val previewAction: GalleryPreviewAction = GalleryPreviewAction.PlayPause,
+    val videoPlaying: Boolean = false,
+    /** Compatibility flag mirrored while [browserAction] is Back. */
+    val browserBackFocused: Boolean = false,
+    val browserAction: GalleryBrowserAction? = null,
+    /** Preview/Delete/Back selection shown after activating an album card. */
+    val albumAction: GalleryAlbumAction = GalleryAlbumAction.Preview,
+    /** Back/Preview/Delete selection shown after activating a media cell. */
+    val mediaAction: GalleryMediaAction = GalleryMediaAction.Preview,
+    /** Move/Rename/Cancel selection inside the Options sheet. */
+    val optionIndex: Int = 0,
+    val moveTargets: List<GalleryItem> = emptyList(),
+    val moveTargetIndex: Int = 0,
+    val renameDraft: String = "",
+    val pendingMutation: GalleryMutation? = null,
+    val operationMessage: String? = null,
+    val confirmationReturnToPreview: Boolean = false,
+    val confirmationReturnToMediaActions: Boolean = false,
+    val folderDeleteReturnToActions: Boolean = false,
     val confirmButtonIndex: Int = 1, // 0 = Delete/Confirm, 1 = Cancel (default to Cancel for safety)
 )
 
@@ -467,6 +601,12 @@ sealed interface CameraCommand : ControlCommand {
     data object StopVideoRecording : CameraCommand
     data object PauseVideoRecording : CameraCommand
     data object ResumeVideoRecording : CameraCommand
+    data object PreviewVideoRecording : CameraCommand
+    data object DeleteVideoRecording : CameraCommand
+    data object OpenRecordingSaveLocationChooser : CameraCommand
+    data class HighlightRecordingSaveLocation(val index: Int) : CameraCommand
+    data class SelectRecordingSaveLocation(val index: Int) : CameraCommand
+    data class LoadRecordingSaveLocations(val locations: List<RecordingSaveLocation>) : CameraCommand
     data object NavigateUp : CameraCommand
     data object NavigateDown : CameraCommand
     data object NavigateLeft : CameraCommand
@@ -572,8 +712,21 @@ sealed interface GalleryCommand : ControlCommand {
     data object InitiateDelete : GalleryCommand
     data object CreateFolder : GalleryCommand
     data object DeleteFolder : GalleryCommand
+    data class ActivateBrowserAction(val action: GalleryBrowserAction) : GalleryCommand
+    data class ActivateAlbumAction(val action: GalleryAlbumAction) : GalleryCommand
+    data class ActivateMediaAction(val action: GalleryMediaAction) : GalleryCommand
+    data class OpenItem(val index: Int) : GalleryCommand
+    data class ActivatePreviewAction(val action: GalleryPreviewAction) : GalleryCommand
+    data class SelectOption(val index: Int) : GalleryCommand
+    data class SelectMoveTarget(val index: Int) : GalleryCommand
+    data class SelectConfirmation(val index: Int) : GalleryCommand
+    data class SetRenameDraft(val value: String) : GalleryCommand
+    data class SetFolderName(val value: String) : GalleryCommand
     data class LoadItems(val items: List<GalleryItem>) : GalleryCommand
+    data class LoadMoveTargets(val items: List<GalleryItem>) : GalleryCommand
     data class SetExifLines(val lines: List<String>) : GalleryCommand
+    data class OperationSucceeded(val message: String) : GalleryCommand
+    data class OperationFailed(val message: String) : GalleryCommand
 }
 
 sealed interface PlatformEffect {
@@ -609,9 +762,14 @@ sealed interface PlatformEffect {
         val spanMs: Long = 250L,
     ) : PlatformEffect
     data object LoadGalleryItems : PlatformEffect
+    data object LoadGalleryMoveTargets : PlatformEffect
+    data object LoadRecordingSaveLocations : PlatformEffect
     data class DeleteGalleryItem(val item: GalleryItem) : PlatformEffect
+    data class MoveGalleryItem(val item: GalleryItem, val targetAlbum: GalleryItem) : PlatformEffect
+    data class RenameGalleryItem(val item: GalleryItem, val newName: String) : PlatformEffect
     data class CreateGalleryFolder(val name: String) : PlatformEffect
     data class DeleteGalleryFolder(val path: String) : PlatformEffect
+    data class DeleteGalleryAlbum(val album: GalleryItem) : PlatformEffect
     data class LoadExifData(val item: GalleryItem) : PlatformEffect
 }
 
@@ -667,4 +825,3 @@ sealed interface BottomBarItem {
     data object GalleryShortcut : BottomBarItem
     data object MoreSettings : BottomBarItem
 }
-

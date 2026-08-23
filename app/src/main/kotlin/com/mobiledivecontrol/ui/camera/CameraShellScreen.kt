@@ -10,6 +10,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.layout.Arrangement
@@ -23,6 +24,8 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -30,6 +33,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -64,8 +70,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import com.mobiledivecontrol.core.CameraCaptureType
 import com.mobiledivecontrol.core.CameraCatalog
+import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.CameraFeatureStatus
 import com.mobiledivecontrol.core.CameraModeId
 import com.mobiledivecontrol.core.CameraModeProfile
@@ -75,6 +83,7 @@ import com.mobiledivecontrol.core.CameraState
 import com.mobiledivecontrol.core.CameraUiZone
 import com.mobiledivecontrol.core.FocusCurveMode
 import com.mobiledivecontrol.core.PlatformEffect
+import com.mobiledivecontrol.core.RecordingPausedAction
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.core.SliderEditTarget
 import com.mobiledivecontrol.core.SliderSensitivity
@@ -96,6 +105,7 @@ fun CameraShellScreen(
     onDetectedLenses: ((List<String>) -> Unit)? = null,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
+    onCameraCommand: (CameraCommand) -> Unit = {},
     /** True while the housing-link banner occupies the top strip, so the mode pill yields to it. */
     housingLinkAlert: Boolean = false,
     modifier: Modifier = Modifier,
@@ -121,22 +131,21 @@ fun CameraShellScreen(
             CameraPreviewPlaceholder()
         }
 
+        // The runtime only publishes this URI after every paused segment has a complete MP4 index
+        // and the cumulative, gap-free review container has been assembled.
+        // Until then the overlay says exactly what is happening instead of opening a corrupt file.
+        if (cameraState.recording && cameraState.recordingPaused && cameraState.recordingPreviewVisible) {
+            RecordingSegmentPreview(modifier = Modifier.fillMaxSize())
+        }
+
         // Top-left: recording badge with the live elapsed clock
         RecordingBadge(
-            visible = cameraState.recording,
-            paused = cameraState.recordingPaused,
+            visible = cameraState.recording && !cameraState.recordingPaused,
+            paused = false,
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(start = 18.dp, top = 72.dp),
         )
-
-        // Centre: the paused chooser. LEFT/RIGHT move the selection, SHUTTER or OK confirms.
-        if (cameraState.recording && cameraState.recordingPaused) {
-            RecordingPausedChooser(
-                stopSelected = cameraState.recordingStopSelected,
-                modifier = Modifier.align(Alignment.Center),
-            )
-        }
 
         // Center: zoom overlay (fades after 1.4s)
         ZoomOverlay(
@@ -200,6 +209,15 @@ fun CameraShellScreen(
         ) {
             BottomSettingsTray(
                 cameraState = cameraState,
+            )
+        }
+
+        // Draw the paused-session controls last so their modal album grid owns the full z-plane.
+        if (cameraState.recording && cameraState.recordingPaused) {
+            RecordingPausedChooser(
+                cameraState = cameraState,
+                onCommand = onCameraCommand,
+                modifier = Modifier.fillMaxSize(),
             )
         }
     }
@@ -1021,10 +1039,14 @@ private fun displaySettingValue(cameraState: CameraState?, spec: CameraSettingSp
             cameraState?.meteredExposure?.shutterNs
                 ?.let { CameraCatalog.nearestShutterOption(it, spec.options) }
                 ?.let { "A $it" } ?: value
-        value == "Auto" && spec.id.endsWith(".white_balance") ->
+        CameraCatalog.isWhiteBalanceAuto(value) && spec.id.endsWith(".white_balance") -> {
+            val shutterMode = CameraCatalog.isWhiteBalanceAutoShutter(value)
+            val shortMode = if (shutterMode) "AS" else "AC"
             cameraState?.meteredExposure?.wbKelvin
                 ?.let { CameraCatalog.nearestWhiteBalanceOption(it, spec.options) }
-                ?.let { "A $it" } ?: value
+                ?.let { "$shortMode $it" }
+                ?: if (shutterMode) "Auto S" else "Auto C"
+        }
         // The native EV meter: with both ISO and shutter manual the compensation index has no
         // authority, so the field turns into a read-only meter of the measured deviation —
         // or an em dash when the vendor meter tag is absent, never a dial that pretends to work.
@@ -1420,45 +1442,179 @@ private fun RecordingBadge(
     }
 }
 
-/**
- * The paused recording's two futures, side by side. RESUME keeps writing the same file; STOP
- * finalises it into the gallery. The selection is core state, so the housing's LEFT/RIGHT own
- * it and this composable only paints.
- */
+/** Paused-session actions and save destination, with housing and touch sharing core selection. */
 @Composable
 private fun RecordingPausedChooser(
-    stopSelected: Boolean,
+    cameraState: CameraState,
+    onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = modifier
-            .background(DiveColors.DeepBlack.copy(alpha = 0.88f), RoundedCornerShape(14.dp))
-            .padding(horizontal = 20.dp, vertical = 14.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            RecordingChoiceChip(label = "RESUME", selected = !stopSelected, critical = false)
-            Spacer(modifier = Modifier.width(14.dp))
-            RecordingChoiceChip(label = "STOP", selected = stopSelected, critical = true)
+    val selectedAction = cameraState.recordingPausedAction
+    val previewVisible = cameraState.recordingPreviewVisible
+    Box(modifier = modifier) {
+        if (cameraState.recordingLocationChooserVisible) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(DiveColors.DeepBlack.copy(alpha = 0.92f), RoundedCornerShape(14.dp))
+                    .padding(horizontal = 20.dp, vertical = 14.dp),
+            ) {
+                Text(
+                    text = "CHOOSE SAVE ALBUM",
+                    color = DiveColors.TextPrimary,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(3),
+                    modifier = Modifier
+                        .width(720.dp)
+                        // Two complete rows fit the S24's 360 dp landscape viewport; further
+                        // albums remain reachable through the grid's native vertical scroll.
+                        .heightIn(max = 130.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    gridItemsIndexed(cameraState.recordingSaveLocations) { index, location ->
+                        val selected = index == cameraState.recordingSaveLocationIndex
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 62.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(
+                                    if (selected) DiveColors.DiveCyan.copy(alpha = 0.2f)
+                                    else DiveColors.SurfaceElevated,
+                                )
+                                .border(
+                                    width = if (selected) 1.5.dp else 0.dp,
+                                    color = if (selected) DiveColors.DiveCyan else Color.Transparent,
+                                    shape = RoundedCornerShape(8.dp),
+                                )
+                                .clickable {
+                                    onCommand(CameraCommand.HighlightRecordingSaveLocation(index))
+                                }
+                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                        ) {
+                            Text(
+                                text = location.name,
+                                color = if (selected) DiveColors.DiveCyan else DiveColors.TextPrimary,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = location.relativePath,
+                                color = DiveColors.TextSecondary,
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.width(720.dp),
+                ) {
+                    RecordingChoiceChip(
+                        label = "BACK",
+                        selected = false,
+                        accent = DiveColors.DiveCyan,
+                        onClick = { onCommand(CameraCommand.Back) },
+                    )
+                    RecordingChoiceChip(
+                        label = "CONFIRM",
+                        selected = true,
+                        accent = DiveColors.Success,
+                        onClick = {
+                            onCommand(
+                                CameraCommand.SelectRecordingSaveLocation(
+                                    cameraState.recordingSaveLocationIndex,
+                                ),
+                            )
+                        },
+                    )
+                }
+            }
+            return@Box
         }
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = "LEFT/RIGHT select · SHUTTER confirms",
-            color = DiveColors.TextSecondary,
-            style = MaterialTheme.typography.labelMedium,
-        )
+
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .align(Alignment.Center)
+                .offset(y = (-80).dp),
+        ) {
+            RecordingChoiceChip(
+                label = "SAVE TO · ${cameraState.recordingSaveLocation.name}",
+                selected = cameraState.recordingLocationFocused,
+                accent = DiveColors.DiveCyan,
+                onClick = { onCommand(CameraCommand.OpenRecordingSaveLocationChooser) },
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            RecordingBadge(visible = true, paused = true)
+        }
+
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .align(Alignment.Center)
+                .background(DiveColors.DeepBlack.copy(alpha = 0.88f), RoundedCornerShape(14.dp))
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+        ) {
+            val actionFocused = !cameraState.recordingLocationFocused
+            RecordingChoiceChip(
+                label = "RESUME",
+                selected = actionFocused && selectedAction == RecordingPausedAction.Resume,
+                accent = DiveColors.Success,
+                onClick = { onCommand(CameraCommand.ResumeVideoRecording) },
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            RecordingChoiceChip(
+                label = if (previewVisible) "PAUSE" else "PREVIEW",
+                selected = actionFocused && selectedAction == RecordingPausedAction.Preview,
+                accent = DiveColors.DiveCyan,
+                onClick = { onCommand(CameraCommand.PreviewVideoRecording) },
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            RecordingChoiceChip(
+                label = "STOP",
+                selected = actionFocused && selectedAction == RecordingPausedAction.Stop,
+                accent = DiveColors.Warning,
+                onClick = { onCommand(CameraCommand.StopVideoRecording) },
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            RecordingChoiceChip(
+                label = "DELETE",
+                selected = actionFocused && selectedAction == RecordingPausedAction.Delete,
+                accent = DiveColors.Critical,
+                critical = true,
+                onClick = { onCommand(CameraCommand.DeleteVideoRecording) },
+            )
+        }
     }
 }
 
 @Composable
-private fun RecordingChoiceChip(label: String, selected: Boolean, critical: Boolean) {
-    val accent = if (critical) DiveColors.Critical else DiveColors.Success
+private fun RecordingChoiceChip(
+    label: String,
+    selected: Boolean,
+    accent: Color,
+    critical: Boolean = false,
+    onClick: () -> Unit,
+) {
     Box(
         modifier = Modifier
             .background(
                 if (selected) accent else DiveColors.SurfaceElevated,
                 RoundedCornerShape(10.dp),
             )
+            .clickable(onClick = onClick)
             .padding(horizontal = 22.dp, vertical = 10.dp),
     ) {
         Text(
@@ -1472,6 +1628,48 @@ private fun RecordingChoiceChip(label: String, selected: Boolean, critical: Bool
             fontWeight = FontWeight.Bold,
         )
     }
+}
+
+@Composable
+private fun RecordingSegmentPreview(modifier: Modifier = Modifier) {
+    val uri by RecordingClock.reviewUri
+    val finalizing by RecordingClock.reviewFinalizing
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier.background(DiveColors.DeepBlack),
+    ) {
+        if (uri != null) {
+            LoopingVideo(uri = uri!!, modifier = Modifier.fillMaxSize())
+        } else {
+            Text(
+                text = if (finalizing) "Finalizing preview…" else "Preview unavailable",
+                color = DiveColors.TextSecondary,
+                style = MaterialTheme.typography.titleMedium,
+            )
+        }
+    }
+}
+
+@Composable
+internal fun LoopingVideo(
+    uri: android.net.Uri,
+    modifier: Modifier = Modifier,
+    playing: Boolean = true,
+    onProgress: ((positionMs: Long, durationMs: Long) -> Unit)? = null,
+) {
+    AndroidView(
+        factory = { context ->
+            LoopingVideoTextureView(context).apply {
+                setProgressListener(onProgress)
+                play(uri, playing)
+            }
+        },
+        update = { view ->
+            view.setProgressListener(onProgress)
+            view.play(uri, playing)
+        },
+        modifier = modifier,
+    )
 }
 
 @Composable

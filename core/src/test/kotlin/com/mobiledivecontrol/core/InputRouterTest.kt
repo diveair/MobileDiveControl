@@ -25,6 +25,57 @@ class InputRouterTest {
     }
 
     @Test
+    fun `paused video shutter confirms each selected review action`() {
+        val expected = mapOf(
+            RecordingPausedAction.Resume to CameraCommand.ResumeVideoRecording,
+            RecordingPausedAction.Preview to CameraCommand.PreviewVideoRecording,
+            RecordingPausedAction.Stop to CameraCommand.StopVideoRecording,
+            RecordingPausedAction.Delete to CameraCommand.DeleteVideoRecording,
+        )
+        expected.forEach { (action, command) ->
+            val state = readyState(
+                mode = AppMode.CameraLive,
+                camera = CameraState(
+                    activeMode = CameraModeId.Video,
+                    recording = true,
+                    recordingPaused = true,
+                    recordingPausedAction = action,
+                ),
+            )
+            assertEquals(
+                listOf(command),
+                router.route(state, HousingButtonEvent.Shutter).commands,
+                "Shutter must confirm $action",
+            )
+        }
+    }
+
+    @Test
+    fun `paused video shutter confirms save location controls`() {
+        for (camera in listOf(
+            CameraState(
+                activeMode = CameraModeId.Video,
+                recording = true,
+                recordingPaused = true,
+                recordingLocationFocused = true,
+            ),
+            CameraState(
+                activeMode = CameraModeId.Video,
+                recording = true,
+                recordingPaused = true,
+                recordingLocationFocused = true,
+                recordingLocationChooserVisible = true,
+            ),
+        )) {
+            val state = readyState(mode = AppMode.CameraLive, camera = camera)
+            assertEquals(
+                listOf(CameraCommand.Confirm),
+                router.route(state, HousingButtonEvent.Shutter).commands,
+            )
+        }
+    }
+
+    @Test
     fun `camera live right focuses the mode rail`() {
         val state = readyState(mode = AppMode.CameraLive)
         val route = router.route(state, HousingButtonEvent.Right)

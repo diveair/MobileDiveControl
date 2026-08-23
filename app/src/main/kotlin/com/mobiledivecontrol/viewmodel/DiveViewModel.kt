@@ -1,6 +1,9 @@
 package com.mobiledivecontrol.viewmodel
 
 import android.app.Application
+import android.app.PendingIntent
+import android.os.Build
+import android.provider.MediaStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.mobiledivecontrol.DiveControlApp
@@ -43,6 +46,17 @@ import kotlinx.coroutines.launch
  * by the Android platform layer.
  */
 class DiveViewModel(application: Application) : AndroidViewModel(application) {
+
+    data class GalleryConsentRequest(
+        val pendingIntent: PendingIntent,
+        val effect: PlatformEffect,
+        val successMessage: String,
+    )
+
+    data class GalleryMediaManagementRequest(
+        val effect: PlatformEffect,
+        val successMessage: String,
+    )
 
     private val sessionStore = CameraSessionStore(application)
 
@@ -91,6 +105,13 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _effects = MutableStateFlow<List<PlatformEffect>>(emptyList())
     val effects: StateFlow<List<PlatformEffect>> = _effects.asStateFlow()
+
+    private val _galleryConsentRequest = MutableStateFlow<GalleryConsentRequest?>(null)
+    val galleryConsentRequest: StateFlow<GalleryConsentRequest?> = _galleryConsentRequest.asStateFlow()
+
+    private val _galleryMediaManagementRequest = MutableStateFlow<GalleryMediaManagementRequest?>(null)
+    val galleryMediaManagementRequest: StateFlow<GalleryMediaManagementRequest?> =
+        _galleryMediaManagementRequest.asStateFlow()
 
     private val _depthUnitMetric = MutableStateFlow(true)
     val depthUnitMetric: StateFlow<Boolean> = _depthUnitMetric.asStateFlow()
@@ -819,9 +840,14 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         // which a ladder spin makes hundreds of times a second; each one launched an IO
         // coroutine whose body fell straight through its `else -> { }`.
         val hasGalleryWork = effects.any {
-            it is PlatformEffect.LoadGalleryItems ||
+                it is PlatformEffect.LoadGalleryItems ||
+                it is PlatformEffect.LoadGalleryMoveTargets ||
+                it is PlatformEffect.LoadRecordingSaveLocations ||
                 it is PlatformEffect.LoadExifData ||
                 it is PlatformEffect.DeleteGalleryItem ||
+                it is PlatformEffect.DeleteGalleryAlbum ||
+                it is PlatformEffect.MoveGalleryItem ||
+                it is PlatformEffect.RenameGalleryItem ||
                 it is PlatformEffect.DeleteGalleryFolder ||
                 it is PlatformEffect.CreateGalleryFolder
         }
@@ -836,6 +862,21 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                             dispatch(GalleryCommand.LoadItems(items))
                         }
                     }
+                    is PlatformEffect.LoadGalleryMoveTargets -> {
+                        val albums = galleryRepository.loadItems(
+                            com.mobiledivecontrol.core.GalleryTab.Folders,
+                            currentFolder = null,
+                        )
+                        launch(Dispatchers.Main) {
+                            dispatch(GalleryCommand.LoadMoveTargets(albums))
+                        }
+                    }
+                    is PlatformEffect.LoadRecordingSaveLocations -> {
+                        val locations = galleryRepository.loadRecordingSaveLocations()
+                        launch(Dispatchers.Main) {
+                            dispatch(CameraCommand.LoadRecordingSaveLocations(locations))
+                        }
+                    }
                     is PlatformEffect.LoadExifData -> {
                         val lines = galleryRepository.loadExifData(effect.item)
                         launch(Dispatchers.Main) {
@@ -843,12 +884,24 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                     is PlatformEffect.DeleteGalleryItem -> {
-                        galleryRepository.deleteItem(effect.item)
-                        val gallery = controlCore.state.gallery
-                        val items = galleryRepository.loadItems(gallery.tab, gallery.currentFolder)
-                        launch(Dispatchers.Main) {
-                            dispatch(GalleryCommand.LoadItems(items))
-                        }
+                        val result = galleryRepository.deleteItem(effect.item)
+                        completeGalleryMutation(result, "Deleted ${effect.item.name}", effect)
+                    }
+                    is PlatformEffect.DeleteGalleryAlbum -> {
+                        val result = galleryRepository.deleteAlbum(effect.album)
+                        completeGalleryMutation(result, "Deleted album ${effect.album.name}", effect)
+                    }
+                    is PlatformEffect.MoveGalleryItem -> {
+                        val result = galleryRepository.moveItem(effect.item, effect.targetAlbum)
+                        completeGalleryMutation(
+                            result,
+                            "Moved ${effect.item.name} to ${effect.targetAlbum.name}",
+                            effect,
+                        )
+                    }
+                    is PlatformEffect.RenameGalleryItem -> {
+                        val result = galleryRepository.renameItem(effect.item, effect.newName)
+                        completeGalleryMutation(result, "Renamed ${effect.item.name}", effect)
                     }
                     is PlatformEffect.DeleteGalleryFolder -> {
                         galleryRepository.deleteFolder(effect.path)
@@ -859,17 +912,156 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                     is PlatformEffect.CreateGalleryFolder -> {
-                        galleryRepository.createFolder(effect.name)
-                        val gallery = controlCore.state.gallery
-                        val items = galleryRepository.loadItems(gallery.tab, gallery.currentFolder)
-                        launch(Dispatchers.Main) {
-                            dispatch(GalleryCommand.LoadItems(items))
-                        }
+                        completeGalleryMutation(
+                            result = galleryRepository.createFolder(effect.name),
+                            successMessage = "Created album ${effect.name}",
+                            effect = effect,
+                        )
                     }
                     else -> { /* handled elsewhere */ }
                 }
             }
         }
+    }
+
+    /** Runs on the gallery IO coroutine and commits UI state only after MediaStore confirms success. */
+    private fun completeGalleryMutation(
+        result: Result<Unit>,
+        successMessage: String,
+        effect: PlatformEffect,
+        allowConsentRequest: Boolean = true,
+    ) {
+        if (result.isFailure) {
+            val error = result.exceptionOrNull()
+            if (allowConsentRequest && error is SecurityException) {
+                if (
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    !MediaStore.canManageMedia(getApplication())
+                ) {
+                    _galleryMediaManagementRequest.value = GalleryMediaManagementRequest(
+                        effect = effect,
+                        successMessage = successMessage,
+                    )
+                    return
+                }
+                val pendingIntent = runCatching {
+                    when (effect) {
+                        is PlatformEffect.DeleteGalleryAlbum ->
+                            galleryRepository.createAlbumDeleteRequest(effect.album)
+                        else -> galleryMutationItem(effect)?.let { item ->
+                            galleryRepository.createConsentRequest(
+                                item = item,
+                                delete = effect is PlatformEffect.DeleteGalleryItem,
+                                cause = error,
+                            )
+                        }
+                    }
+                }.getOrNull()
+                if (pendingIntent != null) {
+                    _galleryConsentRequest.value = GalleryConsentRequest(
+                        pendingIntent = pendingIntent,
+                        effect = effect,
+                        successMessage = successMessage,
+                    )
+                    return
+                }
+            }
+            val message = error?.message ?: "The media operation failed."
+            viewModelScope.launch(Dispatchers.Main) {
+                dispatch(GalleryCommand.OperationFailed(message))
+            }
+            return
+        }
+
+        val gallery = controlCore.state.gallery
+        val items = galleryRepository.loadItems(gallery.tab, gallery.currentFolder)
+        viewModelScope.launch(Dispatchers.Main) {
+            dispatch(GalleryCommand.LoadItems(items))
+            dispatch(GalleryCommand.OperationSucceeded(successMessage))
+        }
+    }
+
+    /** Retries the queued mutation after the one-time Android media-management settings screen. */
+    fun resolveGalleryMediaManagement(granted: Boolean) {
+        val request = _galleryMediaManagementRequest.value ?: return
+        _galleryMediaManagementRequest.value = null
+        if (!granted) {
+            dispatch(
+                GalleryCommand.OperationFailed(
+                    "Media management access was not enabled. Delete, move, or rename was cancelled.",
+                ),
+            )
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = when (val effect = request.effect) {
+                is PlatformEffect.DeleteGalleryItem -> galleryRepository.deleteItem(effect.item)
+                is PlatformEffect.DeleteGalleryAlbum -> galleryRepository.deleteAlbum(effect.album)
+                is PlatformEffect.MoveGalleryItem -> galleryRepository.moveItem(effect.item, effect.targetAlbum)
+                is PlatformEffect.RenameGalleryItem -> galleryRepository.renameItem(effect.item, effect.newName)
+                else -> Result.failure(IllegalArgumentException("Unsupported gallery operation."))
+            }
+            completeGalleryMutation(
+                result = result,
+                successMessage = request.successMessage,
+                effect = request.effect,
+            )
+        }
+    }
+
+    /** Called by MainActivity after Android's per-file MediaStore confirmation dialog closes. */
+    fun resolveGalleryConsent(granted: Boolean) {
+        val request = _galleryConsentRequest.value ?: return
+        _galleryConsentRequest.value = null
+        if (!granted) {
+            dispatch(GalleryCommand.OperationFailed("Media permission was not granted."))
+            return
+        }
+
+        // createDeleteRequest performs the deletion itself before RESULT_OK is delivered.
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            (request.effect is PlatformEffect.DeleteGalleryItem ||
+                request.effect is PlatformEffect.DeleteGalleryAlbum)
+        ) {
+            viewModelScope.launch(Dispatchers.IO) {
+                if (request.effect is PlatformEffect.DeleteGalleryAlbum) {
+                    galleryRepository.finishAlbumDeletion(request.effect.album)
+                }
+                completeGalleryMutation(
+                    result = Result.success(Unit),
+                    successMessage = request.successMessage,
+                    effect = request.effect,
+                    allowConsentRequest = false,
+                )
+            }
+            return
+        }
+
+        // createWriteRequest (and Android 10's recoverable action) grants access; retry the write.
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = when (val effect = request.effect) {
+                is PlatformEffect.DeleteGalleryItem -> galleryRepository.deleteItem(effect.item)
+                is PlatformEffect.DeleteGalleryAlbum -> galleryRepository.deleteAlbum(effect.album)
+                is PlatformEffect.MoveGalleryItem -> galleryRepository.moveItem(effect.item, effect.targetAlbum)
+                is PlatformEffect.RenameGalleryItem -> galleryRepository.renameItem(effect.item, effect.newName)
+                else -> Result.failure(IllegalArgumentException("Unsupported gallery operation."))
+            }
+            completeGalleryMutation(
+                result = result,
+                successMessage = request.successMessage,
+                effect = request.effect,
+                allowConsentRequest = false,
+            )
+        }
+    }
+
+    private fun galleryMutationItem(effect: PlatformEffect) = when (effect) {
+        is PlatformEffect.DeleteGalleryItem -> effect.item
+        is PlatformEffect.MoveGalleryItem -> effect.item
+        is PlatformEffect.RenameGalleryItem -> effect.item
+        else -> null
     }
 
     private companion object {
@@ -920,4 +1112,3 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 }
-

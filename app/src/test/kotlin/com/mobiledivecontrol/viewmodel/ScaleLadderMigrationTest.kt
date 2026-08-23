@@ -55,36 +55,19 @@ class ScaleLadderMigrationTest {
         }
     }
 
-    /**
-     * White balance moved from the native flat-100K grid onto the mired-uniform fine ladder.
-     * Legacy values from the 100K builds are mostly no longer exact rungs; each must land on
-     * the NEAREST mired rung — never on Auto, and never past a bracketing rung.
-     */
+    /** Legacy single-Auto state maps explicitly; Samsung's native 100 K values stay exact. */
     @Test
-    fun `every legacy white balance value lands on the nearest mired rung`() {
-        assertEquals("Auto", migrate("pro.white_balance", "Auto"))
+    fun `legacy white balance values land on the native table and explicit auto mode`() {
+        assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, migrate("pro.white_balance", "Auto"))
         // Every current rung is untouched exactly — the ladder itself is a fixed point.
         CameraCatalog.whiteBalanceLadder.forEach { rung ->
             assertEquals(rung, migrate("pro.white_balance", rung))
         }
-        // Every value the old flat-100K builds could have saved snaps to the nearest rung.
-        val kelvins = CameraCatalog.whiteBalanceLadder
-            .mapNotNull { it.removeSuffix("K").toIntOrNull() }
+        // Every value the old flat-100K builds could have saved remains byte-identical.
         for (legacy in 2300..10000 step 100) {
-            val migrated = migrate("pro.white_balance", "${legacy}K")
-            assertEquals(
-                CameraCatalog.nearestWhiteBalanceOption(legacy, CameraCatalog.whiteBalanceLadder),
-                migrated,
-                "${legacy}K snapped wrong",
-            )
-            val landed = migrated!!.removeSuffix("K").toInt()
-            val below = kelvins.last { it <= legacy }
-            val above = kelvins.first { it >= legacy }
-            assertTrue(
-                abs(landed - legacy) <= (above - below + 1) / 2 + 1,
-                "${legacy}K moved to $migrated, past the nearest rung",
-            )
+            assertEquals("${legacy}K", migrate("pro.white_balance", "${legacy}K"))
         }
+        assertEquals("2800K", migrate("pro.white_balance", "2830K"))
     }
 
     @Test
@@ -193,9 +176,10 @@ class ScaleLadderMigrationTest {
                 else -> CameraCatalog.exposureProLadder
             }
             assertTrue(value in ladder, "$key = $value is not on its ladder")
-            if (!key.endsWith("exposure_value") && !key.endsWith("exposure_compensation") && !key.endsWith(".exposure")) {
-                assertTrue(ladder.indexOf(value) > 0, "$key collapsed to Auto")
+            if (key.endsWith(".iso") || key.endsWith(".shutter_speed")) {
+                assertTrue(value != "Auto", "$key collapsed to Auto")
             }
+            if (key.endsWith(".white_balance")) assertTrue(value.endsWith("K"), "$key collapsed to auto")
         }
     }
 
@@ -213,7 +197,7 @@ class ScaleLadderMigrationTest {
     fun `every catalog setting built on one of the four ladders is covered by the migration`() {
         // Off-ladder on purpose, and chosen to avoid an exact midpoint so the nearest rung is
         // unambiguous: 6400 is a stop above the ISO top, 1/2 is a legacy spelling of 0.5",
-        // 2830K sits between mired rungs but not halfway, and +1.23 sits nearer +1.2 on both
+        // 2830K sits between native 100 K rungs but not halfway, and +1.23 sits nearer +1.2 on both
         // EV dials. The WB expectation is computed, not spelled, so it tracks the ladder.
         val wbProbeExpected =
             CameraCatalog.nearestWhiteBalanceOption(2_830, CameraCatalog.whiteBalanceLadder)!!

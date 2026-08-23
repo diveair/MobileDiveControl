@@ -46,7 +46,7 @@ class ControlReducer(
         is SafetyCommand -> reduceSafety(state, command)
         is HousingCommand -> reduceHousing(state, command)
         is SystemCommand -> reduceSystem(state, command)
-        is GalleryCommand -> reduceGallery(state, command)
+        is GalleryCommand -> reduceGalleryGrid(state, command)
     }
 
     fun updateBleState(
@@ -201,8 +201,9 @@ class ControlReducer(
     /**
      * Merges the live AE/AWB readings into state. Platform telemetry on the same footing as
      * [updatePhoneBattery]: it never changes a mode, never emits an effect, and arrives outside
-     * the housing-input critical path. The HUD prints these beside "Auto" the way the native
-     * chips do, and [seededManualValue] reads them at the moment a dial leaves Auto.
+     * the housing-input critical path. The HUD prints these beside the automatic modes the way
+     * the native chips do. Ring controls deliberately traverse their literal neighbours instead
+     * of jumping to these readings when they leave Auto.
      */
     fun updateMeteredExposure(state: AppState, metered: MeteredExposure): Reduction {
         return Reduction(
@@ -271,7 +272,10 @@ class ControlReducer(
                 camera = state.camera.copy(
                     recording = true,
                     recordingPaused = false,
-                    recordingStopSelected = false,
+                    recordingPausedAction = RecordingPausedAction.Resume,
+                    recordingPreviewVisible = false,
+                    recordingLocationFocused = false,
+                    recordingLocationChooserVisible = false,
                 ),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(CameraCommand.StartVideoRecording)),
@@ -280,31 +284,140 @@ class ControlReducer(
             state = state.copy(
                 camera = state.camera.copy(
                     recordingPaused = true,
-                    // The chooser always opens on RESUME: the least destructive answer is the
-                    // default, and STOP is one deliberate press away.
-                    recordingStopSelected = false,
+                    // The chooser always opens on RESUME: the least destructive answer remains
+                    // the default while CameraX finalises a valid reviewable segment.
+                    recordingPausedAction = RecordingPausedAction.Resume,
+                    recordingPreviewVisible = false,
+                    recordingLocationFocused = false,
+                    recordingLocationChooserVisible = false,
                 ),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(command)),
         )
         CameraCommand.ResumeVideoRecording -> Reduction(
             state = state.copy(
-                camera = state.camera.copy(recordingPaused = false),
+                camera = state.camera.copy(
+                    recordingPaused = false,
+                    recordingPausedAction = RecordingPausedAction.Resume,
+                    recordingPreviewVisible = false,
+                    recordingLocationFocused = false,
+                    recordingLocationChooserVisible = false,
+                ),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(command)),
         )
+        CameraCommand.PreviewVideoRecording -> {
+            if (!state.camera.recording || !state.camera.recordingPaused) {
+                Reduction(state = state)
+            } else {
+                Reduction(
+                    state = state.copy(
+                        camera = state.camera.copy(
+                            recordingPreviewVisible = !state.camera.recordingPreviewVisible,
+                            recordingLocationFocused = false,
+                            recordingLocationChooserVisible = false,
+                        ),
+                    ),
+                )
+            }
+        }
         CameraCommand.StopVideoRecording -> Reduction(
             state = state.copy(
                 camera = state.camera.copy(
                     recording = false,
                     recordingPaused = false,
-                    recordingStopSelected = false,
+                    recordingPausedAction = RecordingPausedAction.Resume,
+                    recordingPreviewVisible = false,
+                    recordingLocationFocused = false,
+                    recordingLocationChooserVisible = false,
                     // Bumped so the gallery thumbnail refreshes with the finished video.
                     captureCounter = state.camera.captureCounter + 1,
                 ),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(command)),
         )
+        CameraCommand.DeleteVideoRecording -> Reduction(
+            state = state.copy(
+                camera = state.camera.copy(
+                    recording = false,
+                    recordingPaused = false,
+                    recordingPausedAction = RecordingPausedAction.Resume,
+                    recordingPreviewVisible = false,
+                    recordingLocationFocused = false,
+                    recordingLocationChooserVisible = false,
+                    // Force the gallery shortcut to discard any thumbnail of the deleted clip.
+                    captureCounter = state.camera.captureCounter + 1,
+                ),
+            ),
+            effects = listOf(PlatformEffect.ExecuteCamera(command)),
+        )
+        CameraCommand.OpenRecordingSaveLocationChooser -> {
+            if (!state.camera.recording || !state.camera.recordingPaused) {
+                Reduction(state = state)
+            } else {
+                val selectedIndex = state.camera.recordingSaveLocations
+                    .indexOf(state.camera.recordingSaveLocation)
+                    .coerceAtLeast(0)
+                Reduction(
+                    state = state.copy(
+                        camera = state.camera.copy(
+                            recordingLocationFocused = true,
+                            recordingLocationChooserVisible = true,
+                            recordingSaveLocationIndex = selectedIndex,
+                            recordingPreviewVisible = false,
+                        ),
+                    ),
+                    effects = listOf(PlatformEffect.LoadRecordingSaveLocations),
+                )
+            }
+        }
+        is CameraCommand.LoadRecordingSaveLocations -> {
+            val locations = command.locations
+                .distinctBy { it.relativePath.trimEnd('/').lowercase() }
+                .ifEmpty { listOf(RecordingSaveLocation.Default) }
+            val selectedIndex = locations.indexOf(state.camera.recordingSaveLocation).let { index ->
+                if (index >= 0) index else 0
+            }
+            Reduction(
+                state = state.copy(
+                    camera = state.camera.copy(
+                        recordingSaveLocations = locations,
+                        recordingSaveLocationIndex = selectedIndex,
+                    ),
+                ),
+            )
+        }
+        is CameraCommand.HighlightRecordingSaveLocation -> {
+            if (
+                !state.camera.recordingLocationChooserVisible ||
+                command.index !in state.camera.recordingSaveLocations.indices
+            ) {
+                Reduction(state = state)
+            } else {
+                Reduction(
+                    state = state.copy(
+                        camera = state.camera.copy(recordingSaveLocationIndex = command.index),
+                    ),
+                )
+            }
+        }
+        is CameraCommand.SelectRecordingSaveLocation -> {
+            val location = state.camera.recordingSaveLocations.getOrNull(command.index)
+            if (location == null) {
+                Reduction(state = state)
+            } else {
+                Reduction(
+                    state = state.copy(
+                        camera = state.camera.copy(
+                            recordingSaveLocation = location,
+                            recordingSaveLocationIndex = command.index,
+                            recordingLocationChooserVisible = false,
+                            recordingLocationFocused = true,
+                        ),
+                    ),
+                )
+            }
+        }
         CameraCommand.NavigateUp -> navigateCameraUp(state, repeatCount)
         CameraCommand.NavigateDown -> navigateCameraDown(state, repeatCount)
         CameraCommand.NavigateLeft -> navigateCameraLeft(state, repeatCount)
@@ -346,17 +459,19 @@ class ControlReducer(
                 Reduction(state = state)
             } else {
                 val currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue
-                val nextValue = seededManualValue(state.camera, spec, currentValue, command.step)
-                    ?: run {
-                        val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
-                        // Focus's AF and white balance's Auto both live at index 0 behind a
-                        // deliberate barrier: a nudge (including every held-ramp drain) clamps
-                        // at the first real value and never falls into the mode change.
-                        val gated = spec.id.endsWith(".manual_focus") || spec.id.endsWith(".white_balance")
-                        val minIndex = if (gated && currentIndex > 0) 1 else 0
-                        val nextIndex = (currentIndex + command.step).coerceIn(minIndex, spec.options.lastIndex)
-                        spec.options[nextIndex]
-                    }
+                val nextValue = if (CameraCatalog.isCircularSlider(spec)) {
+                    advanceOption(currentValue, spec.options, command.step, wrap = true)
+                } else {
+                    seededManualValue(state.camera, spec, currentValue, command.step)
+                        ?: run {
+                            val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
+                            // Focus's AF remains a deliberate mode barrier. Circular exposure
+                            // controls take the branch above and intentionally have no rail.
+                            val minIndex = if (spec.id.endsWith(".manual_focus") && currentIndex > 0) 1 else 0
+                            val nextIndex = (currentIndex + command.step).coerceIn(minIndex, spec.options.lastIndex)
+                            spec.options[nextIndex]
+                        }
+                }
                 if (nextValue == currentValue) {
                     Reduction(state = state)
                 } else {
@@ -624,20 +739,53 @@ class ControlReducer(
         return reduceCamera(state, CameraCommand.SetZoom(zoom))
     }
 
-    /** While the paused RESUME/STOP chooser is up, LEFT/RIGHT move its selection and nothing else. */
-    private fun pausedChooserNavigation(state: AppState, horizontal: Boolean): Reduction? {
+    /** Housing navigation for the paused action rail and its save-location control. */
+    private fun pausedChooserNavigation(
+        state: AppState,
+        horizontalStep: Int = 0,
+        verticalStep: Int = 0,
+    ): Reduction? {
         val camera = state.camera
         if (!camera.recording || !camera.recordingPaused) return null
-        if (!horizontal) return Reduction(state = state)
+        if (camera.recordingLocationChooserVisible) {
+            if (verticalStep == 0 && horizontalStep == 0) return Reduction(state = state)
+            val count = camera.recordingSaveLocations.size
+            val step = if (verticalStep != 0) verticalStep * RECORDING_LOCATION_GRID_COLUMNS else horizontalStep
+            val next = if (count > 0) {
+                ((camera.recordingSaveLocationIndex + step) % count + count) % count
+            } else {
+                0
+            }
+            return Reduction(
+                state = state.copy(camera = camera.copy(recordingSaveLocationIndex = next)),
+            )
+        }
+        if (verticalStep < 0) {
+            return Reduction(
+                state = state.copy(camera = camera.copy(recordingLocationFocused = true)),
+            )
+        }
+        if (verticalStep > 0) {
+            return Reduction(
+                state = state.copy(camera = camera.copy(recordingLocationFocused = false)),
+            )
+        }
+        if (camera.recordingLocationFocused || horizontalStep == 0) return Reduction(state = state)
+        val actions = RecordingPausedAction.entries
+        val current = actions.indexOf(camera.recordingPausedAction).coerceAtLeast(0)
         return Reduction(
             state = state.copy(
-                camera = camera.copy(recordingStopSelected = !camera.recordingStopSelected),
+                camera = camera.copy(
+                    recordingPausedAction = actions[
+                        ((current + horizontalStep) % actions.size + actions.size) % actions.size
+                    ],
+                ),
             ),
         )
     }
 
     private fun navigateCameraUp(state: AppState, repeatCount: Int = 0): Reduction {
-        pausedChooserNavigation(state, horizontal = false)?.let { return it }
+        pausedChooserNavigation(state, verticalStep = -1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
             CameraUiZone.LiveView -> {
@@ -670,7 +818,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraDown(state: AppState, repeatCount: Int = 0): Reduction {
-        pausedChooserNavigation(state, horizontal = false)?.let { return it }
+        pausedChooserNavigation(state, verticalStep = +1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
             CameraUiZone.LiveView -> {
@@ -703,7 +851,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraLeft(state: AppState, repeatCount: Int = 0): Reduction {
-        pausedChooserNavigation(state, horizontal = true)?.let { return it }
+        pausedChooserNavigation(state, horizontalStep = -1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
             CameraUiZone.LiveView -> Reduction(state = state)
@@ -732,7 +880,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraRight(state: AppState, repeatCount: Int = 0): Reduction {
-        pausedChooserNavigation(state, horizontal = true)?.let { return it }
+        pausedChooserNavigation(state, horizontalStep = +1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
             CameraUiZone.LiveView -> Reduction(state = state.copy(camera = focusModeRail(camera)))
@@ -748,12 +896,22 @@ class ControlReducer(
     }
 
     private fun confirmCameraSelection(state: AppState): Reduction {
-        // OK mirrors the shutter while the paused chooser is up: confirm the selected side.
+        // OK mirrors the shutter while the paused chooser is up: confirm the selected action.
         if (state.camera.recording && state.camera.recordingPaused) {
-            val command = if (state.camera.recordingStopSelected) {
-                CameraCommand.StopVideoRecording
-            } else {
-                CameraCommand.ResumeVideoRecording
+            if (state.camera.recordingLocationChooserVisible) {
+                return reduceCamera(
+                    state,
+                    CameraCommand.SelectRecordingSaveLocation(state.camera.recordingSaveLocationIndex),
+                )
+            }
+            if (state.camera.recordingLocationFocused) {
+                return reduceCamera(state, CameraCommand.OpenRecordingSaveLocationChooser)
+            }
+            val command = when (state.camera.recordingPausedAction) {
+                RecordingPausedAction.Resume -> CameraCommand.ResumeVideoRecording
+                RecordingPausedAction.Preview -> CameraCommand.PreviewVideoRecording
+                RecordingPausedAction.Stop -> CameraCommand.StopVideoRecording
+                RecordingPausedAction.Delete -> CameraCommand.DeleteVideoRecording
             }
             return reduceCamera(state, command)
         }
@@ -772,8 +930,31 @@ class ControlReducer(
     }
 
     private fun backOutCameraUi(state: AppState): Reduction {
-        // Back from the paused chooser is the safe answer: keep the recording, resume it.
+        // Back closes a clip preview first. From the chooser itself it keeps the session by
+        // starting a continuation clip, which is still the least destructive answer.
         if (state.camera.recording && state.camera.recordingPaused) {
+            if (state.camera.recordingLocationChooserVisible) {
+                return Reduction(
+                    state = state.copy(
+                        camera = state.camera.copy(
+                            recordingLocationChooserVisible = false,
+                            recordingLocationFocused = true,
+                        ),
+                    ),
+                )
+            }
+            if (state.camera.recordingPreviewVisible) {
+                return Reduction(
+                    state = state.copy(
+                        camera = state.camera.copy(recordingPreviewVisible = false),
+                    ),
+                )
+            }
+            if (state.camera.recordingLocationFocused) {
+                return Reduction(
+                    state = state.copy(camera = state.camera.copy(recordingLocationFocused = false)),
+                )
+            }
             return reduceCamera(state, CameraCommand.ResumeVideoRecording)
         }
         val camera = state.camera
@@ -1034,7 +1215,22 @@ class ControlReducer(
                 )
             }
             is BottomBarItem.GalleryShortcut -> Reduction(
-                state = state.copy(mode = AppMode.Gallery),
+                state = state.copy(
+                    mode = AppMode.Gallery,
+                    gallery = state.gallery.copy(
+                        viewMode = GalleryViewMode.Browser,
+                        items = emptyList(),
+                        selectedIndex = 0,
+                        currentFolder = null,
+                        currentFolderName = null,
+                        previewExifLines = emptyList(),
+                        detailsVisible = false,
+                        videoPlaying = false,
+                        browserBackFocused = false,
+                        browserAction = null,
+                        operationMessage = null,
+                    ),
+                ),
                 effects = listOf(PlatformEffect.LoadGalleryItems),
             )
             is BottomBarItem.MoreSettings -> {
@@ -1467,47 +1663,21 @@ class ControlReducer(
                     )
                 }
                 val sliderCurrentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue
-                // Mirror of focus's AF EXIT GUARD: one sustained gesture must not cross into
-                // Auto and straight back out to manual. Quiet first, then leaving is deliberate.
-                if (spec.id.endsWith(".white_balance") && sliderCurrentValue == "Auto" &&
-                    rawGapMs < AF_EXIT_GUARD_MS
-                ) {
-                    val stamped = preparedCamera.copy(lastFocusInputAtMs = now)
-                    return Reduction(
-                        state = preparedState.copy(camera = stamped),
-                        effects = manualFocusPreparation.effects,
-                    )
+                // ISO, shutter, WB and EV are literal rings. Their option order defines the
+                // edge transitions, including WB's two automatic modes, and a wheel turn is
+                // allowed to traverse that order without pause gates or an auto-to-meter jump.
+                val circular = CameraCatalog.isCircularSlider(spec)
+                val seededValue = if (circular) {
+                    null
+                } else {
+                    seededManualValue(preparedCamera, spec, sliderCurrentValue, step)
                 }
-                // WHITE BALANCE'S AUTO GATE, the same barrier focus has at its AF rail: dialing
-                // to the 2300K or 10000K end STOPS there; only a further press after resting
-                // [FOCUS_AF_PAUSE_MS] at the rail crosses into Auto. Auto is a mode change, not
-                // the next value along, so a turn must never fall into it by momentum.
-                if (spec.id.endsWith(".white_balance") && sliderCurrentValue != "Auto") {
-                    val currentIndex = spec.options.indexOf(sliderCurrentValue)
-                    val pushingOffMin = currentIndex == 1 && step < 0
-                    val pushingOffMax = currentIndex == spec.options.lastIndex && step > 0
-                    if (pushingOffMin || pushingOffMax) {
-                        // The camera hears the change the same way it hears every ordinary WB
-                        // detent: by observing settingValues — no effect is mapped for WB.
-                        val crossed = rawGapMs >= FOCUS_AF_PAUSE_MS
-                        val nextCamera = applySettingValue(
-                            preparedCamera,
-                            spec.id,
-                            if (crossed) "Auto" else sliderCurrentValue,
-                        ).copy(lastFocusInputAtMs = now)
-                        return Reduction(
-                            state = preparedState.copy(camera = nextCamera),
-                            effects = manualFocusPreparation.effects,
-                        )
-                    }
-                }
-                val seededValue = seededManualValue(preparedCamera, spec, sliderCurrentValue, step)
                 val nextValue = seededValue
                     ?: advanceOption(
                         currentValue = sliderCurrentValue,
                         options = spec.options,
                         step = step,
-                        wrap = false,
+                        wrap = circular,
                     )
                 // A seeded detent's whole meaning is "land where the meter is" — geared extra
                 // rungs on top would overshoot the very value the diver converted to keep.
@@ -1603,11 +1773,8 @@ class ControlReducer(
     }
 
     /**
-     * The auto-to-manual handoff, gated to the moment it applies: the value is sitting on
-     * "Auto" and the diver moves the dial — in EITHER direction. The first input converts to
-     * manual AT the rung nearest the live metered value ([CameraCatalog.meteredSeedValue]), so
-     * "auto at 6000" becomes "manual 6000", and only the inputs after it walk up or down from
-     * there. With no telemetry the caller falls back to ordinary stepping.
+     * Meter-seeded auto-to-manual handoff for any future non-circular Auto slider. ISO, shutter,
+     * WB and EV bypass this helper because their physical wheel contract is an exact ring.
      */
     private fun seededManualValue(
         camera: CameraState,
@@ -1633,6 +1800,11 @@ class ControlReducer(
     }
 
     internal companion object {
+        const val ALBUM_GRID_COLUMNS = GALLERY_ALBUM_COLUMNS
+        const val MEDIA_GRID_COLUMNS = GALLERY_MEDIA_COLUMNS
+        const val RECORDING_LOCATION_GRID_COLUMNS = 3
+        const val MAX_RENAME_LENGTH = 96
+
         /** Fastest ramp cadence: one frame. Slower ladders stretch the interval instead. */
         const val FOCUS_RAMP_TICK_MS = 16L
 
@@ -2156,286 +2328,992 @@ class ControlReducer(
         )
     }
 
-    private fun reduceGallery(state: AppState, command: GalleryCommand): Reduction {
+    private fun reduceGalleryGrid(state: AppState, command: GalleryCommand): Reduction {
         val gallery = state.gallery
         return when (command) {
-            GalleryCommand.NavigateUp -> {
-                when (gallery.viewMode) {
-                    GalleryViewMode.Browser -> {
-                        if (gallery.items.isNotEmpty()) {
-                            val nextIndex = (gallery.selectedIndex - 1).coerceAtLeast(0)
-                            Reduction(state = state.copy(gallery = gallery.copy(selectedIndex = nextIndex)))
-                        } else {
-                            Reduction(state = state)
-                        }
-                    }
-                    GalleryViewMode.ConfirmDelete, GalleryViewMode.ConfirmFolderDelete, GalleryViewMode.CreateFolder -> {
-                        // Toggle between confirm (0) and cancel (1)
-                        val next = if (gallery.confirmButtonIndex == 0) 1 else 0
-                        Reduction(state = state.copy(gallery = gallery.copy(confirmButtonIndex = next)))
-                    }
-                    else -> Reduction(state = state)
-                }
-            }
-            GalleryCommand.NavigateDown -> {
-                when (gallery.viewMode) {
-                    GalleryViewMode.Browser -> {
-                        if (gallery.items.isNotEmpty()) {
-                            val nextIndex = (gallery.selectedIndex + 1).coerceAtMost(gallery.items.lastIndex)
-                            Reduction(state = state.copy(gallery = gallery.copy(selectedIndex = nextIndex)))
-                        } else {
-                            Reduction(state = state)
-                        }
-                    }
-                    GalleryViewMode.ConfirmDelete, GalleryViewMode.ConfirmFolderDelete, GalleryViewMode.CreateFolder -> {
-                        val next = if (gallery.confirmButtonIndex == 0) 1 else 0
-                        Reduction(state = state.copy(gallery = gallery.copy(confirmButtonIndex = next)))
-                    }
-                    else -> Reduction(state = state)
-                }
-            }
-            GalleryCommand.NavigateLeft -> {
-                when (gallery.viewMode) {
-                    GalleryViewMode.Preview -> {
-                        // Navigate to previous item in preview
-                        val nextIndex = (gallery.selectedIndex - 1).coerceAtLeast(0)
-                        val item = gallery.items.getOrNull(nextIndex)
-                        Reduction(
-                            state = state.copy(gallery = gallery.copy(selectedIndex = nextIndex, previewExifLines = emptyList())),
-                            effects = item?.let { listOf(PlatformEffect.LoadExifData(it)) } ?: emptyList(),
-                        )
-                    }
-                    GalleryViewMode.Browser -> {
-                        // Switch tab left
-                        val tabs = GalleryTab.entries
-                        val currentTabIndex = tabs.indexOf(gallery.tab)
-                        val nextTabIndex = (currentTabIndex - 1 + tabs.size) % tabs.size
-                        Reduction(
-                            state = state.copy(gallery = gallery.copy(
-                                tab = tabs[nextTabIndex],
-                                selectedIndex = 0,
-                                items = emptyList(),
-                            )),
-                            effects = listOf(PlatformEffect.LoadGalleryItems),
-                        )
-                    }
-                    GalleryViewMode.ConfirmDelete, GalleryViewMode.ConfirmFolderDelete, GalleryViewMode.CreateFolder -> {
-                        val next = if (gallery.confirmButtonIndex == 0) 1 else 0
-                        Reduction(state = state.copy(gallery = gallery.copy(confirmButtonIndex = next)))
-                    }
-                    else -> Reduction(state = state)
-                }
-            }
-            GalleryCommand.NavigateRight -> {
-                when (gallery.viewMode) {
-                    GalleryViewMode.Preview -> {
-                        // Navigate to next item in preview
-                        val nextIndex = (gallery.selectedIndex + 1).coerceAtMost(gallery.items.lastIndex.coerceAtLeast(0))
-                        val item = gallery.items.getOrNull(nextIndex)
-                        Reduction(
-                            state = state.copy(gallery = gallery.copy(selectedIndex = nextIndex, previewExifLines = emptyList())),
-                            effects = item?.let { listOf(PlatformEffect.LoadExifData(it)) } ?: emptyList(),
-                        )
-                    }
-                    GalleryViewMode.Browser -> {
-                        // Switch tab right
-                        val tabs = GalleryTab.entries
-                        val currentTabIndex = tabs.indexOf(gallery.tab)
-                        val nextTabIndex = (currentTabIndex + 1) % tabs.size
-                        Reduction(
-                            state = state.copy(gallery = gallery.copy(
-                                tab = tabs[nextTabIndex],
-                                selectedIndex = 0,
-                                items = emptyList(),
-                            )),
-                            effects = listOf(PlatformEffect.LoadGalleryItems),
-                        )
-                    }
-                    GalleryViewMode.ConfirmDelete, GalleryViewMode.ConfirmFolderDelete, GalleryViewMode.CreateFolder -> {
-                        val next = if (gallery.confirmButtonIndex == 0) 1 else 0
-                        Reduction(state = state.copy(gallery = gallery.copy(confirmButtonIndex = next)))
-                    }
-                    else -> Reduction(state = state)
-                }
-            }
-            GalleryCommand.Confirm -> {
-                when (gallery.viewMode) {
-                    GalleryViewMode.Browser -> {
-                        val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
-                        if (item.isFolder) {
-                            Reduction(
-                                state = state.copy(gallery = gallery.copy(
-                                    currentFolder = item.path,
-                                    selectedIndex = 0,
-                                    items = emptyList(),
-                                )),
-                                effects = listOf(PlatformEffect.LoadGalleryItems),
-                            )
-                        } else {
-                            Reduction(
-                                state = state.copy(gallery = gallery.copy(
-                                    viewMode = GalleryViewMode.Preview,
-                                    previewExifLines = emptyList(),
-                                )),
-                                effects = listOf(PlatformEffect.LoadExifData(item)),
-                            )
-                        }
-                    }
-                    GalleryViewMode.ConfirmDelete -> {
-                        if (gallery.confirmButtonIndex == 0) {
-                            // Delete confirmed
-                            val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
-                            val nextItems = gallery.items.toMutableList().apply { removeAt(gallery.selectedIndex) }
-                            val nextIndex = gallery.selectedIndex.coerceAtMost((nextItems.size - 1).coerceAtLeast(0))
-                            Reduction(
-                                state = state.copy(gallery = gallery.copy(
-                                    viewMode = GalleryViewMode.Browser,
-                                    items = nextItems,
-                                    selectedIndex = nextIndex,
-                                    confirmButtonIndex = 1,
-                                )),
-                                effects = listOf(PlatformEffect.DeleteGalleryItem(item)),
-                            )
-                        } else {
-                            // Cancel
-                            Reduction(state = state.copy(gallery = gallery.copy(
-                                viewMode = GalleryViewMode.Browser,
-                                confirmButtonIndex = 1,
-                            )))
-                        }
-                    }
-                    GalleryViewMode.ConfirmFolderDelete -> {
-                        if (gallery.confirmButtonIndex == 0) {
-                            val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
-                            if (item.isFolder) {
-                                val nextItems = gallery.items.toMutableList().apply { removeAt(gallery.selectedIndex) }
-                                val nextIndex = gallery.selectedIndex.coerceAtMost((nextItems.size - 1).coerceAtLeast(0))
-                                Reduction(
-                                    state = state.copy(gallery = gallery.copy(
-                                        viewMode = GalleryViewMode.Browser,
-                                        items = nextItems,
-                                        selectedIndex = nextIndex,
-                                        confirmButtonIndex = 1,
-                                    )),
-                                    effects = listOf(PlatformEffect.DeleteGalleryFolder(item.path)),
-                                )
-                            } else {
-                                Reduction(state = state.copy(gallery = gallery.copy(
-                                    viewMode = GalleryViewMode.Browser,
-                                    confirmButtonIndex = 1,
-                                )))
-                            }
-                        } else {
-                            Reduction(state = state.copy(gallery = gallery.copy(
-                                viewMode = GalleryViewMode.Browser,
-                                confirmButtonIndex = 1,
-                            )))
-                        }
-                    }
-                    GalleryViewMode.CreateFolder -> {
-                        if (gallery.confirmButtonIndex == 0 && gallery.folderName.isNotBlank()) {
-                            Reduction(
-                                state = state.copy(gallery = gallery.copy(
-                                    viewMode = GalleryViewMode.Browser,
-                                    folderName = "",
-                                    confirmButtonIndex = 1,
-                                )),
-                                effects = listOf(
-                                    PlatformEffect.CreateGalleryFolder(gallery.folderName),
-                                    PlatformEffect.LoadGalleryItems,
-                                ),
-                            )
-                        } else {
-                            Reduction(state = state.copy(gallery = gallery.copy(
-                                viewMode = GalleryViewMode.Browser,
-                                folderName = "",
-                                confirmButtonIndex = 1,
-                            )))
-                        }
-                    }
-                    else -> Reduction(state = state)
-                }
-            }
-            GalleryCommand.Back -> {
-                when (gallery.viewMode) {
-                    GalleryViewMode.Preview -> {
-                        Reduction(state = state.copy(gallery = gallery.copy(
-                            viewMode = GalleryViewMode.Browser,
-                            previewExifLines = emptyList(),
-                        )))
-                    }
-                    GalleryViewMode.ConfirmDelete, GalleryViewMode.ConfirmFolderDelete -> {
-                        Reduction(state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.Browser)))
-                    }
-                    GalleryViewMode.CreateFolder -> {
-                        Reduction(state = state.copy(gallery = gallery.copy(
-                            viewMode = GalleryViewMode.Browser,
-                            folderName = "",
-                        )))
-                    }
-                    GalleryViewMode.Browser -> {
-                        if (gallery.currentFolder != null) {
-                            Reduction(
-                                state = state.copy(gallery = gallery.copy(
-                                    currentFolder = null,
-                                    selectedIndex = 0,
-                                    items = emptyList(),
-                                )),
-                                effects = listOf(PlatformEffect.LoadGalleryItems),
-                            )
-                        } else {
-                            // Exit gallery, return to camera
-                            Reduction(state = state.copy(mode = AppMode.CameraLive))
-                        }
-                    }
-                }
-            }
-            GalleryCommand.InitiateDelete -> {
-                if (gallery.viewMode == GalleryViewMode.Browser || gallery.viewMode == GalleryViewMode.Preview) {
-                    val item = gallery.items.getOrNull(gallery.selectedIndex)
-                    if (item != null && !item.isFolder) {
-                        Reduction(state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.ConfirmDelete, confirmButtonIndex = 1)))
-                    } else {
-                        Reduction(state = state)
-                    }
+            GalleryCommand.NavigateUp -> navigateGalleryGrid(state, gallery, rowDelta = -1)
+            GalleryCommand.NavigateDown -> navigateGalleryGrid(state, gallery, rowDelta = 1)
+            GalleryCommand.NavigateLeft -> navigateGalleryGrid(state, gallery, columnDelta = -1)
+            GalleryCommand.NavigateRight -> navigateGalleryGrid(state, gallery, columnDelta = 1)
+            GalleryCommand.Confirm -> confirmGallerySelection(state, gallery)
+            GalleryCommand.Back -> backFromGallery(state, gallery)
+            GalleryCommand.InitiateDelete -> initiateGalleryDelete(state, gallery)
+            GalleryCommand.CreateFolder -> beginCreateAlbum(state, gallery)
+            GalleryCommand.DeleteFolder -> beginDeleteAlbum(state, gallery)
+
+            is GalleryCommand.ActivateBrowserAction -> {
+                if (gallery.viewMode == GalleryViewMode.Browser) {
+                    activateBrowserAction(state, gallery, command.action)
                 } else {
                     Reduction(state = state)
                 }
             }
-            GalleryCommand.CreateFolder -> {
-                if (gallery.viewMode == GalleryViewMode.Browser && gallery.tab == GalleryTab.Folders) {
-                    val timestamp = System.currentTimeMillis()
-                    val folderName = "Dive_$timestamp"
-                    Reduction(
-                        state = state.copy(gallery = gallery.copy(
-                            viewMode = GalleryViewMode.CreateFolder,
-                            folderName = folderName,
-                            confirmButtonIndex = 1,
-                        )),
+            is GalleryCommand.ActivateAlbumAction -> {
+                if (gallery.viewMode == GalleryViewMode.AlbumActions) {
+                    activateAlbumAction(
+                        state,
+                        gallery.copy(albumAction = command.action),
+                        command.action,
                     )
                 } else {
                     Reduction(state = state)
                 }
             }
-            GalleryCommand.DeleteFolder -> {
-                if (gallery.viewMode == GalleryViewMode.Browser && gallery.tab == GalleryTab.Folders) {
-                    val item = gallery.items.getOrNull(gallery.selectedIndex)
-                    if (item != null && item.isFolder) {
-                        Reduction(state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.ConfirmFolderDelete, confirmButtonIndex = 1)))
-                    } else {
-                        Reduction(state = state)
-                    }
+            is GalleryCommand.ActivateMediaAction -> {
+                if (gallery.viewMode == GalleryViewMode.MediaActions) {
+                    activateMediaAction(
+                        state,
+                        gallery.copy(mediaAction = command.action),
+                        command.action,
+                    )
+                } else {
+                    Reduction(state = state)
+                }
+            }
+
+            is GalleryCommand.OpenItem -> openGalleryItem(state, gallery, command.index)
+            is GalleryCommand.ActivatePreviewAction -> {
+                if (gallery.viewMode == GalleryViewMode.Preview) {
+                    activatePreviewAction(state, gallery.copy(previewAction = command.action), command.action)
+                } else {
+                    Reduction(state = state)
+                }
+            }
+            is GalleryCommand.SelectOption -> {
+                if (gallery.viewMode == GalleryViewMode.Options && command.index in 0..2) {
+                    activateGalleryOption(state, gallery.copy(optionIndex = command.index), command.index)
+                } else {
+                    Reduction(state = state)
+                }
+            }
+            is GalleryCommand.SelectMoveTarget -> {
+                if (gallery.viewMode == GalleryViewMode.Move && command.index in gallery.moveTargets.indices) {
+                    confirmGallerySelection(state, gallery.copy(moveTargetIndex = command.index))
+                } else {
+                    Reduction(state = state)
+                }
+            }
+            is GalleryCommand.SelectConfirmation -> {
+                if (
+                    gallery.viewMode in setOf(
+                        GalleryViewMode.ConfirmDelete,
+                        GalleryViewMode.ConfirmFolderDelete,
+                        GalleryViewMode.CreateFolder,
+                    ) && command.index in 0..1
+                ) {
+                    confirmGallerySelection(state, gallery.copy(confirmButtonIndex = command.index))
+                } else {
+                    Reduction(state = state)
+                }
+            }
+            is GalleryCommand.SetRenameDraft -> {
+                if (gallery.viewMode == GalleryViewMode.Rename) {
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(renameDraft = command.value.take(MAX_RENAME_LENGTH)),
+                        ),
+                    )
+                } else {
+                    Reduction(state = state)
+                }
+            }
+            is GalleryCommand.SetFolderName -> {
+                if (gallery.viewMode == GalleryViewMode.CreateFolder) {
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(folderName = command.value.take(MAX_RENAME_LENGTH)),
+                        ),
+                    )
                 } else {
                     Reduction(state = state)
                 }
             }
             is GalleryCommand.LoadItems -> {
-                Reduction(state = state.copy(gallery = gallery.copy(items = command.items, selectedIndex = 0)))
+                val selectedItem = gallery.items.getOrNull(gallery.selectedIndex)
+                val matchingIndex = selectedItem?.let { selected ->
+                    command.items.indexOfFirst { candidate ->
+                        if (selected.contentUri.isNotBlank()) {
+                            candidate.contentUri == selected.contentUri
+                        } else {
+                            candidate.id == selected.id && candidate.isVideo == selected.isVideo
+                        }
+                    }
+                } ?: -1
+                val nextIndex = when {
+                    gallery.pendingMutation == GalleryMutation.CreateAlbum -> 0
+                    gallery.pendingMutation == GalleryMutation.Delete &&
+                        gallery.confirmationReturnToPreview -> {
+                        // At the same index the following item has shifted into the deleted
+                        // item's slot. Deleting the last item wraps explicitly to the first.
+                        if (gallery.selectedIndex < command.items.size) gallery.selectedIndex else 0
+                    }
+                    matchingIndex >= 0 -> matchingIndex
+                    else -> gallery.selectedIndex.coerceIn(0, command.items.lastIndex.coerceAtLeast(0))
+                }
+                Reduction(
+                    state = state.copy(
+                        gallery = gallery.copy(items = command.items, selectedIndex = nextIndex),
+                    ),
+                )
             }
-            is GalleryCommand.SetExifLines -> {
-                Reduction(state = state.copy(gallery = gallery.copy(previewExifLines = command.lines)))
+            is GalleryCommand.LoadMoveTargets -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        moveTargets = command.items.filter { it.isFolder && it.path != gallery.currentFolder },
+                        moveTargetIndex = 0,
+                    ),
+                ),
+            )
+            is GalleryCommand.SetExifLines -> Reduction(
+                state = state.copy(gallery = gallery.copy(previewExifLines = command.lines)),
+            )
+            is GalleryCommand.OperationSucceeded -> {
+                val deletedPreviewHasNext = gallery.pendingMutation == GalleryMutation.Delete &&
+                    gallery.confirmationReturnToPreview && gallery.items.isNotEmpty()
+                val returnMode = when (gallery.pendingMutation) {
+                    GalleryMutation.Rename -> GalleryViewMode.Preview
+                    GalleryMutation.Delete -> if (deletedPreviewHasNext) {
+                        GalleryViewMode.Preview
+                    } else {
+                        GalleryViewMode.Browser
+                    }
+                    GalleryMutation.Move, GalleryMutation.CreateAlbum -> GalleryViewMode.Browser
+                    null -> gallery.viewMode
+                }
+                Reduction(
+                    state = state.copy(
+                        gallery = gallery.copy(
+                            viewMode = returnMode,
+                            pendingMutation = null,
+                            operationMessage = command.message,
+                            confirmButtonIndex = 1,
+                            previewAction = if (deletedPreviewHasNext) {
+                                GalleryPreviewAction.Delete
+                            } else {
+                                gallery.previewAction
+                            },
+                            previewExifLines = if (deletedPreviewHasNext) emptyList() else gallery.previewExifLines,
+                            detailsVisible = if (deletedPreviewHasNext) false else gallery.detailsVisible,
+                            videoPlaying = if (deletedPreviewHasNext) false else gallery.videoPlaying,
+                            confirmationReturnToPreview = false,
+                            confirmationReturnToMediaActions = false,
+                            folderDeleteReturnToActions = false,
+                            moveTargets = emptyList(),
+                            renameDraft = "",
+                        ),
+                    ),
+                )
+            }
+            is GalleryCommand.OperationFailed -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        pendingMutation = null,
+                        operationMessage = command.message,
+                    ),
+                ),
+            )
+        }
+    }
+
+    private fun navigateGalleryGrid(
+        state: AppState,
+        gallery: GalleryState,
+        rowDelta: Int = 0,
+        columnDelta: Int = 0,
+    ): Reduction = when (gallery.viewMode) {
+        GalleryViewMode.Browser -> {
+            val showingAlbums = gallery.currentFolder == null
+            val columns = if (showingAlbums) ALBUM_GRID_COLUMNS else MEDIA_GRID_COLUMNS
+            val activeAction = gallery.browserAction
+                ?: GalleryBrowserAction.Back.takeIf { gallery.browserBackFocused }
+            when {
+                activeAction != null -> {
+                    if (rowDelta != 0) {
+                        val nextIndex = if (rowDelta < 0) {
+                            0
+                        } else {
+                            gallery.items.lastIndex.coerceAtLeast(0)
+                        }
+                        Reduction(
+                            state = state.copy(
+                                gallery = gallery.copy(
+                                    selectedIndex = nextIndex,
+                                    browserBackFocused = false,
+                                    browserAction = null,
+                                ),
+                            ),
+                        )
+                    } else {
+                        when {
+                            activeAction == GalleryBrowserAction.Back &&
+                                columnDelta < 0 &&
+                                gallery.items.isNotEmpty() -> returnToAnchoredGridRow(
+                                state = state,
+                                gallery = gallery,
+                                columns = columns,
+                                selectRightEdge = false,
+                            )
+                            activeAction == GalleryBrowserAction.Back &&
+                                columnDelta > 0 &&
+                                showingAlbums -> Reduction(
+                                state = state.copy(
+                                    gallery = gallery.copy(
+                                        browserBackFocused = false,
+                                        browserAction = GalleryBrowserAction.CreateAlbum,
+                                    ),
+                                ),
+                            )
+                            columnDelta > 0 && gallery.items.isNotEmpty() -> returnToAnchoredGridRow(
+                                state = state,
+                                gallery = gallery,
+                                columns = columns,
+                                selectRightEdge = true,
+                            )
+                            else -> {
+                                val actions = galleryBrowserActions(showingAlbums)
+                                val currentIndex = actions.indexOf(activeAction).coerceAtLeast(0)
+                                val nextAction = actions[(currentIndex + columnDelta).coerceIn(0, actions.lastIndex)]
+                                Reduction(
+                                    state = state.copy(
+                                        gallery = gallery.copy(
+                                            browserBackFocused = nextAction == GalleryBrowserAction.Back,
+                                            browserAction = nextAction,
+                                        ),
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                }
+                navigationLeavesGalleryGrid(
+                    current = gallery.selectedIndex,
+                    count = gallery.items.size,
+                    columns = columns,
+                    rowDelta = rowDelta,
+                    columnDelta = columnDelta,
+                ) -> {
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                browserBackFocused = true,
+                                browserAction = GalleryBrowserAction.Back,
+                            ),
+                        ),
+                    )
+                }
+                else -> {
+                    val next = moveGalleryGridSelection(
+                        current = gallery.selectedIndex,
+                        count = gallery.items.size,
+                        columns = columns,
+                        rowDelta = rowDelta,
+                        columnDelta = columnDelta,
+                    )
+                    Reduction(state = state.copy(gallery = gallery.copy(selectedIndex = next)))
+                }
             }
         }
+        GalleryViewMode.AlbumActions -> {
+            val actions = GalleryAlbumAction.entries
+            val delta = if (columnDelta != 0) columnDelta else rowDelta
+            val currentIndex = actions.indexOf(gallery.albumAction).coerceAtLeast(0)
+            val nextAction = actions[(currentIndex + delta).coerceIn(0, actions.lastIndex)]
+            Reduction(state = state.copy(gallery = gallery.copy(albumAction = nextAction)))
+        }
+        GalleryViewMode.MediaActions -> {
+            val actions = GalleryMediaAction.entries
+            val delta = if (columnDelta != 0) columnDelta else rowDelta
+            val currentIndex = actions.indexOf(gallery.mediaAction).coerceAtLeast(0)
+            val nextAction = actions[(currentIndex + delta).coerceIn(0, actions.lastIndex)]
+            Reduction(state = state.copy(gallery = gallery.copy(mediaAction = nextAction)))
+        }
+        GalleryViewMode.Preview -> {
+            val nextAction = if (columnDelta != 0) {
+                shiftPreviewAction(gallery, columnDelta)
+            } else {
+                gallery.previewAction
+            }
+            Reduction(state = state.copy(gallery = gallery.copy(previewAction = nextAction)))
+        }
+        GalleryViewMode.Options -> {
+            val delta = if (rowDelta != 0) rowDelta else columnDelta
+            Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(optionIndex = (gallery.optionIndex + delta).coerceIn(0, 2)),
+                ),
+            )
+        }
+        GalleryViewMode.Move -> {
+            val next = moveGalleryGridSelection(
+                current = gallery.moveTargetIndex,
+                count = gallery.moveTargets.size,
+                columns = ALBUM_GRID_COLUMNS,
+                rowDelta = rowDelta,
+                columnDelta = columnDelta,
+            )
+            Reduction(state = state.copy(gallery = gallery.copy(moveTargetIndex = next)))
+        }
+        GalleryViewMode.ConfirmDelete,
+        GalleryViewMode.ConfirmFolderDelete,
+        GalleryViewMode.CreateFolder,
+        -> Reduction(
+            state = state.copy(
+                gallery = gallery.copy(confirmButtonIndex = if (gallery.confirmButtonIndex == 0) 1 else 0),
+            ),
+        )
+        GalleryViewMode.Rename -> Reduction(state = state)
+    }
+
+    private fun returnToAnchoredGridRow(
+        state: AppState,
+        gallery: GalleryState,
+        columns: Int,
+        selectRightEdge: Boolean,
+    ): Reduction {
+        val safeIndex = gallery.selectedIndex.coerceIn(0, gallery.items.lastIndex)
+        val rowStart = (safeIndex / columns) * columns
+        val rowEnd = minOf(rowStart + columns - 1, gallery.items.lastIndex)
+        return Reduction(
+            state = state.copy(
+                gallery = gallery.copy(
+                    selectedIndex = if (selectRightEdge) rowEnd else rowStart,
+                    browserBackFocused = false,
+                    browserAction = null,
+                ),
+            ),
+        )
+    }
+
+    private fun confirmGallerySelection(state: AppState, gallery: GalleryState): Reduction {
+        return when (gallery.viewMode) {
+            GalleryViewMode.Browser -> {
+                val action = gallery.browserAction
+                    ?: GalleryBrowserAction.Back.takeIf { gallery.browserBackFocused }
+                if (action != null) {
+                    activateBrowserAction(state, gallery, action)
+                } else {
+                    openGalleryItem(state, gallery, gallery.selectedIndex)
+                }
+            }
+            GalleryViewMode.AlbumActions -> activateAlbumAction(
+                state,
+                gallery,
+                gallery.albumAction,
+            )
+            GalleryViewMode.MediaActions -> activateMediaAction(
+                state,
+                gallery,
+                gallery.mediaAction,
+            )
+            GalleryViewMode.Preview -> activatePreviewAction(state, gallery, gallery.previewAction)
+            GalleryViewMode.Options -> activateGalleryOption(state, gallery, gallery.optionIndex)
+            GalleryViewMode.Move -> {
+                if (gallery.pendingMutation != null) return Reduction(state = state)
+                val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
+                val target = gallery.moveTargets.getOrNull(gallery.moveTargetIndex) ?: return Reduction(state = state)
+                Reduction(
+                    state = state.copy(
+                        gallery = gallery.copy(
+                            pendingMutation = GalleryMutation.Move,
+                            operationMessage = "Moving ${item.name}…",
+                        ),
+                    ),
+                    effects = listOf(PlatformEffect.MoveGalleryItem(item, target)),
+                )
+            }
+            GalleryViewMode.Rename -> {
+                if (gallery.pendingMutation != null) return Reduction(state = state)
+                val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
+                val newName = gallery.renameDraft.trim()
+                if (newName.isBlank() || newName == item.name) {
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                viewMode = GalleryViewMode.Preview,
+                                renameDraft = "",
+                                operationMessage = null,
+                            ),
+                        ),
+                    )
+                } else {
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                pendingMutation = GalleryMutation.Rename,
+                                operationMessage = "Renaming ${item.name}…",
+                            ),
+                        ),
+                        effects = listOf(PlatformEffect.RenameGalleryItem(item, newName)),
+                    )
+                }
+            }
+            GalleryViewMode.ConfirmDelete -> {
+                if (gallery.confirmButtonIndex != 0) {
+                    val returnMode = when {
+                        gallery.confirmationReturnToPreview -> GalleryViewMode.Preview
+                        gallery.confirmationReturnToMediaActions -> GalleryViewMode.MediaActions
+                        else -> GalleryViewMode.Browser
+                    }
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                viewMode = returnMode,
+                                confirmButtonIndex = 1,
+                                confirmationReturnToPreview = false,
+                                confirmationReturnToMediaActions = false,
+                            ),
+                        ),
+                    )
+                } else {
+                    if (gallery.pendingMutation != null) return Reduction(state = state)
+                    val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                pendingMutation = GalleryMutation.Delete,
+                                operationMessage = "Deleting ${item.name}…",
+                            ),
+                        ),
+                        effects = listOf(PlatformEffect.DeleteGalleryItem(item)),
+                    )
+                }
+            }
+            GalleryViewMode.ConfirmFolderDelete -> {
+                if (gallery.confirmButtonIndex != 0) {
+                    val returnMode = if (gallery.folderDeleteReturnToActions) {
+                        GalleryViewMode.AlbumActions
+                    } else {
+                        GalleryViewMode.Browser
+                    }
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                viewMode = returnMode,
+                                confirmButtonIndex = 1,
+                                folderDeleteReturnToActions = false,
+                                operationMessage = null,
+                            ),
+                        ),
+                    )
+                } else {
+                    if (gallery.pendingMutation != null) return Reduction(state = state)
+                    val album = gallery.items.getOrNull(gallery.selectedIndex)
+                        ?.takeIf { it.isFolder }
+                        ?: return Reduction(state = state)
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                pendingMutation = GalleryMutation.Delete,
+                                operationMessage = "Deleting ${album.name} and its ${album.mediaCount} items…",
+                            ),
+                        ),
+                        effects = listOf(PlatformEffect.DeleteGalleryAlbum(album)),
+                    )
+                }
+            }
+            GalleryViewMode.CreateFolder -> {
+                if (gallery.confirmButtonIndex != 0) {
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                viewMode = GalleryViewMode.Browser,
+                                folderName = "",
+                                confirmButtonIndex = 1,
+                                operationMessage = null,
+                            ),
+                        ),
+                    )
+                } else {
+                    val name = gallery.folderName.trim()
+                    if (name.isBlank()) {
+                        Reduction(
+                            state = state.copy(
+                                gallery = gallery.copy(operationMessage = "Enter an album name."),
+                            ),
+                        )
+                    } else {
+                        Reduction(
+                            state = state.copy(
+                                gallery = gallery.copy(
+                                    viewMode = GalleryViewMode.Browser,
+                                    folderName = "",
+                                    confirmButtonIndex = 1,
+                                    pendingMutation = GalleryMutation.CreateAlbum,
+                                    selectedIndex = 0,
+                                    operationMessage = "Creating $name…",
+                                ),
+                            ),
+                            effects = listOf(PlatformEffect.CreateGalleryFolder(name)),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun backFromGallery(state: AppState, gallery: GalleryState): Reduction =
+        when (gallery.viewMode) {
+            GalleryViewMode.AlbumActions -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = GalleryViewMode.Browser,
+                        albumAction = GalleryAlbumAction.Preview,
+                        browserBackFocused = true,
+                        browserAction = GalleryBrowserAction.Back,
+                        operationMessage = null,
+                    ),
+                ),
+            )
+            GalleryViewMode.MediaActions -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = GalleryViewMode.Browser,
+                        mediaAction = GalleryMediaAction.Preview,
+                        browserBackFocused = true,
+                        browserAction = GalleryBrowserAction.Back,
+                        operationMessage = null,
+                    ),
+                ),
+            )
+            GalleryViewMode.Preview -> {
+                if (gallery.detailsVisible) {
+                    Reduction(state = state.copy(gallery = gallery.copy(detailsVisible = false)))
+                } else {
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                viewMode = GalleryViewMode.Browser,
+                                previewExifLines = emptyList(),
+                                detailsVisible = false,
+                                videoPlaying = false,
+                                browserBackFocused = true,
+                                browserAction = GalleryBrowserAction.Back,
+                            ),
+                        ),
+                    )
+                }
+            }
+            GalleryViewMode.Options, GalleryViewMode.Move, GalleryViewMode.Rename -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = GalleryViewMode.Preview,
+                        moveTargets = emptyList(),
+                        renameDraft = "",
+                        pendingMutation = null,
+                        previewAction = GalleryPreviewAction.Back,
+                        browserBackFocused = false,
+                        browserAction = null,
+                        operationMessage = null,
+                    ),
+                ),
+            )
+            GalleryViewMode.ConfirmDelete -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = when {
+                            gallery.confirmationReturnToPreview -> GalleryViewMode.Preview
+                            gallery.confirmationReturnToMediaActions -> GalleryViewMode.MediaActions
+                            else -> GalleryViewMode.Browser
+                        },
+                        previewAction = if (gallery.confirmationReturnToPreview) {
+                            GalleryPreviewAction.Back
+                        } else {
+                            gallery.previewAction
+                        },
+                        mediaAction = if (gallery.confirmationReturnToMediaActions) {
+                            GalleryMediaAction.Back
+                        } else {
+                            gallery.mediaAction
+                        },
+                        browserBackFocused = !gallery.confirmationReturnToPreview &&
+                            !gallery.confirmationReturnToMediaActions,
+                        browserAction = GalleryBrowserAction.Back.takeIf {
+                            !gallery.confirmationReturnToPreview && !gallery.confirmationReturnToMediaActions
+                        },
+                        confirmationReturnToPreview = false,
+                        confirmationReturnToMediaActions = false,
+                        pendingMutation = null,
+                        operationMessage = null,
+                    ),
+                ),
+            )
+            GalleryViewMode.ConfirmFolderDelete -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = if (gallery.folderDeleteReturnToActions) {
+                            GalleryViewMode.AlbumActions
+                        } else {
+                            GalleryViewMode.Browser
+                        },
+                        albumAction = if (gallery.folderDeleteReturnToActions) {
+                            GalleryAlbumAction.Back
+                        } else {
+                            gallery.albumAction
+                        },
+                        browserBackFocused = !gallery.folderDeleteReturnToActions,
+                        browserAction = GalleryBrowserAction.Back.takeIf {
+                            !gallery.folderDeleteReturnToActions
+                        },
+                        folderDeleteReturnToActions = false,
+                        confirmButtonIndex = 1,
+                        operationMessage = null,
+                    ),
+                ),
+            )
+            GalleryViewMode.CreateFolder -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = GalleryViewMode.Browser,
+                        folderName = "",
+                        confirmButtonIndex = 1,
+                        browserBackFocused = true,
+                        browserAction = GalleryBrowserAction.Back,
+                        operationMessage = null,
+                    ),
+                ),
+            )
+            GalleryViewMode.Browser -> {
+                if (gallery.currentFolder != null) {
+                    Reduction(
+                        state = state.copy(
+                            gallery = gallery.copy(
+                                currentFolder = null,
+                                currentFolderName = null,
+                                selectedIndex = 0,
+                                items = emptyList(),
+                                browserBackFocused = true,
+                                browserAction = GalleryBrowserAction.Back,
+                                operationMessage = null,
+                            ),
+                        ),
+                        effects = listOf(PlatformEffect.LoadGalleryItems),
+                    )
+                } else {
+                    Reduction(state = state.copy(mode = AppMode.CameraLive))
+                }
+            }
+        }
+
+    private fun activateBrowserAction(
+        state: AppState,
+        gallery: GalleryState,
+        action: GalleryBrowserAction,
+    ): Reduction = when (action) {
+        GalleryBrowserAction.Back -> backFromGallery(state, gallery)
+        GalleryBrowserAction.CreateAlbum -> beginCreateAlbum(state, gallery)
+    }
+
+    private fun activateAlbumAction(
+        state: AppState,
+        gallery: GalleryState,
+        action: GalleryAlbumAction,
+    ): Reduction = when (action) {
+        GalleryAlbumAction.Preview -> previewGalleryAlbum(state, gallery)
+        GalleryAlbumAction.Delete -> beginDeleteAlbum(state, gallery)
+        GalleryAlbumAction.Back -> backFromGallery(state, gallery)
+    }
+
+    private fun activateMediaAction(
+        state: AppState,
+        gallery: GalleryState,
+        action: GalleryMediaAction,
+    ): Reduction = when (action) {
+        GalleryMediaAction.Back -> backFromGallery(state, gallery)
+        GalleryMediaAction.Preview -> previewGalleryMedia(state, gallery)
+        GalleryMediaAction.Delete -> initiateGalleryDelete(state, gallery)
+    }
+
+    private fun beginDeleteAlbum(state: AppState, gallery: GalleryState): Reduction {
+        if (
+            gallery.viewMode !in setOf(GalleryViewMode.Browser, GalleryViewMode.AlbumActions) ||
+            gallery.currentFolder != null
+        ) {
+            return Reduction(state = state)
+        }
+        gallery.items.getOrNull(gallery.selectedIndex)
+            ?.takeIf { it.isFolder }
+            ?: return Reduction(state = state)
+        return Reduction(
+            state = state.copy(
+                gallery = gallery.copy(
+                    viewMode = GalleryViewMode.ConfirmFolderDelete,
+                    browserBackFocused = false,
+                    browserAction = null,
+                    confirmButtonIndex = 1,
+                    folderDeleteReturnToActions = gallery.viewMode == GalleryViewMode.AlbumActions,
+                    operationMessage = null,
+                ),
+            ),
+        )
+    }
+
+    private fun beginCreateAlbum(state: AppState, gallery: GalleryState): Reduction {
+        if (gallery.viewMode != GalleryViewMode.Browser || gallery.currentFolder != null) {
+            return Reduction(state = state)
+        }
+        val sequence = gallery.items.count { it.name.startsWith("Dive Album") } + 1
+        return Reduction(
+            state = state.copy(
+                gallery = gallery.copy(
+                    viewMode = GalleryViewMode.CreateFolder,
+                    browserBackFocused = false,
+                    browserAction = null,
+                    folderName = "Dive Album $sequence",
+                    confirmButtonIndex = 1,
+                    operationMessage = null,
+                ),
+            ),
+        )
+    }
+
+    private fun initiateGalleryDelete(state: AppState, gallery: GalleryState): Reduction {
+        if (
+            gallery.viewMode !in setOf(
+                GalleryViewMode.Browser,
+                GalleryViewMode.MediaActions,
+                GalleryViewMode.Preview,
+            )
+        ) {
+            return Reduction(state = state)
+        }
+        val item = gallery.items.getOrNull(gallery.selectedIndex)
+        if (item == null || item.isFolder) return Reduction(state = state)
+        return Reduction(
+            state = state.copy(
+                gallery = gallery.copy(
+                    viewMode = GalleryViewMode.ConfirmDelete,
+                    browserBackFocused = false,
+                    browserAction = null,
+                    confirmButtonIndex = 1,
+                    confirmationReturnToPreview = gallery.viewMode == GalleryViewMode.Preview,
+                    confirmationReturnToMediaActions = gallery.viewMode == GalleryViewMode.MediaActions,
+                    operationMessage = null,
+                ),
+            ),
+        )
+    }
+
+    private fun openGalleryItem(state: AppState, gallery: GalleryState, index: Int): Reduction {
+        if (gallery.viewMode != GalleryViewMode.Browser) return Reduction(state = state)
+        val item = gallery.items.getOrNull(index) ?: return Reduction(state = state)
+        return if (item.isFolder) {
+            Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = GalleryViewMode.AlbumActions,
+                        selectedIndex = index,
+                        albumAction = GalleryAlbumAction.Preview,
+                        browserBackFocused = false,
+                        browserAction = null,
+                        operationMessage = null,
+                    ),
+                ),
+            )
+        } else {
+            Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = GalleryViewMode.MediaActions,
+                        selectedIndex = index,
+                        mediaAction = GalleryMediaAction.Preview,
+                        browserBackFocused = false,
+                        browserAction = null,
+                        operationMessage = null,
+                    ),
+                ),
+            )
+        }
+    }
+
+    private fun previewGalleryMedia(state: AppState, gallery: GalleryState): Reduction {
+        if (gallery.viewMode != GalleryViewMode.MediaActions || gallery.currentFolder == null) {
+            return Reduction(state = state)
+        }
+        val item = gallery.items.getOrNull(gallery.selectedIndex)
+            ?.takeUnless { it.isFolder }
+            ?: return Reduction(state = state)
+        return Reduction(
+            state = state.copy(
+                gallery = gallery.copy(
+                    viewMode = GalleryViewMode.Preview,
+                    mediaAction = GalleryMediaAction.Preview,
+                    previewAction = if (item.isVideo) {
+                        GalleryPreviewAction.PlayPause
+                    } else {
+                        GalleryPreviewAction.Next
+                    },
+                    previewExifLines = emptyList(),
+                    detailsVisible = false,
+                    videoPlaying = false,
+                    browserBackFocused = false,
+                    browserAction = null,
+                    operationMessage = null,
+                ),
+            ),
+        )
+    }
+
+    private fun previewGalleryAlbum(state: AppState, gallery: GalleryState): Reduction {
+        if (gallery.viewMode != GalleryViewMode.AlbumActions || gallery.currentFolder != null) {
+            return Reduction(state = state)
+        }
+        val album = gallery.items.getOrNull(gallery.selectedIndex)
+            ?.takeIf { it.isFolder }
+            ?: return Reduction(state = state)
+        return Reduction(
+            state = state.copy(
+                gallery = gallery.copy(
+                    viewMode = GalleryViewMode.Browser,
+                    currentFolder = album.path,
+                    currentFolderName = album.name,
+                    selectedIndex = 0,
+                    items = emptyList(),
+                    albumAction = GalleryAlbumAction.Preview,
+                    browserBackFocused = false,
+                    browserAction = null,
+                    operationMessage = null,
+                ),
+            ),
+            effects = listOf(PlatformEffect.LoadGalleryItems),
+        )
+    }
+
+    private fun activatePreviewAction(
+        state: AppState,
+        gallery: GalleryState,
+        action: GalleryPreviewAction,
+    ): Reduction {
+        if (gallery.pendingMutation != null) return Reduction(state = state)
+        val selectedGallery = gallery.copy(previewAction = action, operationMessage = null)
+        if (action == GalleryPreviewAction.Back) {
+            // An explicit Back action always leaves preview, even when Details is open. The
+            // physical Back/Zoom-Out command still closes Details first for its legacy behavior.
+            return backFromGallery(state, selectedGallery.copy(detailsVisible = false))
+        }
+        val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
+        return when (action) {
+            GalleryPreviewAction.Back -> error("Handled above")
+            GalleryPreviewAction.Delete -> Reduction(
+                state = state.copy(
+                    gallery = selectedGallery.copy(
+                        viewMode = GalleryViewMode.ConfirmDelete,
+                        confirmButtonIndex = 1,
+                        confirmationReturnToPreview = true,
+                    ),
+                ),
+            )
+            GalleryPreviewAction.Options -> Reduction(
+                state = state.copy(gallery = selectedGallery.copy(viewMode = GalleryViewMode.Options, optionIndex = 0)),
+            )
+            GalleryPreviewAction.Previous, GalleryPreviewAction.Next -> {
+                val delta = if (action == GalleryPreviewAction.Previous) -1 else 1
+                val itemCount = gallery.items.size
+                val nextIndex = ((gallery.selectedIndex + delta) % itemCount + itemCount) % itemCount
+                Reduction(
+                    state = state.copy(
+                        gallery = selectedGallery.copy(
+                            selectedIndex = nextIndex,
+                            previewExifLines = emptyList(),
+                            detailsVisible = false,
+                            videoPlaying = false,
+                        ),
+                    ),
+                )
+            }
+            GalleryPreviewAction.PlayPause -> Reduction(
+                state = state.copy(
+                    gallery = selectedGallery.copy(
+                        videoPlaying = if (item.isVideo) !gallery.videoPlaying else false,
+                    ),
+                ),
+            )
+            GalleryPreviewAction.Details -> {
+                val show = !gallery.detailsVisible
+                Reduction(
+                    state = state.copy(gallery = selectedGallery.copy(detailsVisible = show)),
+                    effects = if (show && gallery.previewExifLines.isEmpty()) {
+                        listOf(PlatformEffect.LoadExifData(item))
+                    } else {
+                        emptyList()
+                    },
+                )
+            }
+        }
+    }
+
+    private fun activateGalleryOption(state: AppState, gallery: GalleryState, index: Int): Reduction {
+        val item = gallery.items.getOrNull(gallery.selectedIndex) ?: return Reduction(state = state)
+        return when (index) {
+            0 -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = GalleryViewMode.Move,
+                        optionIndex = 0,
+                        moveTargets = emptyList(),
+                        moveTargetIndex = 0,
+                        operationMessage = null,
+                    ),
+                ),
+                effects = listOf(PlatformEffect.LoadGalleryMoveTargets),
+            )
+            1 -> Reduction(
+                state = state.copy(
+                    gallery = gallery.copy(
+                        viewMode = GalleryViewMode.Rename,
+                        optionIndex = 1,
+                        renameDraft = item.name,
+                        operationMessage = null,
+                    ),
+                ),
+            )
+            else -> Reduction(
+                state = state.copy(gallery = gallery.copy(viewMode = GalleryViewMode.Preview, optionIndex = 0)),
+            )
+        }
+    }
+
+    private fun moveGalleryGridSelection(
+        current: Int,
+        count: Int,
+        columns: Int,
+        rowDelta: Int = 0,
+        columnDelta: Int = 0,
+    ): Int {
+        if (count <= 0) return 0
+        val safeCurrent = current.coerceIn(0, count - 1)
+        val row = safeCurrent / columns
+        val column = safeCurrent % columns
+        val targetRow = (row + rowDelta).coerceIn(0, (count - 1) / columns)
+        val targetRowLastColumn = minOf(columns - 1, count - 1 - targetRow * columns)
+        val targetColumn = (column + columnDelta).coerceIn(0, targetRowLastColumn)
+        return targetRow * columns + targetColumn
+    }
+
+    private fun navigationLeavesGalleryGrid(
+        current: Int,
+        count: Int,
+        columns: Int,
+        rowDelta: Int,
+        columnDelta: Int,
+    ): Boolean {
+        if (rowDelta == 0 && columnDelta == 0) return false
+        if (count <= 0) return true
+        val safeCurrent = current.coerceIn(0, count - 1)
+        return when {
+            rowDelta < 0 -> safeCurrent < columns
+            rowDelta > 0 -> safeCurrent + columns >= count
+            columnDelta < 0 -> safeCurrent % columns == 0
+            columnDelta > 0 -> safeCurrent % columns == columns - 1 || safeCurrent == count - 1
+            else -> false
+        }
+    }
+
+    private fun shiftPreviewAction(gallery: GalleryState, delta: Int): GalleryPreviewAction {
+        val isVideo = gallery.items.getOrNull(gallery.selectedIndex)?.isVideo == true
+        val actions = galleryPreviewRailActions(isVideo)
+        val currentIndex = actions.indexOf(gallery.previewAction)
+        val safeIndex = if (currentIndex >= 0) currentIndex else actions.indexOf(GalleryPreviewAction.Next)
+        return actions[(safeIndex + delta).coerceIn(0, actions.lastIndex)]
     }
 
     private fun warning(state: AppState, message: String): Reduction {
@@ -2468,4 +3346,3 @@ class ControlReducer(
         CursorSpeedProfile.SmartTarget -> CursorSpeedProfile.SmartTarget
     }
 }
-

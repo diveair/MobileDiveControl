@@ -1,0 +1,762 @@
+{
+  ".claude/settings.local.json": {
+    "mtime": 1785895888.7865884,
+    "ast_hash": "73c482470480df15b1ceb70dc062fe34",
+    "semantic_hash": "73c482470480df15b1ceb70dc062fe34"
+  },
+  "app/build.gradle.kts": {
+    "mtime": 1786216652.3644958,
+    "ast_hash": "edda29407357d58247455fdc24b19578",
+    "semantic_hash": "edda29407357d58247455fdc24b19578"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/DiveControlApp.kt": {
+    "mtime": 1785940928.6036077,
+    "ast_hash": "7c205a697eba5326ed3bd1ba1dd64b81",
+    "semantic_hash": "7c205a697eba5326ed3bd1ba1dd64b81"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/MainActivity.kt": {
+    "mtime": 1786281256.7412534,
+    "ast_hash": "49657ba7aca5c7c3262a54a5027ff050",
+    "semantic_hash": "49657ba7aca5c7c3262a54a5027ff050"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/GalleryRepository.kt": {
+    "mtime": 1779929376.058202,
+    "ast_hash": "bc49158f1feb44b9edb89186338375b9",
+    "semantic_hash": "bc49158f1feb44b9edb89186338375b9"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/PhoneBatteryMonitor.kt": {
+    "mtime": 1785901588.185218,
+    "ast_hash": "2fe96000c0c5516f4226cbf46a09f2f3",
+    "semantic_hash": "2fe96000c0c5516f4226cbf46a09f2f3"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/VacuumStore.kt": {
+    "mtime": 1786045131.976941,
+    "ast_hash": "f7a0dd75cf8a68dad31bed3c3d31ec98",
+    "semantic_hash": "f7a0dd75cf8a68dad31bed3c3d31ec98"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/AndroidBleTransport.kt": {
+    "mtime": 1787466604.6948287,
+    "ast_hash": "60916a675d6633749417b39e970112c4",
+    "semantic_hash": "60916a675d6633749417b39e970112c4"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/BlePermissions.kt": {
+    "mtime": 1785894245.7033162,
+    "ast_hash": "423b874816c23f11ad83cdd2d1efb8eb",
+    "semantic_hash": "423b874816c23f11ad83cdd2d1efb8eb"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/GattQueue.kt": {
+    "mtime": 1785894840.8381002,
+    "ast_hash": "09160c88379a68bf783fa74001a9d875",
+    "semantic_hash": "09160c88379a68bf783fa74001a9d875"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingFeatureFlags.kt": {
+    "mtime": 1785901909.005011,
+    "ast_hash": "ef536504ec99eda77ae3462227a31fce",
+    "semantic_hash": "ef536504ec99eda77ae3462227a31fce"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingLink.kt": {
+    "mtime": 1785949197.5556178,
+    "ast_hash": "7779e14455f09578de5f8ab5920e36d7",
+    "semantic_hash": "7779e14455f09578de5f8ab5920e36d7"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingStore.kt": {
+    "mtime": 1785894268.0632045,
+    "ast_hash": "de8c94c0e547a4d9bf547293c395fd0d",
+    "semantic_hash": "de8c94c0e547a4d9bf547293c395fd0d"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingTransport.kt": {
+    "mtime": 1785893859.29247,
+    "ast_hash": "79c4b67e95ef6ae6ba97e81c900441a6",
+    "semantic_hash": "79c4b67e95ef6ae6ba97e81c900441a6"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingUuidResolver.kt": {
+    "mtime": 1785894796.0515144,
+    "ast_hash": "b4107730a97e455946a884bfa5c59037",
+    "semantic_hash": "b4107730a97e455946a884bfa5c59037"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/service/HousingLinkService.kt": {
+    "mtime": 1785894904.7716343,
+    "ast_hash": "b57f013438cc9e2792ec4287ec84b4eb",
+    "semantic_hash": "b57f013438cc9e2792ec4287ec84b4eb"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/theme/DiveColors.kt": {
+    "mtime": 1779815450.6472948,
+    "ast_hash": "d89ecb94562817c5e5a28d563e8c6d4f",
+    "semantic_hash": "d89ecb94562817c5e5a28d563e8c6d4f"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/theme/DiveTheme.kt": {
+    "mtime": 1779811854.8296025,
+    "ast_hash": "3bbd7cb64b2299b510938073b6b2a803",
+    "semantic_hash": "3bbd7cb64b2299b510938073b6b2a803"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/CameraHudOverlay.kt": {
+    "mtime": 1786140395.8170493,
+    "ast_hash": "abb7b3e738922d2535f4cf7e64acc293",
+    "semantic_hash": "abb7b3e738922d2535f4cf7e64acc293"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/DebugSimulationPanel.kt": {
+    "mtime": 1786118136.4542885,
+    "ast_hash": "6851acec5b9519a9861437156865641e",
+    "semantic_hash": "6851acec5b9519a9861437156865641e"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/DiveControlScreen.kt": {
+    "mtime": 1786281254.3906677,
+    "ast_hash": "6c00113a113825d11cf1f503aecf582c",
+    "semantic_hash": "6c00113a113825d11cf1f503aecf582c"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraPreview.kt": {
+    "mtime": 1779919434.1722887,
+    "ast_hash": "e484fb69be132b76e2ed6c0992fd77c3",
+    "semantic_hash": "e484fb69be132b76e2ed6c0992fd77c3"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt": {
+    "mtime": 1786305760.159155,
+    "ast_hash": "50c1d441179f4f55e94b6d4687229bf4",
+    "semantic_hash": "50c1d441179f4f55e94b6d4687229bf4"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraShellScreen.kt": {
+    "mtime": 1786303251.123269,
+    "ast_hash": "74dc84610961a58a650c6d65e67bebb3",
+    "semantic_hash": "74dc84610961a58a650c6d65e67bebb3"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/FocusPeakingSurfaceProcessor.kt": {
+    "mtime": 1786215824.7331474,
+    "ast_hash": "7f9efb77a7dce18fb4922a7af97f97d5",
+    "semantic_hash": "7f9efb77a7dce18fb4922a7af97f97d5"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/RecordingClock.kt": {
+    "mtime": 1786053885.1683483,
+    "ast_hash": "468fe9b834640851aeb7dee976334b30",
+    "semantic_hash": "468fe9b834640851aeb7dee976334b30"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/StateDrivenCameraPreview.kt": {
+    "mtime": 1786281192.6967235,
+    "ast_hash": "64430a8debbc81aafe806ac7beb88ce4",
+    "semantic_hash": "64430a8debbc81aafe806ac7beb88ce4"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/AutoShrinkText.kt": {
+    "mtime": 1786025807.0253327,
+    "ast_hash": "7958e37c779e19b2646e32d89e5677ae",
+    "semantic_hash": "7958e37c779e19b2646e32d89e5677ae"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/BatteryIndicator.kt": {
+    "mtime": 1785901609.720062,
+    "ast_hash": "360ac9d688b7e34ae9e4b8bcfd4f325e",
+    "semantic_hash": "360ac9d688b7e34ae9e4b8bcfd4f325e"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/ConnectionStatus.kt": {
+    "mtime": 1779815817.0904284,
+    "ast_hash": "6a1518e1e9f6323ae0f224bc581c07e2",
+    "semantic_hash": "6a1518e1e9f6323ae0f224bc581c07e2"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/DepthGauge.kt": {
+    "mtime": 1785973605.2697537,
+    "ast_hash": "870ba214ad51537c2248d328b3bae01f",
+    "semantic_hash": "870ba214ad51537c2248d328b3bae01f"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/HousingLinkBanner.kt": {
+    "mtime": 1786140375.429282,
+    "ast_hash": "1c033c64ce081ce0fed973bb465f28bd",
+    "semantic_hash": "1c033c64ce081ce0fed973bb465f28bd"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/ModeIndicator.kt": {
+    "mtime": 1779929364.3645072,
+    "ast_hash": "b5096514bb58d5c576d5a6755968276d",
+    "semantic_hash": "b5096514bb58d5c576d5a6755968276d"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/SealCheckIndicator.kt": {
+    "mtime": 1786045794.8095124,
+    "ast_hash": "e6c65dc973c4a01c324afdb8fe60a101",
+    "semantic_hash": "e6c65dc973c4a01c324afdb8fe60a101"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/SealStatusBadge.kt": {
+    "mtime": 1779815352.17399,
+    "ast_hash": "83f7fcd9f1888fa3113a367dac8865eb",
+    "semantic_hash": "83f7fcd9f1888fa3113a367dac8865eb"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/TemperatureDisplay.kt": {
+    "mtime": 1779815303.2514083,
+    "ast_hash": "c181e06fe3c324fb4c382cc536e2efeb",
+    "semantic_hash": "c181e06fe3c324fb4c382cc536e2efeb"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/components/VacuumTimerIndicator.kt": {
+    "mtime": 1779815381.6494474,
+    "ast_hash": "a96e18b199fe4fe6d0fc126a97964282",
+    "semantic_hash": "a96e18b199fe4fe6d0fc126a97964282"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/diagnostics/DiagnosticsScreen.kt": {
+    "mtime": 1779812115.499259,
+    "ast_hash": "01e0e4c853d7bd7a2659400042b328a0",
+    "semantic_hash": "01e0e4c853d7bd7a2659400042b328a0"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/gallery/GalleryScreen.kt": {
+    "mtime": 1779935482.0822988,
+    "ast_hash": "c8bce38c555a624450cf32c6982f7dbc",
+    "semantic_hash": "c8bce38c555a624450cf32c6982f7dbc"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/safety/SafetyScreen.kt": {
+    "mtime": 1779815624.9440475,
+    "ast_hash": "67c76568da82be8b339e7f2e688179ca",
+    "semantic_hash": "67c76568da82be8b339e7f2e688179ca"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/tutorial/ButtonTutorialScreen.kt": {
+    "mtime": 1786050489.1625886,
+    "ast_hash": "3b1868d57478c3170fa05291ab477994",
+    "semantic_hash": "3b1868d57478c3170fa05291ab477994"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/tutorial/HousingDiagram.kt": {
+    "mtime": 1786050122.9860098,
+    "ast_hash": "89fc11cb20735cd70f1731f0ed522ec7",
+    "semantic_hash": "89fc11cb20735cd70f1731f0ed522ec7"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/tutorial/HousingPlates.kt": {
+    "mtime": 1785923920.4052792,
+    "ast_hash": "03676504fa731e72aa69ed256ed76d5b",
+    "semantic_hash": "03676504fa731e72aa69ed256ed76d5b"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/viewmodel/CameraSessionStore.kt": {
+    "mtime": 1786283377.017524,
+    "ast_hash": "dfaccad55a5201deb8dba3464a46fe15",
+    "semantic_hash": "dfaccad55a5201deb8dba3464a46fe15"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/viewmodel/DiveViewModel.kt": {
+    "mtime": 1786283360.6918519,
+    "ast_hash": "3b9c9c76fe717e94dc6e7bc77a1ac4e1",
+    "semantic_hash": "3b9c9c76fe717e94dc6e7bc77a1ac4e1"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/platform/ble/HousingUuidResolverTest.kt": {
+    "mtime": 1785894805.183149,
+    "ast_hash": "f28e60db4711a69bd37e4edb90d685c3",
+    "semantic_hash": "f28e60db4711a69bd37e4edb90d685c3"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/viewmodel/FocusLadderMigrationTest.kt": {
+    "mtime": 1786196927.9901574,
+    "ast_hash": "d20cfbe7a30474304ec16d57863f8d47",
+    "semantic_hash": "d20cfbe7a30474304ec16d57863f8d47"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/viewmodel/ScaleLadderMigrationTest.kt": {
+    "mtime": 1786303735.3935685,
+    "ast_hash": "3365ddc94666aba0c0d9465e5a9e9576",
+    "semantic_hash": "3365ddc94666aba0c0d9465e5a9e9576"
+  },
+  "build.gradle.kts": {
+    "mtime": 1779811765.8302116,
+    "ast_hash": "f2207d547d65f957113ee2af36843005",
+    "semantic_hash": "f2207d547d65f957113ee2af36843005"
+  },
+  "core/build.gradle.kts": {
+    "mtime": 1779893382.8697925,
+    "ast_hash": "4a671873cc51bf8b89227271fa388460",
+    "semantic_hash": "4a671873cc51bf8b89227271fa388460"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/app/Main.kt": {
+    "mtime": 1779794608.271585,
+    "ast_hash": "9ed1453a8eb7ca600f214fdaa69ca826",
+    "semantic_hash": "9ed1453a8eb7ca600f214fdaa69ca826"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/app/ScenarioScriptRunner.kt": {
+    "mtime": 1779820074.3194914,
+    "ast_hash": "6b016d25c975e77b4fe86413cc0e3445",
+    "semantic_hash": "6b016d25c975e77b4fe86413cc0e3445"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/BleConnectionMachine.kt": {
+    "mtime": 1779800707.4477506,
+    "ast_hash": "987998e460deb8b5412cab60a10a32ac",
+    "semantic_hash": "987998e460deb8b5412cab60a10a32ac"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/BleTransport.kt": {
+    "mtime": 1779800752.800737,
+    "ast_hash": "6dcc72c22e595a13d7ce685b332ba5d6",
+    "semantic_hash": "6dcc72c22e595a13d7ce685b332ba5d6"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/BleTransportOrchestrator.kt": {
+    "mtime": 1779801039.4043117,
+    "ast_hash": "4fe03e97ac30f7645c3209c2dc7fe43d",
+    "semantic_hash": "4fe03e97ac30f7645c3209c2dc7fe43d"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/ButtonEventNormalizer.kt": {
+    "mtime": 1786059763.6557393,
+    "ast_hash": "89a24f68935e11fc07ccd711fde72ba6",
+    "semantic_hash": "89a24f68935e11fc07ccd711fde72ba6"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/CameraCatalog.kt": {
+    "mtime": 1786303140.4292657,
+    "ast_hash": "69d1d46ee6f33b4350d0fa8664659edf",
+    "semantic_hash": "69d1d46ee6f33b4350d0fa8664659edf"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt": {
+    "mtime": 1786280477.8010528,
+    "ast_hash": "2c62b0f0937302f9e41abf0fe259a5fe",
+    "semantic_hash": "2c62b0f0937302f9e41abf0fe259a5fe"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/ControlCore.kt": {
+    "mtime": 1786283353.9331336,
+    "ast_hash": "0fc062750c164acfb46180c2003f3425",
+    "semantic_hash": "0fc062750c164acfb46180c2003f3425"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/ControlReducer.kt": {
+    "mtime": 1786303946.506516,
+    "ast_hash": "a017c8634548ebd0fea0d3dffc163b93",
+    "semantic_hash": "a017c8634548ebd0fea0d3dffc163b93"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/DiagnosticsStore.kt": {
+    "mtime": 1779820065.6628828,
+    "ast_hash": "66a4c2f83b210f33a090466214599450",
+    "semantic_hash": "66a4c2f83b210f33a090466214599450"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/HexEncoding.kt": {
+    "mtime": 1779798556.6092756,
+    "ast_hash": "f04b6ec13cdea1012ee03dafa47a96da",
+    "semantic_hash": "f04b6ec13cdea1012ee03dafa47a96da"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/HousingBleProfile.kt": {
+    "mtime": 1785898125.8727262,
+    "ast_hash": "64328d338bd2658396f782692ee05e3e",
+    "semantic_hash": "64328d338bd2658396f782692ee05e3e"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/HousingCommandEncoder.kt": {
+    "mtime": 1779798944.8987448,
+    "ast_hash": "51fef0bf96b9182701c3d63e826217a5",
+    "semantic_hash": "51fef0bf96b9182701c3d63e826217a5"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/HousingIdentityVerifier.kt": {
+    "mtime": 1785898139.5030205,
+    "ast_hash": "a1c007fa9f02d376faec101a0c63f336",
+    "semantic_hash": "a1c007fa9f02d376faec101a0c63f336"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/HousingProtocolAdapter.kt": {
+    "mtime": 1779798614.8634214,
+    "ast_hash": "2a3343c7e191835fc4230d5d0477a1ed",
+    "semantic_hash": "2a3343c7e191835fc4230d5d0477a1ed"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/InputRouter.kt": {
+    "mtime": 1786052858.5677776,
+    "ast_hash": "e6cb859617620e06fb47bc7b39989004",
+    "semantic_hash": "e6cb859617620e06fb47bc7b39989004"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/JsonSupport.kt": {
+    "mtime": 1779794152.4972296,
+    "ast_hash": "fa68d8dd9954e49da1b79e25cb0e921e",
+    "semantic_hash": "fa68d8dd9954e49da1b79e25cb0e921e"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/ProtocolParser.kt": {
+    "mtime": 1779798695.826638,
+    "ast_hash": "13d66d0243fd0eb266c7396741ec9f03",
+    "semantic_hash": "13d66d0243fd0eb266c7396741ec9f03"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/SafetyStateMachine.kt": {
+    "mtime": 1786045131.9749398,
+    "ast_hash": "beb0718cf58c895b45600bb382a78322",
+    "semantic_hash": "beb0718cf58c895b45600bb382a78322"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/SimulatedBleTransport.kt": {
+    "mtime": 1779800855.9557276,
+    "ast_hash": "329cedabf3b64b6d1b6a5e46cbaecdd7",
+    "semantic_hash": "329cedabf3b64b6d1b6a5e46cbaecdd7"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/BleConnectionMachineTest.kt": {
+    "mtime": 1779795118.3178978,
+    "ast_hash": "61842fa1972132b1733e5ac9e6921243",
+    "semantic_hash": "61842fa1972132b1733e5ac9e6921243"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/BleTransportOrchestratorTest.kt": {
+    "mtime": 1779801149.7367423,
+    "ast_hash": "114fea9051052620727bfc4a0ac28920",
+    "semantic_hash": "114fea9051052620727bfc4a0ac28920"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/ButtonEventNormalizerTest.kt": {
+    "mtime": 1786059763.6557393,
+    "ast_hash": "b918307feb3ada74bbe9e885b3419030",
+    "semantic_hash": "b918307feb3ada74bbe9e885b3419030"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/CameraCatalogTest.kt": {
+    "mtime": 1786303388.7522633,
+    "ast_hash": "6b9ae64262c373e906ff96aa0566b3c7",
+    "semantic_hash": "6b9ae64262c373e906ff96aa0566b3c7"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/ControlCoreTest.kt": {
+    "mtime": 1786303653.582942,
+    "ast_hash": "d033f34302e0782003e94903b07bf888",
+    "semantic_hash": "d033f34302e0782003e94903b07bf888"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/DiagnosticsStoreTest.kt": {
+    "mtime": 1779795118.3178978,
+    "ast_hash": "947f59f63766e2044c784f7888786803",
+    "semantic_hash": "947f59f63766e2044c784f7888786803"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/HousingCommandEncoderTest.kt": {
+    "mtime": 1779798944.8987448,
+    "ast_hash": "c950fe2ecd089a6b00f61c4ee172ec73",
+    "semantic_hash": "c950fe2ecd089a6b00f61c4ee172ec73"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/HousingIdentityVerifierTest.kt": {
+    "mtime": 1779801112.4895258,
+    "ast_hash": "d7144fe77dde88f3ec2a4fb50011e4a5",
+    "semantic_hash": "d7144fe77dde88f3ec2a4fb50011e4a5"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/HousingProtocolAdapterTest.kt": {
+    "mtime": 1779798944.8987448,
+    "ast_hash": "448c32417dddd0f496d2f24a3d796e84",
+    "semantic_hash": "448c32417dddd0f496d2f24a3d796e84"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/InputRouterTest.kt": {
+    "mtime": 1785968822.9025576,
+    "ast_hash": "004963cfef2a5f7737b629616d9843f5",
+    "semantic_hash": "004963cfef2a5f7737b629616d9843f5"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/ProtocolParserTest.kt": {
+    "mtime": 1779798944.8987448,
+    "ast_hash": "9292fd1615d8d402a4d1fe050a2285e3",
+    "semantic_hash": "9292fd1615d8d402a4d1fe050a2285e3"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/SafetyStateMachineTest.kt": {
+    "mtime": 1786045595.3708389,
+    "ast_hash": "1e533e21084158b4d38ade1df19c6c96",
+    "semantic_hash": "1e533e21084158b4d38ade1df19c6c96"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/ValueLadderGearingTest.kt": {
+    "mtime": 1786281567.0410924,
+    "ast_hash": "ea75039b4f051d9fb1f81c553ded3c30",
+    "semantic_hash": "ea75039b4f051d9fb1f81c553ded3c30"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/WbAutoGateTest.kt": {
+    "mtime": 1786303950.42417,
+    "ast_hash": "685ebe11e4ab0936eeb43332569a51da",
+    "semantic_hash": "685ebe11e4ab0936eeb43332569a51da"
+  },
+  "gradlew": {
+    "mtime": 1779795719.2036407,
+    "ast_hash": "794669d78aef1dd5c7d889ef618b311a",
+    "semantic_hash": "794669d78aef1dd5c7d889ef618b311a"
+  },
+  "run-gradle.ps1": {
+    "mtime": 1779796491.73899,
+    "ast_hash": "770aac491da91802137a0407a375a385",
+    "semantic_hash": "770aac491da91802137a0407a375a385"
+  },
+  "settings.gradle.kts": {
+    "mtime": 1779812195.4432926,
+    "ast_hash": "054ceec57fac7a97485d5551b55d7e37",
+    "semantic_hash": "054ceec57fac7a97485d5551b55d7e37"
+  },
+  "test.ps1": {
+    "mtime": 1779904072.2810166,
+    "ast_hash": "17c2430f189f59327e5ffa4d5dd31c49",
+    "semantic_hash": "17c2430f189f59327e5ffa4d5dd31c49"
+  },
+  "Claude.md": {
+    "mtime": 1779791980.816355,
+    "ast_hash": "632f757eb8c5f1ac22d27fb953116ce1",
+    "semantic_hash": "632f757eb8c5f1ac22d27fb953116ce1"
+  },
+  "README.md": {
+    "mtime": 1779904072.2820423,
+    "ast_hash": "9e835c9dadda4eaa27c1899274f37b50",
+    "semantic_hash": "9e835c9dadda4eaa27c1899274f37b50"
+  },
+  "TEST_PROTOCOL.md": {
+    "mtime": 1779796280.3985686,
+    "ast_hash": "92ce34ccb1a7b81ef942c3ee673933f0",
+    "semantic_hash": "92ce34ccb1a7b81ef942c3ee673933f0"
+  },
+  "docs/ARCHITECTURE.md": {
+    "mtime": 1779798973.406553,
+    "ast_hash": "0798b9116c00605c46d1b5b179cec074",
+    "semantic_hash": "0798b9116c00605c46d1b5b179cec074"
+  },
+  "docs/BLE_PROTOCOL.md": {
+    "mtime": 1785898168.3697338,
+    "ast_hash": "126808ba00bf137d0eaa8c44b2198748",
+    "semantic_hash": "126808ba00bf137d0eaa8c44b2198748"
+  },
+  "docs/COMMANDS.md": {
+    "mtime": 1779794281.2457778,
+    "ast_hash": "d02fb3dc8bb2b42a65f613850f63e3e0",
+    "semantic_hash": "d02fb3dc8bb2b42a65f613850f63e3e0"
+  },
+  "docs/COMPATIBILITY.md": {
+    "mtime": 1779794322.981668,
+    "ast_hash": "b25a75a2289653d61b3a18c492142581",
+    "semantic_hash": "b25a75a2289653d61b3a18c492142581"
+  },
+  "docs/DIAGNOSTICS.md": {
+    "mtime": 1779794090.9467347,
+    "ast_hash": "308048730dafa07a1ac1eb040898f8cd",
+    "semantic_hash": "308048730dafa07a1ac1eb040898f8cd"
+  },
+  "docs/HOUSING_FIRST_CONTACT.md": {
+    "mtime": 1785895335.3110218,
+    "ast_hash": "528172a6f01d102d989cf3cb8a8f6ba0",
+    "semantic_hash": "528172a6f01d102d989cf3cb8a8f6ba0"
+  },
+  "docs/PRIVACY.md": {
+    "mtime": 1779794129.5196679,
+    "ast_hash": "9479e15769b896126118f3ba57359e40",
+    "semantic_hash": "9479e15769b896126118f3ba57359e40"
+  },
+  "docs/README.md": {
+    "mtime": 1779796600.2292264,
+    "ast_hash": "82a220badd88fd9d974f21faeb8fb18e",
+    "semantic_hash": "82a220badd88fd9d974f21faeb8fb18e"
+  },
+  "docs/SAFETY.md": {
+    "mtime": 1779794046.4170122,
+    "ast_hash": "62261b3fc4c9bc4a15164fc1ac716336",
+    "semantic_hash": "62261b3fc4c9bc4a15164fc1ac716336"
+  },
+  "docs/SCENARIOS.md": {
+    "mtime": 1779798896.585929,
+    "ast_hash": "3bd59409190b8c6e62e8380ae1bfcd01",
+    "semantic_hash": "3bd59409190b8c6e62e8380ae1bfcd01"
+  },
+  "docs/SECURITY.md": {
+    "mtime": 1779794420.4168239,
+    "ast_hash": "7c753d46fb6632c3604f71085e584230",
+    "semantic_hash": "7c753d46fb6632c3604f71085e584230"
+  },
+  "docs/TRACEABILITY.md": {
+    "mtime": 1779799009.183483,
+    "ast_hash": "38f42b656fb62c1d3c094b6c4fa67eff",
+    "semantic_hash": "38f42b656fb62c1d3c094b6c4fa67eff"
+  },
+  "manufactuer's spec.pdf": {
+    "mtime": 1779800285.9374688,
+    "ast_hash": "ccc9d642c4cc8e3e2574140c3d18fe0c",
+    "semantic_hash": "ccc9d642c4cc8e3e2574140c3d18fe0c"
+  },
+  "DebugButtonLayout.png": {
+    "mtime": 1779897772.2301004,
+    "ast_hash": "b541f7dbb66aece7605b787092d2e300",
+    "semantic_hash": "b541f7dbb66aece7605b787092d2e300"
+  },
+  "DiveIT Screenshots/1.jpg": {
+    "mtime": 1785915436.1083453,
+    "ast_hash": "6f2195a63e02c45a91e1cbae363571d6",
+    "semantic_hash": "6f2195a63e02c45a91e1cbae363571d6"
+  },
+  "DiveIT Screenshots/10.jpg": {
+    "mtime": 1785921523.0,
+    "ast_hash": "1bb2c5c4d545a2141e1b7fd8d9daa9b2",
+    "semantic_hash": "1bb2c5c4d545a2141e1b7fd8d9daa9b2"
+  },
+  "DiveIT Screenshots/11.jpg": {
+    "mtime": 1785921527.0,
+    "ast_hash": "d288efc5e75fb3ce629837a90fac14e0",
+    "semantic_hash": "d288efc5e75fb3ce629837a90fac14e0"
+  },
+  "DiveIT Screenshots/12.jpg": {
+    "mtime": 1785921882.0,
+    "ast_hash": "46572f7b640271aba087890deafd5c6f",
+    "semantic_hash": "46572f7b640271aba087890deafd5c6f"
+  },
+  "DiveIT Screenshots/13.jpg": {
+    "mtime": 1785921886.0,
+    "ast_hash": "269fcbc04b7fe2655252a8a27cac7ce2",
+    "semantic_hash": "269fcbc04b7fe2655252a8a27cac7ce2"
+  },
+  "DiveIT Screenshots/14.jpg": {
+    "mtime": 1785921562.0,
+    "ast_hash": "765bb4a79d71b209f2d49bee103c4056",
+    "semantic_hash": "765bb4a79d71b209f2d49bee103c4056"
+  },
+  "DiveIT Screenshots/15.jpg": {
+    "mtime": 1785921537.0,
+    "ast_hash": "a8c02dbdeef2a775e59d4f3b8984bd89",
+    "semantic_hash": "a8c02dbdeef2a775e59d4f3b8984bd89"
+  },
+  "DiveIT Screenshots/16.jpg": {
+    "mtime": 1785921543.0,
+    "ast_hash": "f1af5bc49cf3318e4cb103f4fea1ccb6",
+    "semantic_hash": "f1af5bc49cf3318e4cb103f4fea1ccb6"
+  },
+  "DiveIT Screenshots/17.jpg": {
+    "mtime": 1785921548.0,
+    "ast_hash": "f39c771ee2f7284547f269c7549a185b",
+    "semantic_hash": "f39c771ee2f7284547f269c7549a185b"
+  },
+  "DiveIT Screenshots/18.jpg": {
+    "mtime": 1785921545.0,
+    "ast_hash": "3fea23e9aa0249e66ef6b7a074416014",
+    "semantic_hash": "3fea23e9aa0249e66ef6b7a074416014"
+  },
+  "DiveIT Screenshots/2.jpg": {
+    "mtime": 1785921281.0,
+    "ast_hash": "db6570392dd19e34822512bcdd7b9b96",
+    "semantic_hash": "db6570392dd19e34822512bcdd7b9b96"
+  },
+  "DiveIT Screenshots/3.jpg": {
+    "mtime": 1785921283.0,
+    "ast_hash": "07317e39630faea621ef7b49c9f0858c",
+    "semantic_hash": "07317e39630faea621ef7b49c9f0858c"
+  },
+  "DiveIT Screenshots/4.jpg": {
+    "mtime": 1785921292.0,
+    "ast_hash": "36c9bc118d04507e84c7676dc099c678",
+    "semantic_hash": "36c9bc118d04507e84c7676dc099c678"
+  },
+  "DiveIT Screenshots/5.jpg": {
+    "mtime": 1785921288.0,
+    "ast_hash": "21834c761671167606d7737a3f061158",
+    "semantic_hash": "21834c761671167606d7737a3f061158"
+  },
+  "DiveIT Screenshots/6.jpg": {
+    "mtime": 1785921289.0,
+    "ast_hash": "c13a2c01ae2f08cb2ee478deee490712",
+    "semantic_hash": "c13a2c01ae2f08cb2ee478deee490712"
+  },
+  "DiveIT Screenshots/7.jpg": {
+    "mtime": 1785921295.0,
+    "ast_hash": "f927a365420bbed9ecedec42ba63f8d5",
+    "semantic_hash": "f927a365420bbed9ecedec42ba63f8d5"
+  },
+  "DiveIT Screenshots/8.jpg": {
+    "mtime": 1785921298.0,
+    "ast_hash": "58cbed6b2cb2559b2fc63c65ff2db5db",
+    "semantic_hash": "58cbed6b2cb2559b2fc63c65ff2db5db"
+  },
+  "DiveIT Screenshots/9.jpg": {
+    "mtime": 1785921512.0,
+    "ast_hash": "62989e5c5102d988aca657a911c22cff",
+    "semantic_hash": "62989e5c5102d988aca657a911c22cff"
+  },
+  "DiveIT Screenshots/Housing background1.png": {
+    "mtime": 1785918452.13454,
+    "ast_hash": "12b82828868541286a0714248d6661fe",
+    "semantic_hash": "12b82828868541286a0714248d6661fe"
+  },
+  "DiveIT Screenshots/Housing background2.jpg": {
+    "mtime": 1785926000.0,
+    "ast_hash": "9d069f56aa9bf2bf894d562fd520c43c",
+    "semantic_hash": "9d069f56aa9bf2bf894d562fd520c43c"
+  },
+  "DiveIT Screenshots/Housing background3.jpg": {
+    "mtime": 1785949452.6987777,
+    "ast_hash": "182436c528e356b5a8b6a52f3ac42ebb",
+    "semantic_hash": "182436c528e356b5a8b6a52f3ac42ebb"
+  },
+  "DiveIT Screenshots/Screenshot_20260805_021740_DiveIT.jpg": {
+    "mtime": 1785921460.0,
+    "ast_hash": "d5a5c7c14850ec5fe15d8be13ff68d21",
+    "semantic_hash": "d5a5c7c14850ec5fe15d8be13ff68d21"
+  },
+  "DiveIT Screenshots/Screenshot_20260805_022346_DiveIT.jpg": {
+    "mtime": 1785921826.0,
+    "ast_hash": "9b29bbff79d16310f38fdf983320080c",
+    "semantic_hash": "9b29bbff79d16310f38fdf983320080c"
+  },
+  "app/src/main/res/drawable-nodpi/housing_front.png": {
+    "mtime": 1785919529.7357607,
+    "ast_hash": "e91048bb15a43ec49753efa7ab914577",
+    "semantic_hash": "e91048bb15a43ec49753efa7ab914577"
+  },
+  "app/src/main/res/drawable-nodpi/housing_tilt.png": {
+    "mtime": 1785919529.801615,
+    "ast_hash": "b429939a0901cc84921faf5538b1bbe5",
+    "semantic_hash": "b429939a0901cc84921faf5538b1bbe5"
+  },
+  "app_screenshot.png": {
+    "mtime": 1779813868.309228,
+    "ast_hash": "b763f775169c9e180efc94f26aba954c",
+    "semantic_hash": "b763f775169c9e180efc94f26aba954c"
+  },
+  "app_screenshot_v2.png": {
+    "mtime": 1779814216.7983418,
+    "ast_hash": "0579903a82bd318c18a4dea1e3c67c9a",
+    "semantic_hash": "0579903a82bd318c18a4dea1e3c67c9a"
+  },
+  "app_screenshot_v3.png": {
+    "mtime": 1779814437.2833056,
+    "ast_hash": "b449d4dbd022a142659fdbf3c3ce4eb1",
+    "semantic_hash": "b449d4dbd022a142659fdbf3c3ce4eb1"
+  },
+  "docs/.pdf-pages/page_1.png": {
+    "mtime": 1779800416.0689125,
+    "ast_hash": "17a6050fc3abbe4aeee159254ed0a064",
+    "semantic_hash": "17a6050fc3abbe4aeee159254ed0a064"
+  },
+  "docs/.pdf-pages/page_10.png": {
+    "mtime": 1779800416.6854417,
+    "ast_hash": "cfa4b10f1a40afed27944068fd8d9c1c",
+    "semantic_hash": "cfa4b10f1a40afed27944068fd8d9c1c"
+  },
+  "docs/.pdf-pages/page_11.png": {
+    "mtime": 1779800416.7558413,
+    "ast_hash": "f7e90b95b3db46aaae3df157b042fbc0",
+    "semantic_hash": "f7e90b95b3db46aaae3df157b042fbc0"
+  },
+  "docs/.pdf-pages/page_12.png": {
+    "mtime": 1779800416.8314083,
+    "ast_hash": "ca876b7e9f8379bf96355b556d819968",
+    "semantic_hash": "ca876b7e9f8379bf96355b556d819968"
+  },
+  "docs/.pdf-pages/page_2.png": {
+    "mtime": 1779800416.1266792,
+    "ast_hash": "e3e9f896892e1a5563cfa2723a501019",
+    "semantic_hash": "e3e9f896892e1a5563cfa2723a501019"
+  },
+  "docs/.pdf-pages/page_3.png": {
+    "mtime": 1779800416.2361093,
+    "ast_hash": "c4673d9531e78cd567e77c665a06c9a8",
+    "semantic_hash": "c4673d9531e78cd567e77c665a06c9a8"
+  },
+  "docs/.pdf-pages/page_4.png": {
+    "mtime": 1779800416.3068,
+    "ast_hash": "22481654037bc6f223ac3b7224dc5352",
+    "semantic_hash": "22481654037bc6f223ac3b7224dc5352"
+  },
+  "docs/.pdf-pages/page_5.png": {
+    "mtime": 1779800416.3730338,
+    "ast_hash": "651f25dd108c2d1af11c4181da119853",
+    "semantic_hash": "651f25dd108c2d1af11c4181da119853"
+  },
+  "docs/.pdf-pages/page_6.png": {
+    "mtime": 1779800416.42162,
+    "ast_hash": "4f723c1b6a26488fb24edfbc9ce3da20",
+    "semantic_hash": "4f723c1b6a26488fb24edfbc9ce3da20"
+  },
+  "docs/.pdf-pages/page_7.png": {
+    "mtime": 1779800416.4897134,
+    "ast_hash": "8351eeb848420192213307a68d27d406",
+    "semantic_hash": "8351eeb848420192213307a68d27d406"
+  },
+  "docs/.pdf-pages/page_8.png": {
+    "mtime": 1779800416.5455277,
+    "ast_hash": "db8ebb86c46cb2a1a5996093840837e8",
+    "semantic_hash": "db8ebb86c46cb2a1a5996093840837e8"
+  },
+  "docs/.pdf-pages/page_9.png": {
+    "mtime": 1779800416.610687,
+    "ast_hash": "b126171a60eaf07ff9aaba7485fa7634",
+    "semantic_hash": "b126171a60eaf07ff9aaba7485fa7634"
+  },
+  "redesign_debug2.png": {
+    "mtime": 1779816066.434609,
+    "ast_hash": "0265da12992f143f4dc110750d0f6d7a",
+    "semantic_hash": "0265da12992f143f4dc110750d0f6d7a"
+  },
+  "redesign_debug_open.png": {
+    "mtime": 1779815993.1979823,
+    "ast_hash": "320237d76dd506c9e79013340df873b8",
+    "semantic_hash": "320237d76dd506c9e79013340df873b8"
+  },
+  "redesign_safety.png": {
+    "mtime": 1779816184.265304,
+    "ast_hash": "f149d05f601ca83d54049939c78ee58c",
+    "semantic_hash": "f149d05f601ca83d54049939c78ee58c"
+  },
+  "redesign_safety2.png": {
+    "mtime": 1779817538.2109568,
+    "ast_hash": "bf0863990114b8e19541c280352e694b",
+    "semantic_hash": "bf0863990114b8e19541c280352e694b"
+  },
+  "redesign_v1.png": {
+    "mtime": 1779815935.5026248,
+    "ast_hash": "20fb7d0ef636ab649bdc3c45589e5e2a",
+    "semantic_hash": "20fb7d0ef636ab649bdc3c45589e5e2a"
+  },
+  "ui_fixes.png": {
+    "mtime": 1779825858.1390936,
+    "ast_hash": "8f8773d77b51c2ae977ab73e9c0c8012",
+    "semantic_hash": "8f8773d77b51c2ae977ab73e9c0c8012"
+  }
+}

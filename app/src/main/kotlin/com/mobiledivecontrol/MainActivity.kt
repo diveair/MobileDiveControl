@@ -1,15 +1,21 @@
 package com.mobiledivecontrol
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -76,6 +82,43 @@ class MainActivity : ComponentActivity() {
             val bluetoothEnabled by viewModel.bluetoothEnabled.collectAsState()
             val missingPermissions by viewModel.missingPermissions.collectAsState()
             val capPromptVisible by viewModel.capPromptVisible.collectAsState()
+            val galleryConsentRequest by viewModel.galleryConsentRequest.collectAsState()
+            val galleryMediaManagementRequest by viewModel.galleryMediaManagementRequest.collectAsState()
+            val galleryConsentLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.StartIntentSenderForResult(),
+            ) { result ->
+                viewModel.resolveGalleryConsent(result.resultCode == Activity.RESULT_OK)
+            }
+
+            androidx.compose.runtime.LaunchedEffect(galleryConsentRequest) {
+                galleryConsentRequest?.let { request ->
+                    galleryConsentLauncher.launch(
+                        IntentSenderRequest.Builder(request.pendingIntent.intentSender).build(),
+                    )
+                }
+            }
+
+            val galleryMediaManagementLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.StartActivityForResult(),
+            ) {
+                viewModel.resolveGalleryMediaManagement(
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                        MediaStore.canManageMedia(this@MainActivity),
+                )
+            }
+
+            androidx.compose.runtime.LaunchedEffect(galleryMediaManagementRequest) {
+                if (galleryMediaManagementRequest != null) {
+                    val intent = Intent(Settings.ACTION_REQUEST_MANAGE_MEDIA).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    if (intent.resolveActivity(packageManager) != null) {
+                        galleryMediaManagementLauncher.launch(intent)
+                    } else {
+                        viewModel.resolveGalleryMediaManagement(granted = false)
+                    }
+                }
+            }
 
             // Sync Android permission grants into the core state machine
             androidx.compose.runtime.LaunchedEffect(cameraPermissionGranted) {
@@ -134,6 +177,8 @@ class MainActivity : ComponentActivity() {
                             )
                         },
                         onMeteredExposure = viewModel::updateMeteredExposure,
+                        onCameraCommand = { command -> viewModel.dispatch(command) },
+                        onGalleryCommand = { command -> viewModel.dispatch(command) },
                         introVisible = introVisible,
                         onIntroDismiss = viewModel::dismissIntro,
                         // The intro is the app's only honest surface for "why can I not do

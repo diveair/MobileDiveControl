@@ -38,6 +38,14 @@ data class CameraModeProfile(
 )
 
 object CameraCatalog {
+    /**
+     * White-balance modes live on the Kelvin ring itself so the housing wheel can reach them
+     * from either end without a separate menu. The names are persisted values: keep them stable
+     * and use these constants everywhere instead of open-coded strings.
+     */
+    const val WB_AUTO_CONTINUOUS = "Auto Continuous"
+    const val WB_AUTO_SHUTTER = "Auto Shutter"
+
     val primaryRailEntries: List<CameraRailEntry> = listOf(
         CameraRailEntry("photo", "Photo", CameraModeId.Photo),
         CameraRailEntry("expert_raw", "Expert RAW", CameraModeId.ExpertRaw),
@@ -541,6 +549,22 @@ object CameraCatalog {
         return camera.settingValues[spec.id] ?: spec.defaultValue
     }
 
+    fun isWhiteBalanceAuto(value: String?): Boolean =
+        value == WB_AUTO_CONTINUOUS || value == WB_AUTO_SHUTTER || value == "Auto"
+
+    fun isWhiteBalanceAutoShutter(value: String?): Boolean = value == WB_AUTO_SHUTTER
+
+    /** The four field controls whose physical wheel topology is a ring, not a rail. */
+    fun isCircularSlider(spec: CameraSettingSpec): Boolean {
+        if (spec.kind != CameraSettingKind.Slider) return false
+        return spec.id.endsWith(".iso") ||
+            spec.id.endsWith(".shutter_speed") ||
+            spec.id.endsWith(".white_balance") ||
+            spec.id.endsWith(".exposure_value") ||
+            spec.id.endsWith(".exposure_compensation") ||
+            spec.id.endsWith(".exposure")
+    }
+
     /**
      * When the EV dial has no authority and flips into a read-only meter.
      *
@@ -579,7 +603,7 @@ object CameraCatalog {
         CameraModeId.entries.forEach { mode ->
             settingsFor(camera.copy(activeMode = mode))
                 .filter { spec -> spec.kind == CameraSettingKind.Slider }
-                .forEach { spec ->
+                .forEach specLoop@{ spec ->
                     val magnitude: (String) -> Double? = when {
                         spec.id.endsWith(".iso") ->
                             { option -> option.toDoubleOrNull()?.takeIf { it > 0.0 }?.let { kotlin.math.ln(it) } }
@@ -589,15 +613,19 @@ object CameraCatalog {
                             { option -> option.removeSuffix("K").toDoubleOrNull() }
                         spec.id.endsWith(".exposure_value") || spec.id.endsWith(".exposure_compensation") ->
                             { option -> option.replace("+", "").toDoubleOrNull() }
-                        else -> return@forEach
+                        else -> return@specLoop
                     }
-                    val stored = values[spec.id] ?: return@forEach
-                    if (stored in spec.options) return@forEach
-                    val target = magnitude(stored) ?: return@forEach
+                    val stored = values[spec.id] ?: return@specLoop
+                    if (stored in spec.options) return@specLoop
+                    if (spec.id.endsWith(".white_balance") && stored == "Auto") {
+                        values = values + (spec.id to WB_AUTO_CONTINUOUS)
+                        return@specLoop
+                    }
+                    val target = magnitude(stored) ?: return@specLoop
                     val nearest = spec.options
                         .mapNotNull { option -> magnitude(option)?.let { option to it } }
                         .minByOrNull { (_, value) -> kotlin.math.abs(value - target) }
-                        ?.first ?: return@forEach
+                        ?.first ?: return@specLoop
                     values = values + (spec.id to nearest)
                 }
         }
@@ -767,7 +795,7 @@ object CameraCatalog {
                 choice("expert.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
                 choice("expert.save_format", "RAW / JPEG", "Core", listOf("RAW", "JPEG", "RAW + JPEG"), "RAW + JPEG"),
                 choice("expert.lens", "Lens", "Core", lenses, "Auto"),
-                slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions, "Auto"),
+                slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
                 slider("expert.iso", "ISO", "Manual", isoOptions, "Auto"),
                 slider("expert.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("expert.focus_peaking", "Focus Assist", "Assist"),
@@ -793,7 +821,7 @@ object CameraCatalog {
             availableExposureControls = listOf("White balance", "ISO", "Focus", "Shutter", "Exposure value"),
             availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid", "HDR"),
             settings = listOf(
-                slider("pro.white_balance", "White balance", "Manual", whiteBalanceOptions, "Auto"),
+                slider("pro.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
                 slider("pro.iso", "ISO", "Manual", isoOptions, "Auto"),
                 slider("pro.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("pro.focus_peaking", "Focus Assist", "Assist"),
@@ -948,7 +976,7 @@ object CameraCatalog {
             availableAudioControls = listOf("Microphone", "Microphone gain"),
             availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid", "HDR", "LOG"),
             settings = listOf(
-                slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions, "Auto"),
+                slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
                 slider("pro_video.iso", "ISO", "Manual", isoOptions, "Auto"),
                 slider("pro_video.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("pro_video.focus_peaking", "Focus Assist", "Assist"),
@@ -1179,66 +1207,45 @@ object CameraCatalog {
             .minByOrNull { (_, value) -> kotlin.math.abs(value - ns) }?.first
 
     /**
-     * The native camera's white-balance scale, VERBATIM: 78 rungs, 2300K to 10000K in flat 100K
-     * steps (kelvin_value in the decoded resources; MakerParameter.getColorTemperature is simply
-     * `step * 100`). The range is also exactly the HAL's declared domain —
-     * samsung.android.control.colorTemperatureRange reads [2300, 10000] on every camera id — and
-     * colorGainsForKelvin() clamps to the same pair. Same scale in Pro photo, Pro Video and the
-     * photo-mode WB menu; the native app applies no per-lens or per-mode clipping to kelvin, and
-     * neither do we.
+     * The native Samsung white-balance scale, verbatim: 78 values from 2300 K through 10000 K in
+     * flat 100 K steps (`kelvin_value`; MakerParameter.getColorTemperature is `step * 100`).
      *
-     * Auto is index 0 here (the native dial keeps Auto on a separate button — same semantics, our
-     * navigation). While Auto is active the stock slider prints the HAL's live AWB kelvin
-     * estimate snapped to the nearest 100K rung; we reproduce that from
-     * [CameraState.meteredExposure], and the first wheel movement out of Auto seeds manual WB
-     * from that estimate — the native auto-to-manual handoff.
+     * The two automatic modes follow the cold end. That ordering is the wheel topology the
+     * housing exposes:
      *
-     * One honest divergence, by necessity: Samsung hands the kelvin number to the HAL on a vendor
-     * request tag (samsung.android.control.colorTemperature, AWB mode 101) and gets the vendor's
-     * calibrated conversion; that channel is closed to third parties, so we convert kelvin to
-     * COLOR_CORRECTION_GAINS app-side. Same dial, same numbers; the rendered cast at a given
-     * kelvin can differ from the stock app until calibrated against it.
-     */
-    /**
-     * The white-balance dial: [WB_LADDER_RUNGS] rungs from 2300K to 10000K, uniform in MIRED
-     * (reciprocal kelvin) rather than in kelvin, plus Auto at index 0.
+     *   10000 K -> Auto Continuous -> Auto Shutter -> 2300 K
      *
-     * Mired is the perceptually near-uniform axis for white point: colour shift goes as 1/K, so
-     * a flat kelvin grid leaps at the warm end and crawls invisibly at the cold end. Uniform
-     * mired makes EVERY detent the same perceived size — the "consistent, smoothly adjustable,
-     * continuous" scale the field asked for — and at ~2.5 mired per rung each step sits right at
-     * the just-noticeable white-point shift, the finest spacing where every rung is still a real
-     * change. The application pipeline (harvested AWB curve + calibrated sensor model) is
-     * continuous in kelvin, so the finer grid costs nothing downstream. Spacing runs ~13K per
-     * rung at 2300K to ~250K per rung at 10000K; endpoints are exact.
+     * and the exact reverse when turned the other way. Continuous leaves Samsung AWB running;
+     * Shutter runs it during preview and locks its converged gain-plus-transform solution for the
+     * capture/recording. The latter is deliberately not represented by a made-up Kelvin beyond
+     * 10000 K: underwater neutral-card correction needs green/tint and independent channel gains,
+     * not merely a longer colour-temperature rail.
      */
     private val whiteBalanceOptions: List<String> by lazy {
         buildList {
-            add("Auto")
-            val warmMired = 1_000_000.0 / WB_MIN_KELVIN
-            val coldMired = 1_000_000.0 / WB_MAX_KELVIN
-            val steps = WB_LADDER_RUNGS - 1
-            for (i in 0..steps) {
-                val mired = warmMired - (warmMired - coldMired) * i / steps
-                add("${Math.round(1_000_000.0 / mired)}K")
-            }
+            for (kelvin in WB_MIN_KELVIN..WB_MAX_KELVIN step WB_KELVIN_STEP) add("${kelvin}K")
+            add(WB_AUTO_CONTINUOUS)
+            add(WB_AUTO_SHUTTER)
         }.also { ladder ->
-            val kelvin = ladder.drop(1).map { it.removeSuffix("K").toInt() }
+            val kelvin = ladder.mapNotNull { it.removeSuffix("K").toIntOrNull() }
             check(kelvin.first() == WB_MIN_KELVIN && kelvin.last() == WB_MAX_KELVIN) {
                 "WB ladder endpoints must be exact"
             }
-            check(kelvin.zipWithNext().all { (a, b) -> b > a }) { "WB ladder must strictly increase" }
+            check(kelvin.zipWithNext().all { (a, b) -> b - a == WB_KELVIN_STEP }) {
+                "WB ladder must use the native 100 K step"
+            }
         }
     }
 
-    /** The WB scale's bounds and rung count. ~2.5 mired per rung across 135 rungs. */
+    /** The Samsung dial's exact bounds, step and manual-rung count. */
     const val WB_MIN_KELVIN = 2_300
     const val WB_MAX_KELVIN = 10_000
-    const val WB_LADDER_RUNGS = 135
+    const val WB_KELVIN_STEP = 100
+    const val WB_LADDER_RUNGS = 78
 
     /**
-     * Metered kelvin -> the nearest rung of the given (possibly clipped) dial, by linear kelvin
-     * distance — the Auto readout's snap and the auto-to-manual seed both use it.
+     * Metered kelvin -> the nearest manual rung of the given dial, by linear kelvin distance.
+     * Automatic-mode HUD readouts use this without changing the ring's selected value.
      */
     fun nearestWhiteBalanceOption(kelvin: Int, options: List<String>): String? =
         options.mapNotNull { option -> option.removeSuffix("K").toIntOrNull()?.let { option to it } }
@@ -1358,5 +1365,3 @@ val CameraState.secondaryHighlightedMode: CameraModeId
 
 val CameraState.selectedSetting: CameraSettingSpec?
     get() = CameraCatalog.selectedSetting(this)
-
-

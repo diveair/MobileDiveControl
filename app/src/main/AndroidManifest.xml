@@ -26,6 +26,9 @@
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    <!-- One-time special access: lets housing-only gallery sessions manage third-party media
+         without an inaccessible per-file Android confirmation dialog. -->
+    <uses-permission android:name="android.permission.MANAGE_MEDIA" />
 
     <!-- Foreground service for persistent BLE connection -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

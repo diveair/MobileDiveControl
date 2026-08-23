@@ -179,14 +179,21 @@ class InputRouter {
         if (cameraState.activeMode.captureType != CameraCaptureType.Video) {
             return CameraCommand.CapturePhoto
         }
-        // The whole recording lifecycle lives on the shutter: first press starts, second
-        // pauses, and while the paused RESUME/STOP chooser is up the same button confirms
-        // whichever side LEFT/RIGHT selected. STOP finalises the file; RESUME continues it.
+        // The whole recording lifecycle lives on the shutter. The second press closes a valid
+        // segment, then the same button confirms the action LEFT/RIGHT selected. Finalising at
+        // that boundary is what makes Preview and Delete reliable on every CameraX device.
         return when {
             !cameraState.recording -> CameraCommand.ToggleVideoRecording
             !cameraState.recordingPaused -> CameraCommand.PauseVideoRecording
-            cameraState.recordingStopSelected -> CameraCommand.StopVideoRecording
-            else -> CameraCommand.ResumeVideoRecording
+            cameraState.recordingLocationChooserVisible || cameraState.recordingLocationFocused ->
+                CameraCommand.Confirm
+            cameraState.recordingPausedAction == RecordingPausedAction.Resume ->
+                CameraCommand.ResumeVideoRecording
+            cameraState.recordingPausedAction == RecordingPausedAction.Preview ->
+                CameraCommand.PreviewVideoRecording
+            cameraState.recordingPausedAction == RecordingPausedAction.Stop ->
+                CameraCommand.StopVideoRecording
+            else -> CameraCommand.DeleteVideoRecording
         }
     }
 
@@ -195,10 +202,10 @@ class InputRouter {
         HousingButtonEvent.Down -> RouteDecision(commands = listOf(GalleryCommand.NavigateDown))
         HousingButtonEvent.Left -> RouteDecision(commands = listOf(GalleryCommand.NavigateLeft))
         HousingButtonEvent.Right -> RouteDecision(commands = listOf(GalleryCommand.NavigateRight))
-        HousingButtonEvent.Ok -> RouteDecision(commands = listOf(GalleryCommand.Confirm))
-        HousingButtonEvent.Shutter -> RouteDecision(commands = listOf(GalleryCommand.InitiateDelete))
-        HousingButtonEvent.ZoomIn -> RouteDecision(commands = listOf(GalleryCommand.CreateFolder))
-        HousingButtonEvent.ZoomOut -> RouteDecision(commands = listOf(GalleryCommand.Back))
+        HousingButtonEvent.Ok, HousingButtonEvent.Shutter ->
+            RouteDecision(commands = listOf(GalleryCommand.Confirm))
+        HousingButtonEvent.ZoomIn, HousingButtonEvent.ZoomOut ->
+            RouteDecision(commands = listOf(GalleryCommand.Back))
         HousingButtonEvent.BackOrSafety -> RouteDecision(commands = listOf(GalleryCommand.Back))
         is HousingButtonEvent.Unknown -> RouteDecision()
     }

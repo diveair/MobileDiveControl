@@ -280,35 +280,32 @@ class ControlCoreTest {
 
         val editOutcome = core.dispatch(CameraCommand.Confirm)
         assertTrue(editOutcome.state.camera.settingsEditing)
-        assertEquals("Auto", editOutcome.state.camera.settingValues["pro.white_balance"])
+        assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, editOutcome.state.camera.settingValues["pro.white_balance"])
 
         // 0x10 = Right button (now adjusts value +1)
         val firstPress = core.handleButtonPayload(
             payload = byteArrayOf(0x10),
             receivedAt = Instant.parse("2026-05-27T12:00:00Z"),
         )
-        assertEquals("2300K", firstPress.state.camera.settingValues["pro.white_balance"])
+        assertEquals(CameraCatalog.WB_AUTO_SHUTTER, firstPress.state.camera.settingValues["pro.white_balance"])
 
         val secondPress = core.handleButtonPayload(
             payload = byteArrayOf(0x10),
             receivedAt = Instant.parse("2026-05-27T12:00:00.250Z"),
         )
-        // ONE RUNG PER TAP: Auto -> first rung -> second rung. The kelvin text is incidental;
+        // ONE RUNG PER TAP: Auto Continuous -> Auto Shutter -> first Kelvin rung.
         // what this pins is that a deliberate, isolated press moves exactly one step and
         // never a geared stride.
         assertEquals(
-            CameraCatalog.whiteBalanceLadder[2],
+            "2300K",
             secondPress.state.camera.settingValues["pro.white_balance"],
-            "second press must land on the ladder's second kelvin rung",
+            "second press must land on the ring's first kelvin rung",
         )
     }
 
-    /**
-     * The native auto-to-manual handoff: with live telemetry present, the first press out of
-     * Auto lands on the rung nearest what AE is metering — not on the dial's first rung.
-     */
+    /** Live telemetry changes the readout, never the explicitly circular wheel topology. */
     @Test
-    fun `leaving Auto seeds from the live metered value`() {
+    fun `leaving automatic modes follows the ring instead of jumping to metered values`() {
         val core = ControlCore()
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
@@ -319,19 +316,11 @@ class ControlCoreTest {
         core.updateMeteredExposure(MeteredExposure(iso = 137, shutterNs = 5_000_000L, wbKelvin = 5_649))
 
         val seeded = core.dispatch(CameraCommand.NudgeSetting("pro.iso", +1))
-        assertEquals(
-            "125",
-            seeded.state.camera.settingValues["pro.iso"],
-            "the first press out of Auto must land on the metered 137's nearest rung",
-        )
+        assertEquals("50", seeded.state.camera.settingValues["pro.iso"])
         val shutterSeeded = core.dispatch(CameraCommand.NudgeSetting("pro.shutter_speed", +1))
-        assertEquals("1/180", shutterSeeded.state.camera.settingValues["pro.shutter_speed"])
+        assertEquals("1/24000", shutterSeeded.state.camera.settingValues["pro.shutter_speed"])
         val wbSeeded = core.dispatch(CameraCommand.NudgeSetting("pro.white_balance", +1))
-        val wbValue = wbSeeded.state.camera.settingValues["pro.white_balance"]!!
-        assertTrue(
-            kotlin.math.abs(wbValue.removeSuffix("K").toInt() - 5_649) <= 45,
-            "WB must seed within half a rung of the metered 5649K, got $wbValue",
-        )
+        assertEquals(CameraCatalog.WB_AUTO_SHUTTER, wbSeeded.state.camera.settingValues["pro.white_balance"])
 
         // With no telemetry, the fallback is ordinary stepping: Auto -> the first rung.
         val blind = ControlCore()
@@ -872,36 +861,29 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `gallery navigation cycles through items`() {
+    fun `gallery grid navigation follows rows and columns`() {
         val reducer = ControlReducer()
-        val items = listOf(
-            GalleryItem(id = 1, name = "photo1.jpg", path = "/photo1.jpg"),
-            GalleryItem(id = 2, name = "photo2.jpg", path = "/photo2.jpg"),
-            GalleryItem(id = 3, name = "photo3.jpg", path = "/photo3.jpg"),
-        )
+        val items = (1L..8L).map { GalleryItem(id = it, name = "photo$it.jpg", path = "/photo$it.jpg") }
         val state = AppState(
             mode = AppMode.Gallery,
-            gallery = GalleryState(items = items, selectedIndex = 0),
+            gallery = GalleryState(items = items, selectedIndex = 0, currentFolder = "camera"),
         )
 
-        // Navigate down
         val down1 = reducer.reduce(state, GalleryCommand.NavigateDown)
-        assertEquals(1, down1.state.gallery.selectedIndex)
+        assertEquals(6, down1.state.gallery.selectedIndex)
 
         val down2 = reducer.reduce(down1.state, GalleryCommand.NavigateDown)
-        assertEquals(2, down2.state.gallery.selectedIndex)
+        assertEquals(6, down2.state.gallery.selectedIndex)
 
-        // Navigate down at end clamps to last index
-        val down3 = reducer.reduce(down2.state, GalleryCommand.NavigateDown)
-        assertEquals(2, down3.state.gallery.selectedIndex)
-
-        // Navigate up from 0 clamps at 0
         val up1 = reducer.reduce(state, GalleryCommand.NavigateUp)
         assertEquals(0, up1.state.gallery.selectedIndex)
 
-        // Navigate up from middle
         val up2 = reducer.reduce(down1.state, GalleryCommand.NavigateUp)
         assertEquals(0, up2.state.gallery.selectedIndex)
+
+        val right = reducer.reduce(state, GalleryCommand.NavigateRight)
+        assertEquals(1, right.state.gallery.selectedIndex)
+        assertEquals(0, reducer.reduce(right.state, GalleryCommand.NavigateLeft).state.gallery.selectedIndex)
     }
 
     @Test
@@ -931,7 +913,8 @@ class ControlCoreTest {
 
         // OK while Delete is highlighted — executes delete
         val confirmDelete = reducer.reduce(switchToDelete.state, GalleryCommand.Confirm)
-        assertEquals(GalleryViewMode.Browser, confirmDelete.state.gallery.viewMode)
+        assertEquals(GalleryViewMode.ConfirmDelete, confirmDelete.state.gallery.viewMode)
+        assertEquals(GalleryMutation.Delete, confirmDelete.state.gallery.pendingMutation)
         assertTrue(confirmDelete.effects.any { it is PlatformEffect.DeleteGalleryItem })
     }
 
@@ -1039,23 +1022,24 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `gallery left-right switches tabs`() {
+    fun `gallery preview left-right selects the seven action rail`() {
         val reducer = ControlReducer()
         val state = AppState(
             mode = AppMode.Gallery,
-            gallery = GalleryState(tab = GalleryTab.Photos),
+            gallery = GalleryState(
+                viewMode = GalleryViewMode.Preview,
+                previewAction = GalleryPreviewAction.PlayPause,
+                items = listOf(GalleryItem(1, "clip.mp4", "/clip.mp4", isVideo = true)),
+            ),
         )
 
-        // Right goes to Videos
-        val right1 = reducer.reduce(state, GalleryCommand.NavigateRight)
-        assertEquals(GalleryTab.Videos, right1.state.gallery.tab)
-
-        // Right again goes to Folders
-        val right2 = reducer.reduce(right1.state, GalleryCommand.NavigateRight)
-        assertEquals(GalleryTab.Folders, right2.state.gallery.tab)
-
-        // Left from Folders back to Videos
-        val left1 = reducer.reduce(right2.state, GalleryCommand.NavigateLeft)
-        assertEquals(GalleryTab.Videos, left1.state.gallery.tab)
+        assertEquals(
+            GalleryPreviewAction.Previous,
+            reducer.reduce(state, GalleryCommand.NavigateLeft).state.gallery.previewAction,
+        )
+        assertEquals(
+            GalleryPreviewAction.Next,
+            reducer.reduce(state, GalleryCommand.NavigateRight).state.gallery.previewAction,
+        )
     }
 }

@@ -349,29 +349,20 @@ class CameraCatalogTest {
         }
     }
 
-    /**
-     * The white-balance dial: Auto + 135 rungs, 2300K..10000K, uniform in MIRED — every detent
-     * the same perceived white-point shift (~2.5 mired, the just-noticeable step), far finer
-     * than the native 100K grid at the warm end where a diver actually works.
-     */
+    /** Samsung's native manual table plus the two housing-specific automatic modes. */
     @Test
-    fun `white balance ladder is mired-uniform with exact endpoints`() {
+    fun `white balance ladder is the native 100K table followed by both auto modes`() {
         val wb = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "pro.white_balance" }
             .options
 
-        assertEquals(CameraCatalog.WB_LADDER_RUNGS + 1, wb.size, "Auto plus the mired rungs")
-        assertEquals("Auto", wb[0])
-        assertEquals("2300K", wb[1])
-        assertEquals("10000K", wb.last())
-        val kelvin = wb.drop(1).map { it.removeSuffix("K").toInt() }
-        assertTrue(kelvin.zipWithNext().all { (a, b) -> b > a }, "must be strictly increasing")
-        assertEquals(kelvin.size, kelvin.toSet().size, "duplicate rungs are dead detents")
-        val miredSteps = kelvin.zipWithNext { a, b -> 1_000_000.0 / a - 1_000_000.0 / b }
-        assertTrue(
-            miredSteps.max() - miredSteps.min() < 0.3,
-            "mired spacing must be uniform, got ${miredSteps.min()}..${miredSteps.max()}",
-        )
+        assertEquals(CameraCatalog.WB_LADDER_RUNGS + 2, wb.size)
+        assertEquals("2300K", wb.first())
+        assertEquals("10000K", wb[CameraCatalog.WB_LADDER_RUNGS - 1])
+        assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, wb[CameraCatalog.WB_LADDER_RUNGS])
+        assertEquals(CameraCatalog.WB_AUTO_SHUTTER, wb.last())
+        val kelvin = wb.take(CameraCatalog.WB_LADDER_RUNGS).map { it.removeSuffix("K").toInt() }
+        assertTrue(kelvin.zipWithNext().all { (a, b) -> b - a == 100 })
 
         val proVideo = CameraCatalog.settingsFor(CameraModeId.ProVideo, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "pro_video.white_balance" }.options
@@ -381,11 +372,11 @@ class CameraCatalogTest {
     /** The Auto readouts snap metered values onto the dial by linear distance. */
     @Test
     fun `metered values snap to the nearest rung`() {
-        val wbOptions = listOf("Auto", "5000K", "5600K", "5700K")
+        val wbOptions = listOf("5000K", "5600K", "5700K", CameraCatalog.WB_AUTO_CONTINUOUS)
         assertEquals("5600K", CameraCatalog.nearestWhiteBalanceOption(5649, wbOptions))
         assertEquals("5700K", CameraCatalog.nearestWhiteBalanceOption(5651, wbOptions))
         assertEquals("5000K", CameraCatalog.nearestWhiteBalanceOption(40, wbOptions))
-        assertEquals(null, CameraCatalog.nearestWhiteBalanceOption(5000, listOf("Auto")))
+        assertEquals(null, CameraCatalog.nearestWhiteBalanceOption(5000, listOf(CameraCatalog.WB_AUTO_CONTINUOUS)))
         // ...and findNearestShutterSpeed (linear nanosecond distance over the visible options).
         val options = listOf("Auto", "1/12000", "1/8000", "1/6000", "1/30")
         assertEquals("1/8000", CameraCatalog.nearestShutterOption(126_000L, options))
@@ -394,7 +385,7 @@ class CameraCatalogTest {
         assertEquals(null, CameraCatalog.nearestShutterOption(1_000L, listOf("Auto")))
     }
 
-    /** The native auto-to-manual handoff: leaving Auto seeds from the live metered value. */
+    /** The reusable metered snap remains correct, although circular controls do not jump to it. */
     @Test
     fun `metered seed lands on the rung nearest the live value`() {
         val camera = CameraCatalog.launchCameraState(CameraModeId.Pro).copy(
@@ -411,7 +402,7 @@ class CameraCatalogTest {
         assertTrue(wbSeed in wb.options && wbSeed != "Auto", "WB seed must be a real rung")
         val seedKelvin = wbSeed!!.removeSuffix("K").toInt()
         assertTrue(
-            kotlin.math.abs(seedKelvin - 5_649) <= 45,
+            kotlin.math.abs(seedKelvin - 5_649) <= 50,
             "WB seed $wbSeed must sit within half a rung of the metered 5649",
         )
 
@@ -467,7 +458,11 @@ class CameraCatalogTest {
             "an off-clip rung must land on the nearest surviving one",
         )
         assertEquals("400", resnapped.settingValues["pro.iso"], "on-ladder values pass through")
-        assertEquals("Auto", resnapped.settingValues["pro.white_balance"], "Auto is never displaced")
+        assertEquals(
+            CameraCatalog.WB_AUTO_CONTINUOUS,
+            resnapped.settingValues["pro.white_balance"],
+            "legacy Auto migrates to its exact behavioural successor",
+        )
         // Idempotent: a second pass changes nothing.
         assertEquals(resnapped.settingValues, CameraCatalog.resnapToClippedLadders(resnapped).settingValues)
     }
@@ -510,8 +505,13 @@ class CameraCatalogTest {
             val spec = clipped.firstOrNull { it.id == id }
             assertTrue(spec != null, "$id was clipped out of existence")
             assertTrue(spec!!.options.isNotEmpty(), "$id lost every option")
-            assertEquals("Auto", spec.options.first(), "$id lost its Auto rung")
         }
+        assertEquals("Auto", clipped.first { it.id == "pro.iso" }.options.first())
+        assertEquals("Auto", clipped.first { it.id == "pro.shutter_speed" }.options.first())
+        val clippedWb = clipped.first { it.id == "pro.white_balance" }.options
+        assertEquals("2300K", clippedWb.first())
+        assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, clippedWb[clippedWb.lastIndex - 1])
+        assertEquals(CameraCatalog.WB_AUTO_SHUTTER, clippedWb.last())
         // The native fast floor (the vendor characteristic's 1/12000) trims the two rungs the
         // stock dial never shows either.
         val shutter = clipped.first { it.id == "pro.shutter_speed" }.options

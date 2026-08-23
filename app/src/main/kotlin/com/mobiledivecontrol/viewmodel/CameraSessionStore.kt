@@ -74,6 +74,12 @@ private val EXPOSURE_QUICK_KEYS = listOf(
  */
 internal fun snapScaleValuesToLadders(values: Map<String, String>): Map<String, String> {
     val result = values.toMutableMap()
+    // "Auto" was the single WB mode in older builds. Its exact behavioural successor is the
+    // continuously metering mode; spell it explicitly before generic ladder snapping so an
+    // upgrade never drops a user's automatic-WB selection or mistakes it for a Kelvin value.
+    WHITE_BALANCE_KEYS.forEach { key ->
+        if (result[key] == "Auto") result[key] = CameraCatalog.WB_AUTO_CONTINUOUS
+    }
     snapToLadder(result, ISO_KEYS, CameraCatalog.isoLadder, ::isoMagnitude)
     // Snap targets exclude the 1/24000 and 1/16000 rungs the native fast floor removes from
     // every render of this dial: a value snapped onto them would sit off the clipped ladder at

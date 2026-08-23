@@ -51,6 +51,10 @@ fun CameraHudOverlay(
     Box(modifier = modifier.fillMaxSize()) {
         content()
 
+        // The save-album grid is a true modal owned by CameraShellScreen. Let it cover the
+        // camera HUD cleanly; the paused action rail restores every status pill when it closes.
+        if (state.camera.recordingLocationChooserVisible) return@Box
+
         OverlayPill(
             modifier = Modifier
                 .align(Alignment.TopStart)
@@ -98,8 +102,12 @@ fun CameraHudOverlay(
             )
         }
 
-        val isCameraMode = state.mode in listOf(AppMode.CameraLive, AppMode.CameraAdjust)
-        val bottomPadding = if (isCameraMode) 86.dp else 28.dp
+        val bottomPadding = when (state.mode) {
+            AppMode.CameraLive, AppMode.CameraAdjust -> 86.dp
+            // Gallery's preview actions and bottom-centre Back share one dock below the gauge.
+            AppMode.Gallery -> 150.dp
+            else -> 28.dp
+        }
 
         OverlayPill(
             modifier = Modifier
