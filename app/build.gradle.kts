@@ -30,6 +30,14 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        // Marking a type stable only ever lets Compose SKIP a composable whose arguments compare
+        // equal to the previous composition; anything genuinely changed still recomposes and
+        // draws identically. See compose_stability.conf for why these types need it.
+        freeCompilerArgs += listOf(
+            "-P",
+            "plugin:androidx.compose.compiler.plugins.kotlin:stabilityConfigurationPath=" +
+                "${rootProject.projectDir}/compose_stability.conf",
+        )
     }
 
     buildTypes {

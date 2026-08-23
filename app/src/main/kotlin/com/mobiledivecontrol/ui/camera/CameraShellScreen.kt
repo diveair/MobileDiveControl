@@ -95,6 +95,7 @@ fun CameraShellScreen(
     onEffectsConsumed: () -> Unit = {},
     onDetectedLenses: ((List<String>) -> Unit)? = null,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
+    onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     /** True while the housing-link banner occupies the top strip, so the mode pill yields to it. */
     housingLinkAlert: Boolean = false,
     modifier: Modifier = Modifier,
@@ -114,6 +115,7 @@ fun CameraShellScreen(
                 onEffectsConsumed = onEffectsConsumed,
                 onDetectedLenses = onDetectedLenses,
                 onCapabilities = onCapabilities,
+                onMeteredExposure = onMeteredExposure,
             )
         } else {
             CameraPreviewPlaceholder()
@@ -1008,6 +1010,27 @@ private fun displaySettingValue(cameraState: CameraState?, spec: CameraSettingSp
         spec.id.endsWith(".lens") -> formatLensValue(value)
         spec.id.endsWith(".manual_focus") -> formatFocusValue(cameraState, spec, value)
         spec.id.endsWith(".focus_peaking") -> if (focusLensValue(cameraState, spec) == "0.6x") "Off" else if (value == "On") "On" else "Off"
+        // The native Auto readouts: while a scale sits on Auto, the stock chips print what the
+        // HAL is actually choosing — the raw metered ISO integer, the metered exposure snapped
+        // to the shutter table, the AWB kelvin estimate at 100 K. The "A" prefix keeps the mode
+        // legible where the native UI uses a lit Auto button instead. Value-slot text only; the
+        // option lists (cameraState == null) still read plain "Auto".
+        value == "Auto" && spec.id.endsWith(".iso") ->
+            cameraState?.meteredExposure?.iso?.let { "A $it" } ?: value
+        value == "Auto" && spec.id.endsWith(".shutter_speed") ->
+            cameraState?.meteredExposure?.shutterNs
+                ?.let { CameraCatalog.nearestShutterOption(it, spec.options) }
+                ?.let { "A $it" } ?: value
+        value == "Auto" && spec.id.endsWith(".white_balance") ->
+            cameraState?.meteredExposure?.wbKelvin
+                ?.let { CameraCatalog.nearestWhiteBalanceOption(it, spec.options) }
+                ?.let { "A $it" } ?: value
+        // The native EV meter: with both ISO and shutter manual the compensation index has no
+        // authority, so the field turns into a read-only meter of the measured deviation —
+        // or an em dash when the vendor meter tag is absent, never a dial that pretends to work.
+        cameraState != null && CameraCatalog.evMeterLocked(cameraState, spec) ->
+            cameraState.meteredExposure.evTenths
+                ?.let { "M ${CameraCatalog.evLabel(it.coerceIn(-20, 20))}" } ?: "—"
         else -> value
     }
 }
@@ -1270,7 +1293,11 @@ private fun SliderMeterAdjuster(
                     .background(DiveColors.DiveCyan, RoundedCornerShape(999.dp))
             )
 
-            if (totalSteps in 2..15) {
+            // Per-rung dots only while they stay legible at 4dp — sixteen across the meter is the
+            // limit. This is now a pure legibility bound: the value ladders (ISO 86, white balance
+            // 114, shutter 206) are far past it and render as a continuous bar, which is the right
+            // read for a scale you sweep rather than count.
+            if (totalSteps in 2..16) {
                 Row(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp)

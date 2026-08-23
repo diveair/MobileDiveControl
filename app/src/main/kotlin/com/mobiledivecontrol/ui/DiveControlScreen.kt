@@ -54,6 +54,7 @@ fun DiveControlScreen(
     onEffectsConsumed: () -> Unit = {},
     onDetectedLenses: ((List<String>) -> Unit)? = null,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
+    onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     introVisible: Boolean = false,
     onIntroDismiss: () -> Unit = {},
     permissionsGranted: Boolean = false,
@@ -73,6 +74,7 @@ fun DiveControlScreen(
             onEffectsConsumed = onEffectsConsumed,
             onDetectedLenses = onDetectedLenses,
             onCapabilities = onCapabilities,
+            onMeteredExposure = onMeteredExposure,
             bluetoothEnabled = bluetoothEnabled,
         )
 
@@ -107,6 +109,7 @@ private fun DiveControlContent(
     onEffectsConsumed: () -> Unit,
     onDetectedLenses: ((List<String>) -> Unit)?,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)?,
+    onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     bluetoothEnabled: Boolean = true,
 ) {
     CameraHudOverlay(
@@ -131,6 +134,7 @@ private fun DiveControlContent(
                     onEffectsConsumed = onEffectsConsumed,
                     onDetectedLenses = onDetectedLenses,
                     onCapabilities = onCapabilities,
+                    onMeteredExposure = onMeteredExposure,
                     housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.CameraAdjust -> CameraShellScreen(
@@ -142,6 +146,7 @@ private fun DiveControlContent(
                     onEffectsConsumed = onEffectsConsumed,
                     onDetectedLenses = onDetectedLenses,
                     onCapabilities = onCapabilities,
+                    onMeteredExposure = onMeteredExposure,
                     housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.Safety -> SafetyScreen(safety = state.safety)

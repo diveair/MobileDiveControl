@@ -74,6 +74,51 @@ class CameraRuntimeController(
     companion object {
         private const val TAG = "DiveCameraCtrl"
         private const val RESUME_STREAM_CHECK_DELAY_MS = 2_500L
+
+        /** The native app's vendor "manual kelvin" AWB mode (AeAfController branch B). */
+        /** XYZ (D65) to linear sRGB. */
+        private val XYZ_TO_SRGB = arrayOf(
+            doubleArrayOf(3.2404542, -1.5371385, -0.4985314),
+            doubleArrayOf(-0.9692660, 1.8760108, 0.0415560),
+            doubleArrayOf(0.0556434, -0.2040259, 1.0572252),
+        )
+
+        /** Bradford chromatic-adaptation matrix and its inverse. */
+        private val BRADFORD = arrayOf(
+            doubleArrayOf(0.8951, 0.2664, -0.1614),
+            doubleArrayOf(-0.7502, 1.7135, 0.0367),
+            doubleArrayOf(0.0389, -0.0685, 1.0296),
+        )
+        private val BRADFORD_INV = arrayOf(
+            doubleArrayOf(0.9869929, -0.1470543, 0.1599627),
+            doubleArrayOf(0.4323053, 0.5183603, 0.0492912),
+            doubleArrayOf(-0.0085287, 0.0400428, 0.9684867),
+        )
+
+        /** The D65 white point in XYZ. */
+        private val D65_WHITE = doubleArrayOf(0.95047, 1.0, 1.08883)
+
+        /**
+         * How far (kelvin) beyond harvested AWB data the manual dial may still play the
+         * harvested curve before handing over to the calibrated pipeline. Wide enough to bridge
+         * the estimate's wander, narrow enough that far extrapolation never fakes coverage.
+         */
+        /**
+         * How far (mired) beyond the harvested span the AWB-curve correction takes to fade to
+         * zero. The 110-mired version let the harvest centre's correction reach most of the
+         * dial (53% weight at 8100K), dragging every distant kelvin toward the auto estimate's
+         * own correction — the stable-light native comparison measured that as a systematic
+         * 3-10% undershoot across 6800-10000K. With the backbone LUT now fitted from
+         * interleaved native pairs the backbone is accurate on its own, so the fade only has
+         * to bridge the last few percent around the span — 40 mired keeps the hand-off smooth
+         * without exporting the harvest correction across the dial. (The old 45-mired hump at
+         * 4300-5300K came from an UNFITTED backbone disagreeing with the harvest, not from the
+         * width itself.)
+         */
+        private const val WB_HARVEST_FADE_MIRED = 40.0
+
+        /** How long WB must have been continuously auto before its results are trusted as AWB truth. */
+        private const val WB_AUTO_SETTLE_MS = 1_500L
         private const val MACRO_STOP_REBIND_DEBOUNCE_MS = 450L
 
         /** A beat on the landed plane before the HAL takes the lens, so the arrival reads. */
@@ -124,6 +169,13 @@ class CameraRuntimeController(
         val iso: String?,
         val shutter: String?,
         val resolution: String?,
+        /**
+         * In the signature because SENSOR_FRAME_DURATION is derived from it: without this field
+         * an fps change under an unchanged manual shutter early-returns on the signature latch
+         * and the repeating request keeps the OLD frame pin — a 30 fps stream under a HUD that
+         * reads 60fps.
+         */
+        val frameRate: String?,
         val waterPressureKpa: Double?,
         val atmosphericPressureKpa: Double?,
     )
@@ -191,6 +243,26 @@ class CameraRuntimeController(
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
     private var onCapabilities: ((CameraCapabilities) -> Unit)? = null
+    private var onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null
+
+    /**
+     * The EV index window writes are clamped to: the vendor aeCompensationRange where it
+     * resolves ([-40,40] = +/-4.0 EV on this hardware, the native Pro dial's real span), else
+     * the public range. Kept in INDEX units because CONTROL_AE_EXPOSURE_COMPENSATION is an
+     * index; the write path must NOT use CameraX's exposureCompensationRange, which only ever
+     * knows the public window.
+     */
+    @Volatile private var evCompensationIndexRange: android.util.Range<Int>? = null
+
+    /**
+     * Samsung vendor RESULT tags behind the native Auto readouts: the HAL's live AWB kelvin
+     * estimate and the metered EV deviation. Resolved by name through the global vendor tag
+     * descriptor; on hardware where construction or the first read throws, the slot is nulled so
+     * the cost is paid once and the readout simply stays absent.
+     */
+    private var vendorColorTempResultKey: CaptureResult.Key<Int>? = null
+    private var vendorEvMeterResultKey: CaptureResult.Key<Int>? = null
+    private var vendorResultKeysProbed = false
     private var boundLensFacing: Int? = null
     private var boundLensValue: String? = null
     private var boundResolution: String? = null
@@ -280,7 +352,13 @@ class CameraRuntimeController(
                     if (info.size > 3) lastObservedVendorLensPos = info[3]
                 }
             }
-            result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { lastAutoColorTransform = it }
+            // AWB truth is latched ONLY while white balance is genuinely auto. While a manual
+            // kelvin or the underwater filter drives the request, these results echo our own
+            // writes — latching them would poison the anchor with our own output.
+            if (wbIsAuto(latestState)) {
+                result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { lastAutoColorTransform = it }
+                result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { lastAutoColorGains = it }
+            }
             // The exposure envelope CameraX negotiated. Our own request must inherit it, or the
             // frame rate and flicker bounds change the instant we take over the session and the
             // preview visibly jumps in brightness.
@@ -289,20 +367,83 @@ class CameraRuntimeController(
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastAeExposureNs = it }
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastAeSensitivity = it }
 
-            // Periodic diagnostic logging
+            // Periodic diagnostic logging and the live Auto readouts, on one 2 Hz throttle.
             val now = SystemClock.elapsedRealtime()
             if (now - lastFocusResultLogAtMs < 500L) return
             lastFocusResultLogAtMs = now
+
+            // Everything the native chips print beside "Auto": the AE-metered ISO/exposure pair
+            // (public results), the HAL's live AWB kelvin estimate and the metered EV deviation
+            // (Samsung vendor result tags — resolved once, and permanently absent where they do
+            // not exist). Merged into state off the critical path, like the phone battery.
+            if (!vendorResultKeysProbed) {
+                vendorResultKeysProbed = true
+                vendorColorTempResultKey = makeVendorResultKey("samsung.android.control.colorTemperature")
+                vendorEvMeterResultKey = makeVendorResultKey("samsung.android.control.evCompensationValue")
+            }
+            val meteredWbKelvin = readVendorResult(result, vendorColorTempResultKey) { vendorColorTempResultKey = null }
+            val meteredEvTenths = readVendorResult(result, vendorEvMeterResultKey) { vendorEvMeterResultKey = null }
+            onMeteredExposure?.invoke(
+                com.mobiledivecontrol.core.MeteredExposure(
+                    iso = lastAeSensitivity,
+                    shutterNs = lastAeExposureNs,
+                    wbKelvin = meteredWbKelvin,
+                    evTenths = meteredEvTenths,
+                ),
+            )
+
+            // The continuity anchor: the HAL's kelvin estimate with the gains AND transform it
+            // applied, all from the same tick, kept fresh for as long as AWB paints the picture.
+            // Both the latch and the harvest wait out the manual-to-Auto echo window.
+            if (!wbIsAuto(latestState)) {
+                wbManualSeenAtMs = now
+            } else if (now - wbManualSeenAtMs > WB_AUTO_SETTLE_MS) {
+                val gains = lastAutoColorGains
+                if (meteredWbKelvin != null && gains != null) {
+                    lastAutoWbAnchor = WbAnchor(meteredWbKelvin, gains, lastAutoColorTransform)
+                    harvestAwbCurvePoint(meteredWbKelvin, gains, lastAutoColorTransform, now)
+                }
+            }
+
             val fd = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
             val af = result.get(CaptureResult.CONTROL_AF_MODE)
             val lp = samsungFocusLensPosition(result)
             val physicalId = runningPhysicalCameraId(result)
+            // evIdx is the HAL's echo of CONTROL_AE_EXPOSURE_COMPENSATION — the on-metal proof
+            // line for the +/-4.0 EV window: past index +/-20 the echo AND the iso x expNs
+            // product must keep moving, or the wider dial saturates and must be pulled back.
+            val evEcho = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION)
+            val resultGains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let {
+                String.format(java.util.Locale.US, "%.2f/%.2f", it.red, it.blue)
+            }
             Log.d(
                 TAG,
                 "CaptureResult fd=$fd af=$af lpEcho=$lp lpActual=$lastObservedVendorLensPos " +
                     "wanted=$lastCommandedLensPos physical=$physicalId native=$nativeFocusActive " +
-                    "iso=$lastAeSensitivity expNs=$lastAeExposureNs",
+                    "iso=$lastAeSensitivity expNs=$lastAeExposureNs evIdx=$evEcho " +
+                    "wbK=$meteredWbKelvin evMeter=$meteredEvTenths " +
+                    "wbAnchor=${lastAutoWbAnchor?.kelvin} gains=$resultGains",
             )
+        }
+    }
+
+    private fun makeVendorResultKey(name: String): CaptureResult.Key<Int>? = try {
+        CaptureResult.Key(name, Int::class.javaObjectType)
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun readVendorResult(
+        result: CaptureResult,
+        key: CaptureResult.Key<Int>?,
+        onUnresolvable: () -> Unit,
+    ): Int? {
+        if (key == null) return null
+        return try {
+            result.get(key)
+        } catch (_: Exception) {
+            onUnresolvable()
+            null
         }
     }
 
@@ -313,12 +454,16 @@ class CameraRuntimeController(
         onReady: (Boolean) -> Unit,
         onDetectedLenses: ((List<String>) -> Unit)? = null,
         onCapabilities: ((CameraCapabilities) -> Unit)? = null,
+        onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     ) {
         this.previewView = previewView
         this.lifecycleOwner = lifecycleOwner
         installResumeWatchdog(lifecycleOwner)
         this.onDetectedLenses = onDetectedLenses
         this.onCapabilities = onCapabilities
+        this.onMeteredExposure = onMeteredExposure
+        wbCalibration = runCatching { loadWbCalibration() }.getOrNull()
+        loadAwbCurve()
         latestState = initialState
         focusAssistEnabled = isFocusAssistEnabled(initialState)
 
@@ -475,7 +620,6 @@ class CameraRuntimeController(
     @Volatile private var lastAntibandingMode: Int? = null
 
     /** Last 3A settings actually pushed, so re-applying an unchanged value never disturbs them. */
-    private var lastAppliedExposureIndex: Int? = null
     private var lastAppliedFlash: String? = null
 
     /** The last lens position we asked for — the thing [lastObservedVendorLensPos] must converge to. */
@@ -519,7 +663,16 @@ class CameraRuntimeController(
     private var focusRampBuilder: CaptureRequest.Builder? = null
     private var focusRampSession: CameraCaptureSession? = null
 
-    /** Command a focus plane cheaply, reusing the ramp builder. False if no session owns it. */
+    /**
+     * Command a focus plane cheaply, reusing the ramp builder. False if no session owns it.
+     *
+     * The cached builder carries the SAME look as the full repeating request — white balance,
+     * ISO/shutter, EV, tonemap, flash — via [populateSessionLook]. It used to carry a bare
+     * template, so every focus step wiped the manual exposure settings off the frame (AWB back
+     * to auto, AE back on) until the next full rebuild. The cache is invalidated whenever the
+     * full request is submitted, so a settings change costs one rebuild on the next focus step
+     * and each step after that is still a single key write.
+     */
     private fun commandFocusDistance(diopters: Float): Boolean {
         val session = cam2Session ?: return false
         if (focusRampBuilder == null || focusRampSession !== session) {
@@ -536,7 +689,10 @@ class CameraRuntimeController(
                     lastAntibandingMode?.let { m ->
                         b.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, m)
                     }
-                    camera?.let { cam -> applyNativeZoom(b, latestState, cam) }
+                    camera?.let { cam ->
+                        applyNativeZoom(b, latestState, cam)
+                        populateSessionLook(b, latestState, cam)
+                    }
                 }
             }.getOrNull()
             focusRampSession = session
@@ -734,6 +890,304 @@ class CameraRuntimeController(
 
     /** The HAL's own sensor→sRGB matrix while AWB ran auto — the anchor for manual kelvin WB. */
     @Volatile private var lastAutoColorTransform: android.hardware.camera2.params.ColorSpaceTransform? = null
+
+    /**
+     * The HAL's OWN white-balance rendering, latched only while white balance is genuinely auto
+     * (no manual kelvin, no underwater filter — otherwise the result would echo our own writes
+     * back to us as if they were the HAL's truth).
+     *
+     * [lastAutoWbAnchor] pairs the HAL's AWB kelvin estimate with the gains it applied on the
+     * same telemetry tick. That pair is a measured point on THIS sensor's true CCT-to-gains
+     * curve, and it is what makes manual white balance colour-match the Auto readout: "A 4500K"
+     * converting to manual 4500K must render the identical frame, which no idealised black-body
+     * fit can promise but the HAL's own gains at 4500K do by definition.
+     */
+    @Volatile private var lastAutoColorGains: RggbChannelVector? = null
+    @Volatile private var lastAutoWbAnchor: WbAnchor? = null
+
+    /**
+     * The HAL's own white-balance rendering at one known kelvin: the AWB estimate with the gains
+     * AND colour transform it applied on the same telemetry tick. This is the continuity anchor
+     * for manual white balance — at the anchor kelvin the manual pipeline must reproduce this
+     * frame exactly, or Auto-to-manual conversion visibly jumps.
+     *
+     * A NOTE ON THE VENDOR ROUTE, tried and rejected: writing the native pair
+     * (CONTROL_AWB_MODE=101 + samsung.android.control.colorTemperature) from our session IS
+     * accepted by this HAL — the result echoes the commanded kelvin and real gains are applied —
+     * but only Samsung's GAINS arrive; the illuminant-matched colour matrix their own pipeline
+     * adds does not run for third-party clients, so 10000K rendered yellow where the native app
+     * renders magenta-warm. Gains can only scale channels; the green-to-magenta axis lives in
+     * the TRANSFORM, so the route can never visually match native for us and manual WB now
+     * computes the full pipeline itself instead.
+     */
+    private class WbAnchor(
+        val kelvin: Int,
+        val gains: RggbChannelVector,
+        val transform: android.hardware.camera2.params.ColorSpaceTransform?,
+    )
+
+    /**
+     * A MEASURED point of the native camera's own kelvin-to-gains curve, harvested from the
+     * AsShotNeutral tags of DNGs the stock Pro mode saved at known manual kelvins. This is the
+     * objective ground truth the user asked for: not a model of what Samsung should do, but a
+     * record of what it did, on this exact unit. When the table is present it REPLACES the
+     * computed gains (the transform math then derives from the same measured values), pinned by
+     * mired-linear interpolation between points and clamped at the measured ends.
+     */
+    private class WbCalPoint(
+        val kelvin: Double,
+        val rGain: Double,
+        val bGain: Double,
+        /** Post-transform diagonal correction fitted from rendered-output measurements. */
+        val tr: Double = 1.0,
+        val tb: Double = 1.0,
+    )
+
+    /**
+     * The HAL's OWN white-balance curve, harvested live: while WB is on Auto, every telemetry
+     * tick pairs the AWB's kelvin estimate with the exact gains and colour transform it applied,
+     * EMA-smoothed into 100K buckets and persisted across sessions.
+     *
+     * This is the curve the field asked for by name: "manual should correct just like auto, but
+     * manually." Manual playback inside the harvested span IS the auto correction pinned by
+     * hand — converting at the estimate is seamless by identity, and every covered kelvin
+     * renders exactly as Auto would render a scene it estimated at that kelvin. Coverage grows
+     * with use (dives sweep the cold half naturally); outside it, the calibrated pipeline
+     * stands in.
+     */
+    private class AwbCurvePoint(
+        var rGain: Float,
+        var greenGain: Float,
+        var bGain: Float,
+        var transform: FloatArray?,
+        var samples: Int,
+    )
+
+    private val awbCurve = java.util.concurrent.ConcurrentHashMap<Int, AwbCurvePoint>()
+    @Volatile private var awbCurveDirty = false
+    @Volatile private var awbCurveSavedAtMs = 0L
+
+    /**
+     * When WB was last seen NOT genuinely auto. Harvesting (and anchor latching) waits
+     * [WB_AUTO_SETTLE_MS] after this: at the manual-to-Auto switch the first results still ECHO
+     * our manual gains while the kelvin estimate already reads the scene — folding those frames
+     * into the curve poisoned the buckets around the scene's estimate with manual-dial colour
+     * ("why is 5200 so blue": blue-boosting warm-manual gains keyed under the ~5200 estimate).
+     */
+    @Volatile private var wbManualSeenAtMs = 0L
+
+    @Volatile private var wbCalibration: List<WbCalPoint>? = null
+
+    /**
+     * Loads the measured curve from the app's external-files dir, where adb can push it without
+     * any permission dance:
+     *   /sdcard/Android/data/com.mobiledivecontrol/files/wb_calibration.json
+     *   { "points": [ { "kelvin": 2300, "rGain": 1.62, "bGain": 2.88 }, ... ] }
+     * Gains are sensor-space, green-normalised — exactly what 1/AsShotNeutral yields.
+     */
+    private fun loadWbCalibration(): List<WbCalPoint>? {
+        val file = java.io.File(context.getExternalFilesDir(null), "wb_calibration.json")
+        if (!file.exists()) return null
+        val array = org.json.JSONObject(file.readText()).getJSONArray("points")
+        val points = (0 until array.length()).map { index ->
+            val point = array.getJSONObject(index)
+            WbCalPoint(
+                point.getDouble("kelvin"),
+                point.optDouble("rGain", Double.NaN),
+                point.optDouble("bGain", Double.NaN),
+                point.optDouble("tr", 1.0),
+                point.optDouble("tb", 1.0),
+            )
+        }.sortedBy { it.kelvin }
+        return points.takeIf { it.size >= 2 }?.also {
+            Log.i(
+                TAG,
+                "WB calibration loaded: ${it.size} measured points " +
+                    "${it.first().kelvin.toInt()}K..${it.last().kelvin.toInt()}K",
+            )
+        }
+    }
+
+    /** EMA-fold one live AWB sample into its 100K bucket; persist the curve at most every 20 s. */
+    private fun harvestAwbCurvePoint(
+        estimateKelvin: Int,
+        gains: RggbChannelVector,
+        transform: android.hardware.camera2.params.ColorSpaceTransform?,
+        nowMs: Long,
+    ) {
+        if (estimateKelvin < 1500 || estimateKelvin > 12000) return
+        // Plausibility gate against the sensor model: an AWB sample whose channel ratios sit
+        // more than ~50% from the calibrated prediction at its own estimate is an echo of our
+        // manual writes or a mid-transition frame, never a real AWB point — reject it rather
+        // than average it in.
+        sensorCalibratedGains(estimateKelvin)?.let { model ->
+            val sampleR = gains.red / ((gains.greenEven + gains.greenOdd) / 2f)
+            val sampleB = gains.blue / ((gains.greenEven + gains.greenOdd) / 2f)
+            val modelR = model.red / ((model.greenEven + model.greenOdd) / 2f)
+            val modelB = model.blue / ((model.greenEven + model.greenOdd) / 2f)
+            if (sampleR !in modelR * 0.5f..modelR * 1.5f) return
+            if (sampleB !in modelB * 0.5f..modelB * 1.5f) return
+        }
+        val bucket = ((estimateKelvin + 50) / 100) * 100
+        val flat = transform?.let { t ->
+            FloatArray(9) { i -> t.getElement(i % 3, i / 3).toFloat() }
+        }
+        val green = (gains.greenEven + gains.greenOdd) / 2f
+        val existing = awbCurve[bucket]
+        if (existing == null) {
+            awbCurve[bucket] = AwbCurvePoint(gains.red, green, gains.blue, flat, 1)
+        } else {
+            val a = 0.1f
+            existing.rGain += a * (gains.red - existing.rGain)
+            existing.greenGain += a * (green - existing.greenGain)
+            existing.bGain += a * (gains.blue - existing.bGain)
+            if (flat != null) {
+                val t = existing.transform
+                if (t == null) existing.transform = flat
+                else for (i in 0..8) t[i] += a * (flat[i] - t[i])
+            }
+            existing.samples++
+        }
+        awbCurveDirty = true
+        if (nowMs - awbCurveSavedAtMs > 20_000L) {
+            awbCurveSavedAtMs = nowMs
+            persistAwbCurveAsync()
+        }
+    }
+
+    private fun awbCurveFile() = java.io.File(context.getExternalFilesDir(null), "wb_awb_curve.json")
+
+    private fun persistAwbCurveAsync() {
+        if (!awbCurveDirty) return
+        awbCurveDirty = false
+        val snapshot = awbCurve.entries.associate { (k, v) ->
+            k.toString() to org.json.JSONObject().apply {
+                put("r", v.rGain.toDouble()); put("g", v.greenGain.toDouble()); put("b", v.bGain.toDouble())
+                put("n", v.samples)
+                v.transform?.let { t -> put("t", org.json.JSONArray(t.map { it.toDouble() })) }
+            }
+        }
+        Thread {
+            runCatching {
+                awbCurveFile().writeText(org.json.JSONObject(snapshot).toString())
+            }
+        }.start()
+    }
+
+    private fun loadAwbCurve() {
+        runCatching {
+            val file = awbCurveFile()
+            if (!file.exists()) return
+            val json = org.json.JSONObject(file.readText())
+            json.keys().forEach { key ->
+                val bucket = key.toIntOrNull() ?: return@forEach
+                val o = json.getJSONObject(key)
+                val t = o.optJSONArray("t")?.let { arr -> FloatArray(9) { arr.getDouble(it).toFloat() } }
+                awbCurve[bucket] = AwbCurvePoint(
+                    o.getDouble("r").toFloat(), o.getDouble("g").toFloat(), o.getDouble("b").toFloat(),
+                    t, o.optInt("n", 1),
+                )
+            }
+            if (awbCurve.isNotEmpty()) {
+                Log.i(TAG, "AWB curve loaded: ${awbCurve.size} buckets ${awbCurve.keys.min()}K..${awbCurve.keys.max()}K")
+            }
+        }
+    }
+
+    /**
+     * The harvested AWB curve evaluated at one kelvin, with the DISTANCE (in mired) from the
+     * covered span. Inside the span the value interpolates between buckets (interior gaps lerp
+     * across, so the span is continuous); beyond either end the edge value holds flat and the
+     * distance grows — the caller uses that distance to FADE the harvested correction out
+     * smoothly rather than switching curves on a cliff. One smooth spectrum, no seams.
+     */
+    private class HarvestedWb(
+        val rGain: Float,
+        val greenGain: Float,
+        val bGain: Float,
+        val transform: FloatArray?,
+        val distanceMired: Double,
+    )
+
+    private fun harvestedWbAt(kelvin: Int): HarvestedWb? {
+        if (awbCurve.isEmpty()) return null
+        val keys = awbCurve.keys.sorted()
+        val lower = keys.lastOrNull { it <= kelvin }
+        val upper = keys.firstOrNull { it >= kelvin }
+        fun point(bucket: Int) = awbCurve[bucket]!!
+        return when {
+            lower != null && upper != null && lower != upper -> {
+                val lo = point(lower); val hi = point(upper)
+                val f = (((1e6 / kelvin) - (1e6 / lower)) / ((1e6 / upper) - (1e6 / lower))).toFloat()
+                HarvestedWb(
+                    lo.rGain + f * (hi.rGain - lo.rGain),
+                    lo.greenGain + f * (hi.greenGain - lo.greenGain),
+                    lo.bGain + f * (hi.bGain - lo.bGain),
+                    if (lo.transform != null && hi.transform != null) {
+                        FloatArray(9) { i -> lo.transform!![i] + f * (hi.transform!![i] - lo.transform!![i]) }
+                    } else lo.transform ?: hi.transform,
+                    0.0,
+                )
+            }
+            lower != null && upper != null -> point(lower).let {
+                HarvestedWb(it.rGain, it.greenGain, it.bGain, it.transform, 0.0)
+            }
+            else -> {
+                val edge = lower ?: upper ?: return null
+                val p = point(edge)
+                HarvestedWb(
+                    p.rGain, p.greenGain, p.bGain, p.transform,
+                    kotlin.math.abs(1e6 / kelvin - 1e6 / edge),
+                )
+            }
+        }
+    }
+
+    /** Mired-linear interpolation over the measured table, clamped at the measured ends. */
+    private fun interpolateWbCal(kelvin: Double, select: (WbCalPoint) -> Double): Double? {
+        val lut = wbCalibration ?: return null
+        if (kelvin <= lut.first().kelvin) return select(lut.first())
+        if (kelvin >= lut.last().kelvin) return select(lut.last())
+        val upper = lut.first { it.kelvin >= kelvin }
+        val lower = lut.last { it.kelvin <= kelvin }
+        if (upper === lower) return select(lower)
+        val t = ((1e6 / kelvin) - (1e6 / lower.kelvin)) / ((1e6 / upper.kelvin) - (1e6 / lower.kelvin))
+        return select(lower) + t * (select(upper) - select(lower))
+    }
+
+    /** The measured gains curve at one kelvin; null when the table is tr/tb-only. */
+    private fun measuredWbGains(kelvin: Double): Pair<Double, Double>? {
+        val r = interpolateWbCal(kelvin) { it.rGain } ?: return null
+        val b = interpolateWbCal(kelvin) { it.bGain } ?: return null
+        if (r.isNaN() || b.isNaN()) return null
+        return r to b
+    }
+
+    /** The measured rendered-output diagonal at one kelvin, when the table carries one. */
+    private fun measuredWbTransformFix(kelvin: Double): Pair<Double, Double>? {
+        val tr = interpolateWbCal(kelvin) { it.tr } ?: return null
+        val tb = interpolateWbCal(kelvin) { it.tb } ?: return null
+        if (tr == 1.0 && tb == 1.0) return null
+        return tr to tb
+    }
+
+    /**
+     * This sensor's factory colour calibration, DNG-style: the XYZ-to-sensor matrix at each of
+     * the two reference illuminants (calibration transform folded in where present), plus each
+     * illuminant's correlated colour temperature. Read once at probe time. This is the same
+     * per-unit data Samsung's own pipeline is calibrated from, and it is what lets the manual
+     * kelvin dial follow the SENSOR's real colour locus instead of an idealised sRGB black body
+     * — the black-body model pins green and so cannot express the green-to-magenta axis at all,
+     * which is why 10000K used to render yellow where the native app renders magenta-warm.
+     */
+    private class SensorColorCalibration(
+        val cct1: Double,
+        val m1: Array<DoubleArray>,
+        val cct2: Double,
+        val m2: Array<DoubleArray>,
+    )
+
+    @Volatile private var sensorColorCalibration: SensorColorCalibration? = null
 
     /** AE's last chosen pair, so a lone manual ISO or shutter inherits a sane partner. */
     @Volatile private var lastAeExposureNs: Long? = null
@@ -972,7 +1426,6 @@ class CameraRuntimeController(
                 }
             }
             boundMacroStop = false
-            lastAppliedExposureIndex = null
             lastAppliedFlash = null
             focusRampBuilder = null
             Log.d(
@@ -1235,6 +1688,31 @@ class CameraRuntimeController(
             val evRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
             val evStep = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
                 ?.let { it.numerator.toDouble() / it.denominator.toDouble() }
+                ?: 0.1
+            // The native Pro camera sizes its rulers from Samsung's VENDOR characteristics, not
+            // the public ones, and both diverge on this hardware: aeCompensationRange is [-40,40]
+            // (+/-4.0 EV) against the public [-20,20], and the vendor exposureTimeRange floor is
+            // 1/12000 against the public ~1/20000 — the stock dial's actual fast stop. Reading
+            // them here is what lets the catalog clip its native tables to the native window.
+            // Both are CameraCharacteristics values resolved through the global vendor tag
+            // descriptor; on hardware where they do not resolve, the public window stands and
+            // the dials honestly show the narrower range.
+            val vendorEvRange = vendorCharacteristic(chars, "samsung.android.control.aeCompensationRange", IntArray::class.java)
+                ?.takeIf { it.size >= 2 }
+            val vendorExposureRange = vendorCharacteristic(chars, "samsung.android.sensor.info.exposureTimeRange", LongArray::class.java)
+                ?.takeIf { it.size >= 2 }
+            val evIndexLower = vendorEvRange?.get(0) ?: evRange?.lower
+            val evIndexUpper = vendorEvRange?.get(1) ?: evRange?.upper
+            evCompensationIndexRange = if (evIndexLower != null && evIndexUpper != null) {
+                android.util.Range(evIndexLower, evIndexUpper)
+            } else {
+                null
+            }
+            // Fast floor: the native dial is trimmed by the vendor floor (1/12000 here), never by
+            // the public one. Fall back to the same constant the native table implies, but never
+            // below what this sensor can actually do.
+            val shutterFloorNs = (vendorExposureRange?.get(0) ?: CameraCatalog.SHUTTER_NATIVE_MIN_NS)
+                .coerceAtLeast(exposureRange?.lower ?: CameraCatalog.SHUTTER_NATIVE_MIN_NS)
             val minFocus = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
             val zoomMax: Double? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper?.toDouble()
@@ -1244,18 +1722,37 @@ class CameraRuntimeController(
             val caps = CameraCapabilities(
                 isoMin = isoRange?.lower,
                 isoMax = isoRange?.upper,
-                exposureMinNs = exposureRange?.lower,
+                exposureMinNs = if (exposureRange != null) shutterFloorNs else null,
+                // The public ceiling stands: the vendor 30 s tail is the stock app's private
+                // still-capture pipeline, not a live-preview range this session can hold.
                 exposureMaxNs = exposureRange?.upper,
-                evMin = if (evRange != null && evStep != null) evRange.lower * evStep else null,
-                evMax = if (evRange != null && evStep != null) evRange.upper * evStep else null,
+                evMin = evIndexLower?.let { it * evStep },
+                evMax = evIndexUpper?.let { it * evStep },
                 manualFocusSupported = minFocus > 0f,
                 zoomMaxRatio = zoomMax,
             )
-            Log.i(TAG, "Camera capabilities probed: $caps")
+            sensorColorCalibration = runCatching { readSensorColorCalibration(chars) }.getOrNull()
+            Log.i(
+                TAG,
+                "Camera capabilities probed: $caps (vendorEv=${vendorEvRange?.contentToString()} " +
+                    "vendorExp=${vendorExposureRange?.contentToString()} evStep=$evStep " +
+                    "sensorColorCal=${sensorColorCalibration?.let { "${it.cct1.toInt()}K/${it.cct2.toInt()}K" }})",
+            )
             onCapabilities?.invoke(caps)
         } catch (e: Exception) {
             Log.w(TAG, "Capability probe failed: ${e.message}")
         }
+    }
+
+    /** A Samsung vendor characteristic by name, or null wherever the tag does not resolve. */
+    private fun <T> vendorCharacteristic(
+        chars: android.hardware.camera2.CameraCharacteristics,
+        name: String,
+        type: Class<T>,
+    ): T? = try {
+        chars.get(CameraCharacteristics.Key(name, type))
+    } catch (_: Exception) {
+        null
     }
 
     private fun detectDeviceCapabilitiesViaCameraManager() {
@@ -1451,6 +1948,7 @@ class CameraRuntimeController(
             iso = currentValue(cameraState, ".iso"),
             shutter = currentValue(cameraState, ".shutter_speed"),
             resolution = desiredResolutionValue(cameraState),
+            frameRate = currentValue(cameraState, ".frame_rate"),
             waterPressureKpa = latestWaterPressureKpa?.takeIf { filterValue == "Auto" },
             atmosphericPressureKpa = latestAtmosphericPressureKpa?.takeIf { filterValue == "Auto" },
         )
@@ -1532,8 +2030,9 @@ class CameraRuntimeController(
             }
         } else {
             // ── CAMERAX MODE (no session captured yet) ───────────────────
+            // EV rides applyCamera2Options' bundle, not a separate CameraX call: two writers
+            // alternating on the same session is what used to make the preview pulse.
             applyFlash(cameraState)
-            applyExposure(cameraState, boundCamera)
             applyCamera2Options(cameraState, boundCamera)
             if (nativeFocusActive) {
                 nativeFocusActive = false
@@ -1571,6 +2070,112 @@ class CameraRuntimeController(
      * Includes ALL camera settings (focus, AE, AWB, ISO, shutter, HDR).
      * CameraX is completely bypassed — no CameraControl calls while this is active.
      */
+    /**
+     * Everything about the frame's LOOK — tonemap, white balance, ISO/shutter, EV, flash — in
+     * one writer, shared by the full repeating request AND the cached focus-ramp builder.
+     *
+     * It exists because these used to live inline in [submitNativeRepeatingRequest] only, while
+     * [commandFocusDistance]'s cached builder carried a bare TEMPLATE_PREVIEW: the moment any
+     * focus step ran, the repeating request silently reverted to template defaults — AWB auto,
+     * AE on, no EV, no LOG curve — and every manual exposure setting fell off the frame until
+     * the next full rebuild. "Adjusting focus changes my white balance" was exactly this.
+     */
+    private fun populateSessionLook(
+        builder: CaptureRequest.Builder,
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ) {
+        // ── HDR / LOG ──
+        when (resolvedHdrLogMode(cameraState)) {
+            "HDR" -> {
+                builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
+                builder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
+            }
+            "LOG" -> {
+                builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                builder.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
+                builder.set(CaptureRequest.TONEMAP_CURVE, flatLogCurve())
+            }
+            else -> builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+        }
+
+        // ── White Balance ──
+        val filterProfile = underwaterFilterProfile(
+            value = currentValue(cameraState, ".filters"),
+            depthMeters = currentDepthMeters(),
+        )
+        if (filterProfile != null) {
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, filterProfile)
+            lastAutoColorTransform?.let { builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
+        } else {
+            val wbValue = currentValue(cameraState, ".white_balance")
+            val kelvin = wbValue?.removeSuffix("K")?.toIntOrNull()
+            if (wbValue != null && wbValue != "Auto" && kelvin != null) {
+                val colour = manualWbColour(kelvin)
+                builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+                builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+                builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, colour.first)
+                colour.second?.let { builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
+            } else {
+                builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+            }
+        }
+
+        // ── AE / ISO / Shutter ──
+        // Manual exposure per the Camera2 contract: AE OFF requires BOTH a sensitivity
+        // and an exposure time in the request, or the missing half falls to a template
+        // default. Like the native Pro camera, a lone manual ISO (or shutter) keeps its
+        // partner at whatever auto-exposure last chose, observed live off the pipe.
+        val isoValue = currentValue(cameraState, ".iso")?.toIntOrNull()
+        val shutterNs = currentValue(cameraState, ".shutter_speed")?.let { parseShutterNs(it) }
+        // Native video rule (AeAfController): a manual shutter in a recording mode pins
+        // SENSOR_FRAME_DURATION to one frame period, so a slow shutter can never stretch
+        // the frame and sag the recording's rate; the exposure is clamped to the same
+        // period. The catalog already clips the DIAL to the frame period — this is the
+        // write-time backstop for values arriving from persistence or mid-change states.
+        val framePeriodNs = if (shutterNs != null) CameraCatalog.videoShutterCapNs(cameraState) else null
+        if (isoValue != null || shutterNs != null) {
+            val info = Camera2CameraInfo.from(boundCamera.cameraInfo)
+            val isoRange = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            val exposureRange = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            val iso = isoValue ?: lastAeSensitivity ?: 800
+            val exposure = (shutterNs ?: lastAeExposureNs ?: 16_666_666L)
+                .let { ns -> framePeriodNs?.let { ns.coerceAtMost(it) } ?: ns }
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+            if (isoRange != null) {
+                builder.set(CaptureRequest.SENSOR_SENSITIVITY, iso.coerceIn(isoRange.lower, isoRange.upper))
+            }
+            if (exposureRange != null) {
+                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure.coerceIn(exposureRange.lower, exposureRange.upper))
+            }
+            framePeriodNs?.let { builder.set(CaptureRequest.SENSOR_FRAME_DURATION, it) }
+        } else {
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+        }
+        val aeOff = isoValue != null || shutterNs != null
+
+        // ── Exposure Compensation (pass through when AE is ON) ──
+        // With AE off the index means nothing and the native app flips EV to a read-only
+        // meter — the reducer refuses the detents, and nothing is written here.
+        if (!aeOff) {
+            val ev = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
+                ?.replace("+", "")?.toDoubleOrNull()
+            if (ev != null) {
+                builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evCompensationIndex(boundCamera, ev))
+            }
+        }
+
+        // ── Flash ──
+        val flashValue = currentValue(cameraState, ".flash")
+        if (flashValue == "On" || flashValue == "Torch") {
+            builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_TORCH)
+        } else {
+            builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+        }
+    }
+
     private fun submitNativeRepeatingRequest(cameraState: CameraState, boundCamera: Camera): Boolean {
         val session = cam2Session
         val surfaces = cam2Surfaces
@@ -1619,6 +2224,9 @@ class CameraRuntimeController(
             return true
         }
         try {
+            // The cached focus-step builder snapshots the look; a full rebuild means the look
+            // may have changed, so the snapshot is dropped and the next focus step re-takes it.
+            focusRampBuilder = null
             val builder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             surfaces.forEach { builder.addTarget(it) }
             builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
@@ -1657,92 +2265,7 @@ class CameraRuntimeController(
                 applyNativeFocusRequest(builder, cameraState, manualFocusRequest, session.device.id)
             }
 
-            // ── HDR / LOG ──
-            when (resolvedHdrLogMode(cameraState)) {
-                "HDR" -> {
-                    builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
-                    builder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
-                }
-                "LOG" -> {
-                    builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                    builder.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
-                    builder.set(CaptureRequest.TONEMAP_CURVE, flatLogCurve())
-                }
-                else -> builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-            }
-
-            // ── White Balance ──
-            val filterProfile = underwaterFilterProfile(
-                value = currentValue(cameraState, ".filters"),
-                depthMeters = currentDepthMeters(),
-            )
-            if (filterProfile != null) {
-                builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
-                builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-                builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, filterProfile)
-                lastAutoColorTransform?.let { builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
-            } else {
-                val wbValue = currentValue(cameraState, ".white_balance")
-                val kelvin = wbValue?.removeSuffix("K")?.toIntOrNull()
-                if (wbValue != null && wbValue != "Auto" && kelvin != null) {
-                    builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
-                    builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-                    builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, colorGainsForKelvin(kelvin))
-                    lastAutoColorTransform?.let {
-                        builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it)
-                    }
-                } else {
-                    builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-                }
-            }
-
-            // ── AE / ISO / Shutter ──
-            // Manual exposure per the Camera2 contract: AE OFF requires BOTH a sensitivity
-            // and an exposure time in the request, or the missing half falls to a template
-            // default. Like the native Pro camera, a lone manual ISO (or shutter) keeps its
-            // partner at whatever auto-exposure last chose, observed live off the pipe.
-            val isoValue = currentValue(cameraState, ".iso")?.toIntOrNull()
-            val shutterNs = currentValue(cameraState, ".shutter_speed")?.let { parseShutterNs(it) }
-            if (isoValue != null || shutterNs != null) {
-                val info = Camera2CameraInfo.from(boundCamera.cameraInfo)
-                val isoRange = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-                val exposureRange = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-                val iso = isoValue ?: lastAeSensitivity ?: 800
-                val exposure = shutterNs ?: lastAeExposureNs ?: 16_666_666L
-                builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                if (isoRange != null) {
-                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, iso.coerceIn(isoRange.lower, isoRange.upper))
-                }
-                if (exposureRange != null) {
-                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure.coerceIn(exposureRange.lower, exposureRange.upper))
-                }
-            } else {
-                builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
-            }
-            val aeOff = isoValue != null || shutterNs != null
-
-            // ── Exposure Compensation (pass through when AE is ON) ──
-            if (!aeOff) {
-                val ev = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
-                    ?.replace("+", "")?.toDoubleOrNull()
-                if (ev != null) {
-                    val exposureState = boundCamera.cameraInfo.exposureState
-                    val step = exposureState.exposureCompensationStep.toFloat().takeIf { it > 0f } ?: 0.1f
-                    val idx = (ev / step).roundToInt().coerceIn(
-                        exposureState.exposureCompensationRange.lower,
-                        exposureState.exposureCompensationRange.upper,
-                    )
-                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, idx)
-                }
-            }
-
-            // ── Flash ──
-            val flashValue = currentValue(cameraState, ".flash")
-            if (flashValue == "On" || flashValue == "Torch") {
-                builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_TORCH)
-            } else {
-                builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
-            }
+            populateSessionLook(builder, cameraState, boundCamera)
 
             session.setRepeatingRequest(builder.build(), sessionCaptureCallback, cameraRequestHandler)
             // Gated, and the capability lookup moved INSIDE the guard: composing this line cost
@@ -1810,7 +2333,7 @@ class CameraRuntimeController(
     private fun applyFlash(cameraState: CameraState) {
         val flashValue = currentValue(cameraState, ".flash") ?: return
         val capture = imageCapture ?: return
-        // Same reasoning as applyExposure: re-asserting the torch on every focus step disturbs 3A.
+        // Re-asserting the torch on every focus step disturbs 3A, so unchanged values cost nothing.
         if (flashValue == lastAppliedFlash) return
         lastAppliedFlash = flashValue
         capture.flashMode = when (flashValue) {
@@ -1819,26 +2342,6 @@ class CameraRuntimeController(
             else -> ImageCapture.FLASH_MODE_OFF
         }
         camera?.cameraControl?.enableTorch(flashValue == "On" || flashValue == "Torch")
-    }
-
-    private fun applyExposure(cameraState: CameraState, boundCamera: Camera) {
-        val exposureValue = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
-            ?.replace("+", "")
-            ?.toDoubleOrNull()
-            ?: return
-        val exposureState = boundCamera.cameraInfo.exposureState
-        val compensationStep = exposureState.exposureCompensationStep.toFloat().takeIf { it > 0f } ?: 0.1f
-        val requestedIndex = (exposureValue / compensationStep).roundToInt()
-        val clamped = requestedIndex.coerceIn(
-            exposureState.exposureCompensationRange.lower,
-            exposureState.exposureCompensationRange.upper,
-        )
-        // Idempotent: re-issuing the same index makes CameraX rebuild its request and the HAL
-        // re-converge auto-exposure, which reads on screen as a brightness pulse. Focus moves
-        // re-run this method on every step, so an unchanged value must cost nothing.
-        if (clamped == lastAppliedExposureIndex) return
-        lastAppliedExposureIndex = clamped
-        boundCamera.cameraControl.setExposureCompensationIndex(clamped)
     }
 
     private fun applyZoom(cameraState: CameraState, boundCamera: Camera) {
@@ -1922,10 +2425,11 @@ class CameraRuntimeController(
             val wbValue = currentValue(cameraState, ".white_balance")
             val kelvin = wbValue?.removeSuffix("K")?.toIntOrNull()
             if (wbValue != null && wbValue != "Auto" && kelvin != null) {
+                val colour = manualWbColour(kelvin)
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
                 builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-                builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_GAINS, colorGainsForKelvin(kelvin))
-                lastAutoColorTransform?.let {
+                builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_GAINS, colour.first)
+                colour.second?.let {
                     builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it)
                 }
             } else {
@@ -1943,13 +2447,15 @@ class CameraRuntimeController(
         // --- ISO / Shutter: manual exposure needs the full pair (see native path) ---
         val isoValue = currentValue(cameraState, ".iso")?.toIntOrNull()
         val shutterNs = currentValue(cameraState, ".shutter_speed")?.let { parseShutterNs(it) }
+        val framePeriodNs = if (shutterNs != null) CameraCatalog.videoShutterCapNs(cameraState) else null
         if (isoValue != null || shutterNs != null) {
             try {
                 val info = Camera2CameraInfo.from(boundCamera.cameraInfo)
                 val isoRange = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 val exposureRange = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
                 val iso = isoValue ?: lastAeSensitivity ?: 800
-                val exposure = shutterNs ?: lastAeExposureNs ?: 16_666_666L
+                val exposure = (shutterNs ?: lastAeExposureNs ?: 16_666_666L)
+                    .let { ns -> framePeriodNs?.let { ns.coerceAtMost(it) } ?: ns }
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                 if (isoRange != null) {
                     builder.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso.coerceIn(isoRange.lower, isoRange.upper))
@@ -1957,7 +2463,23 @@ class CameraRuntimeController(
                 if (exposureRange != null) {
                     builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure.coerceIn(exposureRange.lower, exposureRange.upper))
                 }
+                framePeriodNs?.let { builder.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, it) }
             } catch (_: Exception) { }
+        } else {
+            // --- Exposure Compensation (only meaningful while AE is ON) ---
+            // Written through THIS bundle, never through CameraX's
+            // setExposureCompensationIndex: that API validates against the public range and
+            // rejects the +/-4.0 half of the native Pro window outright, while the interop
+            // bundle is unvalidated and wins the request merge — the same channel that carries
+            // the vendor focus key. One writer, one bundle, no 3A tug-of-war.
+            val ev = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
+                ?.replace("+", "")?.toDoubleOrNull()
+            if (ev != null) {
+                builder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                    evCompensationIndex(boundCamera, ev),
+                )
+            }
         }
 
         try {
@@ -1968,22 +2490,34 @@ class CameraRuntimeController(
         }
     }
 
-    private fun parseShutterNs(value: String): Long? {
-        if (value == "Auto") return null
-        return if (value.endsWith("\"")) {
-            value.removeSuffix("\"").toDoubleOrNull()?.let { (it * 1_000_000_000L).toLong() }
+    /**
+     * EV in stops -> the compensation INDEX, clamped to the window the capability probe read —
+     * the vendor aeCompensationRange ([-40,40] = +/-4.0 EV here, the native Pro dial's true
+     * span) where it resolves, the public range otherwise. Deliberately NOT
+     * ExposureState.exposureCompensationRange, which only ever knows the public window.
+     */
+    private fun evCompensationIndex(boundCamera: Camera, ev: Double): Int {
+        val exposureState = boundCamera.cameraInfo.exposureState
+        val step = exposureState.exposureCompensationStep.toFloat().takeIf { it > 0f } ?: 0.1f
+        val idx = (ev / step).roundToInt()
+        val widened = evCompensationIndexRange
+        return if (widened != null) {
+            idx.coerceIn(widened.lower, widened.upper)
         } else {
-            val parts = value.split("/")
-            if (parts.size == 2) {
-                val num = parts[0].toDoubleOrNull() ?: return null
-                val den = parts[1].toDoubleOrNull() ?: return null
-                if (den == 0.0) return null
-                ((num / den) * 1_000_000_000L).toLong()
-            } else {
-                null
-            }
+            idx.coerceIn(
+                exposureState.exposureCompensationRange.lower,
+                exposureState.exposureCompensationRange.upper,
+            )
         }
     }
+
+    /**
+     * One parser, [CameraCatalog.shutterOptionNanos], shared with the reducer's effect mapper and
+     * with capability clipping. This used to be a private near-copy that rejected bare-seconds
+     * labels, so a rung clipping had accepted could reach the strip and never reach the capture
+     * request — auto-exposure silently left on under a manual-looking HUD.
+     */
+    private fun parseShutterNs(value: String): Long? = CameraCatalog.shutterOptionNanos(value)
 
     private fun openGallery() {
         val intents = buildList {
@@ -2979,13 +3513,361 @@ class CameraRuntimeController(
         return TonemapCurve(channel, channel, channel)
     }
 
+    /** The mode's manual kelvin, or null when white balance sits on Auto (or has no dial). */
+    private fun manualWbKelvin(cameraState: CameraState): Int? {
+        val wb = currentValue(cameraState, ".white_balance") ?: return null
+        if (wb == "Auto") return null
+        return wb.removeSuffix("K").toIntOrNull()
+    }
+
+    /** White balance is genuinely auto: no manual kelvin, and no underwater filter owning the gains. */
+    private fun wbIsAuto(cameraState: CameraState): Boolean {
+        val filters = currentValue(cameraState, ".filters")
+        if (filters != null && filters != "Off") return false
+        return manualWbKelvin(cameraState) == null
+    }
+
+    /**
+     * The complete manual white-balance rendering for a kelvin: gains AND colour transform.
+     *
+     * Preferred route computes BOTH halves from the sensor's factory calibration —
+     * [wbPipeline] — with a continuity correction folded into the transform so that at the
+     * anchor kelvin the output is EXACTLY the frame the HAL's own AWB was rendering (that is
+     * what makes Auto-to-manual seamless). Away from the anchor, the hue follows the
+     * illuminant-matched matrix: warm renderings pull green DOWN toward magenta, which channel
+     * gains alone can never do — the reason both the raw-gains route and Samsung's
+     * gains-only vendor route read yellow at 10000K where the native app reads magenta.
+     *
+     * Fallback (no calibration matrices): the anchor-ratio gains with the AWB's latched
+     * transform, which still colour-matches the conversion point.
+     */
+    private fun manualWbColour(
+        kelvin: Int,
+    ): Pair<RggbChannelVector, android.hardware.camera2.params.ColorSpaceTransform?> {
+        // ONE CONTINUOUS CURVE from 2300K to 10000K — the field's requirement, verbatim: "one
+        // smooth spectrum". The smooth analytic backbone (sensor calibration + measured LUT)
+        // covers the whole dial; the harvested AWB curve — "corrects just like auto, but
+        // manually" — BLENDS over it by a weight that is 1 inside the harvested span and fades
+        // to 0 over [WB_HARVEST_FADE_MIRED] beyond its ends. No priority switch, no seam:
+        // inside coverage manual IS the auto correction, far outside it is the calibrated
+        // curve, and in between every rung moves a little of both.
+        val backbone = computedWbColour(kelvin)
+            ?: (anchoredWbGains(kelvin) to lastAutoColorTransform)
+        val harvested = harvestedWbAt(kelvin) ?: return backbone
+        val weight = (1.0 - harvested.distanceMired / WB_HARVEST_FADE_MIRED).coerceIn(0.0, 1.0).toFloat()
+        if (weight <= 0f) return backbone
+        val baseGains = backbone.first
+        val gains = RggbChannelVector(
+            baseGains.red + weight * (harvested.rGain - baseGains.red),
+            baseGains.greenEven + weight * (harvested.greenGain - baseGains.greenEven),
+            baseGains.greenOdd + weight * (harvested.greenGain - baseGains.greenOdd),
+            baseGains.blue + weight * (harvested.bGain - baseGains.blue),
+        )
+        val harvestedT = harvested.transform
+        val baseT = backbone.second
+        val transform = when {
+            harvestedT == null -> baseT
+            baseT == null || weight >= 1f -> {
+                val elements = IntArray(18)
+                var i = 0
+                for (v in harvestedT) {
+                    if (!v.isFinite()) return backbone
+                    elements[i++] = Math.round(v * 10_000f); elements[i++] = 10_000
+                }
+                android.hardware.camera2.params.ColorSpaceTransform(elements)
+            }
+            else -> {
+                val elements = IntArray(18)
+                var i = 0
+                for (idx in 0..8) {
+                    val baseV = baseT.getElement(idx % 3, idx / 3).toFloat()
+                    val v = baseV + weight * (harvestedT[idx] - baseV)
+                    if (!v.isFinite()) return backbone
+                    elements[i++] = Math.round(v * 10_000f); elements[i++] = 10_000
+                }
+                android.hardware.camera2.params.ColorSpaceTransform(elements)
+            }
+        }
+        return gains to transform
+    }
+
+    private class WbPipeline(val gains: RggbChannelVector, val transform: Array<DoubleArray>)
+
+    /**
+     * The DNG-style rendering pipeline at one kelvin, in Camera2's decomposition:
+     * raw -> diag(gains) -> transform -> linear sRGB.
+     *
+     *   gains: reciprocal of the sensor's response to the illuminant, green-normalised.
+     *   transform: XYZtoSRGB x Bradford(WP_K -> D65) x inv(M_K) x inv(diag(gains))
+     *
+     * so that for ANY scene colour, out = XYZtoSRGB x CAT x XYZ — the correct rendering under
+     * the declared illuminant, hue axis included.
+     */
+    private fun wbPipeline(cal: SensorColorCalibration, kelvin: Int): WbPipeline? {
+        val k = kelvin.coerceIn(2300, 10000).toDouble()
+        val (x, y) = whitePointXy(k)
+        if (y <= 1e-6) return null
+        val whiteXyz = doubleArrayOf(x / y, 1.0, (1.0 - x - y) / y)
+        val m = interpolatedSensorMatrix(cal, k)
+        val r = dot(m[0], whiteXyz)
+        val g = dot(m[1], whiteXyz)
+        val b = dot(m[2], whiteXyz)
+        if (r <= 1e-6 || g <= 1e-6 || b <= 1e-6) return null
+        // The MEASURED native curve wins where it exists; the matrix-derived ratio is the model
+        // for anything nobody has measured yet. These are the TRUE white ratios and may sit
+        // below 1 at warm kelvins.
+        val measured = measuredWbGains(k)
+        val rTrue = (measured?.first ?: (g / r)).coerceIn(0.1, 10.0)
+        val bTrue = (measured?.second ?: (g / b)).coerceIn(0.1, 10.0)
+        // MIN-NORMALISED, scalar folded into the transform. Real HALs accept only gains >= 1,
+        // and matrix hardware clamps CCM entries near +/-4 — so neither half may carry the whole
+        // warm-end correction alone. Normalising the gain triple to min = 1 keeps every channel
+        // gain hardware-legal (2300K becomes ~(1.0, 2.5, 7.8) instead of an illegal 0.4 red),
+        // and multiplying the transform by the SAME min scales its rows DOWN into range —
+        // net rendering identical, nothing clipped. The old green-normalised form crushed red
+        // to black at 2300K twice over: first through the sub-1 gain, then through the 1/gain
+        // row the matrix had to carry.
+        val minGain = minOf(rTrue, 1.0, bTrue)
+        val mInv = invert3x3(m) ?: return null
+        val cat = bradfordCat(whiteXyz, D65_WHITE)
+        val trueGainsInv = diag3(1.0 / rTrue, 1.0, 1.0 / bTrue)
+        var transform = multiply3x3(
+            multiply3x3(XYZ_TO_SRGB, cat),
+            multiply3x3(mInv, trueGainsInv),
+        )
+        transform = Array(3) { row -> DoubleArray(3) { col -> transform[row][col] * minGain } }
+        // The measured rendered-output correction: a per-kelvin diagonal fitted from the
+        // native-vs-ours patch measurements, folded into the transform. This is what makes the
+        // dial numerically identical to the native app's rendering at the measured points.
+        measuredWbTransformFix(k)?.let { (tr, tb) ->
+            transform = multiply3x3(diag3(tr, 1.0, tb), transform)
+        }
+        // REBALANCE: matrix hardware clamps CCM entries near +/-4, and at the warm extreme the
+        // adaptation still overflows that even min-normalised — which is what kept crushing red
+        // at 2300K. Any overflow is traded into the gains (headroom to 16): scale the matrix
+        // down into range, scale every gain up by the same factor — the rendering is identical
+        // and every register stays legal.
+        var gainScale = 1.0
+        val maxAbs = transform.maxOf { row -> row.maxOf { kotlin.math.abs(it) } }
+        if (maxAbs > 3.9) {
+            gainScale = maxAbs / 3.9
+            transform = Array(3) { row -> DoubleArray(3) { col -> transform[row][col] / gainScale } }
+        }
+        val gains = RggbChannelVector(
+            (rTrue / minGain * gainScale).coerceIn(1.0, 16.0).toFloat(),
+            (1.0 / minGain * gainScale).coerceIn(1.0, 16.0).toFloat(),
+            (1.0 / minGain * gainScale).coerceIn(1.0, 16.0).toFloat(),
+            (bTrue / minGain * gainScale).coerceIn(1.0, 16.0).toFloat(),
+        )
+        // Calibration-fit visibility: whether a channel hit the 16x gain ceiling or the CCM
+        // rebalance is active decides whether a LUT tr/tb correction can actually be DELIVERED
+        // at this kelvin — saturation here means the fit must move to the rGain/bGain rows.
+        Log.i(
+            TAG,
+            "wbPipeline k=$kelvin rTrue=%.4f bTrue=%.4f minGain=%.4f gainScale=%.4f maxAbs=%.3f gains=[%.3f %.3f %.3f]"
+                .format(rTrue, bTrue, minGain, gainScale, maxAbs, gains.red, gains.greenEven, gains.blue),
+        )
+        return WbPipeline(gains, transform)
+    }
+
+    /** [wbPipeline] with the anchor-continuity correction, quantised for the capture request. */
+    private fun computedWbColour(
+        kelvin: Int,
+    ): Pair<RggbChannelVector, android.hardware.camera2.params.ColorSpaceTransform>? {
+        val cal = sensorColorCalibration ?: return null
+        val base = wbPipeline(cal, kelvin) ?: return null
+        var transform = base.transform
+        // A measured calibration SUPERSEDES the AWB-continuity correction, by the field's own
+        // requirement: our MANUAL curve must equal the native app's manual rendering at every
+        // kelvin, and our AUTO is the same HAL AWB native uses — so the Auto-to-manual seam is
+        // then identical in both apps by construction. A seam-hiding correction here would make
+        // our manual deviate from native's manual near the conversion point, which is exactly
+        // what the requirement forbids.
+        val anchor = if (wbCalibration != null) null else lastAutoWbAnchor
+        val anchorTransform = anchor?.transform
+        if (anchor != null && anchorTransform != null) {
+            wbPipeline(cal, anchor.kelvin)?.let { reference ->
+                val halTotal = multiply3x3(toMatrix(anchorTransform), rggbDiag(anchor.gains))
+                invert3x3(multiply3x3(reference.transform, rggbDiag(reference.gains)))?.let { refInv ->
+                    // C x model(K_anchor) == HAL's rendering at the anchor, and C rides along
+                    // the whole dial: continuity exactly where the diver converted, calibrated
+                    // trajectory everywhere else.
+                    transform = multiply3x3(multiply3x3(halTotal, refInv), transform)
+                }
+            }
+        }
+        val quantised = toColorSpaceTransform(transform) ?: return null
+        return base.gains to quantised
+    }
+
+    private fun dot(row: DoubleArray, v: DoubleArray): Double =
+        row[0] * v[0] + row[1] * v[1] + row[2] * v[2]
+
+    private fun diag3(a: Double, b: Double, c: Double): Array<DoubleArray> = arrayOf(
+        doubleArrayOf(a, 0.0, 0.0),
+        doubleArrayOf(0.0, b, 0.0),
+        doubleArrayOf(0.0, 0.0, c),
+    )
+
+    private fun rggbDiag(gains: RggbChannelVector): Array<DoubleArray> = diag3(
+        gains.red.toDouble(),
+        ((gains.greenEven + gains.greenOdd) / 2.0).toDouble(),
+        gains.blue.toDouble(),
+    )
+
+    private fun invert3x3(m: Array<DoubleArray>): Array<DoubleArray>? {
+        val a = m[0][0]; val b = m[0][1]; val c = m[0][2]
+        val d = m[1][0]; val e = m[1][1]; val f = m[1][2]
+        val g = m[2][0]; val h = m[2][1]; val i = m[2][2]
+        val det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+        if (kotlin.math.abs(det) < 1e-9) return null
+        val inv = 1.0 / det
+        return arrayOf(
+            doubleArrayOf((e * i - f * h) * inv, (c * h - b * i) * inv, (b * f - c * e) * inv),
+            doubleArrayOf((f * g - d * i) * inv, (a * i - c * g) * inv, (c * d - a * f) * inv),
+            doubleArrayOf((d * h - e * g) * inv, (b * g - a * h) * inv, (a * e - b * d) * inv),
+        )
+    }
+
+    private fun bradfordCat(fromWhiteXyz: DoubleArray, toWhiteXyz: DoubleArray): Array<DoubleArray> {
+        val from = DoubleArray(3) { dot(BRADFORD[it], fromWhiteXyz) }
+        val to = DoubleArray(3) { dot(BRADFORD[it], toWhiteXyz) }
+        val scale = diag3(to[0] / from[0], to[1] / from[1], to[2] / from[2])
+        return multiply3x3(BRADFORD_INV, multiply3x3(scale, BRADFORD))
+    }
+
+    /** Row-major (numerator, denominator) pairs; null when the matrix has run away. */
+    private fun toColorSpaceTransform(
+        m: Array<DoubleArray>,
+    ): android.hardware.camera2.params.ColorSpaceTransform? {
+        val elements = IntArray(18)
+        var index = 0
+        for (row in 0..2) {
+            for (col in 0..2) {
+                val value = m[row][col]
+                if (!value.isFinite() || kotlin.math.abs(value) > 30.0) return null
+                elements[index++] = Math.round(value * 10_000).toInt()
+                elements[index++] = 10_000
+            }
+        }
+        return android.hardware.camera2.params.ColorSpaceTransform(elements)
+    }
+
+    /**
+     * Fallback gains when the device withholds its calibration matrices: the black-body (or
+     * calibrated, when available) curve re-based through the HAL's own AWB sample so the
+     * conversion point still colour-matches Auto:
+     *
+     *   gains(K) = halGains(K_anchor) * model(K) / model(K_anchor)
+     */
+    private fun anchoredWbGains(kelvin: Int): RggbChannelVector {
+        val model = colorGainsForKelvin(kelvin)
+        val anchor = lastAutoWbAnchor ?: return model
+        val modelAtAnchor = colorGainsForKelvin(anchor.kelvin)
+        fun calibrated(anchorGain: Float, target: Float, atAnchor: Float): Float =
+            (anchorGain * (target / atAnchor)).coerceIn(0.1f, 8.0f)
+        return RggbChannelVector(
+            calibrated(anchor.gains.red, model.red, modelAtAnchor.red),
+            calibrated(anchor.gains.greenEven, model.greenEven, modelAtAnchor.greenEven),
+            calibrated(anchor.gains.greenOdd, model.greenOdd, modelAtAnchor.greenOdd),
+            calibrated(anchor.gains.blue, model.blue, modelAtAnchor.blue),
+        )
+    }
+
+    /** The two reference-illuminant matrices, calibration transform folded in where present. */
+    private fun readSensorColorCalibration(
+        chars: android.hardware.camera2.CameraCharacteristics,
+    ): SensorColorCalibration? {
+        val ct1 = chars.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1) ?: return null
+        val ct2 = chars.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2) ?: return null
+        val cct1 = illuminantCct(chars.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1) ?: return null)
+            ?: return null
+        val cct2 = illuminantCct(
+            (chars.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2) ?: return null).toInt(),
+        ) ?: return null
+        if (cct1 == cct2) return null
+        val cal1 = chars.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1)
+        val cal2 = chars.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2)
+        val m1 = cal1?.let { multiply3x3(toMatrix(it), toMatrix(ct1)) } ?: toMatrix(ct1)
+        val m2 = cal2?.let { multiply3x3(toMatrix(it), toMatrix(ct2)) } ?: toMatrix(ct2)
+        return SensorColorCalibration(cct1, m1, cct2, m2)
+    }
+
+    /** CCTs of the EXIF illuminant codes Camera2 uses; null for codes we will not guess at. */
+    private fun illuminantCct(code: Int): Double? = when (code) {
+        1 -> 5503.0 // DAYLIGHT
+        2 -> 4230.0 // FLUORESCENT
+        3 -> 2856.0 // TUNGSTEN
+        17 -> 2856.0 // STANDARD_A
+        18 -> 4874.0 // STANDARD_B
+        19 -> 6774.0 // STANDARD_C
+        20 -> 5503.0 // D55
+        21 -> 6504.0 // D65
+        22 -> 7504.0 // D75
+        23 -> 5003.0 // D50
+        24 -> 3200.0 // ISO_STUDIO_TUNGSTEN
+        else -> null
+    }
+
+    /** ColorSpaceTransform stores getElement(column, row); we work row-major. */
+    private fun toMatrix(t: android.hardware.camera2.params.ColorSpaceTransform): Array<DoubleArray> =
+        Array(3) { row -> DoubleArray(3) { col -> t.getElement(col, row).toDouble() } }
+
+    private fun multiply3x3(a: Array<DoubleArray>, b: Array<DoubleArray>): Array<DoubleArray> =
+        Array(3) { r ->
+            DoubleArray(3) { c -> a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c] }
+        }
+
+    /**
+     * The white point's chromaticity at a colour temperature: the Planckian locus (Kim cubic
+     * approximation) below 4000K, the CIE DAYLIGHT locus at and above it. The daylight locus
+     * sits BELOW the Planckian one in y — toward magenta — and photographic kelvin dials mean
+     * D-series illuminants at the cold end, which is exactly the magenta component the pure
+     * black-body model could never produce at 10000K.
+     */
+    private fun whitePointXy(kelvin: Double): Pair<Double, Double> {
+        val t = kelvin
+        return if (t < 4000.0) {
+            val x = -0.2661239e9 / (t * t * t) - 0.2343589e6 / (t * t) + 0.8776956e3 / t + 0.179910
+            val y = if (t <= 2222.0) {
+                -1.1063814 * x * x * x - 1.34811020 * x * x + 2.18555832 * x - 0.20219683
+            } else {
+                -0.9549476 * x * x * x - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
+            }
+            x to y
+        } else {
+            val x = if (t <= 7000.0) {
+                -4.6070e9 / (t * t * t) + 2.9678e6 / (t * t) + 0.09911e3 / t + 0.244063
+            } else {
+                -2.0064e9 / (t * t * t) + 1.9018e6 / (t * t) + 0.24748e3 / t + 0.237040
+            }
+            val y = -3.0 * x * x + 2.87 * x - 0.275
+            x to y
+        }
+    }
+
+    /** DNG interpolation of the two reference matrices: weights linear in inverse CCT, clamped. */
+    private fun interpolatedSensorMatrix(cal: SensorColorCalibration, kelvin: Double): Array<DoubleArray> {
+        val w = (((1.0 / kelvin) - (1.0 / cal.cct2)) / ((1.0 / cal.cct1) - (1.0 / cal.cct2)))
+            .coerceIn(0.0, 1.0)
+        return Array(3) { r ->
+            DoubleArray(3) { c -> w * cal.m1[r][c] + (1.0 - w) * cal.m2[r][c] }
+        }
+    }
+
+    /** The gains half of [wbPipeline] alone, for the black-body fallback's calibrated cousin. */
+    private fun sensorCalibratedGains(kelvin: Int): RggbChannelVector? =
+        sensorColorCalibration?.let { cal -> wbPipeline(cal, kelvin)?.gains }
+
     /**
      * Manual white balance done to the Camera2 contract: AWB OFF is undefined without explicit
-     * colour-correction gains. Black-body white point (Tanner Helland fit) at the chosen
-     * kelvin, gains = reciprocal illuminant normalised to green — a scene lit at that kelvin
-     * renders neutral. 2300K boosts blue ~3x; 6500K is ~unity; 10000K leans warm.
+     * colour-correction gains. First choice is [sensorCalibratedGains] — the sensor's own
+     * factory colour locus; the black-body fit below is only the fallback for hardware that
+     * withholds its matrices. Never applied raw any more either way: [anchoredWbGains] re-bases
+     * whichever curve is in use through the HAL's live AWB sample.
      */
     private fun colorGainsForKelvin(kelvin: Int): RggbChannelVector {
+        sensorCalibratedGains(kelvin)?.let { return it }
         val t = kelvin.coerceIn(2300, 10000) / 100.0
         val r: Double
         val g: Double

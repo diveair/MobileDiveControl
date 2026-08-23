@@ -129,6 +129,7 @@ object CameraCatalog {
         val variant: GalaxyDeviceVariant,
         val lenses: List<String>,
         val capabilities: CameraCapabilities?,
+        val videoShutterCapNs: Long? = null,
     )
 
     /**
@@ -180,17 +181,53 @@ object CameraCatalog {
         variant: GalaxyDeviceVariant,
         detectedLenses: List<String>,
         capabilities: CameraCapabilities?,
+        videoShutterCapNs: Long? = null,
     ): List<CameraSettingSpec> {
         val base = settingsFor(mode, variant, detectedLenses)
-        if (capabilities == null) return base
-        // This is the reducer's per-tick call. Uncached it re-filtered the 162-entry exposure
-        // ladder on every focus nudge, each option running a regex-screened parse.
-        return cachedSettings(SettingsKey(mode, variant, detectedLenses, capabilities)) {
-            base.mapNotNull { spec -> applyCapabilities(spec, capabilities) }
+        if (capabilities == null && videoShutterCapNs == null) return base
+        // This is the reducer's per-tick call. Uncached it re-filtered every ladder on every
+        // focus nudge, each option running a parse.
+        return cachedSettings(SettingsKey(mode, variant, detectedLenses, capabilities, videoShutterCapNs)) {
+            base.mapNotNull { spec -> applyCapabilities(spec, capabilities, videoShutterCapNs) }
         }
     }
 
-    private fun applyCapabilities(spec: CameraSettingSpec, caps: CameraCapabilities): CameraSettingSpec? {
+    /**
+     * The slowest shutter this camera state may honestly offer: one frame period in a video
+     * mode, nothing anywhere else. This is exactly the native rule — ProUtil.getMaxVideoShutterSpeed
+     * caps the video dial at the longest table entry not exceeding the recording frame period
+     * (1/30 at 24-30 fps, 1/50 at 50, 1/60 at 60, 1/125 at 100/120), which filtering the ladder by
+     * `ns <= period` reproduces for every rate — and the native app also demotes an over-cap
+     * stored setting and pins SENSOR_FRAME_DURATION at write time, both mirrored in the runtime
+     * controller. Without this clamp, choosing 1/8 while recording at 30 fps stretched the frame
+     * duration and dragged the recording toward 8 fps.
+     */
+    fun videoShutterCapNs(camera: CameraState): Long? {
+        if (profile(camera.activeMode, camera.deviceVariant).captureType != CameraCaptureType.Video) return null
+        val frameRateId = modeKey(camera.activeMode) + ".frame_rate"
+        val fps = (camera.settingValues[frameRateId] ?: defaultSettingValues[frameRateId])
+            ?.removeSuffix("fps")?.toIntOrNull() ?: return null
+        if (fps <= 0) return null
+        // ROUNDED, not truncated: the native rule admits the table entry that IS one frame
+        // period (1/60 at 60 fps), and 1/60 spells 16666667 ns while truncating division gives
+        // 16666666 — a one-nanosecond error that would evict the native cap rung itself.
+        return Math.round(1_000_000_000.0 / fps)
+    }
+
+    /** [settingsFor] with every clamp the CameraState itself implies — the one call the reducer and UI share. */
+    fun settingsFor(camera: CameraState): List<CameraSettingSpec> = settingsFor(
+        camera.activeMode,
+        camera.deviceVariant,
+        camera.detectedLenses,
+        camera.capabilities,
+        videoShutterCapNs(camera),
+    )
+
+    private fun applyCapabilities(
+        spec: CameraSettingSpec,
+        caps: CameraCapabilities?,
+        videoShutterCapNs: Long? = null,
+    ): CameraSettingSpec? {
         fun clip(keep: (String) -> Boolean): CameraSettingSpec? {
             val kept = spec.options.filter(keep)
             if (kept.isEmpty()) return null
@@ -199,35 +236,64 @@ object CameraCatalog {
         }
         return when {
             spec.id.endsWith(".manual_focus") ->
-                if (caps.manualFocusSupported == false) null else spec
-            spec.id.endsWith(".iso") && caps.isoMin != null && caps.isoMax != null ->
+                if (caps?.manualFocusSupported == false) null else spec
+            spec.id.endsWith(".iso") && caps?.isoMin != null && caps.isoMax != null ->
                 clip { option ->
                     val value = option.filter { it.isDigit() }.toIntOrNull()
                     value == null || value in caps.isoMin..caps.isoMax
                 }
-            spec.id.endsWith(".shutter_speed") && caps.exposureMinNs != null && caps.exposureMaxNs != null ->
+            spec.id.endsWith(".shutter_speed") && (
+                (caps?.exposureMinNs != null && caps.exposureMaxNs != null) || videoShutterCapNs != null
+                ) ->
                 clip { option ->
-                    val ns = shutterOptionNanos(option)
-                    ns == null || ns in caps.exposureMinNs..caps.exposureMaxNs
+                    val ns = shutterOptionNanos(option) ?: return@clip true
+                    val floor = caps?.exposureMinNs ?: Long.MIN_VALUE
+                    val ceiling = minOf(
+                        caps?.exposureMaxNs ?: Long.MAX_VALUE,
+                        videoShutterCapNs ?: Long.MAX_VALUE,
+                    )
+                    ns in floor..ceiling
                 }
             (spec.id.endsWith(".exposure_value") || spec.id.endsWith(".exposure_compensation")) &&
-                caps.evMin != null && caps.evMax != null ->
+                caps?.evMin != null && caps.evMax != null ->
                 clip { option ->
                     val ev = option.replace("+", "").toDoubleOrNull()
                     ev == null || ev in caps.evMin..caps.evMax
                 }
+            // No .white_balance branch by design: kelvin WB is applied app-side through
+            // COLOR_CORRECTION_GAINS, not through a CameraCharacteristics range, the ladder's
+            // 2300..10000 bounds already match colorGainsForKelvin's own clamp, and the native
+            // app applies no per-lens or per-mode clipping to kelvin either.
             else -> spec
         }
     }
 
-    /** "1/8000" → 125000ns, "2\"" or "2s" → 2s in ns; null for AUTO and other words. */
-    private fun shutterOptionNanos(option: String): Long? {
-        val text = option.trim().removeSuffix("\"").removeSuffix("s")
-        return when {
-            text.startsWith("1/") -> text.drop(2).toDoubleOrNull()?.takeIf { it > 0 }
-                ?.let { (1_000_000_000L / it).toLong() }
-            else -> text.toDoubleOrNull()?.let { (it * 1_000_000_000L).toLong() }
+    /**
+     * The one shutter-label parser. "1/8000" → 125000 ns, "2\"" / "2s" / bare "2" → 2 s in ns;
+     * null for "Auto", for unparseable words and for anything non-positive.
+     *
+     * Public because it must be the ONLY one. There used to be three near-copies — this, the
+     * reducer's effect mapper and the runtime controller's capture-request builder — and they
+     * disagreed about bare seconds, so a label this parser accepted could pass capability
+     * clipping, reach the strip, and then produce neither an effect nor a capture-request change:
+     * auto-exposure silently left on while the HUD read a manual shutter. That is precisely the
+     * "never imply certainty where none exists" failure, so the parsers are now one function.
+     */
+    fun shutterOptionNanos(option: String): Long? {
+        val text = option.trim().removeSuffix("\"").removeSuffix("s").trim()
+        if (text.isEmpty()) return null
+        val seconds = if (text.contains('/')) {
+            val pieces = text.split('/')
+            if (pieces.size != 2) return null
+            val numerator = pieces[0].trim().toDoubleOrNull() ?: return null
+            val denominator = pieces[1].trim().toDoubleOrNull() ?: return null
+            if (denominator == 0.0) return null
+            numerator / denominator
+        } else {
+            text.toDoubleOrNull() ?: return null
         }
+        if (!seconds.isFinite() || seconds <= 0.0) return null
+        return Math.round(seconds * 1_000_000_000.0)
     }
 
     // --- the wheel's assignment -----------------------------------------------------------
@@ -269,12 +335,7 @@ object CameraCatalog {
 
     /** The spec the wheel currently drives, or null when the assignment is Zoom. */
     fun assignedSliderSpec(camera: CameraState): CameraSettingSpec? {
-        val settings = settingsFor(
-            camera.activeMode,
-            camera.deviceVariant,
-            camera.detectedLenses,
-            camera.capabilities,
-        )
+        val settings = settingsFor(camera)
         val assignSpec = sliderAssignmentSpec(camera.activeMode, settings)
         val choice = camera.settingValues[assignSpec.id] ?: assignSpec.defaultValue
         val suffixes = sliderTargetSuffixes[choice] ?: return null
@@ -320,12 +381,8 @@ object CameraCatalog {
 
     /** Whether the diver flipped the focus wheel for the active mode. */
     fun focusWheelReversed(camera: CameraState): Boolean {
-        val focus = settingsFor(
-            camera.activeMode,
-            camera.deviceVariant,
-            camera.detectedLenses,
-            camera.capabilities,
-        ).firstOrNull { it.id.endsWith(".manual_focus") } ?: return false
+        val focus = settingsFor(camera)
+            .firstOrNull { it.id.endsWith(".manual_focus") } ?: return false
         val spec = focusDirectionSpec(focus.id)
         return (camera.settingValues[spec.id] ?: spec.defaultValue) == "Reversed"
     }
@@ -418,8 +475,9 @@ object CameraCatalog {
         showMore: Boolean,
         detectedLenses: List<String> = emptyList(),
         capabilities: CameraCapabilities? = null,
+        videoShutterCapNs: Long? = null,
     ): List<BottomBarItem> {
-        val allSettings = settingsFor(mode, variant, detectedLenses, capabilities)
+        val allSettings = settingsFor(mode, variant, detectedLenses, capabilities, videoShutterCapNs)
 
         fun find(vararg suffixes: String): CameraSettingSpec? =
             allSettings.firstOrNull { spec -> suffixes.any { spec.id.endsWith(it) } }
@@ -448,13 +506,14 @@ object CameraCatalog {
         }
     }
 
-    /** The bar exactly as the reducer must see it: same lenses, same capabilities as the UI. */
+    /** The bar exactly as the reducer must see it: same lenses, same capabilities, same video clamp as the UI. */
     fun settingsBarItems(camera: CameraState): List<BottomBarItem> = settingsBarItems(
         mode = camera.activeMode,
         variant = camera.deviceVariant,
         showMore = camera.showMoreSettings,
         detectedLenses = camera.detectedLenses,
         capabilities = camera.capabilities,
+        videoShutterCapNs = videoShutterCapNs(camera),
     )
 
     /**
@@ -480,6 +539,95 @@ object CameraCatalog {
 
     fun currentValue(camera: CameraState, spec: CameraSettingSpec): String {
         return camera.settingValues[spec.id] ?: spec.defaultValue
+    }
+
+    /**
+     * When the EV dial has no authority and flips into a read-only meter.
+     *
+     * The native rule (ProBasePresenter.updateEvState) locks EV only when BOTH ISO and shutter
+     * are manual, because with one axis manual Samsung keeps AE metering the other through the
+     * vendor aeExtraMode priority channel — and EV still steers that metering. That channel is
+     * closed to third parties, so OUR lone-manual-axis implementation turns AE fully off and
+     * freezes the other axis; the compensation index then does nothing the moment EITHER axis is
+     * manual. The lock therefore follows what this app's sensor actually honours, not the native
+     * UI's wider window — a dial that turns while the sensor ignores it is exactly the false
+     * certainty CLAUDE.md forbids. This is also precisely the write-side gate: the controller
+     * writes EV only while neither axis is manual (`!aeOff`), and the two rules must agree.
+     */
+    fun evMeterLocked(camera: CameraState, spec: CameraSettingSpec): Boolean {
+        if (!spec.id.endsWith(".exposure_value") && !spec.id.endsWith(".exposure_compensation")) return false
+        val prefix = spec.id.substringBeforeLast('.')
+        val iso = camera.settingValues["$prefix.iso"]
+        val shutter = camera.settingValues["$prefix.shutter_speed"]
+        return (iso != null && iso != "Auto") || (shutter != null && shutter != "Auto")
+    }
+
+    /**
+     * Re-spells the four exposure scales' CURRENT values onto the capability-clipped ladders.
+     * Run when the hardware ranges arrive (UpdateCameraCapabilities).
+     *
+     * Persistence snaps against the FULL native tables because it cannot know this device, so a
+     * stored value can be a real native rung the probed window then removes — "0.5\"" on a
+     * sensor whose live-preview ceiling is 0.15 s. Left alone, the strip keeps showing a value
+     * the write path clamps away, and the reducer resolves the unfound value from index 0 on the
+     * next detent. The snap is nearest-by-value in each scale's own metric (log-space for the
+     * two multiplicative scales), never lands on "Auto", and passes through anything already on
+     * its clipped ladder — so it is idempotent and a no-op on the simulator.
+     */
+    fun resnapToClippedLadders(camera: CameraState): CameraState {
+        var values = camera.settingValues
+        CameraModeId.entries.forEach { mode ->
+            settingsFor(camera.copy(activeMode = mode))
+                .filter { spec -> spec.kind == CameraSettingKind.Slider }
+                .forEach { spec ->
+                    val magnitude: (String) -> Double? = when {
+                        spec.id.endsWith(".iso") ->
+                            { option -> option.toDoubleOrNull()?.takeIf { it > 0.0 }?.let { kotlin.math.ln(it) } }
+                        spec.id.endsWith(".shutter_speed") ->
+                            { option -> shutterOptionNanos(option)?.takeIf { it > 0L }?.let { kotlin.math.ln(it.toDouble()) } }
+                        spec.id.endsWith(".white_balance") ->
+                            { option -> option.removeSuffix("K").toDoubleOrNull() }
+                        spec.id.endsWith(".exposure_value") || spec.id.endsWith(".exposure_compensation") ->
+                            { option -> option.replace("+", "").toDoubleOrNull() }
+                        else -> return@forEach
+                    }
+                    val stored = values[spec.id] ?: return@forEach
+                    if (stored in spec.options) return@forEach
+                    val target = magnitude(stored) ?: return@forEach
+                    val nearest = spec.options
+                        .mapNotNull { option -> magnitude(option)?.let { option to it } }
+                        .minByOrNull { (_, value) -> kotlin.math.abs(value - target) }
+                        ?.first ?: return@forEach
+                    values = values + (spec.id to nearest)
+                }
+        }
+        return if (values === camera.settingValues) camera else camera.copy(settingValues = values)
+    }
+
+    /**
+     * The native auto-to-manual handoff (ProSliderContainerPresenter.onScrollStart): the first
+     * movement out of Auto lands on the rung nearest what auto-exposure / auto-white-balance is
+     * metering RIGHT NOW, not on the first rung of the dial. Distances are linear in the native
+     * app's own metric (findNearestIso, findNearestShutterSpeed, kelvin/100 rounding) and the
+     * candidates are the mode's CLIPPED options, so the seed can never name an unreachable rung.
+     * Null when there is no metered seed — no telemetry yet, or a setting that has no Auto
+     * conversion — and the caller steps the ladder normally instead.
+     */
+    fun meteredSeedValue(camera: CameraState, spec: CameraSettingSpec): String? {
+        val metered = camera.meteredExposure
+        return when {
+            spec.id.endsWith(".iso") -> metered.iso?.let { iso ->
+                spec.options.mapNotNull { option -> option.toIntOrNull()?.let { option to it } }
+                    .minByOrNull { (_, value) -> kotlin.math.abs(value - iso) }?.first
+            }
+            spec.id.endsWith(".shutter_speed") -> metered.shutterNs?.let { ns ->
+                nearestShutterOption(ns, spec.options)
+            }
+            spec.id.endsWith(".white_balance") -> metered.wbKelvin?.let { kelvin ->
+                nearestWhiteBalanceOption(kelvin, spec.options)
+            }
+            else -> null
+        }
     }
 
     fun focusAssistSettingId(focusSettingId: String): String? = when (focusSettingId) {
@@ -595,7 +743,7 @@ object CameraCatalog {
                 slider("photo.manual_focus", "Focus", "Core", focusOptions, "AF"),
                 toggle("photo.focus_peaking", "Focus Assist", "Assist"),
                 choice("photo.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
-                slider("photo.exposure_compensation", "EV", "Core", evOptions, "Auto"),
+                slider("photo.exposure_compensation", "EV", "Core", evQuickOptions, "0.0"),
                 choice("photo.hdr_log", "HDR / LOG", "Assist", listOf("HDR", "LOG", "Off"), "HDR"),
                 choice("photo.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
             ),
@@ -619,13 +767,13 @@ object CameraCatalog {
                 choice("expert.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
                 choice("expert.save_format", "RAW / JPEG", "Core", listOf("RAW", "JPEG", "RAW + JPEG"), "RAW + JPEG"),
                 choice("expert.lens", "Lens", "Core", lenses, "Auto"),
-                slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions(), "Auto"),
-                slider("expert.iso", "ISO", "Manual", isoOptions(), "100"),
+                slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions, "Auto"),
+                slider("expert.iso", "ISO", "Manual", isoOptions, "Auto"),
                 slider("expert.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("expert.focus_peaking", "Focus Assist", "Assist"),
                 choice("expert.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
-                slider("expert.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
-                slider("expert.exposure_value", "Exposure Value", "Manual", evOptions, "Auto"),
+                slider("expert.shutter_speed", "Shutter", "Manual", shutterOptions, "Auto"),
+                slider("expert.exposure_value", "Exposure Value", "Manual", evProOptions, "0.0"),
                 toggle("expert.exposure_monitor", "Exposure monitor", "Assist"),
                 choice("expert.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
                 choice("expert.grid", "Grid", "Assist", gridOptions(), "3x3"),
@@ -645,13 +793,13 @@ object CameraCatalog {
             availableExposureControls = listOf("White balance", "ISO", "Focus", "Shutter", "Exposure value"),
             availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid", "HDR"),
             settings = listOf(
-                slider("pro.white_balance", "White balance", "Manual", whiteBalanceOptions(), "Auto"),
-                slider("pro.iso", "ISO", "Manual", isoOptions(), "100"),
+                slider("pro.white_balance", "White balance", "Manual", whiteBalanceOptions, "Auto"),
+                slider("pro.iso", "ISO", "Manual", isoOptions, "Auto"),
                 slider("pro.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("pro.focus_peaking", "Focus Assist", "Assist"),
                 choice("pro.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
-                slider("pro.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
-                slider("pro.exposure_value", "Exposure Value", "Manual", evOptions, "Auto"),
+                slider("pro.shutter_speed", "Shutter", "Manual", shutterOptions, "Auto"),
+                slider("pro.exposure_value", "Exposure Value", "Manual", evProOptions, "0.0"),
                 choice("pro.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
                 choice("pro.lens", "Lens", "Core", lenses, "Auto"),
                 toggle("pro.exposure_monitor", "Exposure monitor", "Assist"),
@@ -691,7 +839,7 @@ object CameraCatalog {
                 choice("night.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Auto"),
                 choice("night.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
                 choice("night.lens", "Lens", "Core", lenses, "1x"),
-                slider("night.exposure", "Exposure Value", "Core", evOptions, "0", supportsSensitivity = false),
+                slider("night.exposure", "Exposure Value", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
                 choice("night.grid", "Grid", "Assist", gridOptions(), "3x3"),
             ),
         )
@@ -800,13 +948,13 @@ object CameraCatalog {
             availableAudioControls = listOf("Microphone", "Microphone gain"),
             availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid", "HDR", "LOG"),
             settings = listOf(
-                slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions(), "Auto"),
-                slider("pro_video.iso", "ISO", "Manual", isoOptions(), "100"),
+                slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions, "Auto"),
+                slider("pro_video.iso", "ISO", "Manual", isoOptions, "Auto"),
                 slider("pro_video.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("pro_video.focus_peaking", "Focus Assist", "Assist"),
                 choice("pro_video.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
-                slider("pro_video.shutter_speed", "Shutter", "Manual", shutterOptions(), "1/60"),
-                slider("pro_video.exposure_value", "Exposure Value", "Manual", evOptions, "Auto"),
+                slider("pro_video.shutter_speed", "Shutter", "Manual", shutterOptions, "Auto"),
+                slider("pro_video.exposure_value", "Exposure Value", "Manual", evProOptions, "0.0"),
                 slider("pro_video.frame_rate", "Frame rate", "Manual", frameRates, "30fps"),
                 choice("pro_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
                 choice("pro_video.lens", "Lens", "Core", lenses, "auto"),
@@ -938,40 +1086,182 @@ object CameraCatalog {
 
     private fun gridOptions(): List<String> = listOf("Off", "3x3", "Square")
 
-    private fun isoOptions(): List<String> = listOf("Auto", "50", "100", "200", "400", "800", "1600", "3200", "6400")
-
-    private fun shutterOptions(): List<String> = listOf(
-        "Auto",
-        "1/8000",
-        "1/4000",
-        "1/2000",
-        "1/1000",
-        "1/500",
-        "1/250",
-        "1/125",
-        "1/60",
-        "1/30",
-        "1/15",
-        "1/8",
-        "1/4",
-        "1/2",
-        "1\"",
-        "2\"",
-        "4\"",
-        "8\"",
-        "15\"",
-        "30\"",
+    /**
+     * The native camera's ISO table, VERBATIM: MakerParameter.SENSOR_SENSITIVITY_ARRAY minus its
+     * leading 0 (index 0 is the HAL's "let AE decide" sentinel — our "Auto"). Thirds of a stop
+     * from 50 to 800, then whole stops to 3200. Fifteen rungs on every device that runs the
+     * native APK — ProConstants.initializeIsoValues() carries no feature gate.
+     *
+     * The field asked for an exact native match, so the finer generated ladder this replaces is
+     * deliberately gone: same values, same count, same span as the stock Pro / Pro Video dial.
+     * Note what that means at the edges, because the native app means it too: manual ISO starts
+     * at 50 even though the sensor floor is 25 — the 25..49 band is Auto-only there and Auto-only
+     * here — and while ISO is on Auto the stock chip prints the raw metered integer from
+     * CaptureResult.SENSOR_SENSITIVITY (which is why a bright scene reads "25"). We reproduce
+     * that readout from [CameraState.meteredExposure].
+     *
+     * Identical in Pro photo and Pro Video: ISO is the one exposure control with no
+     * mode-dependent clamp in the native app.
+     */
+    internal val isoNativeValues = listOf(
+        50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1600, 3200,
     )
 
-    private fun whiteBalanceOptions(): List<String> =
-        listOf("Auto", "2300K", "2800K", "3200K", "4000K", "5600K", "6500K", "7500K", "8500K", "10000K")
+    private val isoOptions: List<String> by lazy {
+        buildList {
+            add("Auto")
+            isoNativeValues.forEach { add(it.toString()) }
+        }
+    }
+
+    /**
+     * The native camera's shutter table, VERBATIM: MakerParameter.EXPOSURE_TIME_ARRAY minus its
+     * leading 0 (Auto). Thirty-seven hand-written speeds from 1/24000 to 30 seconds — roughly
+     * half-stops, interrupted by a mains-flicker cluster at 1/60-1/50-1/45, a third-stop nudge at
+     * 1/8, and whole stops from 1" up. There is no closed-form formula behind it; it is a hand-made
+     * list and is COPIED, not generated, which is the field's explicit instruction.
+     *
+     * THE LABEL IS THE VALUE: every rung reaches the capture request by parsing its own text
+     * through [shutterOptionNanos], and each of these labels parses back to the native table's
+     * exact nanosecond entry (e.g. "1/180" -> 5555556, "1/45" -> 22222222, "0.3\"" -> 300000000).
+     * Sub-second rungs keep our `"` suffix where Samsung's dial prints a bare "0.3"/"1"/"30" —
+     * same value, established HUD spelling.
+     *
+     * What trims it, exactly as in the native app:
+     *  - the FAST end by the sensor: Samsung validates against the vendor characteristic
+     *    samsung.android.sensor.info.exposureTimeRange, whose floor is 1/12000 on every S24 lens
+     *    ([SHUTTER_NATIVE_MIN_NS]); [applyCapabilities] applies the same floor, so 1/24000 and
+     *    1/16000 exist in the table but never render there or here.
+     *  - the SLOW end by mode: in video the slowest rung is one frame period (1/30 at 30 fps,
+     *    1/60 at 60, 1/125 at 120 — ProUtil.getMaxVideoShutterSpeed), applied through
+     *    [settingsFor]'s videoShutterCapNs; in photo the ~0.15 s public live-preview ceiling
+     *    clips the long tail Samsung reaches only through its private still-capture pipeline.
+     *
+     * The 30" rung is gated behind SUPPORT_EXPAND_SHUTTER_SPEED in the native app; that flag is a
+     * CSC lookup we cannot read, so it ships and capability clipping decides.
+     */
+    private val shutterNativeLabels = listOf(
+        "1/24000", "1/16000", "1/12000", "1/8000", "1/6000", "1/4000", "1/3000", "1/2000",
+        "1/1500", "1/1000", "1/750", "1/500", "1/350", "1/250", "1/180", "1/125", "1/90",
+        "1/60", "1/50", "1/45", "1/30", "1/20", "1/15", "1/10", "1/8", "1/6", "1/4",
+        "0.3\"", "0.5\"", "1\"", "2\"", "4\"", "8\"", "10\"", "15\"", "20\"", "30\"",
+    )
+
+    /**
+     * The native app's fast-end floor: the lower bound of the vendor characteristic
+     * samsung.android.sensor.info.exposureTimeRange (83333 ns = 1/12000 on every S24 lens), which
+     * is what the stock camera's shutter dial is trimmed by — NOT the public
+     * SENSOR_INFO_EXPOSURE_TIME_RANGE, whose 49856 ns floor would admit 1/16000. The runtime
+     * controller reads the vendor tag when it can and falls back to this constant, so the dial
+     * matches the native one either way.
+     */
+    const val SHUTTER_NATIVE_MIN_NS = 83_333L
+
+    private val shutterOptions: List<String> by lazy {
+        buildList {
+            add("Auto")
+            addAll(shutterNativeLabels)
+        }.also { ladder ->
+            val nanos = ladder.drop(1).map { checkNotNull(shutterOptionNanos(it)) { "unparseable shutter label $it" } }
+            check(nanos.zipWithNext().all { (a, b) -> b > a }) { "shutter ladder not strictly increasing" }
+        }
+    }
+
+    /**
+     * The nearest native rung label to a live metered exposure, by linear nanosecond distance —
+     * the same metric as the native app's findNearestShutterSpeed. Used for the Auto readout
+     * (Samsung snaps the metered exposure to its table before printing it) and for seeding
+     * manual control from Auto. [options] is the mode's CLIPPED ladder so the snap can never
+     * name a rung the current mode cannot reach.
+     */
+    fun nearestShutterOption(ns: Long, options: List<String>): String? =
+        options.mapNotNull { option -> shutterOptionNanos(option)?.let { option to it } }
+            .minByOrNull { (_, value) -> kotlin.math.abs(value - ns) }?.first
+
+    /**
+     * The native camera's white-balance scale, VERBATIM: 78 rungs, 2300K to 10000K in flat 100K
+     * steps (kelvin_value in the decoded resources; MakerParameter.getColorTemperature is simply
+     * `step * 100`). The range is also exactly the HAL's declared domain —
+     * samsung.android.control.colorTemperatureRange reads [2300, 10000] on every camera id — and
+     * colorGainsForKelvin() clamps to the same pair. Same scale in Pro photo, Pro Video and the
+     * photo-mode WB menu; the native app applies no per-lens or per-mode clipping to kelvin, and
+     * neither do we.
+     *
+     * Auto is index 0 here (the native dial keeps Auto on a separate button — same semantics, our
+     * navigation). While Auto is active the stock slider prints the HAL's live AWB kelvin
+     * estimate snapped to the nearest 100K rung; we reproduce that from
+     * [CameraState.meteredExposure], and the first wheel movement out of Auto seeds manual WB
+     * from that estimate — the native auto-to-manual handoff.
+     *
+     * One honest divergence, by necessity: Samsung hands the kelvin number to the HAL on a vendor
+     * request tag (samsung.android.control.colorTemperature, AWB mode 101) and gets the vendor's
+     * calibrated conversion; that channel is closed to third parties, so we convert kelvin to
+     * COLOR_CORRECTION_GAINS app-side. Same dial, same numbers; the rendered cast at a given
+     * kelvin can differ from the stock app until calibrated against it.
+     */
+    /**
+     * The white-balance dial: [WB_LADDER_RUNGS] rungs from 2300K to 10000K, uniform in MIRED
+     * (reciprocal kelvin) rather than in kelvin, plus Auto at index 0.
+     *
+     * Mired is the perceptually near-uniform axis for white point: colour shift goes as 1/K, so
+     * a flat kelvin grid leaps at the warm end and crawls invisibly at the cold end. Uniform
+     * mired makes EVERY detent the same perceived size — the "consistent, smoothly adjustable,
+     * continuous" scale the field asked for — and at ~2.5 mired per rung each step sits right at
+     * the just-noticeable white-point shift, the finest spacing where every rung is still a real
+     * change. The application pipeline (harvested AWB curve + calibrated sensor model) is
+     * continuous in kelvin, so the finer grid costs nothing downstream. Spacing runs ~13K per
+     * rung at 2300K to ~250K per rung at 10000K; endpoints are exact.
+     */
+    private val whiteBalanceOptions: List<String> by lazy {
+        buildList {
+            add("Auto")
+            val warmMired = 1_000_000.0 / WB_MIN_KELVIN
+            val coldMired = 1_000_000.0 / WB_MAX_KELVIN
+            val steps = WB_LADDER_RUNGS - 1
+            for (i in 0..steps) {
+                val mired = warmMired - (warmMired - coldMired) * i / steps
+                add("${Math.round(1_000_000.0 / mired)}K")
+            }
+        }.also { ladder ->
+            val kelvin = ladder.drop(1).map { it.removeSuffix("K").toInt() }
+            check(kelvin.first() == WB_MIN_KELVIN && kelvin.last() == WB_MAX_KELVIN) {
+                "WB ladder endpoints must be exact"
+            }
+            check(kelvin.zipWithNext().all { (a, b) -> b > a }) { "WB ladder must strictly increase" }
+        }
+    }
+
+    /** The WB scale's bounds and rung count. ~2.5 mired per rung across 135 rungs. */
+    const val WB_MIN_KELVIN = 2_300
+    const val WB_MAX_KELVIN = 10_000
+    const val WB_LADDER_RUNGS = 135
+
+    /**
+     * Metered kelvin -> the nearest rung of the given (possibly clipped) dial, by linear kelvin
+     * distance — the Auto readout's snap and the auto-to-manual seed both use it.
+     */
+    fun nearestWhiteBalanceOption(kelvin: Int, options: List<String>): String? =
+        options.mapNotNull { option -> option.removeSuffix("K").toIntOrNull()?.let { option to it } }
+            .minByOrNull { (_, value) -> kotlin.math.abs(value - kelvin) }?.first
+
+    /**
+     * Read-only views of the four ladders, for CameraSessionStore's restore-time snapping.
+     * `get() =` rather than a direct alias so these stay lazy and cannot be read during this
+     * object's construction.
+     */
+    val isoLadder: List<String> get() = isoOptions
+    val shutterLadder: List<String> get() = shutterOptions
+    val whiteBalanceLadder: List<String> get() = whiteBalanceOptions
+    /** The Pro-mode +/-4.0 scale and the quick-bar +/-2.0 scale — snapped separately, matching the native split. */
+    val exposureProLadder: List<String> get() = evProOptions
+    val exposureQuickLadder: List<String> get() = evQuickOptions
 
     /**
      * The option ladders are built ONCE, not per profile lookup.
      *
      * They are constants that happen to be spelled as loops: the same 201 focus rungs and the
-     * same 161 exposure rungs, formatted identically every time. Rebuilding them per call cost
-     * 362 [String.format] invocations, and a focus adjustment reaches [profile] about thirty
+     * same exposure rungs, formatted identically every time. Rebuilding them per call cost a
+     * [String.format] invocation each, and a focus adjustment reaches [profile] about thirty
      * times per state application at up to 500 applications per second — around a million
      * formatter calls per second on the main thread, every one of them discarded.
      *
@@ -1010,21 +1300,52 @@ object CameraCatalog {
         }
     }
 
-    private val evOptions: List<String> by lazy { buildList {
-        // "Auto" leads the ladder: auto-exposure with zero offset, the explicit hands-off
-        // choice the field asked for. Then 4x finer granularity: 0.025 EV steps over the
-        // +/-2.0 range (161 numeric options); applyExposure() rounds to the nearest
-        // hardware compensation index.
-        add("Auto")
-        for (step in -80..80) {
-            val value = step / 40.0
-            if (value == 0.0) {
-                add("0")
-            } else {
-                add(String.format(Locale.US, "%+.2f", value))
-            }
-        }
-    } }
+    /**
+     * Exposure compensation, exactly as the native camera ships it — TWO scales, one spacing.
+     *
+     * 0.1 EV is both the native spacing (ProUtil.getExposureValueString = step / 10.0) and the
+     * hardware atom: CONTROL_AE_EXPOSURE_COMPENSATION is an integer index whose unit is
+     * android.control.aeCompensationStep = 1/10 on every camera id. Nothing finer exists to ship.
+     *
+     * SPANS, from the decompiled app: the Pro / Pro Video dialer is the full 81-entry
+     * exposure_value array, -4.0..+4.0; the quick EV bar every other mode shows is that same
+     * array's middle 41 entries, -2.0..+2.0. [evProOptions] and [evQuickOptions] mirror that
+     * split. Labels are the native spellings: signed one-decimal, zero printed "0.0".
+     *
+     * NO "Auto" RUNG, because the native app has none: EV is not auto-convertible (dialer id 3 is
+     * excluded from isAutoToManualConversionSupported), it has a reset-to-0.0 affordance instead,
+     * and it is live exactly while at least one of ISO / shutter is on Auto. When BOTH are manual
+     * the native EV field flips to a read-only meter of the HAL's measured deviation — the
+     * reducer refuses EV detents in that state and the HUD shows the metered value from
+     * [CameraState.meteredExposure] instead.
+     *
+     * HOW +/-4.0 travels, from the decompile: through the ordinary PUBLIC key. Samsung sizes its
+     * ruler from the vendor CHARACTERISTIC samsung.android.control.aeCompensationRange ([-40,40]
+     * here, vs the public [-20,20]) and writes the raw index on
+     * CONTROL_AE_EXPOSURE_COMPENSATION — there is no vendor request key for EV anywhere in the
+     * APK, and the focusLensPos package-gate does not apply to public request metadata. The
+     * runtime controller therefore reads the vendor characteristic into
+     * [CameraCapabilities.evMin]/[evMax] (falling back to the public one) and writes the index
+     * through the unvalidated Camera2 interop route — CameraX's setExposureCompensationIndex
+     * rejects anything past the public range outright. [applyCapabilities] clips this ladder to
+     * whichever range was actually read, so on a device where the vendor characteristic does not
+     * resolve the dial honestly stops at +/-2.0. Whether the HAL ACTS on indices past +/-20 from
+     * a third-party client is verified on-device by reading the result echo alongside
+     * SENSOR_SENSITIVITY x SENSOR_EXPOSURE_TIME during the field sweep — if it saturates, the
+     * clip bound is where to pull back.
+     */
+    private val evProOptions: List<String> by lazy { evLadder(-40..40) }
+    private val evQuickOptions: List<String> by lazy { evLadder(-20..20) }
+
+    private fun evLadder(tenthsRange: IntRange): List<String> =
+        tenthsRange.map { tenths -> evLabel(tenths) }
+
+    /** Native spelling: "+%.1f" above zero, "%.1f" at and below it — zero prints "0.0". */
+    fun evLabel(tenths: Int): String = String.format(
+        Locale.US,
+        if (tenths > 0) "+%.1f" else "%.1f",
+        tenths / 10.0,
+    )
 
     private fun focusCurveOptions(): List<String> = listOf("Linear", "SquareRoot", "Logarithmic")
 }

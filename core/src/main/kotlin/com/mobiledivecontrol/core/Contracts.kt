@@ -251,6 +251,34 @@ data class CameraState(
      * requires the wheel to STOP first — a genuine pause — and then travel again.
      */
     val lastFocusInputAtMs: Long = 0L,
+    /**
+     * Consecutive presses pushed against a focus rail since the deliberate pause that armed
+     * them. Zeroed the moment focus moves normally, so it can only ever count a sustained,
+     * intentional push and never accumulate across a dive.
+     */
+    val focusRailPresses: Int = 0,
+    /**
+     * What auto-exposure and auto-white-balance are choosing RIGHT NOW, observed off the capture
+     * pipe at ~2 Hz. Platform telemetry merged outside the critical path, exactly like
+     * [AppState.phoneBatteryPercent]: it can never change a mode or issue a command. Two uses,
+     * both copied from the native camera: the HUD prints the live value beside "Auto" the way the
+     * native chips do, and the first wheel movement out of Auto seeds manual control from the
+     * metered value rather than from a fixed default. Never persisted.
+     */
+    val meteredExposure: MeteredExposure = MeteredExposure(),
+)
+
+/**
+ * Live values chosen by AE / AWB, read from the capture results. Any field may be null when the
+ * pipe has not reported yet or the device does not expose it (the kelvin and EV meters ride
+ * Samsung vendor result tags that may not resolve on other hardware).
+ */
+data class MeteredExposure(
+    val iso: Int? = null,
+    val shutterNs: Long? = null,
+    val wbKelvin: Int? = null,
+    /** Metered EV deviation in tenths of a stop — the read-only meter the native app shows while both ISO and shutter are manual. */
+    val evTenths: Int? = null,
 )
 
 val CameraState.selectedControl: CameraControl

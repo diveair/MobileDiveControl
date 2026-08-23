@@ -60,6 +60,18 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      */
     private val pendingSave = MutableStateFlow<AppState?>(null)
 
+    /**
+     * One live ramp per setting. Same-direction requests ADD to the ticks still owed — a fast
+     * wheel spin banks distance rather than cancelling its own momentum — while a direction
+     * change cancels outright. All touches happen on the main dispatcher.
+     *
+     * Declared HERE, above the init block: Kotlin initialises properties in declaration order,
+     * `init` reaches `emitOutcome`, and `emitOutcome` reads this map to cancel a ramp that has
+     * landed on AF. Declared any lower it is still null on the first emission — the same trap
+     * that caught `pendingSave`.
+     */
+    private val ramps = mutableMapOf<String, Ramp>()
+
     private val controlCore = ControlCore(initialState = sessionStore.restoreAppState())
     private val galleryRepository = GalleryRepository(application)
     private val diveApp: DiveControlApp? = application as? DiveControlApp
@@ -195,6 +207,26 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleDepthUnit() {
         _depthUnitMetric.value = !_depthUnitMetric.value
+    }
+
+    /**
+     * Live AE/AWB readings from the capture pipe, throttled to ~2 Hz by the controller. Same
+     * non-critical-path footing as [collectPhoneBattery]: telemetry that feeds the HUD's Auto
+     * readouts and the auto-to-manual seeding, and can never change a mode or issue a command.
+     *
+     * Two deliberate differences from [dispatch]:
+     *  - The controller invokes this from CameraX's camera executor, and everything the core
+     *    touches is main-confined (ControlCore.state is an unsynchronized var; a camera-thread
+     *    read-modify-write racing a wheel detent would silently revert housing input). The
+     *    launch hops to the main dispatcher first.
+     *  - It bypasses [emitOutcome]: metered values are never persisted, so refilling
+     *    [pendingSave] every 500 ms would write SharedPreferences continuously for nothing, and
+     *    this reducer path can produce no effects to run.
+     */
+    fun updateMeteredExposure(metered: com.mobiledivecontrol.core.MeteredExposure) {
+        viewModelScope.launch {
+            _state.value = controlCore.updateMeteredExposure(metered).state
+        }
     }
 
     /**
@@ -510,12 +542,6 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         var lastFedAtMs: Long = System.currentTimeMillis()
     }
 
-    /**
-     * One live ramp per setting. Same-direction requests ADD to the ticks still owed — a fast
-     * wheel spin banks distance rather than cancelling its own momentum — while a direction
-     * change cancels outright. All touches happen on the main dispatcher.
-     */
-    private val ramps = mutableMapOf<String, Ramp>()
 
     /**
      * Drains a [PlatformEffect.RampSetting] as real single-tick commands, one per interval, so
@@ -747,6 +773,15 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         }
         lastSealState = sealNow
         pendingSave.value = outcome.state
+        // AF IS A TERMINUS. Crossing into it must consume the gesture: any distance still owed
+        // from the approach would otherwise keep dispatching, and each queued tick leaving AF
+        // walks onward — 1.000 into AF and straight out to 0.000 in one motion. Landing on AF
+        // therefore cancels the ramp, so leaving again takes a fresh, separate input.
+        if (ramps.isNotEmpty()) {
+            val values = outcome.state.camera.settingValues
+            val landedOnAf = ramps.keys.filter { values[it] == "AF" }
+            landedOnAf.forEach { id -> ramps.remove(id)?.job?.cancel() }
+        }
         if (outcome.effects.isNotEmpty()) {
             _effects.value = outcome.effects
             processGalleryEffects(outcome.effects)
@@ -780,6 +815,17 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun processGalleryEffects(effects: List<PlatformEffect>) {
+        // Gate BEFORE launching. This is reached for every outcome carrying any effect at all,
+        // which a ladder spin makes hundreds of times a second; each one launched an IO
+        // coroutine whose body fell straight through its `else -> { }`.
+        val hasGalleryWork = effects.any {
+            it is PlatformEffect.LoadGalleryItems ||
+                it is PlatformEffect.LoadExifData ||
+                it is PlatformEffect.DeleteGalleryItem ||
+                it is PlatformEffect.DeleteGalleryFolder ||
+                it is PlatformEffect.CreateGalleryFolder
+        }
+        if (!hasGalleryWork) return
         viewModelScope.launch(Dispatchers.IO) {
             for (effect in effects) {
                 when (effect) {

@@ -7,6 +7,8 @@ import com.mobiledivecontrol.core.CameraModeId
 import com.mobiledivecontrol.core.FocusCurveMode
 import com.mobiledivecontrol.core.SliderSensitivity
 import org.json.JSONObject
+import kotlin.math.abs
+import kotlin.math.ln
 
 /**
  * Re-spells saved focus values onto the current 0.005 ladder.
@@ -39,6 +41,111 @@ internal fun snapFocusValuesToLadder(values: Map<String, String>): Map<String, S
         }
     return result
 }
+
+private val ISO_KEYS = listOf("expert.iso", "pro.iso", "pro_video.iso")
+private val SHUTTER_KEYS =
+    listOf("expert.shutter_speed", "pro.shutter_speed", "pro_video.shutter_speed")
+private val WHITE_BALANCE_KEYS =
+    listOf("expert.white_balance", "pro.white_balance", "pro_video.white_balance")
+
+// Two exposure scales, matching the native split: the Pro dialer runs +/-4.0, the quick EV bar
+// +/-2.0. Snapping each key against its OWN ladder is what stops a stored "+3.0" from surviving
+// on a mode whose dial ends at +/-2.0.
+private val EXPOSURE_PRO_KEYS = listOf(
+    "expert.exposure_value", "pro.exposure_value", "pro_video.exposure_value",
+)
+private val EXPOSURE_QUICK_KEYS = listOf(
+    "photo.exposure_compensation", "night.exposure",
+)
+
+/**
+ * Re-spells saved ISO / shutter / white-balance / exposure values onto the current ladders.
+ *
+ * Same failure this guards as [snapFocusValuesToLadder]: a stored string that names no rung is
+ * resolved by the reducer to index 0, and for all four of these scales index 0 is "Auto" — so a
+ * saved "6400" would hand exposure back to the camera on the diver's first detent while the HUD
+ * still read 6400. Snapping by VALUE (log-space for the two multiplicative scales) keeps the
+ * exposure the diver actually chose wherever a rung exists for it.
+ *
+ * Idempotent by construction: a value already on its ladder is returned untouched, so a second
+ * pass, or a downgrade/upgrade cycle, is a no-op. No migration flag needed.
+ *
+ * Kept free of Android types so it can be tested directly.
+ */
+internal fun snapScaleValuesToLadders(values: Map<String, String>): Map<String, String> {
+    val result = values.toMutableMap()
+    snapToLadder(result, ISO_KEYS, CameraCatalog.isoLadder, ::isoMagnitude)
+    // Snap targets exclude the 1/24000 and 1/16000 rungs the native fast floor removes from
+    // every render of this dial: a value snapped onto them would sit off the clipped ladder at
+    // runtime, and the reducer resolves an unfound value to index 0 — which is Auto.
+    val reachableShutterLadder = CameraCatalog.shutterLadder.filter { rung ->
+        val ns = CameraCatalog.shutterOptionNanos(rung)
+        ns == null || ns >= CameraCatalog.SHUTTER_NATIVE_MIN_NS
+    }
+    snapToLadder(result, SHUTTER_KEYS, reachableShutterLadder, ::shutterMagnitude)
+    snapToLadder(result, WHITE_BALANCE_KEYS, CameraCatalog.whiteBalanceLadder, ::kelvinMagnitude)
+    // A stored "Auto" from the old exposure ladder has no magnitude, so snapToLadder drops it
+    // and the catalog default "0.0" applies — exactly the native reset, where EV has no Auto.
+    snapToLadder(result, EXPOSURE_PRO_KEYS, CameraCatalog.exposureProLadder, ::exposureMagnitude)
+    snapToLadder(result, EXPOSURE_QUICK_KEYS, CameraCatalog.exposureQuickLadder, ::exposureMagnitude)
+    // Native demotion at restore (ProVideoPresenter.onStartPreviewCompleted): a stored Pro Video
+    // shutter slower than the stored frame rate's period demotes to the slowest admitted rung,
+    // so a value the fps-clipped dial cannot show never reaches the reducer.
+    val fps = (result["pro_video.frame_rate"] ?: CameraCatalog.defaultSettingValues["pro_video.frame_rate"])
+        ?.removeSuffix("fps")?.toIntOrNull()
+    if (fps != null && fps > 0) {
+        // ROUNDED, exactly like CameraCatalog.videoShutterCapNs: truncating division computes
+        // 16666666 at 60 fps and evicts the legal "1/60" cap rung itself (which spells 16666667),
+        // demoting a legitimately stored 1/60 to 1/90 on every restore.
+        val capNs = Math.round(1_000_000_000.0 / fps)
+        result["pro_video.shutter_speed"]?.let { stored ->
+            val ns = CameraCatalog.shutterOptionNanos(stored)
+            if (ns != null && ns > capNs) {
+                val admitted = reachableShutterLadder.filter { rung ->
+                    CameraCatalog.shutterOptionNanos(rung)?.let { it <= capNs } == true
+                }
+                CameraCatalog.nearestShutterOption(capNs, admitted)
+                    ?.let { result["pro_video.shutter_speed"] = it }
+            }
+        }
+    }
+    return result
+}
+
+private fun snapToLadder(
+    values: MutableMap<String, String>,
+    keys: List<String>,
+    ladder: List<String>,
+    magnitude: (String) -> Double?,
+) {
+    // "Auto" yields null and so is never a snap TARGET; a stored "Auto" never reaches the snap
+    // because it is already on the ladder.
+    val rungs = ladder.mapNotNull { rung -> magnitude(rung)?.let { rung to it } }
+    keys.forEach { key ->
+        val stored = values[key] ?: return@forEach
+        if (stored in ladder) return@forEach
+        val target = magnitude(stored)
+        if (target == null || rungs.isEmpty()) {
+            // Unreadable: drop it so the catalog default applies deliberately, rather than the
+            // app arriving at Auto by accident on the diver's next detent.
+            values.remove(key)
+            return@forEach
+        }
+        values[key] = rungs.minByOrNull { (_, value) -> abs(value - target) }!!.first
+    }
+}
+
+/** Log-space: ISO is multiplicative, so 6400 must land on 3200, not be pulled toward 800. */
+private fun isoMagnitude(option: String): Double? =
+    option.toDoubleOrNull()?.takeIf { it > 0.0 }?.let { ln(it) }
+
+/** Log-space seconds. Accepts "1/60", "0.5\"" and the legacy "1/2". */
+private fun shutterMagnitude(option: String): Double? =
+    CameraCatalog.shutterOptionNanos(option)?.takeIf { it > 0L }?.let { ln(it.toDouble()) }
+
+private fun kelvinMagnitude(option: String): Double? = option.removeSuffix("K").toDoubleOrNull()
+
+private fun exposureMagnitude(option: String): Double? = option.replace("+", "").toDoubleOrNull()
 
 class CameraSessionStore(context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
@@ -132,7 +239,7 @@ class CameraSessionStore(context: Context) {
                 result[key] = "SquareRoot"
             }
         }
-        return snapFocusValuesToLadder(result)
+        return snapScaleValuesToLadders(snapFocusValuesToLadder(result))
     }
 
     /**

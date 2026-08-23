@@ -133,6 +133,7 @@ class MainActivity : ComponentActivity() {
                                 com.mobiledivecontrol.core.CameraCommand.UpdateCameraCapabilities(caps)
                             )
                         },
+                        onMeteredExposure = viewModel::updateMeteredExposure,
                         introVisible = introVisible,
                         onIntroDismiss = viewModel::dismissIntro,
                         // The intro is the app's only honest surface for "why can I not do

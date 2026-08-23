@@ -198,6 +198,18 @@ class ControlReducer(
         )
     }
 
+    /**
+     * Merges the live AE/AWB readings into state. Platform telemetry on the same footing as
+     * [updatePhoneBattery]: it never changes a mode, never emits an effect, and arrives outside
+     * the housing-input critical path. The HUD prints these beside "Auto" the way the native
+     * chips do, and [seededManualValue] reads them at the moment a dial leaves Auto.
+     */
+    fun updateMeteredExposure(state: AppState, metered: MeteredExposure): Reduction {
+        return Reduction(
+            state = state.copy(camera = state.camera.copy(meteredExposure = metered)),
+        )
+    }
+
     fun updateDeviceInfo(state: AppState, update: DeviceInfoUpdate): Reduction {
         val nextHousing = when (update) {
             is DeviceInfoUpdate.ManufacturerName -> state.housing.copy(manufacturerName = update.value)
@@ -326,23 +338,28 @@ class ControlReducer(
         CameraCommand.ToggleFocusPeaking,
         CameraCommand.RestartCamera -> emitCameraEffect(state, command)
         is CameraCommand.NudgeSetting -> {
-            val spec = CameraCatalog.settingsFor(
-                state.camera.activeMode,
-                state.camera.deviceVariant,
-                state.camera.detectedLenses,
-                state.camera.capabilities,
-            ).firstOrNull { it.id == command.settingId }
-            if (spec == null) {
+            val spec = CameraCatalog.settingsFor(state.camera)
+                .firstOrNull { it.id == command.settingId }
+            if (spec == null || CameraCatalog.evMeterLocked(state.camera, spec)) {
+                // Missing spec, or the native EV meter rule: with both ISO and shutter manual
+                // the compensation index does nothing, so the detent is refused, not absorbed.
                 Reduction(state = state)
             } else {
                 val currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue
-                val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
-                val minIndex = if (spec.id.endsWith(".manual_focus") && currentIndex > 0) 1 else 0
-                val nextIndex = (currentIndex + command.step).coerceIn(minIndex, spec.options.lastIndex)
-                if (nextIndex == currentIndex) {
+                val nextValue = seededManualValue(state.camera, spec, currentValue, command.step)
+                    ?: run {
+                        val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
+                        // Focus's AF and white balance's Auto both live at index 0 behind a
+                        // deliberate barrier: a nudge (including every held-ramp drain) clamps
+                        // at the first real value and never falls into the mode change.
+                        val gated = spec.id.endsWith(".manual_focus") || spec.id.endsWith(".white_balance")
+                        val minIndex = if (gated && currentIndex > 0) 1 else 0
+                        val nextIndex = (currentIndex + command.step).coerceIn(minIndex, spec.options.lastIndex)
+                        spec.options[nextIndex]
+                    }
+                if (nextValue == currentValue) {
                     Reduction(state = state)
                 } else {
-                    val nextValue = spec.options[nextIndex]
                     val effect = cameraEffectForSetting(spec.id, nextValue)
                     Reduction(
                         state = state.copy(camera = applySettingValue(state.camera, spec.id, nextValue)),
@@ -351,11 +368,16 @@ class ControlReducer(
                 }
             }
         }
-        is CameraCommand.UpdateCameraCapabilities -> Reduction(
-            state = state.copy(
-                camera = state.camera.copy(capabilities = command.capabilities),
-            ),
-        )
+        is CameraCommand.UpdateCameraCapabilities -> {
+            // Capabilities SHRINK the ladders, so values that were legal against the full native
+            // tables must be re-spelled onto the clipped ones the moment the ranges arrive —
+            // otherwise the strip keeps showing a rung the write path clamps away, and the next
+            // detent resolves the unfound value from index 0.
+            val withCaps = state.camera.copy(capabilities = command.capabilities)
+            Reduction(
+                state = state.copy(camera = CameraCatalog.resnapToClippedLadders(withCaps)),
+            )
+        }
         is CameraCommand.UpdateDetectedLenses -> {
             val nextCamera = state.camera.copy(detectedLenses = command.lenses)
             Reduction(state = state.copy(camera = nextCamera))
@@ -1237,10 +1259,29 @@ class ControlReducer(
                 // moved a single rung. A rest of even 30 s was enough to reap a whole turn.
                 // Anything slower than one detent a second is a fresh press, not a turn in
                 // progress, so treating it as the slowest real cadence loses nothing.
-                val gapMs = (now - preparedCamera.lastFocusInputAtMs)
-                    .coerceIn(1L, MAX_WHEEL_GAP_MS)
+                val rawGapMs = now - preparedCamera.lastFocusInputAtMs
+                val gapMs = rawGapMs.coerceIn(1L, MAX_WHEEL_GAP_MS)
                 val usable = spec.options.size - 1 // the numeric scale, AF excluded
                 val motor = sliderMotorFor(usable, currentSensitivity, gapMs, held = repeatCount > 0)
+                // A CONTINUOUS blend from a geared turn down to a single-rung click, never a
+                // cliff. The gearing table fixes a detent at ~50 rungs at sensitivity 100 — that
+                // is what "a quarter turn sweeps the range" means arithmetically — so a turn can
+                // never place a value precisely. A hard click/turn boundary was worse: 1799 ms
+                // bought ~50 rungs and 1801 ms bought 1, and the middle ground where a diver
+                // actually sets focus did not exist at all.
+                //
+                // Geometric rather than linear, so the midpoint is the geometric mean: the
+                // progression reads 1, 7, 50 instead of 1, 25, 50, putting the fine range where
+                // the hand naturally slows. A real turn sits at or under TURN_GAP_MS and keeps
+                // full gearing, so the sensitivity table and the fast pull are untouched.
+                val turnBlend = ((FINE_CLICK_GAP_MS - rawGapMs).toDouble() /
+                    (FINE_CLICK_GAP_MS - TURN_GAP_MS).toDouble()).coerceIn(0.0, 1.0)
+                val credit = kotlin.math.max(
+                    1.0,
+                    kotlin.math.round(
+                        Math.pow(motor.creditTicks.coerceAtLeast(1).toDouble(), turnBlend),
+                    ),
+                ).toInt()
 
                 // A HELD button deposits run-time, not an immediate jump: the motor walks the
                 // value tick by tick at this sensitivity's full rate for as long as repeats
@@ -1265,26 +1306,62 @@ class ControlReducer(
                 // step really visited — and the rest of this detent's worth plays out through
                 // the motor at the sensitivity's rate.
                 val raw = currentIndex + step
-                // AF is behind a REAL stop at both rails: the wheel must rest before further
-                // travel may cross into auto. A spin that never pauses parks at the rail.
-                val restedAtRail = gapMs >= FOCUS_AF_PAUSE_MS
+                // TWO conditions, because divers were crossing into AF by accident. Autofocus
+                // is a MODE CHANGE, not the next value along, so arriving at a rail must never
+                // be enough — and neither is pausing there, which happens naturally mid-turn.
+                // The wheel has to STOP at the rail for [FOCUS_AF_PAUSE_MS], and then keep
+                // pushing outward for [AF_BREAKTHROUGH_PRESSES] further detents. A pause is
+                // ambiguous; a pause followed by sustained pushing against a rail that is
+                // visibly not moving can only be someone asking for autofocus.
+                //
+                // Measured on the RAW gap, not the pacing-clamped one: gapMs is capped at
+                // MAX_WHEEL_GAP_MS so a stale timestamp cannot poison the drain rate, and
+                // against that cap this test could never see a pause longer than the cap.
+                val restedAtRail = rawGapMs >= FOCUS_AF_PAUSE_MS
+                val pushingPastRail = raw == 0 || raw > spec.options.lastIndex
+                // Counting is FORGIVING; only crossing is strict. Requiring the pause to land on
+                // the very first press was brittle: one stray wheel event as the hand comes to
+                // rest re-stamps lastFocusInputAtMs, so a real pause got measured from the stray
+                // event and nothing ever armed — the barrier then could not be passed at all.
+                // Presses against a rail therefore always accumulate, and a qualifying pause at
+                // ANY point in the run arms it.
+                val railPresses = when {
+                    // Focus moved normally: the run is over and the count means nothing.
+                    !pushingPastRail -> 0
+                    restedAtRail -> kotlin.math.max(preparedCamera.focusRailPresses, 0) + 1
+                    preparedCamera.focusRailPresses > 0 -> preparedCamera.focusRailPresses + 1
+                    // Pushing at a rail with no pause yet: parks, and waits to be armed.
+                    else -> 0
+                }
+                val breakIntoAf = railPresses >= AF_BREAKTHROUGH_PRESSES
+                // AF DWELL. The housing auto-repeats at roughly 15 Hz, and wheel events are
+                // deliberately treated as fresh presses (repeatCount is forced to 0 so gearing
+                // applies at speed). One physical input is therefore several events: the first
+                // crossed into AF and the next, ~67 ms later, walked straight back out to the
+                // opposite rail — the reported "one input, 0.000 to AF to 1.000". Leaving AF
+                // requires an input genuinely separated from the one that arrived, so the same
+                // gesture cannot pass through. It also stops the repeat stream from racing the
+                // rail detection, which made crossings land or miss unpredictably.
+                val mayLeaveAf = rawGapMs >= AF_EXIT_GUARD_MS
                 val nextIndex = when {
+                    // Still inside the dwell: hold AF, whatever the wheel says.
+                    currentIndex == 0 && !mayLeaveAf -> 0
                     // From AF a press enters the scale at whichever end it points to.
                     currentIndex == 0 && step < 0 -> spec.options.lastIndex
                     currentIndex == 0 -> 1
-                    // At 0.00 pressing outward: into AF only after the rest.
-                    raw == 0 -> if (restedAtRail) 0 else 1
-                    // At 1.00 pressing outward: same gate on the infinity side.
+                    // At 0.000 pressing outward: into AF only once BOTH conditions are met.
+                    raw == 0 -> if (breakIntoAf) 0 else 1
+                    // At 1.000 pressing outward: the same barrier on the infinity side.
                     raw > spec.options.lastIndex ->
-                        if (restedAtRail) 0 else spec.options.lastIndex
+                        if (breakIntoAf) 0 else spec.options.lastIndex
                     else -> raw
                 }
                 // `currentIndex > 0` keeps the AF exit exact. Leaving AF lands deliberately on a
                 // rail (see the branch at currentIndex == 0 above); banking this click's ticks on
                 // top of that landing would carry the lens straight back off it — at sensitivity
                 // 100 the 51-tick credit would finish at 0.750 instead of 1.000.
-                val rampEffects = if (motor.creditTicks > 1 && nextIndex != currentIndex &&
-                    nextIndex > 0 && currentIndex > 0
+                val rampEffects = if (credit > 1 &&
+                    nextIndex != currentIndex && nextIndex > 0 && currentIndex > 0
                 ) {
                     // Velocity-matched pacing: this click's ticks are spread across the diver's
                     // own clicking cadence, so slow turning is one continuous creep instead of
@@ -1292,7 +1369,7 @@ class ControlReducer(
                     // cadence too — a slow clicker is still "turning" between clicks — while a
                     // fast spin keeps the tight stop-on-stop feel.
                     // Rate first, then a (ticks, interval) pair that actually delivers it.
-                    val rate = drainRatePerSecond(motor, gapMs.coerceAtLeast(1L))
+                    val rate = credit * 1000.0 / (gapMs.coerceAtLeast(1L) * UNDER_RUN)
                     val (spread, paced) = pacing(rate, motor)
                     val span = kotlin.math.round(
                         gapMs.coerceAtLeast(1L) * UNDER_RUN,
@@ -1300,7 +1377,7 @@ class ControlReducer(
                     listOf(
                         PlatformEffect.RampSetting(
                             settingId = spec.id,
-                            steps = motor.creditTicks - 1,
+                            steps = credit - 1,
                             step = step,
                             intervalMs = paced,
                             maxTicksPerInterval = spread,
@@ -1316,8 +1393,21 @@ class ControlReducer(
                     emptyList()
                 }
                 val nextValue = spec.options[nextIndex]
+                // Stamp only when focus actually MOVED. Every ramp tick re-enters this reducer,
+                // so stamping unconditionally let the app's own drain reset the pause clock while
+                // parked at a rail — a real, deliberate pause could never accumulate and the
+                // crossing never triggered. Time since the last MOVEMENT is also the honest
+                // reading of "stopped at the rail for a while".
+                val previousValue = preparedCamera.settingValues[spec.id]
+                val focusMoved = nextValue != previousValue
                 val nextCamera = applySettingValue(preparedCamera, spec.id, nextValue)
-                    .copy(lastFocusInputAtMs = now)
+                    .copy(
+                        lastFocusInputAtMs =
+                            if (focusMoved) now else preparedCamera.lastFocusInputAtMs,
+                        // Crossing consumes the run, so returning demands the whole deliberate
+                        // act again rather than one more nudge.
+                        focusRailPresses = if (breakIntoAf) 0 else railPresses,
+                    )
                 val effect = cameraEffectForSetting(spec.id, nextValue)
                 Reduction(
                     state = preparedState.copy(camera = nextCamera),
@@ -1326,8 +1416,15 @@ class ControlReducer(
                         rampEffects,
                 )
             } else if (spec.kind == CameraSettingKind.Slider) {
-                // Every slider rides the same motor as focus — ISO, shutter, white balance,
-                // exposure — scaled to its own ladder, per the generalisation rule.
+                // ISO, shutter, white balance and exposure ride the same MACHINERY as focus —
+                // the debt-and-span drain, the under-run, the click-to-turn blend — but not the
+                // same gearing: they take [SliderLaw.Discrete], where one detent is one value.
+                // See [sliderMotorFor] for why the two laws have to differ.
+                if (CameraCatalog.evMeterLocked(preparedCamera, spec)) {
+                    // Native EV meter rule: both ISO and shutter manual means the compensation
+                    // index does nothing, so the wheel is refused rather than silently absorbed.
+                    return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
+                }
                 val now = nowMs()
                 // CLAMPED. lastFocusInputAtMs starts at 0 while the clock is epoch millis, so an
                 // untouched dial reports a gap of ~1.8e12 ms and every pacing figure derived from
@@ -1336,14 +1433,24 @@ class ControlReducer(
                 // moved a single rung. A rest of even 30 s was enough to reap a whole turn.
                 // Anything slower than one detent a second is a fresh press, not a turn in
                 // progress, so treating it as the slowest real cadence loses nothing.
-                val gapMs = (now - preparedCamera.lastFocusInputAtMs)
-                    .coerceIn(1L, MAX_WHEEL_GAP_MS)
+                val rawGapMs = now - preparedCamera.lastFocusInputAtMs
+                val gapMs = rawGapMs.coerceIn(1L, MAX_WHEEL_GAP_MS)
                 val motor = sliderMotorFor(
                     spec.options.size,
                     currentSensitivity,
                     gapMs,
                     held = repeatCount > 0,
+                    law = SliderLaw.Discrete,
                 )
+                // Same continuous click-to-turn blend as the focus branch above.
+                val turnBlend = ((FINE_CLICK_GAP_MS - rawGapMs).toDouble() /
+                    (FINE_CLICK_GAP_MS - TURN_GAP_MS).toDouble()).coerceIn(0.0, 1.0)
+                val credit = kotlin.math.max(
+                    1.0,
+                    kotlin.math.round(
+                        Math.pow(motor.creditTicks.coerceAtLeast(1).toDouble(), turnBlend),
+                    ),
+                ).toInt()
                 if (repeatCount > 0) {
                     val stamped = preparedCamera.copy(lastFocusInputAtMs = now)
                     return Reduction(
@@ -1359,15 +1466,54 @@ class ControlReducer(
                         ),
                     )
                 }
-                val nextValue = advanceOption(
-                    currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue,
-                    options = spec.options,
-                    step = step,
-                    wrap = false,
-                )
-                val rampEffects = if (motor.creditTicks > 1) {
+                val sliderCurrentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue
+                // Mirror of focus's AF EXIT GUARD: one sustained gesture must not cross into
+                // Auto and straight back out to manual. Quiet first, then leaving is deliberate.
+                if (spec.id.endsWith(".white_balance") && sliderCurrentValue == "Auto" &&
+                    rawGapMs < AF_EXIT_GUARD_MS
+                ) {
+                    val stamped = preparedCamera.copy(lastFocusInputAtMs = now)
+                    return Reduction(
+                        state = preparedState.copy(camera = stamped),
+                        effects = manualFocusPreparation.effects,
+                    )
+                }
+                // WHITE BALANCE'S AUTO GATE, the same barrier focus has at its AF rail: dialing
+                // to the 2300K or 10000K end STOPS there; only a further press after resting
+                // [FOCUS_AF_PAUSE_MS] at the rail crosses into Auto. Auto is a mode change, not
+                // the next value along, so a turn must never fall into it by momentum.
+                if (spec.id.endsWith(".white_balance") && sliderCurrentValue != "Auto") {
+                    val currentIndex = spec.options.indexOf(sliderCurrentValue)
+                    val pushingOffMin = currentIndex == 1 && step < 0
+                    val pushingOffMax = currentIndex == spec.options.lastIndex && step > 0
+                    if (pushingOffMin || pushingOffMax) {
+                        // The camera hears the change the same way it hears every ordinary WB
+                        // detent: by observing settingValues — no effect is mapped for WB.
+                        val crossed = rawGapMs >= FOCUS_AF_PAUSE_MS
+                        val nextCamera = applySettingValue(
+                            preparedCamera,
+                            spec.id,
+                            if (crossed) "Auto" else sliderCurrentValue,
+                        ).copy(lastFocusInputAtMs = now)
+                        return Reduction(
+                            state = preparedState.copy(camera = nextCamera),
+                            effects = manualFocusPreparation.effects,
+                        )
+                    }
+                }
+                val seededValue = seededManualValue(preparedCamera, spec, sliderCurrentValue, step)
+                val nextValue = seededValue
+                    ?: advanceOption(
+                        currentValue = sliderCurrentValue,
+                        options = spec.options,
+                        step = step,
+                        wrap = false,
+                    )
+                // A seeded detent's whole meaning is "land where the meter is" — geared extra
+                // rungs on top would overshoot the very value the diver converted to keep.
+                val rampEffects = if (seededValue == null && credit > 1) {
                     // Rate first, then a (ticks, interval) pair that actually delivers it.
-                    val rate = drainRatePerSecond(motor, gapMs.coerceAtLeast(1L))
+                    val rate = credit * 1000.0 / (gapMs.coerceAtLeast(1L) * UNDER_RUN)
                     val (spread, paced) = pacing(rate, motor)
                     val span = kotlin.math.round(
                         gapMs.coerceAtLeast(1L) * UNDER_RUN,
@@ -1375,7 +1521,7 @@ class ControlReducer(
                     listOf(
                         PlatformEffect.RampSetting(
                             settingId = spec.id,
-                            steps = motor.creditTicks - 1,
+                            steps = credit - 1,
                             step = step,
                             intervalMs = paced,
                             maxTicksPerInterval = spread,
@@ -1425,7 +1571,7 @@ class ControlReducer(
 
     private fun applySettingValue(camera: CameraState, settingId: String, value: String): CameraState {
         val updatedValues = camera.settingValues + (settingId to value)
-        return if (settingId == "photo.zoom_level" || settingId == "video.zoom") {
+        val next = if (settingId == "photo.zoom_level" || settingId == "video.zoom") {
             camera.copy(
                 zoomFactor = parseZoom(value) ?: camera.zoomFactor,
                 settingValues = updatedValues,
@@ -1433,6 +1579,44 @@ class ControlReducer(
         } else {
             camera.copy(settingValues = updatedValues)
         }
+        return if (settingId.endsWith(".frame_rate")) demoteShutterToFramePeriod(next, settingId) else next
+    }
+
+    /**
+     * The native demotion rule (ProVideoPresenter.onStartPreviewCompleted): raising the frame
+     * rate past a manual shutter demotes the shutter to the slowest rung the new frame period
+     * admits — 1/30 at 30 fps becomes 1/60 at 60 fps — rather than leaving a value the dial can
+     * no longer show. Without it the stored value falls off the clipped ladder, the HUD keeps
+     * printing it, and the next detent resolves from index 0, which is Auto.
+     */
+    private fun demoteShutterToFramePeriod(camera: CameraState, frameRateSettingId: String): CameraState {
+        val shutterId = frameRateSettingId.substringBeforeLast('.') + ".shutter_speed"
+        val current = camera.settingValues[shutterId] ?: return camera
+        val ns = CameraCatalog.shutterOptionNanos(current) ?: return camera
+        val capNs = CameraCatalog.videoShutterCapNs(camera) ?: return camera
+        if (ns <= capNs) return camera
+        val admitted = CameraCatalog.shutterLadder.filter { rung ->
+            CameraCatalog.shutterOptionNanos(rung)?.let { it <= capNs } == true
+        }
+        val demoted = CameraCatalog.nearestShutterOption(capNs, admitted) ?: return camera
+        return camera.copy(settingValues = camera.settingValues + (shutterId to demoted))
+    }
+
+    /**
+     * The auto-to-manual handoff, gated to the moment it applies: the value is sitting on
+     * "Auto" and the diver moves the dial — in EITHER direction. The first input converts to
+     * manual AT the rung nearest the live metered value ([CameraCatalog.meteredSeedValue]), so
+     * "auto at 6000" becomes "manual 6000", and only the inputs after it walk up or down from
+     * there. With no telemetry the caller falls back to ordinary stepping.
+     */
+    private fun seededManualValue(
+        camera: CameraState,
+        spec: CameraSettingSpec,
+        currentValue: String,
+        step: Int,
+    ): String? {
+        if (currentValue != "Auto" || step == 0) return null
+        return CameraCatalog.meteredSeedValue(camera, spec)
     }
 
     private fun advanceOption(currentValue: String, options: List<String>, step: Int, wrap: Boolean = false): String {
@@ -1480,6 +1664,26 @@ class ControlReducer(
         const val MAX_WHEEL_GAP_MS = 1_000L
 
         /**
+         * Silence after which the next detent counts as a deliberate single increment rather
+         * than part of a turn.
+         *
+         * This has to clear the SLOWEST continuous turn, not a typical one. At 900 ms it did
+         * not: a deliberately slow turn has gaps that long, so every one of its detents was
+         * read as an isolated click, dropped to a single rung, and the turn stopped being
+         * smooth. The distinction being drawn is isolated-click versus sequence, and a
+         * sequence keeps arriving — so the bar belongs above any cadence a turning hand
+         * produces, leaving only a real pause on the other side of it.
+         */
+        const val FINE_CLICK_GAP_MS = 1_800L
+
+        /**
+         * At or below this cadence the wheel is unambiguously being TURNED, so full gearing
+         * applies and the sensitivity table holds exactly. Above it, gearing tapers toward a
+         * single rung as the hand slows, which is the range that makes a value placeable.
+         */
+        const val TURN_GAP_MS = 500L
+
+        /**
          * Floor on the gap between deliveries. Below a frame the display cannot show it anyway,
          * but going finer than 16 ms lets a fast turn arrive as several small steps across the
          * frame instead of one visible lurch, at no extra dispatch cost.
@@ -1487,7 +1691,28 @@ class ControlReducer(
         const val MIN_INTERVAL_MS = FOCUS_RAMP_TICK_MS
 
         /** How long the wheel must rest at a rail before further travel may enter AF. */
-        const val FOCUS_AF_PAUSE_MS = 600L
+        const val FOCUS_AF_PAUSE_MS = 700L
+
+        /**
+         * Detents pushed against a rail, AFTER the pause, before AF is entered.
+         *
+         * ONE. A count above one compounds the ways a deliberate attempt can fail — a press
+         * landing fractionally early, or a stray auto-repeat re-stamping the timestamp, resets
+         * the run and the diver has to start over, which read as the barrier simply ignoring
+         * them. The pause carries the whole burden of proving intent, and overshoot is
+         * prevented separately by AF cancelling any in-flight ramp rather than by making the
+         * crossing itself hard to reach. If accidental crossings return, lengthen
+         * [FOCUS_AF_PAUSE_MS] rather than raising this: a longer stop is still one clear
+         * gesture, whereas more presses is a sequence that can be broken.
+         */
+        const val AF_BREAKTHROUGH_PRESSES = 1
+
+        /**
+         * Quiet required before AF may be LEFT. Longer than the housing's auto-repeat interval
+         * (~67 ms at 15 Hz) so a single held gesture cannot cross in and straight back out,
+         * short enough that a genuine second input is never refused.
+         */
+        const val AF_EXIT_GUARD_MS = 350L
 
         /**
          * Wheel events the housing delivers in a fast quarter turn — the calibration anchor
@@ -1497,6 +1722,37 @@ class ControlReducer(
          * housing firmware paces wheel notifications, so this is events, not physical clicks.
          */
         const val QUARTER_TURN_DETENTS = 4.0
+
+        /**
+         * Most rungs a single detent may move a VALUE ladder — ISO, shutter, white balance,
+         * exposure — at sensitivity 100 and full spin. Focus is not governed by this.
+         *
+         * Four, sized to the NATIVE ladders these settings now carry. The native scales are
+         * short and coarse by design — ISO has fifteen third-stop rungs, the Pro Video shutter
+         * nineteen, white balance seventy-eight — so a native rung is already a big, visible
+         * move and skipping many of them per detent would make the dial unusable. Four keeps the
+         * fastest gesture worth about a stop on ISO and two on shutter while a slow click stays
+         * exactly one rung; a fast spin still crosses the whole ISO dial in four detents and
+         * white balance in twenty.
+         *
+         * Ladder-independent (a stride in RUNGS, not ladder/4) for the same reason as before:
+         * tying stride to length is what once made a finer scale harder to use. Peak load is now
+         * 4 x 12 detents/s = 48 dispatches a second — a third of the previous 144.
+         */
+        const val VALUE_MAX_DETENT_RUNGS = 4.0
+
+        /**
+         * How fast a HELD direction button walks a value ladder, in rungs per second, at the
+         * bottom and the top of the sensitivity dial.
+         *
+         * Three a second is a readable tick the diver can stop on deliberately; sixteen crosses
+         * white balance's 78 native rungs in about 5 s and the fifteen-rung ISO dial in under a
+         * second — sized to the native ladders, where every rung is a real photographic step and
+         * overshooting one costs a third of a stop. Ladder-independent for the reason in
+         * [VALUE_MAX_DETENT_RUNGS].
+         */
+        const val VALUE_HELD_MIN_RUNGS_PER_SECOND = 3.0
+        const val VALUE_HELD_MAX_RUNGS_PER_SECOND = 16.0
 
         /** A held button tops the motor up with this much run-time per repeat event. */
         const val HOLD_TOPUP_MS = 120L
@@ -1580,19 +1836,56 @@ class ControlReducer(
      * to run continuously until the next repeat arrives — smooth motion at the sensitivity's
      * full rate, stopping when the button does.
      */
+    /**
+     * Which gearing law a slider obeys. Focus and the value ladders want opposite things.
+     *
+     * [Continuous] is focus: a pull through a physical range, where the diver's target is a
+     * PLANE and the rungs are only how finely it is sampled. Sweeping the whole scale in a
+     * quarter turn is the right feel, and its arithmetic is signed off — nothing here may
+     * change it.
+     *
+     * [Discrete] is ISO, shutter, white balance and exposure: ladders whose rungs are NAMED
+     * values the diver means to land on. "ISO 400" is a destination, not a position along a
+     * pull, so a detent that moves twenty-two rungs makes the setting unusable however smooth
+     * it feels.
+     */
+    private enum class SliderLaw { Continuous, Discrete }
+
     private fun sliderMotorFor(
         usableTicks: Int,
         sensitivity: SliderSensitivity,
         gapMs: Long,
         held: Boolean,
+        law: SliderLaw = SliderLaw.Continuous,
     ): SliderMotor {
-        // Re-centred by field calibration: the full-sweep-per-quarter-turn feel lives at the
-        // MIDPOINT (50), with real headroom above it — 100 plays the ladder in ~220 ms.
-        val sweepMs = (2400L - (sensitivity.level - 1) * 40L).coerceAtLeast(220L)
-        // Double, not integer, division. Truncating here made the pace depend on ladder length:
-        // once focus doubled to 201 rungs, level 1 played its sweep in 1608 ms instead of the
-        // nominal 2400 ms, because 2400/201 floored to 11 rather than 11.94.
-        val perTickMs = (sweepMs.toDouble() / usableTicks.coerceAtLeast(1)).coerceAtLeast(0.001)
+        val perTickMs = when (law) {
+            // Re-centred by field calibration: the full-sweep-per-quarter-turn feel lives at the
+            // MIDPOINT (50), with real headroom above it — 100 plays the ladder in ~220 ms.
+            //
+            // Double, not integer, division. Truncating here made the pace depend on ladder
+            // length: once focus doubled to 201 rungs, level 1 played its sweep in 1608 ms
+            // instead of the nominal 2400 ms, because 2400/201 floored to 11 rather than 11.94.
+            SliderLaw.Continuous -> {
+                val sweepMs = (2400L - (sensitivity.level - 1) * 40L).coerceAtLeast(220L)
+                (sweepMs.toDouble() / usableTicks.coerceAtLeast(1)).coerceAtLeast(0.001)
+            }
+            // A RATE, not a sweep — the same reason the detent stride is a rung count.
+            //
+            // Pacing a value ladder by "play the whole thing in N ms" has the ladder-length
+            // pathology in its other form: a held button would walk white balance's 113 rungs
+            // and exposure's 41 in the same 220 ms at full sensitivity, so the finer scale would
+            // scroll nearly three times faster and be that much harder to stop on. Fixing the
+            // rungs PER SECOND instead makes a held button feel identical on every value ladder
+            // and makes a longer ladder simply take longer to cross, which is what a diver
+            // expects.
+            SliderLaw.Discrete -> {
+                val sensNorm = (sensitivity.level - 1) / 99.0
+                val rungsPerSecond = VALUE_HELD_MIN_RUNGS_PER_SECOND +
+                    (VALUE_HELD_MAX_RUNGS_PER_SECOND - VALUE_HELD_MIN_RUNGS_PER_SECOND) *
+                    (sensNorm * sensNorm)
+                (1000.0 / rungsPerSecond).coerceAtLeast(0.001)
+            }
+        }
         val intervalMs: Long
         val maxTicks: Int
         if (perTickMs >= FOCUS_RAMP_TICK_MS) {
@@ -1619,22 +1912,57 @@ class ControlReducer(
             val detentsPerSecond = if (gapMs <= 0L) VELOCITY_FAST_DPS else 1000.0 / gapMs
             val velocity = ((detentsPerSecond - VELOCITY_SLOW_DPS) /
                 (VELOCITY_FAST_DPS - VELOCITY_SLOW_DPS)).coerceIn(0.0, 1.0)
-            // Above the midpoint the velocity gate progressively stands down, and at 100 it
-            // stands down COMPLETELY: a quarter turn spends the whole ladder however slowly the
-            // diver turns. Previously this floor topped out at 0.35, so an unhurried quarter
-            // turn carried only ~58% of nominal worth and stalled around the middle of the
-            // scale — the diver chose raw sensitivity, and gets it. The one-tick precision
-            // guarantee remains absolute at and below 50, where the floor is still zero.
-            val sensFloor = ((sensitivity.level - 50).coerceAtLeast(0) / 50.0)
-                .let { it * it }
-            val effectiveVelocity = maxOf(velocity, sensFloor)
-            // Sensitivity 100 spends the WHOLE ladder in one quarter turn, and not a step
-            // more: perDetent = ladder / quarter-turn detents. Below that it falls away
-            // quadratically, so mid-scale is a full turn end to end and the low end is a
-            // fine-focus vernier — while the one-step-per-detent floor guarantees every
-            // 0.01 remains reachable at any sensitivity.
-            val sensFactor = (sensitivity.level / 100.0).let { it * it }
-            val perDetent = usableTicks / QUARTER_TURN_DETENTS * sensFactor * effectiveVelocity
+            val perDetent = when (law) {
+                SliderLaw.Continuous -> {
+                    // Above the midpoint the velocity gate progressively stands down, and at 100
+                    // it stands down COMPLETELY: a quarter turn spends the whole ladder however
+                    // slowly the diver turns. Previously this floor topped out at 0.35, so an
+                    // unhurried quarter turn carried only ~58% of nominal worth and stalled
+                    // around the middle of the scale — the diver chose raw sensitivity, and gets
+                    // it. The one-tick precision guarantee remains absolute at and below 50,
+                    // where the floor is still zero.
+                    //
+                    // This stand-down is exactly what a VALUE ladder must not have, which is why
+                    // it lives in this branch and not above the `when`: it is the reason the
+                    // wheel could reach only four of white balance's seventy-eight kelvin rungs.
+                    val sensFloor = ((sensitivity.level - 50).coerceAtLeast(0) / 50.0)
+                        .let { it * it }
+                    val effectiveVelocity = maxOf(velocity, sensFloor)
+                    // Sensitivity 100 spends the WHOLE ladder in one quarter turn, and not a step
+                    // more: perDetent = ladder / quarter-turn detents. Below that it falls away
+                    // quadratically, so mid-scale is a full turn end to end and the low end is a
+                    // fine-focus vernier — while the one-step-per-detent floor guarantees every
+                    // 0.01 remains reachable at any sensitivity.
+                    val sensFactor = (sensitivity.level / 100.0).let { it * it }
+                    usableTicks / QUARTER_TURN_DETENTS * sensFactor * effectiveVelocity
+                }
+                // ONE DETENT IS ONE VALUE, and everything else is added on top of that.
+                //
+                // Two changes from the focus law, and both are needed:
+                //
+                // The BASE is 1 instead of 0, and the ceiling is a fixed number of rungs
+                // instead of ladder/quarter-turn. Tying the stride to the ladder's LENGTH is
+                // what made these settings unusable: the same wheel gesture moved 3 rungs when
+                // white balance had 10 and 20 once it had 78, so making a scale finer made it
+                // harder to use — exactly backwards. A stride measured in rungs means a longer
+                // ladder buys resolution and costs nothing else.
+                //
+                // The velocity gate is NOT stood down at high sensitivity. Focus lets
+                // sensitivity 100 sweep the range however slowly the hand moves, and that is
+                // precisely what stops a value landing: at 100 the stride was pinned to its
+                // maximum at every speed, so white balance could only ever reach four of its
+                // kelvin rungs and ISO skipped twenty-one values at a time. Here speed is the
+                // only accelerator, so a slow, deliberate click is exactly one rung at EVERY
+                // sensitivity — the precision guarantee is absolute rather than conditional —
+                // and sensitivity sets how much a fast spin is worth on top.
+                //
+                // [VALUE_MAX_DETENT_RUNGS] is 4, sized to the native third-stop/half-stop
+                // ladders: about a stop per detent at full sensitivity and full speed.
+                SliderLaw.Discrete -> {
+                    val sensNorm = (sensitivity.level - 1) / 99.0
+                    1.0 + (VALUE_MAX_DETENT_RUNGS - 1) * (sensNorm * sensNorm) * velocity
+                }
+            }
             // Round UP, so the quarter-turn guarantee is exact rather than one step short of
             // the rail (a ladder rarely divides evenly by the quarter-turn detent count).
             kotlin.math.ceil(kotlin.math.max(1.0, perDetent)).toInt()
@@ -1746,10 +2074,16 @@ class ControlReducer(
         "pro.white_balance",
         "expert.white_balance",
         "pro_video.white_balance" -> value.removeSuffix("K").toIntOrNull()?.let { CameraCommand.SetWhiteBalanceKelvin(it) }
+        // Manual focus reaches the lens through STATE, never through an effect — the runtime
+        // controller has no SetManualFocus branch, so this only ever fell through `else -> Unit`.
+        // Emitting it still made outcome.effects non-empty on every one of up to 1250 rungs a
+        // second, and that alone opened the whole effects pipeline in the ViewModel, including a
+        // Dispatchers.IO coroutine per rung — measured costlier than the reducer dispatch it
+        // accompanied, and it kept a second core out of idle for the length of a spin.
         "photo.manual_focus",
         "pro.manual_focus",
         "expert.manual_focus",
-        "pro_video.manual_focus" -> parseManualFocus(value)?.let { CameraCommand.SetManualFocus(it) }
+        "pro_video.manual_focus" -> null
         "photo.exposure_compensation",
         "portrait.exposure",
         "pro.exposure_value",
@@ -1784,23 +2118,13 @@ class ControlReducer(
         // "Auto" is the explicit zero-offset entry: auto-exposure with no compensation.
         if (value == "Auto") 0.0 else value.replace("+", "").toDoubleOrNull()
 
-    private fun parseShutterSpeedNs(value: String): Long? {
-        if (value == "Auto") {
-            return null
-        }
-        return if (value.endsWith("\"")) {
-            value.removeSuffix("\"").toDoubleOrNull()?.let { (it * 1_000_000_000L).toLong() }
-        } else {
-            val pieces = value.split("/")
-            if (pieces.size != 2) {
-                null
-            } else {
-                val numerator = pieces[0].toDoubleOrNull() ?: return null
-                val denominator = pieces[1].toDoubleOrNull() ?: return null
-                ((numerator / denominator) * 1_000_000_000L).toLong()
-            }
-        }
-    }
+    /**
+     * One parser, [CameraCatalog.shutterOptionNanos], shared with capability clipping and with
+     * the runtime controller. A private near-copy here disagreed about bare-seconds labels, and a
+     * label that clipping accepted but this rejected produced no effect at all — the strip showed
+     * a manual shutter while the sensor stayed on auto-exposure.
+     */
+    private fun parseShutterSpeedNs(value: String): Long? = CameraCatalog.shutterOptionNanos(value)
 
     private fun emitCameraEffect(state: AppState, command: CameraCommand): Reduction {
         return if (!state.permissions.camera) {

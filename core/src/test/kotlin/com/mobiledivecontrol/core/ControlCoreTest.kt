@@ -199,7 +199,66 @@ class ControlCoreTest {
         assertEquals(initialVal, held.state.camera.settingValues["pro.white_balance"])
         val ramp = held.effects.filterIsInstance<PlatformEffect.RampSetting>().single()
         assertEquals("pro.white_balance", ramp.settingId)
-        assertTrue(ramp.intervalMs > 100L, "sensitivity 1 must pace the walk slowly: ${ramp.intervalMs}ms")
+        // Pacing is a RATE, not a sweep. A value ladder is a list of destinations, so a held
+        // button has to walk it at a speed the diver can stop on — and that speed must not
+        // depend on how many rungs the ladder happens to have, or making white balance finer
+        // would make it scroll faster. At sensitivity 1 that rate is
+        // VALUE_HELD_MIN_RUNGS_PER_SECOND.
+        val rungsPerSecond = ramp.maxTicksPerInterval * 1000.0 / ramp.intervalMs
+        assertTrue(
+            rungsPerSecond in 2.0..4.5,
+            "sensitivity 1 must crawl at about 3 rungs/s, got $rungsPerSecond",
+        )
+    }
+
+    /**
+     * The property that the old sweep-based pacing could not give: a held button walks EVERY
+     * value ladder at the same speed, so a diver who learns the wheel on ISO is not surprised by
+     * white balance. Focus is deliberately excluded — it is a pull through a physical range and
+     * keeps its own full-sweep law.
+     */
+    @Test
+    fun `held button rate is the same on every value ladder`() {
+        val reducer = ControlReducer()
+        val rates = listOf("pro.iso", "pro.shutter_speed", "pro.white_balance", "pro.exposure_value")
+            .map { settingId ->
+                val settings = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
+                val cursor = CameraCatalog.settingsBarItems(
+                    CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra, false,
+                ).indexOfFirst { it is BottomBarItem.Setting && it.spec.id == settingId }
+                val state = AppState(
+                    camera = CameraCatalog.launchCameraState(
+                        activeMode = CameraModeId.Pro,
+                        settingValues = CameraCatalog.defaultSettingValues,
+                        sliderSensitivities = CameraCatalog.defaultSliderSensitivities +
+                            (settingId to SliderSensitivity(100)),
+                        focusCurveModes = CameraCatalog.defaultFocusCurveModes,
+                        detectedLenses = emptyList(),
+                    ),
+                ).let {
+                    it.copy(
+                        camera = it.camera.copy(
+                            focusedZone = CameraUiZone.SettingsPanel,
+                            settingsEditing = true,
+                            sliderEditTarget = SliderEditTarget.Value,
+                            settingsCursor = cursor,
+                        ),
+                    )
+                }
+                assertEquals(settingId, CameraCatalog.selectedSetting(state.camera)?.id)
+                val ramp = reducer.reduce(state, CameraCommand.NavigateRight, repeatCount = 1)
+                    .effects.filterIsInstance<PlatformEffect.RampSetting>().single()
+                assertEquals(settingId, ramp.settingId)
+                settingId to ramp.maxTicksPerInterval * 1000.0 / ramp.intervalMs
+            }
+        // Ladder lengths here run from 42 rungs (exposure) to 206 (shutter) — a five-fold
+        // spread that used to become a five-fold spread in scroll speed.
+        val slowest = rates.minOf { it.second }
+        val fastest = rates.maxOf { it.second }
+        assertTrue(
+            fastest - slowest < 6.0,
+            "held rate must not depend on ladder length, got $rates",
+        )
     }
 
     @Test
@@ -234,7 +293,88 @@ class ControlCoreTest {
             payload = byteArrayOf(0x10),
             receivedAt = Instant.parse("2026-05-27T12:00:00.250Z"),
         )
-        assertEquals("2800K", secondPress.state.camera.settingValues["pro.white_balance"])
+        // ONE RUNG PER TAP: Auto -> first rung -> second rung. The kelvin text is incidental;
+        // what this pins is that a deliberate, isolated press moves exactly one step and
+        // never a geared stride.
+        assertEquals(
+            CameraCatalog.whiteBalanceLadder[2],
+            secondPress.state.camera.settingValues["pro.white_balance"],
+            "second press must land on the ladder's second kelvin rung",
+        )
+    }
+
+    /**
+     * The native auto-to-manual handoff: with live telemetry present, the first press out of
+     * Auto lands on the rung nearest what AE is metering — not on the dial's first rung.
+     */
+    @Test
+    fun `leaving Auto seeds from the live metered value`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+        core.forceMode(AppMode.CameraLive)
+        core.dispatch(CameraCommand.NavigateDown)
+        core.dispatch(CameraCommand.NavigateDown)
+        core.dispatch(CameraCommand.Confirm) // Pro mode, settings panel
+        core.updateMeteredExposure(MeteredExposure(iso = 137, shutterNs = 5_000_000L, wbKelvin = 5_649))
+
+        val seeded = core.dispatch(CameraCommand.NudgeSetting("pro.iso", +1))
+        assertEquals(
+            "125",
+            seeded.state.camera.settingValues["pro.iso"],
+            "the first press out of Auto must land on the metered 137's nearest rung",
+        )
+        val shutterSeeded = core.dispatch(CameraCommand.NudgeSetting("pro.shutter_speed", +1))
+        assertEquals("1/180", shutterSeeded.state.camera.settingValues["pro.shutter_speed"])
+        val wbSeeded = core.dispatch(CameraCommand.NudgeSetting("pro.white_balance", +1))
+        val wbValue = wbSeeded.state.camera.settingValues["pro.white_balance"]!!
+        assertTrue(
+            kotlin.math.abs(wbValue.removeSuffix("K").toInt() - 5_649) <= 45,
+            "WB must seed within half a rung of the metered 5649K, got $wbValue",
+        )
+
+        // With no telemetry, the fallback is ordinary stepping: Auto -> the first rung.
+        val blind = ControlCore()
+        blind.advanceBle(BleSignal.Ready)
+        blind.updatePermission(PermissionKind.Camera, true)
+        blind.forceMode(AppMode.CameraLive)
+        blind.dispatch(CameraCommand.NavigateDown)
+        blind.dispatch(CameraCommand.NavigateDown)
+        blind.dispatch(CameraCommand.Confirm)
+        val stepped = blind.dispatch(CameraCommand.NudgeSetting("pro.iso", +1))
+        assertEquals("50", stepped.state.camera.settingValues["pro.iso"])
+    }
+
+    /**
+     * The EV authority rule as THIS app's sensor honours it: any manual exposure axis turns AE
+     * off here (the native app's vendor priority channel is closed to third parties), so an EV
+     * detent must be refused the moment either axis leaves Auto — not absorbed into a value the
+     * sensor will never honour.
+     */
+    @Test
+    fun `ev detents are refused while any exposure axis is manual`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+        core.forceMode(AppMode.CameraLive)
+        core.dispatch(CameraCommand.NavigateDown)
+        core.dispatch(CameraCommand.NavigateDown)
+        core.dispatch(CameraCommand.Confirm) // Pro mode
+
+        // EV is live while everything is Auto...
+        val live = core.dispatch(CameraCommand.NudgeSetting("pro.exposure_value", +1))
+        assertEquals("+0.1", live.state.camera.settingValues["pro.exposure_value"])
+
+        // ...and locks the moment ANY exposure axis goes manual.
+        core.dispatch(CameraCommand.NudgeSetting("pro.iso", +1))
+        val locked = core.dispatch(CameraCommand.NudgeSetting("pro.exposure_value", +1))
+        assertEquals("+0.1", locked.state.camera.settingValues["pro.exposure_value"])
+        assertTrue(locked.effects.isEmpty(), "a locked EV detent must not emit a camera effect")
+
+        // Returning the axis to Auto restores EV authority.
+        core.dispatch(CameraCommand.NudgeSetting("pro.iso", -1))
+        val restored = core.dispatch(CameraCommand.NudgeSetting("pro.exposure_value", +1))
+        assertEquals("+0.2", restored.state.camera.settingValues["pro.exposure_value"])
     }
 
     @Test
@@ -247,13 +387,13 @@ class ControlCoreTest {
         assertEquals(CameraUiZone.SettingsPanel, settingsOutcome.state.camera.focusedZone)
 
         val evSelected = core.dispatch(CameraCommand.NavigateLeft)
-        assertEquals("Auto", evSelected.state.camera.settingValues["photo.exposure_compensation"])
+        // The native quick EV bar has no Auto — it rests at 0.0, exactly like the stock dial.
+        assertEquals("0.0", evSelected.state.camera.settingValues["photo.exposure_compensation"])
 
         val adjusted = core.dispatch(CameraCommand.NavigateUp)
-        // "Auto" leads the ladder now; the first step off it enters the numeric scale.
-        assertEquals("-2.00", adjusted.state.camera.settingValues["photo.exposure_compensation"])
+        assertEquals("+0.1", adjusted.state.camera.settingValues["photo.exposure_compensation"])
         assertEquals(
-            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SetExposureCompensation(-2.0))),
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SetExposureCompensation(0.1))),
             adjusted.effects,
         )
     }
@@ -352,7 +492,10 @@ class ControlCoreTest {
 
     @Test
     fun `fresh focus presses wrap through AF while hold repeat stays in manual range`() {
-        val reducer = ControlReducer()
+        // A movable clock: AF holds for AF_EXIT_GUARD_MS after arrival so the housing's own
+        // auto-repeat cannot cross in and straight back out, so leaving needs time to pass.
+        var clock = 10_000L
+        val reducer = ControlReducer(nowMs = { clock })
         val maxState = AppState(
             camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
                 settingsCursor = 4,
@@ -360,9 +503,19 @@ class ControlCoreTest {
             ),
         )
 
-        val wrapToAf = reducer.reduce(maxState, CameraCommand.NavigateUp, repeatCount = 0)
+        // Reaching AF is deliberate: the barrier wants the pause AND sustained pushing, so a
+        // fresh press at the rail parks there and only the run crosses.
+        clock += ControlReducer.FOCUS_AF_PAUSE_MS + 1
+        var wrapToAf = reducer.reduce(maxState, CameraCommand.NavigateUp, repeatCount = 0)
+        if (ControlReducer.AF_BREAKTHROUGH_PRESSES > 1) {
+            assertEquals("1.000", wrapToAf.state.camera.settingValues["photo.manual_focus"])
+        }
+        repeat(ControlReducer.AF_BREAKTHROUGH_PRESSES - 1) {
+            wrapToAf = reducer.reduce(wrapToAf.state, CameraCommand.NavigateUp, repeatCount = 0)
+        }
         assertEquals("AF", wrapToAf.state.camera.settingValues["photo.manual_focus"])
 
+        clock += ControlReducer.AF_EXIT_GUARD_MS + 1
         val afToZero = reducer.reduce(wrapToAf.state, CameraCommand.NavigateUp, repeatCount = 0)
         assertEquals("0.000", afToZero.state.camera.settingValues["photo.manual_focus"])
 
@@ -479,6 +632,12 @@ class ControlCoreTest {
         assertTrue(fast > slow, "fast ($fast) should traverse more than slow ($slow)")
     }
 
+    /**
+     * Scoped to turns, which is what the guarantee was ever about. Beyond TURN_GAP_MS the
+     * gearing deliberately tapers toward a single rung so a value can be placed precisely —
+     * a quarter turn taken over several seconds is a diver aiming, not sweeping — so the
+     * "whatever the speed" clause holds across turn cadences, not across every cadence.
+     */
     @Test
     fun `at max sensitivity a quarter turn spends the ladder whatever the turn speed`() {
         val reducer = ControlReducer(nowMs = { 10_000L })
@@ -491,7 +650,7 @@ class ControlCoreTest {
         )
         val slow = detentTravel(
             reducer.reduce(
-                focusState("0.500", level = 100, lastInputAtMs = 9_400L),
+                focusState("0.500", level = 100, lastInputAtMs = 9_600L),
                 CameraCommand.NavigateUp,
                 repeatCount = 0,
             ),
@@ -546,13 +705,24 @@ class ControlCoreTest {
         )
         assertEquals("0.000", spinningAtNear.state.camera.settingValues["photo.manual_focus"])
 
-        // Rested, then turned again in the same direction: now it crosses.
-        val deliberateAtNear = reducer.reduce(
+        // Rested AND then kept pushing: a pause alone is not enough, because pausing mid-turn
+        // is natural and divers were falling into AF by accident.
+        var atNear = reducer.reduce(
             focusState("0.000", level = 50, lastInputAtMs = 9_000L),
             CameraCommand.NavigateDown,
             repeatCount = 0,
         )
-        assertEquals("AF", deliberateAtNear.state.camera.settingValues["photo.manual_focus"])
+        if (ControlReducer.AF_BREAKTHROUGH_PRESSES > 1) {
+            assertEquals(
+                "0.000",
+                atNear.state.camera.settingValues["photo.manual_focus"],
+                "one press must not cross while more are required",
+            )
+        }
+        repeat(ControlReducer.AF_BREAKTHROUGH_PRESSES - 1) {
+            atNear = reducer.reduce(atNear.state, CameraCommand.NavigateDown, repeatCount = 0)
+        }
+        assertEquals("AF", atNear.state.camera.settingValues["photo.manual_focus"])
 
         // The far rail behaves identically.
         val spinningAtFar = reducer.reduce(
@@ -562,12 +732,22 @@ class ControlCoreTest {
         )
         assertEquals("1.000", spinningAtFar.state.camera.settingValues["photo.manual_focus"])
 
-        val deliberateAtFar = reducer.reduce(
+        var atFar = reducer.reduce(
             focusState("1.000", level = 50, lastInputAtMs = 9_000L),
             CameraCommand.NavigateUp,
             repeatCount = 0,
         )
-        assertEquals("AF", deliberateAtFar.state.camera.settingValues["photo.manual_focus"])
+        if (ControlReducer.AF_BREAKTHROUGH_PRESSES > 1) {
+            assertEquals(
+                "1.000",
+                atFar.state.camera.settingValues["photo.manual_focus"],
+                "one press must not cross while more are required",
+            )
+        }
+        repeat(ControlReducer.AF_BREAKTHROUGH_PRESSES - 1) {
+            atFar = reducer.reduce(atFar.state, CameraCommand.NavigateUp, repeatCount = 0)
+        }
+        assertEquals("AF", atFar.state.camera.settingValues["photo.manual_focus"])
     }
 
     @Test
@@ -657,11 +837,15 @@ class ControlCoreTest {
         val outcome = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 0)
         assertEquals("0.6x", outcome.state.camera.settingValues["photo.lens"])
         assertEquals("0.000", outcome.state.camera.settingValues["photo.manual_focus"])
-        assertEquals(
-            listOf(
-                PlatformEffect.ExecuteCamera(CameraCommand.SetManualFocus(0.0)),
-            ),
-            outcome.effects,
+        // The lens follows the STATE, not an effect. SetManualFocus had no consumer in the
+        // runtime controller, and emitting it made every rung's outcome carry an effect —
+        // which opened the ViewModel's whole effects pipeline, an IO coroutine included, up to
+        // 1250 times a second. What matters is that the focus value landed, asserted above.
+        assertTrue(
+            outcome.effects.none {
+                it is PlatformEffect.ExecuteCamera && it.command is CameraCommand.SetManualFocus
+            },
+            "manual focus must not emit an unconsumed camera effect",
         )
     }
 

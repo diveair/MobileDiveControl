@@ -281,6 +281,18 @@ class ControlCore(
         )
     }
 
+    /**
+     * Live AE/AWB telemetry off the capture pipe (~2 Hz) — same footing as [updatePhoneBattery],
+     * but deliberately NOT routed through [commitReduction]: at 2 Hz a transition-ring entry per
+     * reading would evict every real state transition inside two minutes, and a latency row per
+     * reading is noise about a path with no work in it. The state commit itself is kept, because
+     * the reducer's auto-to-manual seeding reads [CameraState.meteredExposure] from THIS state.
+     */
+    fun updateMeteredExposure(metered: MeteredExposure): ProcessingOutcome {
+        state = reducer.updateMeteredExposure(state, metered).state
+        return ProcessingOutcome(state = state)
+    }
+
     fun updateSensor(
         sensorUpdate: SensorUpdate,
         receivedAt: Instant = clock.instant(),

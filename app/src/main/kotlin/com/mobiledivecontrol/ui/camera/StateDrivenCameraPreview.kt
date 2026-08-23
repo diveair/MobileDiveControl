@@ -43,6 +43,7 @@ fun StateDrivenCameraPreview(
     onEffectsConsumed: () -> Unit,
     onDetectedLenses: ((List<String>) -> Unit)? = null,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
+    onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -70,6 +71,7 @@ fun StateDrivenCameraPreview(
             },
             onDetectedLenses = onDetectedLenses,
             onCapabilities = onCapabilities,
+            onMeteredExposure = onMeteredExposure,
         )
 
         onDispose {
