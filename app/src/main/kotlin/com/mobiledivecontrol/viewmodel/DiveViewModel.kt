@@ -22,7 +22,11 @@ import com.mobiledivecontrol.core.SealConfidence
 import com.mobiledivecontrol.core.SealState
 import com.mobiledivecontrol.core.SensorUpdate
 import com.mobiledivecontrol.platform.GalleryRepository
+import com.mobiledivecontrol.platform.CompassHeadingMonitor
+import com.mobiledivecontrol.platform.CompassReading
+import com.mobiledivecontrol.platform.HeadingStore
 import com.mobiledivecontrol.platform.PhoneBatteryMonitor
+import com.mobiledivecontrol.platform.ble.BlePermissions
 import com.mobiledivecontrol.platform.ble.HousingFeatureFlags
 import com.mobiledivecontrol.platform.ble.HousingLink
 import com.mobiledivecontrol.platform.ble.HousingLinkEvent
@@ -32,6 +36,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.launch
+import com.mobiledivecontrol.core.HeadingMath
+import com.mobiledivecontrol.ui.camera.PointingGesture
 
 /**
  * Bridges the pure Kotlin [ControlCore] (BLE communication layer)
@@ -92,6 +98,12 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     private val housingLink: HousingLink? = diveApp?.housingLink
     private val phoneBatteryMonitor = PhoneBatteryMonitor(application)
     private val vacuumStore = com.mobiledivecontrol.platform.VacuumStore(application)
+    private val compassMonitor = CompassHeadingMonitor(application)
+    private val headingStore = HeadingStore(application)
+
+    val compassReading: StateFlow<CompassReading> = compassMonitor.reading
+    private val _targetHeading = MutableStateFlow(headingStore.read())
+    val targetHeading: StateFlow<Double?> = _targetHeading.asStateFlow()
 
     /**
      * Read once, before [_introVisible] initialises below: a persisted hold that reached its
@@ -177,6 +189,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         collectHousingLink()
         collectPhoneBattery()
         collectPendingSaves()
+        compassMonitor.start()
     }
 
     override fun onCleared() {
@@ -189,6 +202,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         // teardown can never lose a setting the diver changed.
         pendingSave.value?.let { state -> runCatching { sessionStore.save(state) } }
         phoneBatteryMonitor.stop()
+        compassMonitor.stop()
         super.onCleared()
     }
 
@@ -230,6 +244,10 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         _depthUnitMetric.value = !_depthUnitMetric.value
     }
 
+    fun setCompassMonitoring(active: Boolean) {
+        if (active) compassMonitor.start() else compassMonitor.stop()
+    }
+
     /**
      * Live AE/AWB readings from the capture pipe, throttled to ~2 Hz by the controller. Same
      * non-critical-path footing as [collectPhoneBattery]: telemetry that feeds the HUD's Auto
@@ -248,6 +266,44 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _state.value = controlCore.updateMeteredExposure(metered).state
         }
+    }
+
+    /** Replace the persisted target with the ray selected by a stable pointing gesture. */
+    fun setTargetHeadingFromPoint(gesture: PointingGesture) {
+        // The analyzer calls from its CameraX executor; ControlCore is deliberately main-confined.
+        viewModelScope.launch {
+            if (controlCore.state.camera.recording) return@launch
+            val cameraHeading = compassReading.value.headingDegrees
+            if (cameraHeading == null) {
+                surfaceWarning("Hold the camera level enough to acquire a compass heading.")
+                return@launch
+            }
+            setTargetHeading(
+                HeadingMath.targetFromImageRay(
+                    cameraHeadingDegrees = cameraHeading,
+                    normalizedX = gesture.normalizedX,
+                    horizontalFovDegrees = gesture.horizontalFovDegrees,
+                ),
+            )
+        }
+    }
+
+    /** Housing menu action: store exactly where the camera is pointing now. */
+    private fun trackCurrentHeading() {
+        if (controlCore.state.camera.recording) return
+        val heading = compassReading.value.headingDegrees
+        if (heading == null) {
+            surfaceWarning("Compass heading unavailable — hold the camera level and try again.")
+            return
+        }
+        setTargetHeading(heading)
+    }
+
+    private fun setTargetHeading(degrees: Double) {
+        val normalized = HeadingMath.normalize(degrees)
+        headingStore.write(normalized)
+        _targetHeading.value = normalized
+        android.util.Log.i("DiveHeading", "Tracked heading set to ${normalized.toInt()} degrees magnetic")
     }
 
     /**
@@ -325,12 +381,16 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             .getSystemService(android.content.Context.BLUETOOTH_SERVICE)
                 as? android.bluetooth.BluetoothManager)?.adapter
 
-    private val _bluetoothEnabled = MutableStateFlow(bluetoothAdapter?.isEnabled ?: false)
+    private val _bluetoothEnabled = MutableStateFlow(
+        BlePermissions.isAdapterEnabled(getApplication()),
+    )
     val bluetoothEnabled: StateFlow<Boolean> = _bluetoothEnabled.asStateFlow()
 
     private val bluetoothStateReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
             if (intent?.action == android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED) {
+                // Do not trust an exported broadcast's extras. Sampling the real adapter makes a
+                // spoofed intent harmless while still accepting Bluetooth's privileged broadcast.
                 refreshBluetoothState()
             }
         }
@@ -338,8 +398,10 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Registered here rather than in an init block so it runs AFTER the receiver it registers.
-     * Android 14+ requires the export flag explicitly; without it registration throws and the
-     * banner silently never updates when the radio is toggled.
+     * Bluetooth is a highly privileged framework app but does not broadcast as the system UID.
+     * Android's RECEIVER_NOT_EXPORTED therefore drops its state broadcasts on affected devices;
+     * RECEIVER_EXPORTED is required here. The receiver performs no action from intent data and
+     * samples the adapter itself, so third-party broadcasts cannot forge the state.
      */
     private val bluetoothReceiverRegistered: Boolean = run {
         runCatching {
@@ -347,13 +409,26 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                 getApplication(),
                 bluetoothStateReceiver,
                 android.content.IntentFilter(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED),
-                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED,
             )
+        }.onFailure { error ->
+            android.util.Log.e("DiveBluetooth", "Bluetooth state receiver registration failed", error)
         }.isSuccess
     }
 
     fun refreshBluetoothState() {
-        _bluetoothEnabled.value = bluetoothAdapter?.isEnabled ?: false
+        val enabled = runCatching { bluetoothAdapter?.isEnabled == true }
+            .onFailure { error ->
+                android.util.Log.w("DiveBluetooth", "Could not read Bluetooth adapter state", error)
+            }
+            .getOrDefault(false)
+        if (_bluetoothEnabled.value != enabled) {
+            android.util.Log.i(
+                "DiveBluetooth",
+                "Phone Bluetooth radio changed to ${if (enabled) "ON" else "OFF"}",
+            )
+            _bluetoothEnabled.value = enabled
+        }
     }
 
     fun onButtonPayload(payload: ByteArray) {
@@ -805,6 +880,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (outcome.effects.isNotEmpty()) {
             _effects.value = outcome.effects
+            if (PlatformEffect.TrackCurrentHeading in outcome.effects) trackCurrentHeading()
             processGalleryEffects(outcome.effects)
             processHousingEffects(outcome.effects)
             processRampEffects(outcome.effects)

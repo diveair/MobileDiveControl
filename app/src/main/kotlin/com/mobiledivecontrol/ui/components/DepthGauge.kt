@@ -1,12 +1,17 @@
 package com.mobiledivecontrol.ui.components
 
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import com.mobiledivecontrol.core.HeadingMath
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.core.SealState
 import com.mobiledivecontrol.theme.DiveColors
@@ -29,6 +34,10 @@ const val STANDARD_ATMOSPHERE_KPA = 101.325
  * [temperatureCelsius] rides along in the same pill: depth and water temperature are the two
  * numbers a diver reads together every few minutes, and pairing them here freed the top-centre
  * slot for the vacuum cluster, which needs the width.
+ *
+ * [headingDegrees] occupies the exact middle slot. Equal-width depth and temperature cells keep
+ * the compass geometrically centred even as either reading gains digits. When
+ * [headingTargetSynchronized] is true it shares the navigation arrow's success colour.
  */
 @Composable
 fun DepthGauge(
@@ -36,6 +45,8 @@ fun DepthGauge(
     surfaceAmbientKpa: Double?,
     useMetric: Boolean = true,
     temperatureCelsius: Double? = null,
+    headingDegrees: Double? = null,
+    headingTargetSynchronized: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val depthMeters = waterPressureKpa?.let { water ->
@@ -62,36 +73,79 @@ fun DepthGauge(
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier,
     ) {
+        Box(
+            modifier = Modifier.width(SIDE_READOUT_WIDTH),
+            contentAlignment = Alignment.CenterEnd,
+        ) {
+            Text(
+                text = displayText,
+                color = color,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        ReadoutSeparator()
         Text(
-            text = displayText,
-            color = color,
+            text = headingDegrees?.let(::formatHeading) ?: "---° --",
+            color = headingReadoutColor(headingDegrees, headingTargetSynchronized),
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace,
         )
-        if (temperatureCelsius != null) {
-            Text(
-                // Middle dot, not a slash or a pipe: the two readings are peers, and a separator
-                // that reads as "per" or as a table border would imply a relationship they do not
-                // have. Muted so the pill still parses as a depth gauge at a glance.
-                text = " $READOUT_SEPARATOR ",
-                color = DiveColors.TextMuted,
-                style = MaterialTheme.typography.titleMedium,
-            )
+        ReadoutSeparator()
+        Box(
+            modifier = Modifier.width(SIDE_READOUT_WIDTH),
+            contentAlignment = Alignment.CenterStart,
+        ) {
             Text(
                 // Unit spelled out, not a bare degree sign: 29° reads as either scale, and a
                 // reading whose scale must be guessed is not a reading. Follows the pill's own
                 // unit system, same as the depth beside it.
-                text = if (useMetric) {
-                    "%.1f°C".format(temperatureCelsius)
-                } else {
-                    "%.1f°F".format(temperatureCelsius * 9.0 / 5.0 + 32.0)
-                },
-                color = temperatureTint(temperatureCelsius),
+                text = temperatureCelsius?.let { temperature ->
+                    if (useMetric) {
+                        "%.1f°C".format(temperature)
+                    } else {
+                        "%.1f°F".format(temperature * 9.0 / 5.0 + 32.0)
+                    }
+                } ?: if (useMetric) "--.-°C" else "--.-°F",
+                color = temperatureCelsius?.let(::temperatureTint) ?: DiveColors.TextMuted,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
             )
         }
     }
+}
+
+internal fun headingReadoutColor(
+    headingDegrees: Double?,
+    headingTargetSynchronized: Boolean,
+) = when {
+    headingDegrees == null -> DiveColors.TextMuted
+    headingTargetSynchronized -> DiveColors.Success
+    else -> DiveColors.HeadingViolet
+}
+
+@Composable
+private fun ReadoutSeparator() {
+    Text(
+        text = " $READOUT_SEPARATOR ",
+        color = DiveColors.TextMuted,
+        style = MaterialTheme.typography.titleMedium,
+    )
+}
+
+private fun formatHeading(degrees: Double): String {
+    val normalized = HeadingMath.normalize(degrees)
+    val value = normalized.toInt().let { whole ->
+        // Round manually after normalisation so 359.6 becomes 000 rather than an invalid 360.
+        if (normalized - whole >= 0.5) (whole + 1) % 360 else whole
+    }
+    return "${value.toString().padStart(3, '0')}° ${cardinal(normalized)}"
+}
+
+private fun cardinal(degrees: Double): String {
+    val names = arrayOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    return names[((HeadingMath.normalize(degrees) + 22.5) / 45.0).toInt() % names.size]
 }
 
 /** The same bands TemperatureDisplay used in the top slot, so the move changes nothing but place. */
@@ -152,3 +206,4 @@ private val VACUUM_ENGAGED_STATES = setOf(
 private const val VACUUM_ENGAGED_KPA = 0.5
 
 private const val READOUT_SEPARATOR = "·"
+private val SIDE_READOUT_WIDTH = 76.dp

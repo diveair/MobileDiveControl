@@ -7,7 +7,12 @@ data class CameraRailEntry(
     val label: String,
     val mode: CameraModeId? = null,
     val opensSecondaryRail: Boolean = false,
+    val action: CameraRailAction? = null,
 )
+
+enum class CameraRailAction {
+    TrackHeading,
+}
 
 data class CameraSettingSpec(
     val id: String,
@@ -47,6 +52,8 @@ object CameraCatalog {
     const val WB_AUTO_SHUTTER = "Auto Shutter"
 
     val primaryRailEntries: List<CameraRailEntry> = listOf(
+        // An overlay action, not a capture mode: it never tears down or rebinds CameraX.
+        CameraRailEntry("track_heading", "Track Heading", action = CameraRailAction.TrackHeading),
         CameraRailEntry("photo", "Photo", CameraModeId.Photo),
         CameraRailEntry("expert_raw", "Expert RAW", CameraModeId.ExpertRaw),
         CameraRailEntry("pro", "Pro", CameraModeId.Pro),

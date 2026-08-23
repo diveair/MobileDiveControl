@@ -111,8 +111,10 @@ class GalleryRepository(private val context: Context) {
                     }
                     val bucketId = cursor.getString(bucketIdColumn)
                         ?: relativePath.trimEnd('/').ifBlank { "unfiled" }
-                    val bucketName = cursor.getString(bucketNameColumn)
-                        ?: relativePath.trimEnd('/').substringAfterLast('/').ifBlank { "Other" }
+                    val bucketName = mediaFolderDisplayName(
+                        bucketDisplayName = cursor.getString(bucketNameColumn),
+                        relativePath = relativePath,
+                    ).orEmpty()
 
                     rows += GalleryItem(
                         id = id,
@@ -150,11 +152,15 @@ class GalleryRepository(private val context: Context) {
         val albums = linkedMapOf<String, Album>()
         media.forEach { item ->
             val id = item.albumId ?: return@forEach
+            // A root-level MediaStore row is not an album. Inventing "Other" for it caused every
+            // such diagnostic screenshot or imported file to create a permanent-looking folder.
+            val displayName = item.folderDisplayName.trim().takeIf { it.isNotEmpty() }
+                ?: return@forEach
             val existing = albums[id]
             if (existing == null) {
                 albums[id] = Album(
                     id = id,
-                    name = item.folderDisplayName.ifBlank { "Other" },
+                    name = displayName,
                     count = 1,
                     latest = item.dateAdded,
                     cover = item,
@@ -450,6 +456,19 @@ class GalleryRepository(private val context: Context) {
         const val LAST_CREATED_ALBUM_KEY = "last-created-relative-path"
         const val EMPTY_ALBUM_PREFIX = "empty:"
     }
+}
+
+/** Returns a real MediaStore album name, or null when a row lives at storage root. */
+internal fun mediaFolderDisplayName(bucketDisplayName: String?, relativePath: String): String? {
+    return bucketDisplayName
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: relativePath
+            .trim()
+            .trimEnd('/')
+            .substringAfterLast('/')
+            .trim()
+            .takeIf { it.isNotEmpty() }
 }
 
 /** Pins every app-created album newest-first, preserving repository order for all other albums. */

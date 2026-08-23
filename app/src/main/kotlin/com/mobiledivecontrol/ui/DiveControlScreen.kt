@@ -28,6 +28,8 @@ import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.ui.camera.CameraShellScreen
+import com.mobiledivecontrol.ui.camera.PointingGesture
+import com.mobiledivecontrol.platform.CompassReading
 import com.mobiledivecontrol.ui.diagnostics.DiagnosticsScreen
 import com.mobiledivecontrol.ui.safety.SafetyScreen
 import com.mobiledivecontrol.ui.tutorial.IntroCarouselScreen
@@ -55,6 +57,9 @@ fun DiveControlScreen(
     onDetectedLenses: ((List<String>) -> Unit)? = null,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
+    onPointingGesture: ((PointingGesture) -> Unit)? = null,
+    compassReading: CompassReading = CompassReading(),
+    targetHeading: Double? = null,
     onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit = {},
     onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit = {},
     introVisible: Boolean = false,
@@ -77,6 +82,9 @@ fun DiveControlScreen(
             onDetectedLenses = onDetectedLenses,
             onCapabilities = onCapabilities,
             onMeteredExposure = onMeteredExposure,
+            onPointingGesture = onPointingGesture,
+            compassReading = compassReading,
+            targetHeading = targetHeading,
             onCameraCommand = onCameraCommand,
             onGalleryCommand = onGalleryCommand,
             bluetoothEnabled = bluetoothEnabled,
@@ -114,6 +122,9 @@ private fun DiveControlContent(
     onDetectedLenses: ((List<String>) -> Unit)?,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)?,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
+    onPointingGesture: ((PointingGesture) -> Unit)? = null,
+    compassReading: CompassReading = CompassReading(),
+    targetHeading: Double? = null,
     onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit,
     onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit,
     bluetoothEnabled: Boolean = true,
@@ -122,6 +133,8 @@ private fun DiveControlContent(
         state = state,
         useMetric = useMetric,
         bluetoothEnabled = bluetoothEnabled,
+        compassReading = compassReading,
+        targetHeading = targetHeading,
     ) {
         AnimatedContent(
             targetState = state.mode,
@@ -141,6 +154,7 @@ private fun DiveControlContent(
                     onDetectedLenses = onDetectedLenses,
                     onCapabilities = onCapabilities,
                     onMeteredExposure = onMeteredExposure,
+                    onPointingGesture = onPointingGesture,
                     onCameraCommand = onCameraCommand,
                     housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
@@ -154,6 +168,7 @@ private fun DiveControlContent(
                     onDetectedLenses = onDetectedLenses,
                     onCapabilities = onCapabilities,
                     onMeteredExposure = onMeteredExposure,
+                    onPointingGesture = onPointingGesture,
                     onCameraCommand = onCameraCommand,
                     housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )

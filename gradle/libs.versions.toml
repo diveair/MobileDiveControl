@@ -8,6 +8,7 @@ activity-compose = "1.9.0"
 lifecycle = "2.8.0"
 camerax = "1.4.1"
 junit = "5.10.2"
+mediapipe = "1.0.0"
 
 [libraries]
 kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib" }
@@ -38,6 +39,7 @@ camerax-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref =
 camerax-view = { module = "androidx.camera:camera-view", version.ref = "camerax" }
 camerax-video = { module = "androidx.camera:camera-video", version.ref = "camerax" }
 camerax-extensions = { module = "androidx.camera:camera-extensions", version.ref = "camerax" }
+mediapipe-tasks-vision = { module = "com.google.mediapipe:tasks-vision", version.ref = "mediapipe" }
 
 # Test
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test" }

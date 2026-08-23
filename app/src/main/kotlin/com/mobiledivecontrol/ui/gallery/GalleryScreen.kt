@@ -11,6 +11,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,6 +30,8 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -52,6 +56,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,13 +65,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -680,7 +689,7 @@ private fun GalleryBackActionButton(
             label = "TOP",
             pointsUp = true,
             color = accent,
-            labelColor = if (selected) DiveColors.DeepBlack else DiveColors.TextPrimary,
+            labelColor = DiveColors.TextPrimary,
         )
         Spacer(modifier = Modifier.height(2.dp))
         Row(
@@ -720,7 +729,7 @@ private fun GalleryBackActionButton(
             label = "BOTTOM",
             pointsUp = false,
             color = accent,
-            labelColor = if (selected) DiveColors.DeepBlack else DiveColors.TextPrimary,
+            labelColor = DiveColors.TextPrimary,
         )
     }
 }
@@ -968,30 +977,86 @@ private fun GalleryItemActionsOverlay(
 
 @Composable
 private fun DetailsPanel(galleryState: GalleryState, modifier: Modifier = Modifier) {
+    val listState = rememberLazyListState()
+    LaunchedEffect(
+        galleryState.detailsVisible,
+        galleryState.detailsLineIndex,
+        galleryState.previewExifLines.size,
+    ) {
+        if (galleryState.detailsVisible && galleryState.previewExifLines.isNotEmpty()) {
+            listState.animateScrollToItem(
+                galleryState.detailsLineIndex.coerceIn(galleryState.previewExifLines.indices),
+            )
+        }
+    }
     AnimatedVisibility(
         visible = galleryState.detailsVisible,
         enter = fadeIn(),
         exit = fadeOut(),
-        modifier = modifier.padding(end = 16.dp, bottom = 196.dp),
+        modifier = modifier.padding(top = 52.dp, end = 12.dp, bottom = 88.dp),
     ) {
         Column(
             modifier = Modifier
-                .fillMaxWidth(0.42f)
+                .fillMaxWidth(0.58f)
+                .fillMaxHeight()
                 .background(DiveColors.DeepBlack.copy(alpha = 0.9f), RoundedCornerShape(14.dp))
                 .border(1.dp, DiveColors.DiveCyan.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
-                .padding(16.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
                 Icon(Icons.Rounded.Info, contentDescription = null, tint = DiveColors.DiveCyan, modifier = Modifier.size(17.dp))
                 Spacer(modifier = Modifier.width(7.dp))
-                Text("Details", color = DiveColors.DiveCyan, fontWeight = FontWeight.Bold)
+                Text(
+                    "Details",
+                    color = DiveColors.DiveCyan,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                if (galleryState.previewExifLines.isNotEmpty()) {
+                    Text(
+                        "${galleryState.detailsLineIndex + 1} / ${galleryState.previewExifLines.size}  ·  ↑↓ Scroll",
+                        color = DiveColors.TextMuted,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
             }
-            Spacer(modifier = Modifier.height(7.dp))
             if (galleryState.previewExifLines.isEmpty()) {
-                Text("Loading…", color = DiveColors.TextSecondary)
+                Text(
+                    "Loading…",
+                    color = DiveColors.TextSecondary,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                )
             } else {
-                galleryState.previewExifLines.forEach { line ->
-                    Text(line, color = DiveColors.TextSecondary, style = MaterialTheme.typography.labelMedium)
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        start = 12.dp,
+                        end = 12.dp,
+                        bottom = 12.dp,
+                    ),
+                ) {
+                    items(
+                        count = galleryState.previewExifLines.size,
+                        key = { index -> index },
+                    ) { index ->
+                        val selected = index == galleryState.detailsLineIndex
+                        Text(
+                            text = galleryState.previewExifLines[index],
+                            color = if (selected) DiveColors.TextPrimary else DiveColors.TextSecondary,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(
+                                    if (selected) DiveColors.DiveCyan.copy(alpha = 0.16f)
+                                    else Color.Transparent,
+                                )
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                        )
+                    }
                 }
             }
         }
@@ -1144,6 +1209,18 @@ private fun CreateAlbumOverlay(galleryState: GalleryState, onCommand: (GalleryCo
 
 @Composable
 private fun RenameOverlay(galleryState: GalleryState, onCommand: (GalleryCommand) -> Unit) {
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+        keyboardController?.show()
+    }
+    LaunchedEffect(galleryState.pendingMutation) {
+        if (galleryState.pendingMutation != null) keyboardController?.hide()
+    }
+    DisposableEffect(Unit) {
+        onDispose { keyboardController?.hide() }
+    }
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier.fillMaxSize().background(DiveColors.DeepBlack.copy(alpha = 0.76f)),
@@ -1164,7 +1241,14 @@ private fun RenameOverlay(galleryState: GalleryState, onCommand: (GalleryCommand
                 enabled = galleryState.pendingMutation == null,
                 singleLine = true,
                 label = { Text("File name") },
-                modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(
+                    onDone = {
+                        keyboardController?.hide()
+                        onCommand(GalleryCommand.Confirm)
+                    },
+                ),
+                modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
             )
             Spacer(modifier = Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {

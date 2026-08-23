@@ -25,7 +25,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -36,6 +35,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -66,9 +66,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.mobiledivecontrol.core.CameraCaptureType
@@ -84,6 +86,7 @@ import com.mobiledivecontrol.core.CameraUiZone
 import com.mobiledivecontrol.core.FocusCurveMode
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.RecordingPausedAction
+import com.mobiledivecontrol.core.RecordingSaveConfirmationAction
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.core.SliderEditTarget
 import com.mobiledivecontrol.core.SliderSensitivity
@@ -105,6 +108,7 @@ fun CameraShellScreen(
     onDetectedLenses: ((List<String>) -> Unit)? = null,
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
+    onPointingGesture: ((PointingGesture) -> Unit)? = null,
     onCameraCommand: (CameraCommand) -> Unit = {},
     /** True while the housing-link banner occupies the top strip, so the mode pill yields to it. */
     housingLinkAlert: Boolean = false,
@@ -126,6 +130,7 @@ fun CameraShellScreen(
                 onDetectedLenses = onDetectedLenses,
                 onCapabilities = onCapabilities,
                 onMeteredExposure = onMeteredExposure,
+                onPointingGesture = onPointingGesture,
             )
         } else {
             CameraPreviewPlaceholder()
@@ -1453,6 +1458,67 @@ private fun RecordingPausedChooser(
     val previewVisible = cameraState.recordingPreviewVisible
     Box(modifier = modifier) {
         if (cameraState.recordingLocationChooserVisible) {
+            if (cameraState.recordingSaveConfirmationVisible) {
+                val destination = cameraState.recordingSaveLocations
+                    .getOrNull(cameraState.recordingSaveLocationIndex)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .background(DiveColors.DeepBlack.copy(alpha = 0.92f), RoundedCornerShape(14.dp))
+                        .padding(horizontal = 20.dp, vertical = 14.dp),
+                ) {
+                    Text(
+                        text = "SAVE TO ${destination?.name ?: "SELECTED ALBUM"}?",
+                        color = DiveColors.TextPrimary,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                        RecordingChoiceChip(
+                            label = "BACK",
+                            selected = cameraState.recordingSaveConfirmationAction ==
+                                RecordingSaveConfirmationAction.Back,
+                            accent = DiveColors.DiveCyan,
+                            onClick = { onCommand(CameraCommand.Back) },
+                        )
+                        RecordingChoiceChip(
+                            label = "CONFIRM",
+                            selected = cameraState.recordingSaveConfirmationAction ==
+                                RecordingSaveConfirmationAction.Confirm,
+                            accent = DiveColors.Success,
+                            onClick = {
+                                onCommand(
+                                    CameraCommand.SelectRecordingSaveLocation(
+                                        cameraState.recordingSaveLocationIndex,
+                                    ),
+                                )
+                            },
+                        )
+                    }
+                }
+                return@Box
+            }
+
+            val locationGridState = rememberLazyGridState()
+            LaunchedEffect(
+                cameraState.recordingSaveLocationIndex,
+                cameraState.recordingSaveLocations.size,
+            ) {
+                val index = cameraState.recordingSaveLocationIndex
+                if (index !in cameraState.recordingSaveLocations.indices) return@LaunchedEffect
+                val visibleItem = locationGridState.layoutInfo.visibleItemsInfo
+                    .firstOrNull { it.index == index }
+                val viewportStart = locationGridState.layoutInfo.viewportStartOffset
+                val viewportEnd = locationGridState.layoutInfo.viewportEndOffset
+                val fullyVisible = visibleItem != null &&
+                    visibleItem.offset.y >= viewportStart &&
+                    visibleItem.offset.y + visibleItem.size.height <= viewportEnd
+                if (!fullyVisible) {
+                    locationGridState.animateScrollToItem(index)
+                }
+            }
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
@@ -1469,6 +1535,7 @@ private fun RecordingPausedChooser(
                 Spacer(modifier = Modifier.height(8.dp))
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(3),
+                    state = locationGridState,
                     modifier = Modifier
                         .width(720.dp)
                         // Two complete rows fit the S24's 360 dp landscape viewport; further
@@ -1494,7 +1561,7 @@ private fun RecordingPausedChooser(
                                     shape = RoundedCornerShape(8.dp),
                                 )
                                 .clickable {
-                                    onCommand(CameraCommand.HighlightRecordingSaveLocation(index))
+                                    onCommand(CameraCommand.OpenRecordingSaveLocationConfirmation(index))
                                 }
                                 .padding(horizontal = 10.dp, vertical = 7.dp),
                         ) {
@@ -1516,86 +1583,89 @@ private fun RecordingPausedChooser(
                         }
                     }
                 }
-                Spacer(modifier = Modifier.height(10.dp))
-                Row(
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.width(720.dp),
-                ) {
-                    RecordingChoiceChip(
-                        label = "BACK",
-                        selected = false,
-                        accent = DiveColors.DiveCyan,
-                        onClick = { onCommand(CameraCommand.Back) },
-                    )
-                    RecordingChoiceChip(
-                        label = "CONFIRM",
-                        selected = true,
-                        accent = DiveColors.Success,
-                        onClick = {
-                            onCommand(
-                                CameraCommand.SelectRecordingSaveLocation(
-                                    cameraState.recordingSaveLocationIndex,
-                                ),
-                            )
-                        },
-                    )
-                }
             }
             return@Box
         }
 
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier
-                .align(Alignment.Center)
-                .offset(y = (-80).dp),
-        ) {
-            RecordingChoiceChip(
-                label = "SAVE TO · ${cameraState.recordingSaveLocation.name}",
-                selected = cameraState.recordingLocationFocused,
-                accent = DiveColors.DiveCyan,
-                onClick = { onCommand(CameraCommand.OpenRecordingSaveLocationChooser) },
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            RecordingBadge(visible = true, paused = true)
-        }
+        Layout(
+            content = {
+                RecordingBadge(visible = true, paused = true)
 
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .align(Alignment.Center)
-                .background(DiveColors.DeepBlack.copy(alpha = 0.88f), RoundedCornerShape(14.dp))
-                .padding(horizontal = 20.dp, vertical = 14.dp),
-        ) {
-            val actionFocused = !cameraState.recordingLocationFocused
-            RecordingChoiceChip(
-                label = "RESUME",
-                selected = actionFocused && selectedAction == RecordingPausedAction.Resume,
-                accent = DiveColors.Success,
-                onClick = { onCommand(CameraCommand.ResumeVideoRecording) },
-            )
-            Spacer(modifier = Modifier.width(10.dp))
-            RecordingChoiceChip(
-                label = if (previewVisible) "PAUSE" else "PREVIEW",
-                selected = actionFocused && selectedAction == RecordingPausedAction.Preview,
-                accent = DiveColors.DiveCyan,
-                onClick = { onCommand(CameraCommand.PreviewVideoRecording) },
-            )
-            Spacer(modifier = Modifier.width(10.dp))
-            RecordingChoiceChip(
-                label = "STOP",
-                selected = actionFocused && selectedAction == RecordingPausedAction.Stop,
-                accent = DiveColors.Warning,
-                onClick = { onCommand(CameraCommand.StopVideoRecording) },
-            )
-            Spacer(modifier = Modifier.width(10.dp))
-            RecordingChoiceChip(
-                label = "DELETE",
-                selected = actionFocused && selectedAction == RecordingPausedAction.Delete,
-                accent = DiveColors.Critical,
-                critical = true,
-                onClick = { onCommand(CameraCommand.DeleteVideoRecording) },
-            )
+                Box(modifier = Modifier.padding(start = 20.dp, top = 10.dp, end = 20.dp)) {
+                    RecordingChoiceChip(
+                        label = "SAVE TO · ${cameraState.recordingSaveLocation.name}",
+                        selected = cameraState.recordingLocationFocused,
+                        accent = DiveColors.DiveCyan,
+                        onClick = { onCommand(CameraCommand.OpenRecordingSaveLocationChooser) },
+                    )
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .padding(horizontal = 20.dp, vertical = 14.dp),
+                ) {
+                    val actionFocused = !cameraState.recordingLocationFocused
+                    RecordingChoiceChip(
+                        label = if (previewVisible) "PAUSE" else "PREVIEW",
+                        selected = actionFocused && selectedAction == RecordingPausedAction.Preview,
+                        accent = DiveColors.DiveCyan,
+                        onClick = { onCommand(CameraCommand.PreviewVideoRecording) },
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    RecordingChoiceChip(
+                        label = "RESUME",
+                        selected = actionFocused && selectedAction == RecordingPausedAction.Resume,
+                        accent = DiveColors.Success,
+                        onClick = { onCommand(CameraCommand.ResumeVideoRecording) },
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    RecordingChoiceChip(
+                        label = "STOP",
+                        selected = actionFocused && selectedAction == RecordingPausedAction.Stop,
+                        accent = DiveColors.Warning,
+                        onClick = { onCommand(CameraCommand.StopVideoRecording) },
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    RecordingChoiceChip(
+                        label = "DELETE",
+                        selected = actionFocused && selectedAction == RecordingPausedAction.Delete,
+                        accent = DiveColors.Critical,
+                        critical = true,
+                        onClick = { onCommand(CameraCommand.DeleteVideoRecording) },
+                    )
+                }
+
+                Box(
+                    modifier = Modifier.background(
+                        DiveColors.DeepBlack.copy(alpha = 0.88f),
+                        RoundedCornerShape(14.dp),
+                    ),
+                )
+            },
+            modifier = Modifier.fillMaxSize(),
+        ) { measurables, constraints ->
+            val looseConstraints = constraints.copy(minWidth = 0, minHeight = 0)
+            val pausedBadge = measurables[0].measure(looseConstraints)
+            val savePanel = measurables[1].measure(looseConstraints)
+            val actionRail = measurables[2].measure(looseConstraints)
+            val panelWidth = maxOf(savePanel.width, actionRail.width)
+            val panelHeight = savePanel.height + actionRail.height
+            val panelBackground = measurables[3].measure(Constraints.fixed(panelWidth, panelHeight))
+            val railX = (constraints.maxWidth - actionRail.width) / 2
+            val railY = (constraints.maxHeight - actionRail.height) / 2
+            val saveX = (constraints.maxWidth - savePanel.width) / 2
+            val saveY = railY - savePanel.height
+            val panelX = (constraints.maxWidth - panelWidth) / 2
+            val badgeX = (constraints.maxWidth - pausedBadge.width) / 2
+            val badgeY = saveY - 8.dp.roundToPx() - pausedBadge.height
+
+            layout(constraints.maxWidth, constraints.maxHeight) {
+                panelBackground.placeRelative(panelX, saveY)
+                pausedBadge.placeRelative(badgeX, badgeY)
+                savePanel.placeRelative(saveX, saveY)
+                actionRail.placeRelative(railX, railY)
+            }
         }
     }
 }

@@ -74,6 +74,10 @@ dependencies {
     implementation(libs.camerax.video)
     implementation(libs.camerax.extensions)
 
+    // On-device hand landmarks/gesture classification. The pinned model bundle lives in assets;
+    // no frame or recognition result leaves the phone.
+    implementation(libs.mediapipe.tasks.vision)
+
     // Coroutines
     implementation(libs.coroutines.core)
     implementation(libs.coroutines.android)

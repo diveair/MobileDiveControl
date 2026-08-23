@@ -1,12 +1,16 @@
 package com.mobiledivecontrol.ui
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -20,13 +24,22 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.mobiledivecontrol.core.AppMode
 import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.BleConnectionState
+import com.mobiledivecontrol.core.CameraState
+import com.mobiledivecontrol.core.NavigationArrowMesh
+import com.mobiledivecontrol.core.ProjectedArrowPoint
 import com.mobiledivecontrol.core.SealState
 import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.ui.components.ConnectionStatus
@@ -35,6 +48,10 @@ import com.mobiledivecontrol.ui.components.DualBatteryIndicator
 import com.mobiledivecontrol.ui.components.HousingLinkBanner
 import com.mobiledivecontrol.ui.components.SealCheckIndicator
 import com.mobiledivecontrol.ui.components.VacuumCountdownChip
+import com.mobiledivecontrol.platform.CompassReading
+import com.mobiledivecontrol.core.HeadingMath
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -46,6 +63,8 @@ fun CameraHudOverlay(
     useMetric: Boolean = true,
     modifier: Modifier = Modifier,
     bluetoothEnabled: Boolean = true,
+    compassReading: CompassReading = CompassReading(),
+    targetHeading: Double? = null,
     content: @Composable () -> Unit,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
@@ -102,24 +121,49 @@ fun CameraHudOverlay(
             )
         }
 
-        val bottomPadding = when (state.mode) {
-            AppMode.CameraLive, AppMode.CameraAdjust -> 86.dp
-            // Gallery's preview actions and bottom-centre Back share one dock below the gauge.
-            AppMode.Gallery -> 150.dp
-            else -> 28.dp
-        }
+        val bottomPadding = cameraReadoutBottomPadding(state.mode, state.camera)
 
-        OverlayPill(
+        // Produce the projected arrow and its lock state once. Both the arrow and numeric heading
+        // consume this same result, so their colour cannot disagree at the tolerance boundary.
+        val targetArrowMesh = if (
+            state.mode == AppMode.CameraLive || state.mode == AppMode.CameraAdjust
+        ) {
+            compassReading.cameraBasis?.let { cameraBasis ->
+                targetHeading?.let { heading ->
+                    HeadingMath.navigationArrowMesh(cameraBasis, heading)
+                }
+            }
+        } else {
+            null
+        }
+        val headingTargetSynchronized = targetArrowMesh?.yawErrorDegrees?.let { turn ->
+            abs(turn) < TARGET_HEADING_SYNC_TOLERANCE_DEGREES
+        } == true
+
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = bottomPadding),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            DepthGauge(
-                waterPressureKpa = state.safety.waterPressureKpa,
-                surfaceAmbientKpa = state.safety.surfaceAmbientKpa,
-                useMetric = useMetric,
-                temperatureCelsius = state.safety.waterTemperatureC,
-            )
+            if (targetArrowMesh != null && targetHeading != null) {
+                TargetHeadingArrow(
+                    mesh = targetArrowMesh,
+                    targetHeading = targetHeading,
+                    onHeading = headingTargetSynchronized,
+                )
+                Spacer(modifier = Modifier.height(3.dp))
+            }
+            OverlayPill {
+                DepthGauge(
+                    waterPressureKpa = state.safety.waterPressureKpa,
+                    surfaceAmbientKpa = state.safety.surfaceAmbientKpa,
+                    useMetric = useMetric,
+                    temperatureCelsius = state.safety.waterTemperatureC,
+                    headingDegrees = compassReading.headingDegrees,
+                    headingTargetSynchronized = headingTargetSynchronized,
+                )
+            }
         }
 
         // Offset below the link banner rather than layered with it. Draw order would decide the
@@ -131,7 +175,8 @@ fun CameraHudOverlay(
         // Anchor the seal chip to the vacuum cluster's real bottom edge, not a guess: the cluster
         // is one line tall in the cap wait and two lines while the hold counts, and "SEAL PASSED"
         // belongs directly under the reading it certifies in both shapes.
-        val clusterBottom = with(LocalDensity.current) { clusterHeightPx.toDp() }
+        val density = LocalDensity.current
+        val clusterBottom = with(density) { clusterHeightPx.toDp() }
         val sealTop = if (clusterHeightPx > 0) 16.dp + clusterBottom + SEAL_CLUSTER_GAP else SEAL_TOP
         SealCheckIndicator(
             safety = state.safety,
@@ -153,7 +198,15 @@ fun CameraHudOverlay(
         HousingLinkBanner(
             bleState = state.bleConnectionState,
             bluetoothEnabled = bluetoothEnabled,
-            modifier = if (vacuumEstablished) {
+            modifier = if (!bluetoothEnabled) {
+                // The phone-radio state is a prerequisite failure, not a floating housing
+                // advisory. Give it the complete display width so there is no ambiguous live
+                // camera strip at either edge suggesting the alert is local or dismissible.
+                Modifier
+                    .align(if (vacuumEstablished) Alignment.Center else Alignment.TopCenter)
+                    .then(if (vacuumEstablished) Modifier else Modifier.padding(top = 64.dp))
+                    .fillMaxWidth()
+            } else if (vacuumEstablished) {
                 Modifier
                     .align(Alignment.Center)
                     .padding(start = 16.dp, end = 16.dp)
@@ -168,12 +221,118 @@ fun CameraHudOverlay(
     }
 }
 
+/**
+ * A perspective-projected arrow prism lying on a virtual world-horizontal plane. The complete
+ * face geometry comes from HeadingMath, so pitch and roll alter its vanishing point,
+ * foreshortening and visible sides rather than merely rotating a flat icon.
+ */
+@Composable
+private fun TargetHeadingArrow(
+    mesh: NavigationArrowMesh,
+    targetHeading: Double,
+    onHeading: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val turn = mesh.yawErrorDegrees
+    val direction = when {
+        onHeading -> "on target heading"
+        turn == null -> "target projected through camera perspective"
+        turn > 0.0 -> "turn right ${abs(turn).roundToInt()} degrees"
+        else -> "turn left ${abs(turn).roundToInt()} degrees"
+    }
+    val arrowColor = if (onHeading) DiveColors.Success else DiveColors.DiveCyan
+
+    Canvas(
+        modifier = modifier
+            .size(30.dp)
+            .semantics {
+                contentDescription =
+                    "Target ${targetHeading.roundToInt().mod(360)} degrees, $direction"
+            },
+    ) {
+        val scale = minOf(size.width, size.height) * 0.48f
+        fun screen(point: ProjectedArrowPoint) = Offset(
+            x = center.x + point.x.toFloat() * scale,
+            y = center.y + point.y.toFloat() * scale,
+        )
+        fun face(points: List<ProjectedArrowPoint>) = Path().apply {
+            val first = screen(points.first())
+            moveTo(first.x, first.y)
+            points.drop(1).forEach { point ->
+                val projected = screen(point)
+                lineTo(projected.x, projected.y)
+            }
+            close()
+        }
+
+        // The lower silhouette and every connected perimeter wall make this a real projected
+        // prism. Drawing far walls first prevents a near wall from being covered during roll.
+        drawPath(face(mesh.lowerFace), DiveColors.DeepBlack.copy(alpha = 0.84f))
+        val wallIndices = mesh.lowerFace.indices.sortedBy { index ->
+            val next = (index + 1) % mesh.lowerFace.size
+            (mesh.lowerFace[index].y + mesh.lowerFace[next].y +
+                mesh.upperFace[index].y + mesh.upperFace[next].y) / 4.0
+        }
+        wallIndices.forEachIndexed { order, index ->
+            val next = (index + 1) % mesh.lowerFace.size
+            val wall = face(
+                listOf(
+                    mesh.lowerFace[index],
+                    mesh.lowerFace[next],
+                    mesh.upperFace[next],
+                    mesh.upperFace[index],
+                ),
+            )
+            drawPath(
+                wall,
+                arrowColor.copy(alpha = if (order % 2 == 0) 0.42f else 0.28f),
+            )
+        }
+
+        val top = face(mesh.upperFace)
+        drawPath(
+            path = top,
+            brush = Brush.linearGradient(
+                colors = listOf(arrowColor.copy(alpha = 0.74f), arrowColor),
+                start = Offset(size.width * 0.18f, size.height * 0.92f),
+                end = Offset(size.width * 0.78f, size.height * 0.06f),
+            ),
+        )
+        drawPath(
+            path = top,
+            color = DiveColors.TextPrimary.copy(alpha = 0.76f),
+            style = Stroke(width = 0.8.dp.toPx()),
+        )
+    }
+}
+
 
 /** Same slot the link banner uses, since the two are never both relevant with a healthy link. */
 private val SEAL_TOP = 64.dp
 
 /** Breathing room between the vacuum cluster's bottom edge and the seal chip below it. */
 private val SEAL_CLUSTER_GAP = 6.dp
+
+/** Leaves only the final 15% of the former gap above the collapsed camera navigation tray. */
+private val CAMERA_READOUT_LIVE_PADDING = 54.dp
+
+/** Safe position above the expanded full-width bottom settings editor. */
+private val CAMERA_READOUT_MENU_PADDING = 86.dp
+
+/** Existing lock tolerance, shared by arrow and numeric-heading colour. */
+private const val TARGET_HEADING_SYNC_TOLERANCE_DEGREES = 3.0
+
+/**
+ * Lift the readout only for the full-width bottom editor that can intersect it. The mode rail is
+ * confined to the right edge, so opening Track Heading must leave the centred readout stationary.
+ */
+internal fun cameraReadoutBottomPadding(mode: AppMode, camera: CameraState) = when (mode) {
+    AppMode.CameraLive, AppMode.CameraAdjust ->
+        if (camera.settingsEditing) CAMERA_READOUT_MENU_PADDING else CAMERA_READOUT_LIVE_PADDING
+    // Gallery's preview actions and bottom-centre Back share one dock below the gauge.
+    AppMode.Gallery -> 150.dp
+    else -> 28.dp
+}
 
 /** Clears a two-line link banner so a seal failure and a link warning can coexist. */
 private val SEAL_STACKED_TOP = 140.dp

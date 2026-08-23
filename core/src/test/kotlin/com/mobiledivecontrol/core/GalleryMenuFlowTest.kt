@@ -10,6 +10,78 @@ class GalleryMenuFlowTest {
     private val reducer = ControlReducer()
 
     @Test
+    fun `an empty album grid defaults to Back and vertical navigation cannot clear it`() {
+        val loaded = reducer.reduce(
+            AppState(
+                mode = AppMode.Gallery,
+                gallery = GalleryState(
+                    items = listOf(
+                        GalleryItem(1, "Camera", "bucket-camera", isFolder = true),
+                    ),
+                ),
+            ),
+            GalleryCommand.LoadItems(emptyList()),
+        )
+
+        assertTrue(loaded.state.gallery.browserBackFocused)
+        assertEquals(GalleryBrowserAction.Back, loaded.state.gallery.browserAction)
+
+        val stillBack = reducer.reduce(loaded.state, GalleryCommand.NavigateDown)
+        assertTrue(stillBack.state.gallery.browserBackFocused)
+        assertEquals(GalleryBrowserAction.Back, stillBack.state.gallery.browserAction)
+    }
+
+    @Test
+    fun `an empty inner-album grid defaults to Back in every direction`() {
+        val album = GalleryItem(1, "Empty Album", "bucket-empty", isFolder = true)
+        val opening = reducer.reduce(
+            AppState(
+                mode = AppMode.Gallery,
+                gallery = GalleryState(
+                    viewMode = GalleryViewMode.AlbumActions,
+                    items = listOf(album),
+                ),
+            ),
+            GalleryCommand.Confirm,
+        )
+        val loaded = reducer.reduce(opening.state, GalleryCommand.LoadItems(emptyList()))
+
+        listOf(
+            GalleryCommand.NavigateUp,
+            GalleryCommand.NavigateDown,
+            GalleryCommand.NavigateLeft,
+            GalleryCommand.NavigateRight,
+        ).forEach { command ->
+            val navigated = reducer.reduce(loaded.state, command)
+            assertTrue(navigated.state.gallery.browserBackFocused)
+            assertEquals(GalleryBrowserAction.Back, navigated.state.gallery.browserAction)
+        }
+    }
+
+    @Test
+    fun `loading a non-empty grid focuses its first item unless Back was explicitly preserved`() {
+        val item = GalleryItem(1, "Camera", "bucket-camera", isFolder = true)
+        val initialLoad = reducer.reduce(
+            AppState(mode = AppMode.Gallery),
+            GalleryCommand.LoadItems(listOf(item)),
+        )
+        assertFalse(initialLoad.state.gallery.browserBackFocused)
+        assertNull(initialLoad.state.gallery.browserAction)
+        assertEquals(0, initialLoad.state.gallery.selectedIndex)
+
+        val explicitBack = AppState(
+            mode = AppMode.Gallery,
+            gallery = GalleryState(
+                browserBackFocused = true,
+                browserAction = GalleryBrowserAction.Back,
+            ),
+        )
+        val preserved = reducer.reduce(explicitBack, GalleryCommand.LoadItems(listOf(item)))
+        assertTrue(preserved.state.gallery.browserBackFocused)
+        assertEquals(GalleryBrowserAction.Back, preserved.state.gallery.browserAction)
+    }
+
+    @Test
     fun `albums open into a mixed media grid and media opens full screen`() {
         val album = GalleryItem(
             id = -1,
@@ -116,6 +188,33 @@ class GalleryMenuFlowTest {
         current = state
         repeat(2) { current = reducer.reduce(current, GalleryCommand.NavigateRight).state }
         assertEquals(GalleryPreviewAction.Details, current.gallery.previewAction)
+    }
+
+    @Test
+    fun `open details consume vertical housing input and keep every metadata row reachable`() {
+        val lines = (1..12).map { "Detail $it" }
+        val open = previewState().copy(
+            gallery = previewState().gallery.copy(
+                detailsVisible = true,
+                previewExifLines = lines,
+                detailsLineIndex = 0,
+                previewAction = GalleryPreviewAction.Details,
+            ),
+        )
+
+        val firstCannotUnderflow = reducer.reduce(open, GalleryCommand.NavigateUp)
+        assertEquals(0, firstCannotUnderflow.state.gallery.detailsLineIndex)
+
+        var current = open
+        repeat(lines.size + 3) {
+            current = reducer.reduce(current, GalleryCommand.NavigateDown).state
+        }
+        assertEquals(lines.lastIndex, current.gallery.detailsLineIndex)
+        assertEquals(GalleryPreviewAction.Details, current.gallery.previewAction)
+
+        val horizontal = reducer.reduce(current, GalleryCommand.NavigateRight)
+        assertEquals(GalleryPreviewAction.Delete, horizontal.state.gallery.previewAction)
+        assertEquals(lines.lastIndex, horizontal.state.gallery.detailsLineIndex)
     }
 
     @Test

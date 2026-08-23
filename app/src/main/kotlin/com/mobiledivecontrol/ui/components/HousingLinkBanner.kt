@@ -52,7 +52,11 @@ fun HousingLinkBanner(
         modifier = modifier
             .background(
                 color = alert.background.copy(alpha = 0.92f),
-                shape = RoundedCornerShape(6.dp),
+                // Bluetooth-off owns the full display width. Square horizontal edges make the
+                // filled region genuinely edge-to-edge; rounded corners would leave four camera
+                // slivers even after the parent removed its margins.
+                shape = if (bluetoothEnabled) RoundedCornerShape(6.dp)
+                else RoundedCornerShape(0.dp),
             )
             .padding(horizontal = 16.dp, vertical = 10.dp),
     ) {

@@ -24,6 +24,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -69,11 +70,10 @@ fun SealCheckIndicator(
     housingConnected: Boolean,
     /** Where the top-anchored elements sit; the centred banners ignore it by design. */
     topPadding: Dp = 0.dp,
+    /** Actual top-chip/banner height, so neighbouring HUD elements never guess its footprint. */
+    onTopContentHeightChanged: (Int) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    if (!housingConnected) return
-    val stage = sealStage(safety) ?: return
-
     // A result is an event, not a condition. It announces itself, then leaves — and announces
     // itself again each time the confidence tier climbs, which is the only way "5 min" ever becomes
     // "30 min" on screen without the chip camping there for half an hour.
@@ -85,7 +85,15 @@ fun SealCheckIndicator(
             resultVisible = false
         }
     }
-    if (safety.sealState == SealState.Passed && !resultVisible) return
+    val stage = if (housingConnected) sealStage(safety) else null
+    val visibleStage = stage?.takeUnless {
+        safety.sealState == SealState.Passed && !resultVisible
+    }
+    val hasTopContent = visibleStage != null && !visibleStage.centered
+    LaunchedEffect(hasTopContent) {
+        if (!hasTopContent) onTopContentHeightChanged(0)
+    }
+    if (visibleStage == null) return
 
     Box(modifier = modifier) {
         when {
@@ -93,26 +101,28 @@ fun SealCheckIndicator(
             // stages that exist purely to be answered, and centre is where an instruction that
             // owns the next button press belongs. Everything that merely *reports* stays at the
             // top edge where it cannot sit on the subject.
-            stage.centered -> CenteredSealBanner(
-                stage = stage,
+            visibleStage.centered -> CenteredSealBanner(
+                stage = visibleStage,
                 modifier = Modifier
                     .align(Alignment.Center)
                     .fillMaxWidth(CENTERED_BANNER_WIDTH),
             )
 
-            stage.fullWidth -> SealBanner(
-                stage = stage,
+            visibleStage.fullWidth -> SealBanner(
+                stage = visibleStage,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .padding(top = topPadding)
+                    .onSizeChanged { onTopContentHeightChanged(it.height) }
                     .fillMaxWidth(),
             )
 
             else -> SealChip(
-                stage = stage,
+                stage = visibleStage,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = topPadding),
+                    .padding(top = topPadding)
+                    .onSizeChanged { onTopContentHeightChanged(it.height) },
             )
         }
     }

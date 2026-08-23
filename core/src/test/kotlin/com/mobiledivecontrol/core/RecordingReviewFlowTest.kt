@@ -25,9 +25,9 @@ class RecordingReviewFlowTest {
     fun `paused recording chooser is a four-action ring`() {
         var state = pausedState()
         val forward = listOf(
-            RecordingPausedAction.Preview,
             RecordingPausedAction.Stop,
             RecordingPausedAction.Delete,
+            RecordingPausedAction.Preview,
             RecordingPausedAction.Resume,
         )
         forward.forEach { expected ->
@@ -36,7 +36,7 @@ class RecordingReviewFlowTest {
         }
 
         state = reducer.reduce(state, CameraCommand.NavigateLeft).state
-        assertEquals(RecordingPausedAction.Delete, state.camera.recordingPausedAction)
+        assertEquals(RecordingPausedAction.Preview, state.camera.recordingPausedAction)
     }
 
     @Test
@@ -89,9 +89,18 @@ class RecordingReviewFlowTest {
         assertEquals(RecordingSaveLocation.Default, highlighted.state.camera.recordingSaveLocation)
         assertTrue(highlighted.state.camera.recordingLocationChooserVisible)
 
-        val selected = reducer.reduce(highlighted.state, CameraCommand.Confirm)
+        val decision = reducer.reduce(highlighted.state, CameraCommand.Confirm)
+        assertTrue(decision.state.camera.recordingSaveConfirmationVisible)
+        assertEquals(
+            RecordingSaveConfirmationAction.Confirm,
+            decision.state.camera.recordingSaveConfirmationAction,
+        )
+        assertEquals(RecordingSaveLocation.Default, decision.state.camera.recordingSaveLocation)
+
+        val selected = reducer.reduce(decision.state, CameraCommand.Confirm)
         assertEquals(destinations[1], selected.state.camera.recordingSaveLocation)
         assertFalse(selected.state.camera.recordingLocationChooserVisible)
+        assertFalse(selected.state.camera.recordingSaveConfirmationVisible)
         assertTrue(selected.state.camera.recordingLocationFocused)
 
         val returnedToRail = reducer.reduce(selected.state, CameraCommand.NavigateDown)
@@ -117,6 +126,41 @@ class RecordingReviewFlowTest {
         assertFalse(cancelled.state.camera.recordingLocationChooserVisible)
         assertTrue(cancelled.state.camera.recordingLocationFocused)
         assertEquals(RecordingSaveLocation.Default, cancelled.state.camera.recordingSaveLocation)
+    }
+
+    @Test
+    fun `album activation shows Back Confirm and Back returns to highlighted Save To`() {
+        val destination = RecordingSaveLocation(name = "Wrecks", relativePath = "DCIM/Wrecks/")
+        val grid = pausedState().copy(
+            camera = pausedState().camera.copy(
+                recordingLocationFocused = true,
+                recordingLocationChooserVisible = true,
+                recordingSaveLocations = listOf(RecordingSaveLocation.Default, destination),
+                recordingSaveLocationIndex = 1,
+            ),
+        )
+
+        val decision = reducer.reduce(grid, CameraCommand.Confirm)
+        assertTrue(decision.state.camera.recordingSaveConfirmationVisible)
+        assertEquals(RecordingSaveConfirmationAction.Confirm, decision.state.camera.recordingSaveConfirmationAction)
+
+        val backSelected = reducer.reduce(decision.state, CameraCommand.NavigateLeft)
+        assertEquals(
+            RecordingSaveConfirmationAction.Back,
+            backSelected.state.camera.recordingSaveConfirmationAction,
+        )
+        val returned = reducer.reduce(backSelected.state, CameraCommand.Confirm)
+
+        assertFalse(returned.state.camera.recordingLocationChooserVisible)
+        assertFalse(returned.state.camera.recordingSaveConfirmationVisible)
+        assertTrue(returned.state.camera.recordingLocationFocused)
+        assertEquals(RecordingSaveLocation.Default, returned.state.camera.recordingSaveLocation)
+    }
+
+    @Test
+    fun `Camera is the default recording destination`() {
+        assertEquals("Camera", RecordingSaveLocation.Default.name)
+        assertEquals("DCIM/Camera/", RecordingSaveLocation.Default.relativePath)
     }
 
     @Test

@@ -2,6 +2,7 @@ package com.mobiledivecontrol
 
 import android.Manifest
 import android.app.Activity
+import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -42,7 +43,7 @@ import androidx.compose.ui.Modifier
  * The phone is sealed inside a dive housing. The screen must:
  * 1. Stay on permanently (FLAG_KEEP_SCREEN_ON)
  * 2. Be fully immersive (no system bars — maximizes viewfinder area)
- * 3. Never show the keyboard
+ * 3. Keep the keyboard hidden except while the user is explicitly renaming media
  * 4. Lock to landscape (set in manifest)
  */
 class MainActivity : ComponentActivity() {
@@ -50,6 +51,8 @@ class MainActivity : ComponentActivity() {
     private var cameraPermissionGranted by mutableStateOf(false)
     private var blePermissionsGranted by mutableStateOf(false)
     private var housingServiceStarted = false
+    /** Prevents a denied system enable dialog from reopening in a loop during one off-state. */
+    private var bluetoothEnableRequestedWhileOff = false
 
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -75,15 +78,39 @@ class MainActivity : ComponentActivity() {
             // onResume runs outside the composition; keep a handle so a Bluetooth toggle made
             // from quick settings is picked up the moment the diver returns to the app.
             bluetoothStateRefresh = viewModel::refreshBluetoothState
+            compassMonitoring = viewModel::setCompassMonitoring
             val state by viewModel.state.collectAsState()
             val effects by viewModel.effects.collectAsState()
             val useMetric by viewModel.depthUnitMetric.collectAsState()
             val introVisible by viewModel.introVisible.collectAsState()
             val bluetoothEnabled by viewModel.bluetoothEnabled.collectAsState()
+            val compassReading by viewModel.compassReading.collectAsState()
+            val targetHeading by viewModel.targetHeading.collectAsState()
             val missingPermissions by viewModel.missingPermissions.collectAsState()
             val capPromptVisible by viewModel.capPromptVisible.collectAsState()
             val galleryConsentRequest by viewModel.galleryConsentRequest.collectAsState()
             val galleryMediaManagementRequest by viewModel.galleryMediaManagementRequest.collectAsState()
+            val bluetoothEnableLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.StartActivityForResult(),
+            ) {
+                // ACTION_REQUEST_ENABLE returns only after the transition finishes or is denied.
+                // Re-read the adapter; RESULT_OK alone is not a durable radio-state source.
+                viewModel.refreshBluetoothState()
+            }
+
+            androidx.compose.runtime.LaunchedEffect(bluetoothEnabled, blePermissionsGranted) {
+                if (bluetoothEnabled) {
+                    bluetoothEnableRequestedWhileOff = false
+                } else if (blePermissionsGranted && !bluetoothEnableRequestedWhileOff) {
+                    val request = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
+                    if (request.resolveActivity(packageManager) != null) {
+                        bluetoothEnableRequestedWhileOff = true
+                        bluetoothEnableLauncher.launch(request)
+                    } else {
+                        Log.e("DiveBluetooth", "No system activity can request Bluetooth enable")
+                    }
+                }
+            }
             val galleryConsentLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.StartIntentSenderForResult(),
             ) { result ->
@@ -140,17 +167,18 @@ class MainActivity : ComponentActivity() {
 
             // The housing link only starts once the radio is legally usable. Starting it earlier
             // throws a SecurityException on a binder thread and the diver sees nothing.
-            androidx.compose.runtime.LaunchedEffect(blePermissionsGranted) {
+            androidx.compose.runtime.LaunchedEffect(blePermissionsGranted, bluetoothEnabled) {
                 viewModel.updatePermission(
                     com.mobiledivecontrol.core.PermissionKind.Bluetooth,
                     blePermissionsGranted,
                 )
-                if (blePermissionsGranted) {
+                if (blePermissionsGranted && bluetoothEnabled) {
                     startHousingLinkService()
                 } else {
-                    // Without the permission the service cannot legally start on Android 14+, so
-                    // nothing would ever move the link out of Idle. Say "unavailable" rather than
-                    // leaving the diver with dead buttons and a banner that reads "searching".
+                    // A stopped phone radio cannot produce evidence about the housing. Keeping the
+                    // reconnect supervisor alive here only polls a prerequisite that changes via a
+                    // broadcast, so stop it and let the explicit phone-radio banner own the state.
+                    stopHousingLinkService()
                     viewModel.advanceBle(com.mobiledivecontrol.core.BleSignal.Fail)
                 }
             }
@@ -160,6 +188,8 @@ class MainActivity : ComponentActivity() {
                     // Main UI
                     DiveControlScreen(
                         bluetoothEnabled = bluetoothEnabled,
+                        compassReading = compassReading,
+                        targetHeading = targetHeading,
                         state = state,
                         cameraPermissionGranted = cameraPermissionGranted,
                         lifecycleOwner = this@MainActivity,
@@ -177,6 +207,7 @@ class MainActivity : ComponentActivity() {
                             )
                         },
                         onMeteredExposure = viewModel::updateMeteredExposure,
+                        onPointingGesture = viewModel::setTargetHeadingFromPoint,
                         onCameraCommand = { command -> viewModel.dispatch(command) },
                         onGalleryCommand = { command -> viewModel.dispatch(command) },
                         introVisible = introVisible,
@@ -204,6 +235,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private var bluetoothStateRefresh: (() -> Unit)? = null
+    private var compassMonitoring: ((Boolean) -> Unit)? = null
+
+    override fun onStart() {
+        super.onStart()
+        compassMonitoring?.invoke(true)
+    }
+
+    override fun onStop() {
+        compassMonitoring?.invoke(false)
+        super.onStop()
+    }
 
     override fun onResume() {
         super.onResume()
@@ -225,6 +267,12 @@ class MainActivity : ComponentActivity() {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             } else {
                 add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // MANAGE_MEDIA deliberately does not grant write access itself. Android's
+                // createWriteRequest remains confirmation-free only while this runtime grant is
+                // present, which is essential when the phone is sealed inside the housing.
+                add(Manifest.permission.ACCESS_MEDIA_LOCATION)
             }
             addAll(BlePermissions.required())
         }
@@ -263,10 +311,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun stopHousingLinkService() {
+        runCatching {
+            stopService(Intent(this, HousingLinkService::class.java))
+        }.onFailure { error ->
+            Log.w("DiveBluetooth", "Could not stop housing link while Bluetooth is unavailable", error)
+        }
+        housingServiceStarted = false
+    }
+
     private fun hideSystemBars() {
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
         windowInsetsController.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
     }
+
 }

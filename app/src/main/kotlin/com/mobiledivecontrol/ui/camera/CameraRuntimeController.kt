@@ -6,6 +6,10 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Rect
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -60,10 +64,12 @@ import com.mobiledivecontrol.core.CameraCapabilities
 import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.CameraState
+import com.mobiledivecontrol.core.AutofocusHoldPolicy
 import com.mobiledivecontrol.core.FocusCurveMode
 import com.mobiledivecontrol.ui.components.STANDARD_ATMOSPHERE_KPA
 import kotlin.math.abs
 import kotlin.math.ln
+import kotlin.math.atan
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import java.io.File
@@ -75,6 +81,7 @@ class CameraRuntimeController(
     companion object {
         private const val TAG = "DiveCameraCtrl"
         private const val RESUME_STREAM_CHECK_DELAY_MS = 2_500L
+        private const val DEFAULT_HORIZONTAL_FOV_DEGREES = 70.0
 
         /** The native app's vendor "manual kelvin" AWB mode (AeAfController branch B). */
         /** XYZ (D65) to linear sRGB. */
@@ -124,9 +131,6 @@ class CameraRuntimeController(
         private const val WB_SHUTTER_LOCK_TIMEOUT_MS = 600L
         private const val MACRO_STOP_REBIND_DEBOUNCE_MS = 450L
 
-        /** A beat on the landed plane before the HAL takes the lens, so the arrival reads. */
-        private const val AF_HANDOVER_DELAY_MS = 220L
-
         /** How far the probe steps to decide which way the subject lies. */
         private const val AF_PROBE_STEP = 0.05
 
@@ -141,6 +145,23 @@ class CameraRuntimeController(
 
         /** Subsampling stride of the focus measure. */
         private const val SHARPNESS_STRIDE = 4
+
+        /** Keep native CAF active until the housing has been still for this long. */
+        private const val AF_MOTION_SETTLE_MS = 320L
+
+        /** Held-plane monitoring is cheap but still bounded; gesture inference owns the stream. */
+        private const val AF_HOLD_MONITOR_INTERVAL_MS =
+            AutofocusHoldPolicy.HOLD_MONITOR_INTERVAL_MS
+
+        /** Ignore only the first settling frames after a lock, not an entire subject change. */
+        private const val AF_HOLD_MONITOR_GRACE_MS =
+            AutofocusHoldPolicy.HOLD_MONITOR_GRACE_MS
+
+        /** Give continuous-video AF a short, smooth convergence window before locking it. */
+        private const val AF_LOCK_SETTLE_MS = 650L
+
+        /** Some HALs omit the final AF state; a one-shot START still locks by contract. */
+        private const val AF_LOCK_RESULT_TIMEOUT_MS = 900L
 
         /** One focus tick per frame-ish: the glide reads as continuous motion, not steps. */
         private const val FOCUS_SLEW_TICK_MS = 16L
@@ -319,10 +340,38 @@ class CameraRuntimeController(
     private val focusAssistExecutor = Executors.newSingleThreadExecutor()
     // Callback to report detected lenses back to the ViewModel/state
     private var onDetectedLenses: ((List<String>) -> Unit)? = null
+    private var onPointingGesture: ((PointingGesture) -> Unit)? = null
+    private var pointingRecognizer: PointingGestureRecognizer? = null
     // GPU-accelerated focus peaking via OpenGL shader in the CameraX preview pipeline.
     // Replaces the old CPU bitmap overlay approach which caused jitter and drift.
     private var focusPeakingProcessor: FocusPeakingSurfaceProcessor? = null
     private val cameraRequestHandler = Handler(Looper.getMainLooper())
+    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+    private var focusMotionMonitorRegistered = false
+    @Volatile private var lastSignificantFocusMotionAtMs = 0L
+
+    private val focusMotionListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            if (event.sensor.type != Sensor.TYPE_GYROSCOPE || event.values.size < 3) return
+            if (!AutofocusHoldPolicy.isIntentionalCameraMotion(
+                    event.values[0],
+                    event.values[1],
+                    event.values[2],
+                )
+            ) return
+            if (manualFocusRequestFor(latestState) != null) return
+            val now = SystemClock.elapsedRealtime()
+            lastSignificantFocusMotionAtMs = now
+            // Release on the first deliberate movement, while the new subject is entering the
+            // frame. Waiting until motion stopped was the responsiveness regression: the lens
+            // could not even begin following until the entire turn plus 320 ms had elapsed.
+            // Subsequent gyro samples only extend the relock deadline; they do not resubmit AF.
+            releaseAutofocusForTracking("camera movement", AF_MOTION_SETTLE_MS)
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
 
     // ── Native Camera2 focus control ──────────────────────────────────────
     // When manual focus is active we take FULL ownership of the Camera2
@@ -392,8 +441,11 @@ class CameraRuntimeController(
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastAeExposureNs = it }
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastAeSensitivity = it }
 
+            val captureNow = SystemClock.elapsedRealtime()
+            observeAutofocusState(result, captureNow)
+
             // Periodic diagnostic logging and the live Auto readouts, on one 2 Hz throttle.
-            val now = SystemClock.elapsedRealtime()
+            val now = captureNow
             if (now - lastFocusResultLogAtMs < 500L) return
             lastFocusResultLogAtMs = now
 
@@ -432,6 +484,7 @@ class CameraRuntimeController(
 
             val fd = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
             val af = result.get(CaptureResult.CONTROL_AF_MODE)
+            val afState = result.get(CaptureResult.CONTROL_AF_STATE)
             val lp = samsungFocusLensPosition(result)
             val physicalId = runningPhysicalCameraId(result)
             // evIdx is the HAL's echo of CONTROL_AE_EXPOSURE_COMPENSATION — the on-metal proof
@@ -443,7 +496,7 @@ class CameraRuntimeController(
             }
             Log.d(
                 TAG,
-                "CaptureResult fd=$fd af=$af lpEcho=$lp lpActual=$lastObservedVendorLensPos " +
+                "CaptureResult fd=$fd af=$af afState=$afState lpEcho=$lp lpActual=$lastObservedVendorLensPos " +
                     "wanted=$lastCommandedLensPos physical=$physicalId native=$nativeFocusActive " +
                     "iso=$lastAeSensitivity expNs=$lastAeExposureNs evIdx=$evEcho " +
                     "wbK=$meteredWbKelvin evMeter=$meteredEvTenths " +
@@ -480,6 +533,7 @@ class CameraRuntimeController(
         onDetectedLenses: ((List<String>) -> Unit)? = null,
         onCapabilities: ((CameraCapabilities) -> Unit)? = null,
         onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
+        onPointingGesture: ((PointingGesture) -> Unit)? = null,
     ) {
         this.previewView = previewView
         this.lifecycleOwner = lifecycleOwner
@@ -487,6 +541,8 @@ class CameraRuntimeController(
         this.onDetectedLenses = onDetectedLenses
         this.onCapabilities = onCapabilities
         this.onMeteredExposure = onMeteredExposure
+        this.onPointingGesture = onPointingGesture
+        startFocusMotionMonitor()
         wbCalibration = runCatching { loadWbCalibration() }.getOrNull()
         loadAwbCurve()
         latestState = initialState
@@ -512,6 +568,22 @@ class CameraRuntimeController(
     }
 
     private var resumeObserver: LifecycleEventObserver? = null
+
+    private fun startFocusMotionMonitor() {
+        if (focusMotionMonitorRegistered) return
+        val sensor = gyroscope ?: return
+        focusMotionMonitorRegistered = sensorManager.registerListener(
+            focusMotionListener,
+            sensor,
+            SensorManager.SENSOR_DELAY_GAME,
+        )
+    }
+
+    private fun stopFocusMotionMonitor() {
+        if (!focusMotionMonitorRegistered) return
+        sensorManager.unregisterListener(focusMotionListener)
+        focusMotionMonitorRegistered = false
+    }
 
     /**
      * Eviction-recovery net. When another camera app takes the device and the user returns,
@@ -567,6 +639,7 @@ class CameraRuntimeController(
     }
 
     fun detach() {
+        stopFocusMotionMonitor()
         resumeObserver?.let { observer -> lifecycleOwner?.lifecycle?.removeObserver(observer) }
         resumeObserver = null
         cameraProvider?.unbindAll()
@@ -583,6 +656,14 @@ class CameraRuntimeController(
         cam2Session = null
         cam2Surfaces = emptyList()
         nativeFocusActive = false
+        afSearchGen++
+        afPullActive = false
+        afTracking = false
+        afLocked = false
+        afLockPending = false
+        afHoldDiopters = null
+        afHoldSharpness = null
+        afSharpnessLossSamples = 0
         shutterAwbLockGeneration++
         shutterAwbLockInFlight = false
         shutterAwbLockActive = false
@@ -590,6 +671,14 @@ class CameraRuntimeController(
         lastAppliedSessionSignature = null
         focusPeakingProcessor?.release()
         focusPeakingProcessor = null
+        // MediaPipe's GPU delegate is thread-affine. Stop new analyzer work first, then enqueue
+        // close behind any inference already running on the same executor that created it.
+        onPointingGesture = null
+        val recognizerToClose = pointingRecognizer
+        pointingRecognizer = null
+        recognizerToClose?.let { recognizer ->
+            focusAssistExecutor.execute { recognizer.close() }
+        }
     }
 
     /**
@@ -681,13 +770,20 @@ class CameraRuntimeController(
      */
     @Volatile private var afHoldDiopters: Float? = null
 
-    /**
-     * True while the housing is being moved: focus tracks the subject continuously instead of
-     * holding. Continuous-video AF is the mode built for this — it damps its own travel and
-     * never sweeps the whole range looking for a peak, which is what made a one-shot search
-     * land with a thud every time the camera was repointed.
-     */
+    /** True only while our smooth contrast pull is running; steady auto focus always holds. */
     @Volatile private var afTracking = false
+
+    /** Camera2 AF trigger state: continuous while tracking, locked while the scene is steady. */
+    @Volatile private var afLocked = false
+    @Volatile private var afLockPending = false
+    @Volatile private var afLockRequestedAtMs = 0L
+    @Volatile private var afLockEligibleAtMs = 0L
+
+    /** Contrast of the plane we deliberately landed on, used to detect a genuinely new scene. */
+    @Volatile private var afHoldSharpness: Double? = null
+    @Volatile private var afHoldStartedAtMs = 0L
+    @Volatile private var lastAfHoldMonitorAtMs = 0L
+    private var afSharpnessLossSamples = 0
 
     /**
      * A capture request kept alive for the duration of a ramp, so a focus step costs one key
@@ -753,7 +849,7 @@ class CameraRuntimeController(
     @Volatile private var afPullActive = false
 
     /**
-     * Contrast in the middle of the frame, from the luma plane only.
+     * Contrast in the middle of the frame, from the RGBA analysis plane.
      *
      * Deliberately cheap: a horizontal gradient over a subsampled centre crop. It is not an
      * image-quality metric, only a monotone "is this sharper than that" signal for finding the
@@ -764,6 +860,7 @@ class CameraRuntimeController(
             val plane = image.planes.firstOrNull() ?: return latestSharpness
             val buffer = plane.buffer
             val rowStride = plane.rowStride
+            val pixelStride = plane.pixelStride.coerceAtLeast(4)
             val x0 = image.width / 3
             val x1 = image.width * 2 / 3
             val y0 = image.height / 3
@@ -775,8 +872,15 @@ class CameraRuntimeController(
                 val row = y * rowStride
                 var x = x0
                 while (x < x1 - SHARPNESS_STRIDE) {
-                    val a = buffer.get(row + x).toInt() and 0xFF
-                    val b = buffer.get(row + x + SHARPNESS_STRIDE).toInt() and 0xFF
+                    fun luma(pixelX: Int): Int {
+                        val base = row + pixelX * pixelStride
+                        val r = buffer.get(base).toInt() and 0xFF
+                        val g = buffer.get(base + 1).toInt() and 0xFF
+                        val b = buffer.get(base + 2).toInt() and 0xFF
+                        return (77 * r + 150 * g + 29 * b) ushr 8
+                    }
+                    val a = luma(x)
+                    val b = luma(x + SHARPNESS_STRIDE)
                     sum += kotlin.math.abs(a - b)
                     count++
                     x += SHARPNESS_STRIDE
@@ -789,11 +893,177 @@ class CameraRuntimeController(
         }
     }
 
-    /** Autofocus, at the diver's pace. */
+    /**
+     * Release a held plane only when the centre crop stays dramatically softer for three
+     * consecutive 5 Hz samples. A single swimmer, caustic or compression wobble cannot restart
+     * focus; a real subject-distance change can, including straight translation with no gyro cue.
+     */
+    private fun observeHeldFocusSharpness(sharpness: Double, sampledAtMs: Long) {
+        cameraRequestHandler.post {
+            if (manualFocusRequestFor(latestState) != null || !afLocked || afTracking) {
+                afSharpnessLossSamples = 0
+                return@post
+            }
+            if (sampledAtMs - afHoldStartedAtMs < AF_HOLD_MONITOR_GRACE_MS) return@post
+
+            val baseline = afHoldSharpness
+            if (baseline == null || baseline <= 0.0) {
+                afHoldSharpness = sharpness.takeIf { it > 0.0 }
+                return@post
+            }
+            if (AutofocusHoldPolicy.isSustainedFocusLossSample(baseline, sharpness)) {
+                afSharpnessLossSamples++
+                if (afSharpnessLossSamples >= AutofocusHoldPolicy.SHARPNESS_RELEASE_SAMPLES) {
+                    afSharpnessLossSamples = 0
+                    if (sampledAtMs - lastSignificantFocusMotionAtMs >= AF_MOTION_SETTLE_MS) {
+                        startAutofocusTracking("sustained scene focus loss")
+                    }
+                }
+            } else {
+                afSharpnessLossSamples = 0
+                if (sharpness > baseline) {
+                    // Learn a better reference slowly; never chase ordinary downward noise.
+                    afHoldSharpness = baseline * 0.8 + sharpness * 0.2
+                }
+            }
+        }
+    }
+
+    /** Horizontal optical field of view for the lens currently feeding the analysis stream. */
+    private fun horizontalFovDegrees(): Double = runCatching {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val cameraId = if (boundLensFacing == CameraSelector.LENS_FACING_FRONT) {
+            frontCameraId
+        } else {
+            activeLensProfile?.physicalCameraId
+                ?: activeLensProfile?.logicalCameraId
+                ?: backCameraProfile?.logicalCameraId
+        } ?: return@runCatching DEFAULT_HORIZONTAL_FOV_DEGREES
+        val characteristics = manager.getCameraCharacteristics(cameraId)
+        val sensorWidthMm = characteristics
+            .get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            ?.width
+            ?.toDouble()
+            ?: return@runCatching DEFAULT_HORIZONTAL_FOV_DEGREES
+        val focalLengthMm = if (boundLensFacing == CameraSelector.LENS_FACING_FRONT) {
+            characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                ?.firstOrNull()?.toDouble()
+        } else {
+            activeLensProfile?.focalLengthMm?.toDouble()
+                ?: characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    ?.firstOrNull()?.toDouble()
+        } ?: return@runCatching DEFAULT_HORIZONTAL_FOV_DEGREES
+        val effectiveFocal = focalLengthMm * latestState.zoomFactor.coerceAtLeast(1.0)
+        2.0 * atan(sensorWidthMm / (2.0 * effectiveFocal)) * 180.0 / Math.PI
+    }.getOrDefault(DEFAULT_HORIZONTAL_FOV_DEGREES)
+
+    /** Start Samsung's damped CAF from its current plane, then lock it after convergence. */
     private fun startAutofocusTracking(reason: String) {
         if (manualFocusRequestFor(latestState) != null) return
-        Log.d(TAG, "Autofocus: searching ($reason)")
-        runRampedAutofocus(reason)
+        val capability = selectedFocusCapability(latestState)
+        if (capability?.supportsManualFocus == false) {
+            afLocked = true
+            afTracking = false
+            return
+        }
+        releaseAutofocusForTracking(reason, AF_LOCK_SETTLE_MS)
+    }
+
+    /**
+     * CANCEL releases a prior one-shot lock; the unchanged CONTINUOUS_VIDEO repeating request
+     * then tracks smoothly. Repeated gyro events only extend the settle deadline — no repeated
+     * trigger is submitted and no focus operation is restarted while the housing is moving.
+     */
+    private fun releaseAutofocusForTracking(reason: String, settleMs: Long) {
+        if (manualFocusRequestFor(latestState) != null) return
+        val wasLocked = afLocked || afLockPending
+        val eligibleAt = SystemClock.elapsedRealtime() + settleMs
+        if (!wasLocked && afTracking) {
+            // A gyro stream may report 50 times per second. Extending one deadline is enough;
+            // rebuilding the repeating request for every sample would itself look like pulsing.
+            afLockEligibleAtMs = eligibleAt
+            return
+        }
+        afLocked = false
+        afLockPending = false
+        afTracking = true
+        afHoldDiopters = null
+        afHoldSharpness = null
+        afSharpnessLossSamples = 0
+        afLockEligibleAtMs = eligibleAt
+        if (wasLocked) submitAutofocusTrigger(CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+        camera?.let { submitNativeRepeatingRequest(latestState, it) }
+        if (wasLocked || reason == "session start" || reason == "entered auto") {
+            Log.d(TAG, "Autofocus: tracking ($reason), lock after ${settleMs}ms settle")
+        }
+    }
+
+    /** One trigger frame; repeating stays IDLE, as required by the Camera2 AF state machine. */
+    private fun submitAutofocusTrigger(trigger: Int): Boolean {
+        val session = cam2Session ?: return false
+        if (cam2Surfaces.isEmpty()) return false
+        return try {
+            val builder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            cam2Surfaces.forEach { builder.addTarget(it) }
+            builder.set(
+                CaptureRequest.CONTROL_CAPTURE_INTENT,
+                CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW,
+            )
+            builder.set(
+                CaptureRequest.CONTROL_AF_MODE,
+                CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+            )
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, trigger)
+            lastAeFpsRange?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+            lastAntibandingMode?.let {
+                builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, it)
+            }
+            camera?.let { bound ->
+                applyNativeZoom(builder, latestState, bound)
+                populateSessionLook(builder, latestState, bound)
+            }
+            session.capture(builder.build(), sessionCaptureCallback, cameraRequestHandler)
+            if (trigger == CameraMetadata.CONTROL_AF_TRIGGER_START) {
+                afLockPending = true
+                afLockRequestedAtMs = SystemClock.elapsedRealtime()
+                Log.d(TAG, "Autofocus: one-shot lock requested")
+            }
+            true
+        } catch (error: Exception) {
+            Log.w(TAG, "Autofocus trigger $trigger failed: ${error.message}")
+            false
+        }
+    }
+
+    /** Lock only after CAF reports a settled plane; a timeout covers HALs omitting the state. */
+    private fun observeAutofocusState(result: TotalCaptureResult, now: Long) {
+        if (manualFocusRequestFor(latestState) != null) return
+        val state = result.get(CaptureResult.CONTROL_AF_STATE)
+        if (afLockPending) {
+            val lockedByHal = state == CameraMetadata.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                state == CameraMetadata.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
+            val timedOut = now - afLockRequestedAtMs >= AF_LOCK_RESULT_TIMEOUT_MS
+            if (lockedByHal || timedOut) {
+                afLockPending = false
+                afLocked = true
+                afTracking = false
+                afHoldStartedAtMs = now
+                afHoldSharpness = latestSharpness.takeIf { it > 0.0 }
+                afSharpnessLossSamples = 0
+                Log.d(
+                    TAG,
+                    "Autofocus: locked state=$state${if (timedOut && !lockedByHal) " (HAL timeout)" else ""}",
+                )
+            }
+            return
+        }
+        if (afLocked || !afTracking || now < afLockEligibleAtMs) return
+
+        val passivelyFocused = state == CameraMetadata.CONTROL_AF_STATE_PASSIVE_FOCUSED
+        val settleTimedOut = now - afLockEligibleAtMs >= AF_LOCK_RESULT_TIMEOUT_MS
+        if (passivelyFocused || settleTimedOut) {
+            submitAutofocusTrigger(CameraMetadata.CONTROL_AF_TRIGGER_START)
+        }
     }
 
     /** Generation counter so a new search or a manual input cancels one in flight. */
@@ -858,7 +1128,7 @@ class CameraRuntimeController(
                 val elapsed = (SystemClock.elapsedRealtime() - startedAtMs).toDouble()
                 val value = startValue + direction * (elapsed / durationMs)
                 if (value !in 0.0..1.0) {
-                    finishRampedAutofocus(gen, bestValue, maxD, reason)
+                    finishRampedAutofocus(gen, bestValue, best, maxD, reason)
                     return
                 }
                 command(value)
@@ -870,7 +1140,7 @@ class CameraRuntimeController(
                 } else if (sharp < best * AF_PEAK_DROP) {
                     falling++
                     if (falling >= AF_PEAK_CONFIRM) {
-                        finishRampedAutofocus(gen, bestValue, maxD, reason)
+                        finishRampedAutofocus(gen, bestValue, best, maxD, reason)
                         return
                     }
                 } else {
@@ -883,32 +1153,32 @@ class CameraRuntimeController(
     }
 
     /**
-     * Land on the sharpest plane the pull found, then give the lens to the HAL.
-     *
-     * Our job was the TRAVEL — getting there at the diver's chosen rate instead of snapping.
-     * Keeping the lens afterwards would mean reimplementing autofocus badly: the HAL tracks a
-     * subject far better than a contrast walk can, and it picks up from wherever the lens is,
-     * so the handover itself moves nothing.
+     * Land on the sharpest plane and keep it there. Samsung's continuous-video AF kept scanning
+     * after convergence on the test device (the vendor lens position oscillated while the scene
+     * and public focus distance were unchanged), producing the visible pulse this search exists
+     * to avoid. Gyroscope motion or sustained sharpness loss starts the next smooth pull.
      */
-    private fun finishRampedAutofocus(gen: Int, bestValue: Double, maxD: Float, reason: String) {
+    private fun finishRampedAutofocus(
+        gen: Int,
+        bestValue: Double,
+        bestSharpness: Double,
+        maxD: Float,
+        reason: String,
+    ) {
         if (gen != afSearchGen) return
         // The search is over; stop measuring until the next one asks.
         afPullActive = false
         val landed = ((1.0 - bestValue.coerceIn(0.0, 1.0)) * maxD).toFloat()
         afHoldDiopters = landed
+        afHoldSharpness = bestSharpness.takeIf { it > 0.0 }
+        afHoldStartedAtMs = SystemClock.elapsedRealtime()
+        afSharpnessLossSamples = 0
+        afTracking = false
         camera?.let { submitNativeRepeatingRequest(latestState, it) }
         Log.d(
             TAG,
-            "Autofocus: landed at ${"%.2f".format(landed)} dpt (dial ${"%.2f".format(bestValue)}, $reason) — handing to HAL",
+            "Autofocus: held at ${"%.2f".format(landed)} dpt (dial ${"%.2f".format(bestValue)}, $reason)",
         )
-        // One frame on the landed plane, then continuous AF takes over from exactly there.
-        cameraRequestHandler.postDelayed({
-            if (gen != afSearchGen) return@postDelayed
-            if (manualFocusRequestFor(latestState) != null) return@postDelayed
-            afHoldDiopters = null
-            afTracking = true
-            camera?.let { submitNativeRepeatingRequest(latestState, it) }
-        }, AF_HANDOVER_DELAY_MS)
     }
 
     /** True while a cinematic AF<->manual pull is in flight, so the wheel may retarget it. */
@@ -1419,7 +1689,9 @@ class CameraRuntimeController(
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
         val analysisBuilder = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+            // MediaPipe accepts RGB/RGBA. Keeping this one shared 640x480 stream avoids a second
+            // CameraX use case and its extra ISP/scaler cost.
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .setResolutionSelector(
                 ResolutionSelector.Builder()
                     .setResolutionStrategy(
@@ -1520,8 +1792,36 @@ class CameraRuntimeController(
             // telemetry tap — the live lens position that seeds the AF handoff comes from
             // here. The frame itself is closed immediately; nothing is read or retained.
             it.setAnalyzer(focusAssistExecutor) { image ->
-                if (afPullActive) latestSharpness = centreSharpness(image)
-                image.close()
+                val now = SystemClock.elapsedRealtime()
+                val monitorHeldPlane = afLocked && !afTracking &&
+                    now - lastAfHoldMonitorAtMs >= AF_HOLD_MONITOR_INTERVAL_MS
+                if (afPullActive || monitorHeldPlane) {
+                    val sharpness = centreSharpness(image)
+                    latestSharpness = sharpness
+                    if (monitorHeldPlane) {
+                        lastAfHoldMonitorAtMs = now
+                        observeHeldFocusSharpness(sharpness, now)
+                    }
+                }
+                val callback = onPointingGesture
+                if (!latestState.recording && callback != null) {
+                    val recognizer = pointingRecognizer ?: PointingGestureRecognizer(context) { x, confidence ->
+                        // An inference submitted just before Record may complete just after it;
+                        // the second gate makes "not recording only" an invariant, not a race.
+                        if (!latestState.recording) {
+                            callback(
+                                PointingGesture(
+                                    normalizedX = x,
+                                    horizontalFovDegrees = horizontalFovDegrees(),
+                                    confidence = confidence,
+                                ),
+                            )
+                        }
+                    }.also { pointingRecognizer = it }
+                    recognizer.analyze(image, frontCamera = boundLensFacing == CameraSelector.LENS_FACING_FRONT)
+                } else {
+                    image.close()
+                }
             }
         }
 
@@ -2261,7 +2561,13 @@ class CameraRuntimeController(
         val isManualFocus = manualFocusRequest != null
         if (isManualFocus) {
             // Leaving auto: forget the held plane, the dial owns focus again.
+            afSearchGen++
+            afPullActive = false
+            afLocked = false
+            afLockPending = false
             afHoldDiopters = null
+            afHoldSharpness = null
+            afSharpnessLossSamples = 0
             afTracking = false
         } else if (afHoldDiopters == null && !afTracking && lensFocusApplied?.toDoubleOrNull() != null) {
             // Entering auto from a plane the diver set: start the search THERE, so the pull runs
@@ -2272,6 +2578,7 @@ class CameraRuntimeController(
                         (manualFocusSettingKey(cameraState).orEmpty() to lensFocusApplied.orEmpty()),
                 ),
             )?.diopters
+            afHoldSharpness = null
             cameraRequestHandler.post { startAutofocusTracking("entered auto") }
         }
 

@@ -26,6 +26,9 @@
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    <!-- Required alongside MANAGE_MEDIA so createWriteRequest can authorize Move/Rename
+         without falling back to an inaccessible per-file confirmation dialog. -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
     <!-- One-time special access: lets housing-only gallery sessions manage third-party media
          without an inaccessible per-file Android confirmation dialog. -->
     <uses-permission android:name="android.permission.MANAGE_MEDIA" />

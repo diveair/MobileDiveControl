@@ -211,10 +211,15 @@ data class HousingState(
 
 /** Ordered exactly as the paused-recording chooser is painted and traversed. */
 enum class RecordingPausedAction {
-    Resume,
     Preview,
+    Resume,
     Stop,
     Delete,
+}
+
+enum class RecordingSaveConfirmationAction {
+    Back,
+    Confirm,
 }
 
 data class RecordingSaveLocation(
@@ -223,8 +228,8 @@ data class RecordingSaveLocation(
 ) {
     companion object {
         val Default = RecordingSaveLocation(
-            name = "Mobile DiveControl",
-            relativePath = "Movies/Mobile DiveControl/",
+            name = "Camera",
+            relativePath = "DCIM/Camera/",
         )
     }
 }
@@ -241,6 +246,10 @@ data class CameraState(
     val recordingLocationFocused: Boolean = false,
     /** True while the housing-navigable destination list is open. */
     val recordingLocationChooserVisible: Boolean = false,
+    /** True after an album is activated and its Back/Confirm decision owns housing input. */
+    val recordingSaveConfirmationVisible: Boolean = false,
+    val recordingSaveConfirmationAction: RecordingSaveConfirmationAction =
+        RecordingSaveConfirmationAction.Confirm,
     val recordingSaveLocation: RecordingSaveLocation = RecordingSaveLocation.Default,
     val recordingSaveLocations: List<RecordingSaveLocation> = listOf(RecordingSaveLocation.Default),
     val recordingSaveLocationIndex: Int = 0,
@@ -541,6 +550,8 @@ data class GalleryState(
     val previewExifLines: List<String> = emptyList(),
     /** Metadata is opt-in so the recorded image/video owns the preview screen by default. */
     val detailsVisible: Boolean = false,
+    /** Housing-selected metadata row; the UI keeps this row visible in the scrollable panel. */
+    val detailsLineIndex: Int = 0,
     /** Selected preview action; photo rails omit PlayPause while video rails include it. */
     val previewAction: GalleryPreviewAction = GalleryPreviewAction.PlayPause,
     val videoPlaying: Boolean = false,
@@ -605,6 +616,7 @@ sealed interface CameraCommand : ControlCommand {
     data object DeleteVideoRecording : CameraCommand
     data object OpenRecordingSaveLocationChooser : CameraCommand
     data class HighlightRecordingSaveLocation(val index: Int) : CameraCommand
+    data class OpenRecordingSaveLocationConfirmation(val index: Int) : CameraCommand
     data class SelectRecordingSaveLocation(val index: Int) : CameraCommand
     data class LoadRecordingSaveLocations(val locations: List<RecordingSaveLocation>) : CameraCommand
     data object NavigateUp : CameraCommand
@@ -736,6 +748,8 @@ sealed interface PlatformEffect {
     data class EmitAlert(val priority: AlertPriority, val message: String) : PlatformEffect
     data class ScheduleReconnect(val attempt: Int, val delay: Duration) : PlatformEffect
     data object ExportDiagnostics : PlatformEffect
+    /** Store the current optical-axis compass bearing as the target heading. */
+    data object TrackCurrentHeading : PlatformEffect
 
     /**
      * Asks the platform to feed [steps] further [CameraCommand.NudgeSetting] ticks back into

@@ -12,6 +12,7 @@ class CameraCatalogTest {
         val labels = CameraCatalog.primaryRailEntries.map { it.label }
         assertEquals(
             listOf(
+                "Track Heading",
                 "Photo",
                 "Expert RAW",
                 "Pro",

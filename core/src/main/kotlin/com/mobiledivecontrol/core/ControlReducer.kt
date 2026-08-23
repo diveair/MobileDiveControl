@@ -276,6 +276,7 @@ class ControlReducer(
                     recordingPreviewVisible = false,
                     recordingLocationFocused = false,
                     recordingLocationChooserVisible = false,
+                    recordingSaveConfirmationVisible = false,
                 ),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(CameraCommand.StartVideoRecording)),
@@ -290,6 +291,7 @@ class ControlReducer(
                     recordingPreviewVisible = false,
                     recordingLocationFocused = false,
                     recordingLocationChooserVisible = false,
+                    recordingSaveConfirmationVisible = false,
                 ),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(command)),
@@ -302,6 +304,7 @@ class ControlReducer(
                     recordingPreviewVisible = false,
                     recordingLocationFocused = false,
                     recordingLocationChooserVisible = false,
+                    recordingSaveConfirmationVisible = false,
                 ),
             ),
             effects = listOf(PlatformEffect.ExecuteCamera(command)),
@@ -316,6 +319,7 @@ class ControlReducer(
                             recordingPreviewVisible = !state.camera.recordingPreviewVisible,
                             recordingLocationFocused = false,
                             recordingLocationChooserVisible = false,
+                            recordingSaveConfirmationVisible = false,
                         ),
                     ),
                 )
@@ -330,6 +334,7 @@ class ControlReducer(
                     recordingPreviewVisible = false,
                     recordingLocationFocused = false,
                     recordingLocationChooserVisible = false,
+                    recordingSaveConfirmationVisible = false,
                     // Bumped so the gallery thumbnail refreshes with the finished video.
                     captureCounter = state.camera.captureCounter + 1,
                 ),
@@ -345,6 +350,7 @@ class ControlReducer(
                     recordingPreviewVisible = false,
                     recordingLocationFocused = false,
                     recordingLocationChooserVisible = false,
+                    recordingSaveConfirmationVisible = false,
                     // Force the gallery shortcut to discard any thumbnail of the deleted clip.
                     captureCounter = state.camera.captureCounter + 1,
                 ),
@@ -363,6 +369,8 @@ class ControlReducer(
                         camera = state.camera.copy(
                             recordingLocationFocused = true,
                             recordingLocationChooserVisible = true,
+                            recordingSaveConfirmationVisible = false,
+                            recordingSaveConfirmationAction = RecordingSaveConfirmationAction.Confirm,
                             recordingSaveLocationIndex = selectedIndex,
                             recordingPreviewVisible = false,
                         ),
@@ -390,6 +398,7 @@ class ControlReducer(
         is CameraCommand.HighlightRecordingSaveLocation -> {
             if (
                 !state.camera.recordingLocationChooserVisible ||
+                state.camera.recordingSaveConfirmationVisible ||
                 command.index !in state.camera.recordingSaveLocations.indices
             ) {
                 Reduction(state = state)
@@ -397,6 +406,24 @@ class ControlReducer(
                 Reduction(
                     state = state.copy(
                         camera = state.camera.copy(recordingSaveLocationIndex = command.index),
+                    ),
+                )
+            }
+        }
+        is CameraCommand.OpenRecordingSaveLocationConfirmation -> {
+            if (
+                !state.camera.recordingLocationChooserVisible ||
+                command.index !in state.camera.recordingSaveLocations.indices
+            ) {
+                Reduction(state = state)
+            } else {
+                Reduction(
+                    state = state.copy(
+                        camera = state.camera.copy(
+                            recordingSaveLocationIndex = command.index,
+                            recordingSaveConfirmationVisible = true,
+                            recordingSaveConfirmationAction = RecordingSaveConfirmationAction.Confirm,
+                        ),
                     ),
                 )
             }
@@ -412,6 +439,7 @@ class ControlReducer(
                             recordingSaveLocation = location,
                             recordingSaveLocationIndex = command.index,
                             recordingLocationChooserVisible = false,
+                            recordingSaveConfirmationVisible = false,
                             recordingLocationFocused = true,
                         ),
                     ),
@@ -748,6 +776,20 @@ class ControlReducer(
         val camera = state.camera
         if (!camera.recording || !camera.recordingPaused) return null
         if (camera.recordingLocationChooserVisible) {
+            if (camera.recordingSaveConfirmationVisible) {
+                if (horizontalStep == 0) return Reduction(state = state)
+                val actions = RecordingSaveConfirmationAction.entries
+                val current = actions.indexOf(camera.recordingSaveConfirmationAction).coerceAtLeast(0)
+                return Reduction(
+                    state = state.copy(
+                        camera = camera.copy(
+                            recordingSaveConfirmationAction = actions[
+                                ((current + horizontalStep) % actions.size + actions.size) % actions.size
+                            ],
+                        ),
+                    ),
+                )
+            }
             if (verticalStep == 0 && horizontalStep == 0) return Reduction(state = state)
             val count = camera.recordingSaveLocations.size
             val step = if (verticalStep != 0) verticalStep * RECORDING_LOCATION_GRID_COLUMNS else horizontalStep
@@ -883,7 +925,9 @@ class ControlReducer(
         pausedChooserNavigation(state, horizontalStep = +1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
-            CameraUiZone.LiveView -> Reduction(state = state.copy(camera = focusModeRail(camera)))
+            CameraUiZone.LiveView -> Reduction(
+                state = state.copy(camera = focusModeRail(camera).copy(highlightedPrimaryIndex = 0)),
+            )
             CameraUiZone.ModeRail -> enterFromModeRail(state)
             CameraUiZone.SettingsPanel -> {
                 if (camera.settingsEditing) {
@@ -899,10 +943,24 @@ class ControlReducer(
         // OK mirrors the shutter while the paused chooser is up: confirm the selected action.
         if (state.camera.recording && state.camera.recordingPaused) {
             if (state.camera.recordingLocationChooserVisible) {
-                return reduceCamera(
-                    state,
-                    CameraCommand.SelectRecordingSaveLocation(state.camera.recordingSaveLocationIndex),
-                )
+                return if (!state.camera.recordingSaveConfirmationVisible) {
+                    reduceCamera(
+                        state,
+                        CameraCommand.OpenRecordingSaveLocationConfirmation(
+                            state.camera.recordingSaveLocationIndex,
+                        ),
+                    )
+                } else {
+                    when (state.camera.recordingSaveConfirmationAction) {
+                        RecordingSaveConfirmationAction.Back -> reduceCamera(state, CameraCommand.Back)
+                        RecordingSaveConfirmationAction.Confirm -> reduceCamera(
+                            state,
+                            CameraCommand.SelectRecordingSaveLocation(
+                                state.camera.recordingSaveLocationIndex,
+                            ),
+                        )
+                    }
+                }
             }
             if (state.camera.recordingLocationFocused) {
                 return reduceCamera(state, CameraCommand.OpenRecordingSaveLocationChooser)
@@ -938,6 +996,7 @@ class ControlReducer(
                     state = state.copy(
                         camera = state.camera.copy(
                             recordingLocationChooserVisible = false,
+                            recordingSaveConfirmationVisible = false,
                             recordingLocationFocused = true,
                         ),
                     ),
@@ -1002,6 +1061,8 @@ class ControlReducer(
             focusedZone = CameraUiZone.ModeRail,
             modeRailReturnZone = CameraUiZone.LiveView,
             railLevel = CameraRailLevel.Primary,
+            // Up/Down from live view means cycle relative to the active capture mode. The
+            // explicit Modes-button/right-entry path overrides this to Track Heading (index 0).
             highlightedPrimaryIndex = CameraCatalog.primaryIndexForMode(camera.activeMode),
             settingsEditing = false,
             sliderEditTarget = SliderEditTarget.Value,
@@ -1015,8 +1076,8 @@ class ControlReducer(
         return camera.copy(
             focusedZone = CameraUiZone.ModeRail,
             modeRailReturnZone = returnZone,
-            railLevel = if (CameraCatalog.secondaryModes.contains(camera.activeMode)) CameraRailLevel.Secondary else CameraRailLevel.Primary,
-            highlightedPrimaryIndex = CameraCatalog.primaryIndexForMode(camera.activeMode),
+            railLevel = CameraRailLevel.Primary,
+            highlightedPrimaryIndex = 0,
             highlightedSecondaryIndex = CameraCatalog.secondaryIndexForMode(camera.activeMode),
             settingsEditing = false,
             sliderEditTarget = SliderEditTarget.Value,
@@ -1045,21 +1106,7 @@ class ControlReducer(
     private fun confirmModeSelection(state: AppState): Reduction {
         val camera = state.camera
         return when (camera.railLevel) {
-            CameraRailLevel.Primary -> {
-                val entry = camera.primaryHighlightedEntry
-                if (entry.opensSecondaryRail) {
-                    Reduction(
-                        state = state.copy(
-                            camera = camera.copy(
-                                railLevel = CameraRailLevel.Secondary,
-                                highlightedSecondaryIndex = CameraCatalog.secondaryIndexForMode(camera.activeMode),
-                            ),
-                        ),
-                    )
-                } else {
-                    activateMode(state, entry.mode!!, returnToLiveView = false, openSettings = true)
-                }
-            }
+            CameraRailLevel.Primary -> activatePrimaryRailEntry(state)
             CameraRailLevel.Secondary -> activateMode(
                 state,
                 camera.secondaryHighlightedMode,
@@ -1072,21 +1119,7 @@ class ControlReducer(
     private fun enterFromModeRail(state: AppState): Reduction {
         val camera = state.camera
         return when (camera.railLevel) {
-            CameraRailLevel.Primary -> {
-                val entry = camera.primaryHighlightedEntry
-                if (entry.opensSecondaryRail) {
-                    Reduction(
-                        state = state.copy(
-                            camera = camera.copy(
-                                railLevel = CameraRailLevel.Secondary,
-                                highlightedSecondaryIndex = CameraCatalog.secondaryIndexForMode(camera.activeMode),
-                            ),
-                        ),
-                    )
-                } else {
-                    activateMode(state, entry.mode!!, returnToLiveView = false, openSettings = true)
-                }
-            }
+            CameraRailLevel.Primary -> activatePrimaryRailEntry(state)
             CameraRailLevel.Secondary -> activateMode(
                 state,
                 camera.secondaryHighlightedMode,
@@ -1094,6 +1127,46 @@ class ControlReducer(
                 openSettings = true,
             )
         }
+    }
+
+    private fun activatePrimaryRailEntry(state: AppState): Reduction {
+        val camera = state.camera
+        val entry = camera.primaryHighlightedEntry
+        if (entry.opensSecondaryRail) {
+            return Reduction(
+                state = state.copy(
+                    camera = camera.copy(
+                        railLevel = CameraRailLevel.Secondary,
+                        highlightedSecondaryIndex = CameraCatalog.secondaryIndexForMode(camera.activeMode),
+                    ),
+                ),
+            )
+        }
+        if (entry.action == CameraRailAction.TrackHeading) {
+            if (camera.recording) {
+                val warning = "Stop recording before setting a tracked heading."
+                return Reduction(
+                    state = state.copy(lastWarning = warning),
+                    notes = listOf(warning),
+                )
+            }
+            return Reduction(
+                state = state.copy(
+                    // Track Heading is an action, not a destination. Return through the rail's
+                    // recorded entry path so opening it from the camera navbar restores navbar
+                    // focus, while opening it directly from LiveView still returns to LiveView.
+                    camera = exitModeRail(camera),
+                    lastWarning = null,
+                ),
+                effects = listOf(PlatformEffect.TrackCurrentHeading),
+            )
+        }
+        return activateMode(
+            state,
+            requireNotNull(entry.mode) { "Primary rail entry ${entry.key} has no mode or action" },
+            returnToLiveView = false,
+            openSettings = true,
+        )
     }
 
     private fun activateMode(
@@ -2429,6 +2502,7 @@ class ControlReducer(
                 }
             }
             is GalleryCommand.LoadItems -> {
+                val wasEmpty = gallery.items.isEmpty()
                 val selectedItem = gallery.items.getOrNull(gallery.selectedIndex)
                 val matchingIndex = selectedItem?.let { selected ->
                     command.items.indexOfFirst { candidate ->
@@ -2450,9 +2524,27 @@ class ControlReducer(
                     matchingIndex >= 0 -> matchingIndex
                     else -> gallery.selectedIndex.coerceIn(0, command.items.lastIndex.coerceAtLeast(0))
                 }
+                val isEmpty = command.items.isEmpty()
+                val focusLoadedGrid = !isEmpty && (
+                    gallery.pendingMutation == GalleryMutation.CreateAlbum ||
+                        (wasEmpty && !gallery.browserBackFocused && gallery.browserAction == null)
+                    )
                 Reduction(
                     state = state.copy(
-                        gallery = gallery.copy(items = command.items, selectedIndex = nextIndex),
+                        gallery = gallery.copy(
+                            items = command.items,
+                            selectedIndex = nextIndex,
+                            browserBackFocused = when {
+                                isEmpty -> true
+                                focusLoadedGrid -> false
+                                else -> gallery.browserBackFocused
+                            },
+                            browserAction = when {
+                                isEmpty -> GalleryBrowserAction.Back
+                                focusLoadedGrid -> null
+                                else -> gallery.browserAction
+                            },
+                        ),
                     ),
                 )
             }
@@ -2465,7 +2557,15 @@ class ControlReducer(
                 ),
             )
             is GalleryCommand.SetExifLines -> Reduction(
-                state = state.copy(gallery = gallery.copy(previewExifLines = command.lines)),
+                state = state.copy(
+                    gallery = gallery.copy(
+                        previewExifLines = command.lines,
+                        detailsLineIndex = gallery.detailsLineIndex.coerceIn(
+                            0,
+                            command.lines.lastIndex.coerceAtLeast(0),
+                        ),
+                    ),
+                ),
             )
             is GalleryCommand.OperationSucceeded -> {
                 val deletedPreviewHasNext = gallery.pendingMutation == GalleryMutation.Delete &&
@@ -2528,7 +2628,26 @@ class ControlReducer(
                 ?: GalleryBrowserAction.Back.takeIf { gallery.browserBackFocused }
             when {
                 activeAction != null -> {
-                    if (rowDelta != 0) {
+                    if (gallery.items.isEmpty()) {
+                        val nextAction = if (
+                            showingAlbums &&
+                            activeAction == GalleryBrowserAction.Back &&
+                            columnDelta > 0
+                        ) {
+                            GalleryBrowserAction.CreateAlbum
+                        } else {
+                            GalleryBrowserAction.Back
+                        }
+                        Reduction(
+                            state = state.copy(
+                                gallery = gallery.copy(
+                                    selectedIndex = 0,
+                                    browserBackFocused = nextAction == GalleryBrowserAction.Back,
+                                    browserAction = nextAction,
+                                ),
+                            ),
+                        )
+                    } else if (rowDelta != 0) {
                         val nextIndex = if (rowDelta < 0) {
                             0
                         } else {
@@ -2628,12 +2747,24 @@ class ControlReducer(
             Reduction(state = state.copy(gallery = gallery.copy(mediaAction = nextAction)))
         }
         GalleryViewMode.Preview -> {
-            val nextAction = if (columnDelta != 0) {
-                shiftPreviewAction(gallery, columnDelta)
+            if (gallery.detailsVisible && rowDelta != 0) {
+                val nextLine = (gallery.detailsLineIndex + rowDelta).coerceIn(
+                    0,
+                    gallery.previewExifLines.lastIndex.coerceAtLeast(0),
+                )
+                Reduction(
+                    state = state.copy(
+                        gallery = gallery.copy(detailsLineIndex = nextLine),
+                    ),
+                )
             } else {
-                gallery.previewAction
+                val nextAction = if (columnDelta != 0) {
+                    shiftPreviewAction(gallery, columnDelta)
+                } else {
+                    gallery.previewAction
+                }
+                Reduction(state = state.copy(gallery = gallery.copy(previewAction = nextAction)))
             }
-            Reduction(state = state.copy(gallery = gallery.copy(previewAction = nextAction)))
         }
         GalleryViewMode.Options -> {
             val delta = if (rowDelta != 0) rowDelta else columnDelta
@@ -2885,6 +3016,7 @@ class ControlReducer(
                                 viewMode = GalleryViewMode.Browser,
                                 previewExifLines = emptyList(),
                                 detailsVisible = false,
+                                detailsLineIndex = 0,
                                 videoPlaying = false,
                                 browserBackFocused = true,
                                 browserAction = GalleryBrowserAction.Back,
@@ -3144,6 +3276,7 @@ class ControlReducer(
                     },
                     previewExifLines = emptyList(),
                     detailsVisible = false,
+                    detailsLineIndex = 0,
                     videoPlaying = false,
                     browserBackFocused = false,
                     browserAction = null,
@@ -3215,6 +3348,7 @@ class ControlReducer(
                             selectedIndex = nextIndex,
                             previewExifLines = emptyList(),
                             detailsVisible = false,
+                            detailsLineIndex = 0,
                             videoPlaying = false,
                         ),
                     ),
@@ -3230,7 +3364,12 @@ class ControlReducer(
             GalleryPreviewAction.Details -> {
                 val show = !gallery.detailsVisible
                 Reduction(
-                    state = state.copy(gallery = selectedGallery.copy(detailsVisible = show)),
+                    state = state.copy(
+                        gallery = selectedGallery.copy(
+                            detailsVisible = show,
+                            detailsLineIndex = if (show) 0 else gallery.detailsLineIndex,
+                        ),
+                    ),
                     effects = if (show && gallery.previewExifLines.isEmpty()) {
                         listOf(PlatformEffect.LoadExifData(item))
                     } else {

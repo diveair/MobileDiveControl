@@ -77,7 +77,10 @@ class ControlCoreTest {
             start,
         )
         assertEquals(CameraUiZone.ModeRail, railOutcome.state.camera.focusedZone)
+        assertEquals("Track Heading", railOutcome.state.camera.primaryHighlightedEntry.label)
 
+        // Track Heading owns the default slot; move to Photo to open its settings.
+        core.dispatch(CameraCommand.NavigateDown)
         val settingsOutcome = core.handleNotificationPayload(
             HousingCharacteristic.ButtonEvents.shortHex,
             byteArrayOf(0x10),
@@ -87,13 +90,49 @@ class ControlCoreTest {
     }
 
     @Test
+    fun `track heading is the default mode rail action and never changes capture mode`() {
+        val core = ControlCore()
+        val originalMode = core.state.camera.activeMode
+
+        core.dispatch(CameraCommand.NavigateRight)
+        val outcome = core.dispatch(CameraCommand.Confirm)
+
+        assertEquals(originalMode, outcome.state.camera.activeMode)
+        assertEquals(CameraUiZone.LiveView, outcome.state.camera.focusedZone)
+        assertEquals(listOf(PlatformEffect.TrackCurrentHeading), outcome.effects)
+    }
+
+    @Test
+    fun `track heading opened from mode navbar returns focus to navbar`() {
+        val core = ControlCore()
+
+        val navbar = core.dispatch(CameraCommand.Confirm)
+        assertEquals(CameraUiZone.SettingsPanel, navbar.state.camera.focusedZone)
+        val modesCursor = navbar.state.camera.settingsCursor
+
+        val modeRail = core.dispatch(CameraCommand.Confirm)
+        assertEquals(CameraUiZone.ModeRail, modeRail.state.camera.focusedZone)
+        assertEquals(CameraUiZone.SettingsPanel, modeRail.state.camera.modeRailReturnZone)
+        assertEquals("Track Heading", modeRail.state.camera.primaryHighlightedEntry.label)
+
+        val tracked = core.dispatch(CameraCommand.Confirm)
+        assertEquals(CameraUiZone.SettingsPanel, tracked.state.camera.focusedZone)
+        assertEquals(modesCursor, tracked.state.camera.settingsCursor)
+        assertEquals(listOf(PlatformEffect.TrackCurrentHeading), tracked.effects)
+
+        val moved = core.dispatch(CameraCommand.NavigateLeft)
+        assertEquals(CameraUiZone.SettingsPanel, moved.state.camera.focusedZone)
+        assertTrue(moved.state.camera.settingsCursor != modesCursor)
+    }
+
+    @Test
     fun `modes list loops when scrolling up from first or down from last`() {
         val core = ControlCore()
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
 
-        // Focus ModeRail from LiveView by navigating Up or Down
-        // Initial primary index = 0 (Photo)
+        // Explicitly open the rail; its default is Track Heading at index 0.
+        core.dispatch(CameraCommand.NavigateRight)
         // Navigate Up: should wrap around to last index
         val wrapUpOutcome = core.dispatch(CameraCommand.NavigateUp)
         val lastIndex = CameraCatalog.primaryRailEntries.lastIndex

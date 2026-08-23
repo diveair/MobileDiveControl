@@ -1,11 +1,32 @@
 {
-  "generated_at": "2026-08-23T19:05:54.050752+00:00",
+  "generated_at": "2026-08-23T23:23:15.939724+00:00",
   "nodes": {
-    "app_src_main_kotlin_com_mobiledivecontrol_platform_galleryrepository_galleryrepository": {
-      "code_fingerprint": "b79588c0724f3b2fe44befe8796c98a671b4ddad777123ea79f0297b76502689",
-      "label": "GalleryRepository",
-      "last": "2026-08-23T18:13:16.706467+00:00",
+    "app_src_main_kotlin_com_mobiledivecontrol_mainactivity_mainactivity": {
+      "code_fingerprint": "b3b79eb66e35e743e5a26b6f0d09fbb41617d765d0a6ef793d3be3209d37ec17",
+      "label": "MainActivity",
+      "last": "2026-08-23T20:31:44.761564+00:00",
       "provenance": [
+        {
+          "date": "2026-08-23T20:31:44.761564+00:00",
+          "outcome": "useful",
+          "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
+        }
+      ],
+      "score": 0.997251738,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/MainActivity.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_platform_galleryrepository_galleryrepository": {
+      "code_fingerprint": "5e380eafe4cf6d560d0b35e1ea56138e65c96e2d7b3a6d03d7f74fb90a6f0056",
+      "label": "GalleryRepository",
+      "last": "2026-08-23T19:38:10.720088+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T19:38:10.720088+00:00",
+          "outcome": "useful",
+          "q": "Fix the paused recording controls, SAVE TO album workflow, album ordering, empty-grid Back focus, and gallery Back visuals"
+        },
         {
           "date": "2026-08-23T18:13:16.706467+00:00",
           "outcome": "useful",
@@ -27,29 +48,67 @@
           "q": "lets work on the gallery menu: albums grid, navigable media grid, full-screen preview controls, move, rename, and delete"
         }
       ],
-      "score": 3.990696247,
+      "score": 4.970645872,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/platform/GalleryRepository.kt",
       "status": "preferred",
-      "uses": 4
+      "uses": 5
     },
-    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_cameraruntimecontroller_cameraruntimecontroller": {
-      "code_fingerprint": "79c797fae28e1cdb0be02551b46aee8c42d562f5e4cd18c96b67468a96dd4097",
-      "label": "CameraRuntimeController",
-      "last": "2026-08-23T18:13:16.706467+00:00",
+    "app_src_main_kotlin_com_mobiledivecontrol_service_housinglinkservice_housinglinkservice": {
+      "code_fingerprint": "d32e8553f3a094d0220657075a9bf1cfa2492dacb5e6e3d868b333e0f199ef06",
+      "label": "HousingLinkService",
+      "last": "2026-08-23T20:31:44.761564+00:00",
       "provenance": [
         {
-          "date": "2026-08-23T18:13:16.706467+00:00",
+          "date": "2026-08-23T20:31:44.761564+00:00",
           "outcome": "useful",
-          "q": "How should the paused recording controls and Save To album chooser work?"
+          "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
         }
       ],
-      "score": 0.999156026,
-      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt",
+      "score": 0.997251738,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/service/HousingLinkService.kt",
       "status": "tentative",
       "uses": 1
     },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_cameraruntimecontroller_cameraruntimecontroller": {
+      "code_fingerprint": "13e340f3708896cfefce651328e1828971c5f1436e93c3637507a3e8354b371f",
+      "label": "CameraRuntimeController",
+      "last": "2026-08-23T23:21:28.499136+00:00",
+      "neg": 1,
+      "provenance": [
+        {
+          "date": "2026-08-23T23:21:28.499136+00:00",
+          "outcome": "useful",
+          "q": "Make pointing gesture recognition sub 50 milliseconds."
+        },
+        {
+          "date": "2026-08-23T23:11:04.557441+00:00",
+          "outcome": "useful",
+          "q": "Improve gesture control recognition speed and accuracy so a pointing hand sets the heading faster."
+        },
+        {
+          "date": "2026-08-23T22:56:30.874466+00:00",
+          "outcome": "useful",
+          "q": "Autofocus no longer adjusts smoothly, rapidly, or responsively; check the changes against the repository baseline."
+        },
+        {
+          "date": "2026-08-23T22:30:51.983660+00:00",
+          "outcome": "useful",
+          "q": "try to verify now, camera is facing north"
+        },
+        {
+          "date": "2026-08-23T22:25:37.893325+00:00",
+          "outcome": "corrected",
+          "q": "I show 023 and the compass needle in real life is facing 000/360. use the gps to verify as well. The phone screen currently is facing up, the camera is facing down into the ground"
+        }
+      ],
+      "score": 8.986858029,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt",
+      "status": "contested",
+      "uses": 10,
+      "verdict": "useful"
+    },
     "app_src_main_kotlin_com_mobiledivecontrol_ui_gallery_galleryscreen": {
-      "code_fingerprint": "f55c4e59f2b08dfa0195e3f26ecca5003e318b7cd786f4be8a0083ea219bad93",
+      "code_fingerprint": "a2c3b85166c2f4f40dea111847b1a8d8f51d1e0a683ffa0522cde01fac5e0d41",
       "label": "GalleryScreen.kt",
       "last": "2026-08-23T17:26:31.635427+00:00",
       "provenance": [
@@ -79,13 +138,81 @@
           "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
         }
       ],
-      "score": 5.983408184,
+      "score": 5.95875102,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/gallery/GalleryScreen.kt",
       "status": "preferred",
       "uses": 6
     },
+    "app_src_main_kotlin_com_mobiledivecontrol_viewmodel_diveviewmodel_diveviewmodel": {
+      "code_fingerprint": "11e9c80e63ecf2e3a881b2ba5ffb2392f1334c7f581b395ace2de4cf506eb8b4",
+      "label": "DiveViewModel",
+      "last": "2026-08-23T23:21:28.499136+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T23:21:28.499136+00:00",
+          "outcome": "useful",
+          "q": "Make pointing gesture recognition sub 50 milliseconds."
+        },
+        {
+          "date": "2026-08-23T23:11:04.557441+00:00",
+          "outcome": "useful",
+          "q": "Improve gesture control recognition speed and accuracy so a pointing hand sets the heading faster."
+        },
+        {
+          "date": "2026-08-23T21:45:43.097350+00:00",
+          "outcome": "useful",
+          "q": "Improve gesture recognition for the point"
+        },
+        {
+          "date": "2026-08-23T20:31:44.761564+00:00",
+          "outcome": "useful",
+          "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
+        }
+      ],
+      "score": 3.995463511,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/viewmodel/DiveViewModel.kt",
+      "status": "preferred",
+      "uses": 4
+    },
+    "bluetoothadapter": {
+      "code_fingerprint": "",
+      "label": "BluetoothAdapter",
+      "last": "2026-08-23T20:31:44.761564+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T20:31:44.761564+00:00",
+          "outcome": "useful",
+          "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
+        }
+      ],
+      "score": 0.997251738,
+      "source_file": "",
+      "status": "tentative",
+      "uses": 1
+    },
+    "capturerequest": {
+      "code_fingerprint": "",
+      "label": "CaptureRequest",
+      "last": "2026-08-23T22:56:30.874466+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T22:56:30.874466+00:00",
+          "outcome": "useful",
+          "q": "Autofocus no longer adjusts smoothly, rapidly, or responsively; check the changes against the repository baseline."
+        },
+        {
+          "date": "2026-08-23T20:57:06.398559+00:00",
+          "outcome": "useful",
+          "q": "Why did continuous autofocus pulse and how should it hold focus without becoming unresponsive?"
+        }
+      ],
+      "score": 1.997228484,
+      "source_file": "",
+      "status": "preferred",
+      "uses": 2
+    },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts": {
-      "code_fingerprint": "9d5eaa1eee2c2d76c5e7a9b73721696fe36d7d2cf23f560482605de9a23699bf",
+      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
       "label": "Contracts.kt",
       "last": "2026-08-23T17:07:14.272588+00:00",
       "provenance": [
@@ -105,13 +232,50 @@
           "q": "move back to where delete is and delete where back is"
         }
       ],
-      "score": 2.993333764,
+      "score": 2.980998466,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 3
     },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_camerastate": {
+      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
+      "label": "CameraState",
+      "last": "2026-08-23T22:47:48.115489+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T22:47:48.115489+00:00",
+          "outcome": "useful",
+          "q": "When the TRACK HEADING menu option is open the Depth/heading/arrow/temperature are higher up than when it is closed. I need that fixed. Only menu's that actually interfere with these UI bounding boxes should move them up and just out of the way of the menu's while they are open and then move back when they are closed. The side menu where TRACK HEADING is located does not interfere at all"
+        }
+      ],
+      "score": 0.999431144,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_camerauizone": {
+      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
+      "label": "CameraUiZone",
+      "last": "2026-08-23T22:47:48.115489+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T22:47:48.115489+00:00",
+          "outcome": "useful",
+          "q": "When the TRACK HEADING menu option is open the Depth/heading/arrow/temperature are higher up than when it is closed. I need that fixed. Only menu's that actually interfere with these UI bounding boxes should move them up and just out of the way of the menu's while they are open and then move back when they are closed. The side menu where TRACK HEADING is located does not interfere at all"
+        },
+        {
+          "date": "2026-08-23T21:30:59.897602+00:00",
+          "outcome": "useful",
+          "q": "If I click on the camera mode setting using the Menu/OK button then click track heading, pressing left/right should keep me navigating inside the camera navbar but instead it forces me to navigate in the camera mode UI"
+        }
+      ],
+      "score": 1.997631427,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "preferred",
+      "uses": 2
+    },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_gallerycommand": {
-      "code_fingerprint": "9d5eaa1eee2c2d76c5e7a9b73721696fe36d7d2cf23f560482605de9a23699bf",
+      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
       "label": "GalleryCommand",
       "last": "2026-08-23T17:07:14.272588+00:00",
       "provenance": [
@@ -126,13 +290,13 @@
           "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
         }
       ],
-      "score": 1.996069364,
+      "score": 1.987843716,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 2
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_gallerystate": {
-      "code_fingerprint": "9d5eaa1eee2c2d76c5e7a9b73721696fe36d7d2cf23f560482605de9a23699bf",
+      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
       "label": "GalleryState",
       "last": "2026-08-23T17:26:31.635427+00:00",
       "provenance": [
@@ -147,16 +311,26 @@
           "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
         }
       ],
-      "score": 1.994380193,
+      "score": 1.986161505,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 2
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_controlreducer_controlreducer": {
-      "code_fingerprint": "74527cb944f78030fd6b0bcbe8187f76ad98cf69f8ff6247740f9d56d645fbfa",
+      "code_fingerprint": "595a944b5c4d0dd2328159807df88ddae951cc87fa661c810600d0f68eeea1e2",
       "label": "ControlReducer",
-      "last": "2026-08-23T18:13:16.706467+00:00",
+      "last": "2026-08-23T21:30:59.897602+00:00",
       "provenance": [
+        {
+          "date": "2026-08-23T21:30:59.897602+00:00",
+          "outcome": "useful",
+          "q": "If I click on the camera mode setting using the Menu/OK button then click track heading, pressing left/right should keep me navigating inside the camera navbar but instead it forces me to navigate in the camera mode UI"
+        },
+        {
+          "date": "2026-08-23T19:38:10.720088+00:00",
+          "outcome": "useful",
+          "q": "Fix the paused recording controls, SAVE TO album workflow, album ordering, empty-grid Back focus, and gallery Back visuals"
+        },
         {
           "date": "2026-08-23T18:13:16.706467+00:00",
           "outcome": "useful",
@@ -171,22 +345,46 @@
           "date": "2026-08-23T17:07:14.272588+00:00",
           "outcome": "useful",
           "q": "The top and bottom chevrons are far too large. The Back button must remain the same thickness vertically as Delete Album is now. Album Grid and Inside an Album Photo/Video Grid. The delete button should not exist in the bottom bar. Instead clicking on an album should give you the option to 1) Preview the album by default selected, 2) Delete the selected album, or go back when a selected album is clicked"
-        },
-        {
-          "date": "2026-08-23T16:59:20.875135+00:00",
-          "outcome": "useful",
-          "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
-        },
-        {
-          "date": "2026-08-23T16:15:10.349333+00:00",
-          "outcome": "useful",
-          "q": "move back to where delete is and delete where back is"
         }
       ],
-      "score": 6.982340839,
+      "score": 8.94816241,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/ControlReducer.kt",
       "status": "preferred",
-      "uses": 7
+      "uses": 9
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_protocolparser_sensor": {
+      "code_fingerprint": "e9b7880553072a5937814cec09aba1ee9fa643619745b5312f0c28e5822bf822",
+      "label": "Sensor",
+      "last": "2026-08-23T22:30:51.983660+00:00",
+      "neg": 1,
+      "provenance": [
+        {
+          "date": "2026-08-23T22:30:51.983660+00:00",
+          "outcome": "useful",
+          "q": "try to verify now, camera is facing north"
+        }
+      ],
+      "score": 0.000723509,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/ProtocolParser.kt",
+      "status": "contested",
+      "uses": 1,
+      "verdict": "useful"
+    },
+    "core_src_test_kotlin_com_mobiledivecontrol_core_controlcoretest_controlcoretest": {
+      "code_fingerprint": "1fb77ee7600ff6675f59f8a678821e9262b038a4e3452706514f164e57d205cb",
+      "label": "ControlCoreTest",
+      "last": "2026-08-23T21:30:59.897602+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T21:30:59.897602+00:00",
+          "outcome": "useful",
+          "q": "If I click on the camera mode setting using the Menu/OK button then click track heading, pressing left/right should keep me navigating inside the camera navbar but instead it forces me to navigate in the camera mode UI"
+        }
+      ],
+      "score": 0.998200283,
+      "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/ControlCoreTest.kt",
+      "status": "tentative",
+      "uses": 1
     },
     "core_src_test_kotlin_com_mobiledivecontrol_core_inputroutertest_inputroutertest": {
       "code_fingerprint": "88324eff173ff6d9332984a58a07d960d41562a622f54a0276a9f359e73cc8b7",
@@ -199,7 +397,7 @@
           "q": "lets work on the gallery menu: albums grid, navigable media grid, full-screen preview controls, move, rename, and delete"
         }
       ],
-      "score": 0.995470857,
+      "score": 0.991368598,
       "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/InputRouterTest.kt",
       "status": "tentative",
       "uses": 1
@@ -215,7 +413,7 @@
           "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
         }
       ],
-      "score": 0.995973379,
+      "score": 0.991869049,
       "source_file": "",
       "status": "tentative",
       "uses": 1
