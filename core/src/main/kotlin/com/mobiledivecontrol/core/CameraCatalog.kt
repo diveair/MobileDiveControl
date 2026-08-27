@@ -12,6 +12,7 @@ data class CameraRailEntry(
 
 enum class CameraRailAction {
     TrackHeading,
+    Diagnostics,
 }
 
 data class CameraSettingSpec(
@@ -69,6 +70,9 @@ object CameraCatalog {
         CameraRailEntry("slow_motion", "Slow Motion", CameraModeId.SlowMotion),
         CameraRailEntry("dual_record", "Dual Record", CameraModeId.DualRecording),
         CameraRailEntry("night_video", "Night Video", CameraModeId.NightVideo),
+        // A state screen rather than a capture profile. Keeping it as an action avoids inventing
+        // a camera mode with fake lenses/settings while still placing it last in the Modes menu.
+        CameraRailEntry("diagnostics", "Sensors & App State", action = CameraRailAction.Diagnostics),
     )
 
     val secondaryModes: List<CameraModeId> = emptyList()

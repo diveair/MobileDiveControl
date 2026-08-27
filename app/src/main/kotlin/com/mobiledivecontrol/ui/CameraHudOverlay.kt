@@ -65,10 +65,15 @@ fun CameraHudOverlay(
     bluetoothEnabled: Boolean = true,
     compassReading: CompassReading = CompassReading(),
     targetHeading: Double? = null,
+    hudVisible: Boolean = true,
     content: @Composable () -> Unit,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
         content()
+
+        // Full-screen menus such as Sensors & App State already render these values in their own
+        // layout. Keeping the camera HUD there would cover headings, formulae, and navigation.
+        if (!hudVisible) return@Box
 
         // The save-album grid is a true modal owned by CameraShellScreen. Let it cover the
         // camera HUD cleanly; the paused action rail restores every status pill when it closes.

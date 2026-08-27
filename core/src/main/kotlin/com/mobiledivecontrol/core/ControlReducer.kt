@@ -100,6 +100,15 @@ class ControlReducer(
     }
 
     fun updatePermission(state: AppState, permission: PermissionKind, granted: Boolean): Reduction {
+        val wasGranted = when (permission) {
+            PermissionKind.Bluetooth -> state.permissions.bluetooth
+            PermissionKind.Camera -> state.permissions.camera
+            PermissionKind.Microphone -> state.permissions.microphone
+            PermissionKind.Overlay -> state.permissions.overlay
+            PermissionKind.Accessibility -> state.permissions.accessibility
+            PermissionKind.ForegroundService -> state.permissions.foregroundService
+            PermissionKind.Notifications -> state.permissions.notifications
+        }
         var nextState = state.copy(
             permissions = state.permissions.with(permission, granted),
         )
@@ -138,7 +147,10 @@ class ControlReducer(
                 }
             }
             PermissionKind.Camera -> {
-                if (!granted && nextState.mode in setOf(AppMode.CameraLive, AppMode.CameraAdjust)) {
+                // A first-run permission request reports false before the user has answered. That
+                // is not a revocation and must not strand a fresh install on Diagnostics. Only a
+                // genuine true -> false transition leaves the camera for the safe state screen.
+                if (wasGranted && !granted && nextState.mode in setOf(AppMode.CameraLive, AppMode.CameraAdjust)) {
                     val note = "Camera Permission: Disabled"
                     nextState = nextState.copy(
                         mode = AppMode.Diagnostics,
@@ -456,6 +468,19 @@ class ControlReducer(
         CameraCommand.NavigateRight -> navigateCameraRight(state, repeatCount)
         CameraCommand.Confirm -> confirmCameraSelection(state)
         CameraCommand.Back -> backOutCameraUi(state)
+        CameraCommand.OpenModeRail -> Reduction(
+            state = state.copy(
+                camera = modeRailForCurrentMode(
+                    camera = state.camera,
+                    returnZone = if (state.camera.focusedZone == CameraUiZone.SettingsPanel) {
+                        CameraUiZone.SettingsPanel
+                    } else {
+                        CameraUiZone.LiveView
+                    },
+                ),
+            ),
+        )
+        is CameraCommand.ActivateModeRailEntry -> activateModeRailEntry(state, command.index)
         CameraCommand.ToggleOptionsMenu -> toggleOptionsMenu(state)
         is CameraCommand.SelectOptionsItem -> selectOptionsItem(state, command.index)
         is CameraCommand.AdjustOptionsItem -> {
@@ -1191,12 +1216,42 @@ class ControlReducer(
                 effects = listOf(PlatformEffect.TrackCurrentHeading),
             )
         }
+        if (entry.action == CameraRailAction.Diagnostics) {
+            if (camera.recording) {
+                val warning = "Stop recording before opening Sensors & App State."
+                return Reduction(
+                    state = state.copy(lastWarning = warning),
+                    notes = listOf(warning),
+                )
+            }
+            return Reduction(
+                state = state.copy(
+                    mode = AppMode.Diagnostics,
+                    camera = exitModeRail(camera),
+                    lastWarning = null,
+                ),
+            )
+        }
         return activateMode(
             state,
             requireNotNull(entry.mode) { "Primary rail entry ${entry.key} has no mode or action" },
             returnToLiveView = false,
             openSettings = true,
         )
+    }
+
+    private fun activateModeRailEntry(state: AppState, index: Int): Reduction {
+        if (index !in CameraCatalog.primaryRailEntries.indices) return Reduction(state = state)
+        val selectedState = state.copy(
+            camera = state.camera.copy(
+                focusedZone = CameraUiZone.ModeRail,
+                railLevel = CameraRailLevel.Primary,
+                highlightedPrimaryIndex = index,
+                settingsEditing = false,
+                sliderEditTarget = SliderEditTarget.Value,
+            ),
+        )
+        return activatePrimaryRailEntry(selectedState)
     }
 
     private fun activateMode(

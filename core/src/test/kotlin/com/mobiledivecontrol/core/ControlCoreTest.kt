@@ -145,6 +145,55 @@ class ControlCoreTest {
     }
 
     @Test
+    fun `sensors and app state is the final mode entry and back returns to camera`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+        val originalCameraMode = core.state.camera.activeMode
+
+        core.dispatch(CameraCommand.NavigateRight)
+        val lastEntry = core.dispatch(CameraCommand.NavigateUp)
+        assertEquals("Sensors & App State", lastEntry.state.camera.primaryHighlightedEntry.label)
+        assertEquals(CameraRailAction.Diagnostics, lastEntry.state.camera.primaryHighlightedEntry.action)
+
+        val opened = core.dispatch(CameraCommand.Confirm)
+        assertEquals(AppMode.Diagnostics, opened.state.mode)
+        assertEquals(originalCameraMode, opened.state.camera.activeMode)
+        assertEquals(CameraUiZone.LiveView, opened.state.camera.focusedZone)
+
+        val returned = core.handleButtonPayload(byteArrayOf(0x60))
+        assertEquals(AppMode.CameraLive, returned.state.mode)
+        assertEquals(originalCameraMode, returned.state.camera.activeMode)
+    }
+
+    @Test
+    fun `touch command opens the mode rail and activates its final diagnostics row`() {
+        val core = ControlCore()
+        core.updatePermission(PermissionKind.Camera, true)
+
+        val rail = core.dispatch(CameraCommand.OpenModeRail)
+        assertEquals(CameraUiZone.ModeRail, rail.state.camera.focusedZone)
+
+        val opened = core.dispatch(
+            CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryRailEntries.lastIndex),
+        )
+        assertEquals(AppMode.Diagnostics, opened.state.mode)
+    }
+
+    @Test
+    fun `initial camera permission prompt does not redirect but revocation does`() {
+        val core = ControlCore()
+
+        val pending = core.updatePermission(PermissionKind.Camera, false)
+        assertEquals(AppMode.CameraLive, pending.state.mode)
+
+        core.updatePermission(PermissionKind.Camera, true)
+        val revoked = core.updatePermission(PermissionKind.Camera, false)
+        assertEquals(AppMode.Diagnostics, revoked.state.mode)
+        assertTrue(revoked.notes.contains("Camera Permission: Disabled"))
+    }
+
+    @Test
     fun `settings tray cursor navigates horizontally and wraps`() {
         val core = ControlCore()
         core.advanceBle(BleSignal.Ready)

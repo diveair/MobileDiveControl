@@ -216,6 +216,7 @@ fun CameraShellScreen(
         ) {
             RightModeRail(
                 cameraState = cameraState,
+                onCommand = onCameraCommand,
             )
         }
 
@@ -654,6 +655,7 @@ private fun SaveLocationAlbumCover(
 @Composable
 private fun RightModeRail(
     cameraState: CameraState,
+    onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val items = CameraCatalog.primaryRailEntries
@@ -703,6 +705,7 @@ private fun RightModeRail(
                             color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder,
                             shape = RoundedCornerShape(14.dp),
                         )
+                        .clickable { onCommand(CameraCommand.ActivateModeRailEntry(index)) }
                         .padding(horizontal = 10.dp, vertical = if (selected) 10.dp else 8.dp),
                 ) {
                     Text(
@@ -1143,7 +1146,7 @@ private fun CenteredModesBar(
             cameraState = cameraState,
             selected = cameraState.settingsCursor == modesIndex,
             compact = false,
-            onClick = null,
+            onClick = { onCommand(CameraCommand.OpenModeRail) },
         )
         Spacer(modifier = Modifier.width(4.dp))
         ModesBarSide(

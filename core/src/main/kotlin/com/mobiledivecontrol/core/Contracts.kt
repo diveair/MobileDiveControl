@@ -635,6 +635,10 @@ sealed interface CameraCommand : ControlCommand {
     data object NavigateRight : CameraCommand
     data object Confirm : CameraCommand
     data object Back : CameraCommand
+    /** Opens the camera mode rail directly from the touch UI. */
+    data object OpenModeRail : CameraCommand
+    /** Touch-accessible equivalent of highlighting and confirming a primary mode-rail row. */
+    data class ActivateModeRailEntry(val index: Int) : CameraCommand
     /** Touch-accessible equivalent of activating the far-left Options tile. */
     data object ToggleOptionsMenu : CameraCommand
     /** Selects a vertical Options row without disturbing the horizontal settings cursor. */

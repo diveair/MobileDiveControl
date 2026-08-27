@@ -20,6 +20,21 @@ import com.mobiledivecontrol.theme.DiveColors
 const val STANDARD_ATMOSPHERE_KPA = 101.325
 
 /**
+ * Converts absolute water pressure to gauge depth using the captured surface atmosphere.
+ * The live internal barometer is intentionally not an input: pulling a housing vacuum changes it
+ * without changing depth. The current `9.81 kPa/m` divisor is the freshwater approximation used
+ * throughout the app; a salt-water density selector remains a separate calibration task.
+ */
+fun depthMetersFromPressure(
+    waterPressureKpa: Double?,
+    surfaceAmbientKpa: Double?,
+): Double? {
+    val water = waterPressureKpa ?: return null
+    val surface = surfaceAmbientKpa ?: STANDARD_ATMOSPHERE_KPA
+    return (water - surface).coerceAtLeast(0.0) / 9.81
+}
+
+/**
  * Depth gauge — bottom center of camera UI.
  * No icon. Just clean text: "12.5 m" or "41.0 ft".
  * Color-coded by depth range.
@@ -49,11 +64,7 @@ fun DepthGauge(
     headingTargetSynchronized: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    val depthMeters = waterPressureKpa?.let { water ->
-        val surface = surfaceAmbientKpa ?: STANDARD_ATMOSPHERE_KPA
-        // Salt-water density correction is a separate work item — do not fold it in here.
-        (water - surface).coerceAtLeast(0.0) / 9.81
-    }
+    val depthMeters = depthMetersFromPressure(waterPressureKpa, surfaceAmbientKpa)
 
     val displayText = when {
         depthMeters == null -> if (useMetric) "-- m" else "-- ft"

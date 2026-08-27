@@ -82,7 +82,7 @@ import com.mobiledivecontrol.core.UnderwaterWhiteBalanceEstimator
 import com.mobiledivecontrol.core.UnderwaterWhiteBalanceInput
 import com.mobiledivecontrol.core.UnderwaterWhiteBalanceSolution
 import com.mobiledivecontrol.core.WhiteBalanceChromaticity
-import com.mobiledivecontrol.ui.components.STANDARD_ATMOSPHERE_KPA
+import com.mobiledivecontrol.ui.components.depthMetersFromPressure
 import org.json.JSONObject
 import kotlin.math.abs
 import kotlin.math.ln
@@ -5363,10 +5363,7 @@ class CameraRuntimeController(
      * atmosphere is wrong by altitude and weather but never by the whole vacuum.
      */
     private fun currentDepthMeters(): Double? {
-        val water = latestWaterPressureKpa ?: return null
-        val surface = latestSurfaceAmbientKpa ?: STANDARD_ATMOSPHERE_KPA
-        // Salt-water density correction is tracked separately — do not fold it in here.
-        return (water - surface).coerceAtLeast(0.0) / 9.81
+        return depthMetersFromPressure(latestWaterPressureKpa, latestSurfaceAmbientKpa)
     }
 
     /** The mode's manual kelvin, or null when white balance sits on Auto (or has no dial). */

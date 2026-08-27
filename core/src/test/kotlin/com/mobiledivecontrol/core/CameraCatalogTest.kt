@@ -27,6 +27,7 @@ class CameraCatalogTest {
                 "Slow Motion",
                 "Dual Record",
                 "Night Video",
+                "Sensors & App State",
             ),
             labels,
         )
