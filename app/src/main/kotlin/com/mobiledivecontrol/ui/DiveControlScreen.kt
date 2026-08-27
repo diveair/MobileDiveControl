@@ -24,9 +24,9 @@ import androidx.compose.ui.unit.dp
 import com.mobiledivecontrol.core.AppMode
 import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.BleConnectionState
+import com.mobiledivecontrol.core.DiagnosticsCommand
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.SafetyState
-import com.mobiledivecontrol.core.SystemCommand
 import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.ui.camera.CameraShellScreen
 import com.mobiledivecontrol.ui.camera.PointingGesture
@@ -63,7 +63,7 @@ fun DiveControlScreen(
     targetHeading: Double? = null,
     onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit = {},
     onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit = {},
-    onSystemCommand: (SystemCommand) -> Unit = {},
+    onDiagnosticsCommand: (DiagnosticsCommand) -> Unit = {},
     introVisible: Boolean = false,
     onIntroDismiss: () -> Unit = {},
     permissionsGranted: Boolean = false,
@@ -89,7 +89,7 @@ fun DiveControlScreen(
             targetHeading = targetHeading,
             onCameraCommand = onCameraCommand,
             onGalleryCommand = onGalleryCommand,
-            onSystemCommand = onSystemCommand,
+            onDiagnosticsCommand = onDiagnosticsCommand,
             bluetoothEnabled = bluetoothEnabled,
         )
 
@@ -130,7 +130,7 @@ private fun DiveControlContent(
     targetHeading: Double? = null,
     onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit,
     onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit,
-    onSystemCommand: (SystemCommand) -> Unit,
+    onDiagnosticsCommand: (DiagnosticsCommand) -> Unit,
     bluetoothEnabled: Boolean = true,
 ) {
     CameraHudOverlay(
@@ -182,8 +182,7 @@ private fun DiveControlContent(
                 AppMode.Safety -> SafetyScreen(safety = state.safety)
                 AppMode.Diagnostics -> DiagnosticsScreen(
                     state = state,
-                    onBack = { onSystemCommand(SystemCommand.SwitchToCameraMode) },
-                    onExport = { onSystemCommand(SystemCommand.ExportDiagnostics) },
+                    onCommand = onDiagnosticsCommand,
                 )
                 AppMode.PhoneCursor, AppMode.PhoneTarget -> PhoneControlPlaceholder(mode = mode)
                 AppMode.Gallery -> com.mobiledivecontrol.ui.gallery.GalleryScreen(

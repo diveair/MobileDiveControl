@@ -1,27 +1,65 @@
 {
-  "generated_at": "2026-08-23T23:23:15.939724+00:00",
+  "generated_at": "2026-08-27T18:24:06.025372+00:00",
   "nodes": {
     "app_src_main_kotlin_com_mobiledivecontrol_mainactivity_mainactivity": {
-      "code_fingerprint": "b3b79eb66e35e743e5a26b6f0d09fbb41617d765d0a6ef793d3be3209d37ec17",
+      "code_fingerprint": "6d530ffb47073170b0cd45977aeb075b031a3306f146acb25baa8540dd54a0cb",
       "label": "MainActivity",
-      "last": "2026-08-23T20:31:44.761564+00:00",
+      "last": "2026-08-23T23:29:16.031535+00:00",
       "provenance": [
+        {
+          "date": "2026-08-23T23:29:16.031535+00:00",
+          "outcome": "useful",
+          "q": "Can Bluetooth be auto turned on if the app detects it is off"
+        },
         {
           "date": "2026-08-23T20:31:44.761564+00:00",
           "outcome": "useful",
           "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
         }
       ],
-      "score": 0.997251738,
+      "score": 1.8297893,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/MainActivity.kt",
-      "status": "tentative",
-      "uses": 1
+      "status": "preferred",
+      "uses": 2
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_platform_compassheadingmonitor_compassheadingmonitor": {
+      "code_fingerprint": "f7a7b178aa364258d1c6b22791533b7554dd8022f9b1b2c2c54a56ccac59ec9c",
+      "label": "CompassHeadingMonitor",
+      "last": "2026-08-23T21:30:58.649842+00:00",
+      "neg": 1,
+      "provenance": [
+        {
+          "date": "2026-08-23T21:30:58.649842+00:00",
+          "outcome": "useful",
+          "q": "The Arrow needs to be a triangle like the standard Navigation triangle arrow. Also, check how stable you are holding the compass heading, it appears to drift and I cannot have that be the case. check all of your rotation code and the tilt code to make sure your perspective calculation is correct and intuitive"
+        },
+        {
+          "date": "2026-08-23T21:12:15.434121+00:00",
+          "outcome": "corrected",
+          "q": "phone tilt is not changing the arrow as expected and it should. The arrow should be 3D so that when the phone is perpendicular to the ground and facing the correct heading the arrow points along the camera's perspective towards the heading. I also want the heading moved and placed between the Depth and the temp in the center of their UI and give it a unique colour"
+        },
+        {
+          "date": "2026-08-23T20:57:04.993468+00:00",
+          "outcome": "useful",
+          "q": "How should the compass heading and target arrow adapt to landscape display rotation and phone tilt?"
+        }
+      ],
+      "score": 0.914237803,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/platform/CompassHeadingMonitor.kt",
+      "status": "contested",
+      "uses": 2,
+      "verdict": "useful"
     },
     "app_src_main_kotlin_com_mobiledivecontrol_platform_galleryrepository_galleryrepository": {
-      "code_fingerprint": "5e380eafe4cf6d560d0b35e1ea56138e65c96e2d7b3a6d03d7f74fb90a6f0056",
+      "code_fingerprint": "334df95c59fca3a06985b3cbaa6145408a9b8095dc3e70e169bec138b38dd08b",
       "label": "GalleryRepository",
-      "last": "2026-08-23T19:38:10.720088+00:00",
+      "last": "2026-08-23T23:26:23.188620+00:00",
       "provenance": [
+        {
+          "date": "2026-08-23T23:26:23.188620+00:00",
+          "outcome": "useful",
+          "q": "write me a github summary of what we made today"
+        },
         {
           "date": "2026-08-23T19:38:10.720088+00:00",
           "outcome": "useful",
@@ -41,17 +79,12 @@
           "date": "2026-08-23T16:59:20.875135+00:00",
           "outcome": "useful",
           "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
-        },
-        {
-          "date": "2026-08-23T14:22:59.005558+00:00",
-          "outcome": "useful",
-          "q": "lets work on the gallery menu: albums grid, navigable media grid, full-screen preview controls, move, rename, and delete"
         }
       ],
-      "score": 4.970645872,
+      "score": 5.469810645,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/platform/GalleryRepository.kt",
       "status": "preferred",
-      "uses": 5
+      "uses": 6
     },
     "app_src_main_kotlin_com_mobiledivecontrol_service_housinglinkservice_housinglinkservice": {
       "code_fingerprint": "d32e8553f3a094d0220657075a9bf1cfa2492dacb5e6e3d868b333e0f199ef06",
@@ -64,54 +97,107 @@
           "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
         }
       ],
-      "score": 0.997251738,
+      "score": 0.913591685,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/service/HousingLinkService.kt",
       "status": "tentative",
       "uses": 1
     },
     "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_cameraruntimecontroller_cameraruntimecontroller": {
-      "code_fingerprint": "13e340f3708896cfefce651328e1828971c5f1436e93c3637507a3e8354b371f",
+      "code_fingerprint": "3f7d71095631b44e808d11a7e80807ce16b33bb71419a1ba5c3338caa66a9914",
       "label": "CameraRuntimeController",
-      "last": "2026-08-23T23:21:28.499136+00:00",
+      "last": "2026-08-27T18:19:04.137732+00:00",
       "neg": 1,
       "provenance": [
         {
-          "date": "2026-08-23T23:21:28.499136+00:00",
+          "date": "2026-08-27T18:19:04.137732+00:00",
           "outcome": "useful",
-          "q": "Make pointing gesture recognition sub 50 milliseconds."
+          "q": "In the other screen on initial startup I saw Barometric reading at 85.2kPa, Water Pressure at 101.2kPa, Vacuum at -16.4kPa. So I need to understand how those variables are used to calculate the depth currently. Also, those settings (from the other state) need to be accessible in the menu below all of the camera modes as the last option and need a way to go into that menu and back out of it"
         },
         {
-          "date": "2026-08-23T23:11:04.557441+00:00",
+          "date": "2026-08-24T01:31:25.180327+00:00",
           "outcome": "useful",
-          "q": "Improve gesture control recognition speed and accuracy so a pointing hand sets the heading faster."
+          "q": "Is the LOG profile on the app the exact same as the log profile in the native camera app?"
         },
         {
-          "date": "2026-08-23T22:56:30.874466+00:00",
+          "date": "2026-08-24T00:44:06.665240+00:00",
           "outcome": "useful",
-          "q": "Autofocus no longer adjusts smoothly, rapidly, or responsively; check the changes against the repository baseline."
+          "q": "do it"
         },
         {
-          "date": "2026-08-23T22:30:51.983660+00:00",
+          "date": "2026-08-24T00:11:33.850215+00:00",
           "outcome": "useful",
-          "q": "try to verify now, camera is facing north"
+          "q": "whats your detailed plan and hwat is the math to do this as intelligently as possible"
         },
         {
-          "date": "2026-08-23T22:25:37.893325+00:00",
-          "outcome": "corrected",
-          "q": "I show 023 and the compass needle in real life is facing 000/360. use the gps to verify as well. The phone screen currently is facing up, the camera is facing down into the ground"
+          "date": "2026-08-23T23:45:26.760615+00:00",
+          "outcome": "useful",
+          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
         }
       ],
-      "score": 8.986858029,
+      "score": 13.817568285,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt",
       "status": "contested",
-      "uses": 10,
+      "uses": 16,
       "verdict": "useful"
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_camerashellscreen": {
+      "code_fingerprint": "1e3b91afcf778993390c0538ca71e0f13a47e2e302aae3c5f6ef395481deb3fe",
+      "label": "CameraShellScreen.kt",
+      "last": "2026-08-27T18:19:04.137732+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-27T18:19:04.137732+00:00",
+          "outcome": "useful",
+          "q": "In the other screen on initial startup I saw Barometric reading at 85.2kPa, Water Pressure at 101.2kPa, Vacuum at -16.4kPa. So I need to understand how those variables are used to calculate the depth currently. Also, those settings (from the other state) need to be accessible in the menu below all of the camera modes as the last option and need a way to go into that menu and back out of it"
+        }
+      ],
+      "score": 0.999919273,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraShellScreen.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_recordingsessionmuxer_recordingsessionmuxer": {
+      "code_fingerprint": "567d76463fcb651ee87506e7343b1e66431f9cab77f14252bcb69ac2e84d720b",
+      "label": "RecordingSessionMuxer",
+      "last": "2026-08-23T18:13:16.706467+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T18:13:16.706467+00:00",
+          "outcome": "useful",
+          "q": "How should the paused recording controls and Save To album chooser work?"
+        }
+      ],
+      "score": 0.911564191,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/RecordingSessionMuxer.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_components_depthgauge": {
+      "code_fingerprint": "43c6a6a33d0b399dc1d9a74f8e7ce232b545186b163b1a6ef7a9423d7fb9b913",
+      "label": "DepthGauge.kt",
+      "last": "2026-08-27T18:19:04.137732+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-27T18:19:04.137732+00:00",
+          "outcome": "useful",
+          "q": "In the other screen on initial startup I saw Barometric reading at 85.2kPa, Water Pressure at 101.2kPa, Vacuum at -16.4kPa. So I need to understand how those variables are used to calculate the depth currently. Also, those settings (from the other state) need to be accessible in the menu below all of the camera modes as the last option and need a way to go into that menu and back out of it"
+        }
+      ],
+      "score": 0.999919273,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/components/DepthGauge.kt",
+      "status": "tentative",
+      "uses": 1
     },
     "app_src_main_kotlin_com_mobiledivecontrol_ui_gallery_galleryscreen": {
       "code_fingerprint": "a2c3b85166c2f4f40dea111847b1a8d8f51d1e0a683ffa0522cde01fac5e0d41",
       "label": "GalleryScreen.kt",
-      "last": "2026-08-23T17:26:31.635427+00:00",
+      "last": "2026-08-23T23:26:23.188620+00:00",
       "provenance": [
+        {
+          "date": "2026-08-23T23:26:23.188620+00:00",
+          "outcome": "useful",
+          "q": "write me a github summary of what we made today"
+        },
         {
           "date": "2026-08-23T17:26:31.635427+00:00",
           "outcome": "useful",
@@ -131,23 +217,23 @@
           "date": "2026-08-23T16:15:10.349333+00:00",
           "outcome": "useful",
           "q": "move back to where delete is and delete where back is"
-        },
-        {
-          "date": "2026-08-23T14:54:26.242203+00:00",
-          "outcome": "useful",
-          "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
         }
       ],
-      "score": 5.95875102,
+      "score": 6.375023053,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/gallery/GalleryScreen.kt",
       "status": "preferred",
-      "uses": 6
+      "uses": 7
     },
     "app_src_main_kotlin_com_mobiledivecontrol_viewmodel_diveviewmodel_diveviewmodel": {
       "code_fingerprint": "11e9c80e63ecf2e3a881b2ba5ffb2392f1334c7f581b395ace2de4cf506eb8b4",
       "label": "DiveViewModel",
-      "last": "2026-08-23T23:21:28.499136+00:00",
+      "last": "2026-08-23T23:29:16.031535+00:00",
       "provenance": [
+        {
+          "date": "2026-08-23T23:29:16.031535+00:00",
+          "outcome": "useful",
+          "q": "Can Bluetooth be auto turned on if the app detects it is off"
+        },
         {
           "date": "2026-08-23T23:21:28.499136+00:00",
           "outcome": "useful",
@@ -169,23 +255,44 @@
           "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
         }
       ],
-      "score": 3.995463511,
+      "score": 4.57647927,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/viewmodel/DiveViewModel.kt",
       "status": "preferred",
-      "uses": 4
+      "uses": 5
     },
     "bluetoothadapter": {
       "code_fingerprint": "",
       "label": "BluetoothAdapter",
-      "last": "2026-08-23T20:31:44.761564+00:00",
+      "last": "2026-08-23T23:29:16.031535+00:00",
       "provenance": [
+        {
+          "date": "2026-08-23T23:29:16.031535+00:00",
+          "outcome": "useful",
+          "q": "Can Bluetooth be auto turned on if the app detects it is off"
+        },
         {
           "date": "2026-08-23T20:31:44.761564+00:00",
           "outcome": "useful",
           "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
         }
       ],
-      "score": 0.997251738,
+      "score": 1.8297893,
+      "source_file": "",
+      "status": "preferred",
+      "uses": 2
+    },
+    "camera": {
+      "code_fingerprint": "",
+      "label": "Camera",
+      "last": "2026-08-24T02:39:57.571277+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-24T02:39:57.571277+00:00",
+          "outcome": "useful",
+          "q": "Fix DiveControl LOG to match Samsung Camera Log and assess additional dynamic range"
+        }
+      ],
+      "score": 0.919005172,
       "source_file": "",
       "status": "tentative",
       "uses": 1
@@ -193,6 +300,58 @@
     "capturerequest": {
       "code_fingerprint": "",
       "label": "CaptureRequest",
+      "last": "2026-08-24T01:31:25.180327+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-24T01:31:25.180327+00:00",
+          "outcome": "useful",
+          "q": "Is the LOG profile on the app the exact same as the log profile in the native camera app?"
+        },
+        {
+          "date": "2026-08-24T00:44:06.665240+00:00",
+          "outcome": "useful",
+          "q": "do it"
+        },
+        {
+          "date": "2026-08-24T00:11:33.850215+00:00",
+          "outcome": "useful",
+          "q": "whats your detailed plan and hwat is the math to do this as intelligently as possible"
+        },
+        {
+          "date": "2026-08-23T23:45:26.760615+00:00",
+          "outcome": "useful",
+          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
+        },
+        {
+          "date": "2026-08-23T22:56:30.874466+00:00",
+          "outcome": "useful",
+          "q": "Autofocus no longer adjusts smoothly, rapidly, or responsively; check the changes against the repository baseline."
+        }
+      ],
+      "score": 5.498228458,
+      "source_file": "",
+      "status": "preferred",
+      "uses": 6
+    },
+    "color": {
+      "code_fingerprint": "",
+      "label": "Color",
+      "last": "2026-08-24T02:39:57.571277+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-24T02:39:57.571277+00:00",
+          "outcome": "useful",
+          "q": "Fix DiveControl LOG to match Samsung Camera Log and assess additional dynamic range"
+        }
+      ],
+      "score": 0.919005172,
+      "source_file": "",
+      "status": "tentative",
+      "uses": 1
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_autofocusholdpolicy_autofocusholdpolicy": {
+      "code_fingerprint": "5062e76a4d70aca251835eb448836d19d33ea3ecc8ebdcbdaf1c1186e7215347",
+      "label": "AutofocusHoldPolicy",
       "last": "2026-08-23T22:56:30.874466+00:00",
       "provenance": [
         {
@@ -206,13 +365,49 @@
           "q": "Why did continuous autofocus pulse and how should it hold focus without becoming unresponsive?"
         }
       ],
-      "score": 1.997228484,
-      "source_file": "",
+      "score": 1.829679776,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/AutofocusHoldPolicy.kt",
       "status": "preferred",
       "uses": 2
     },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_cameracatalog_cameracatalog": {
+      "code_fingerprint": "19cf9d35fec7aba2af1f0f83455f37263e767f571a2c0d7649c9f4416ed5a12e",
+      "label": "CameraCatalog",
+      "last": "2026-08-24T01:31:25.180327+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-24T01:31:25.180327+00:00",
+          "outcome": "useful",
+          "q": "Is the LOG profile on the app the exact same as the log profile in the native camera app?"
+        },
+        {
+          "date": "2026-08-24T00:44:06.665240+00:00",
+          "outcome": "useful",
+          "q": "do it"
+        },
+        {
+          "date": "2026-08-24T00:11:33.850215+00:00",
+          "outcome": "useful",
+          "q": "whats your detailed plan and hwat is the math to do this as intelligently as possible"
+        },
+        {
+          "date": "2026-08-23T23:45:26.760615+00:00",
+          "outcome": "useful",
+          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
+        },
+        {
+          "date": "2026-08-23T23:26:23.188620+00:00",
+          "outcome": "useful",
+          "q": "write me a github summary of what we made today"
+        }
+      ],
+      "score": 4.584703949,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/CameraCatalog.kt",
+      "status": "preferred",
+      "uses": 5
+    },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts": {
-      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
+      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
       "label": "Contracts.kt",
       "last": "2026-08-23T17:07:14.272588+00:00",
       "provenance": [
@@ -232,29 +427,44 @@
           "q": "move back to where delete is and delete where back is"
         }
       ],
-      "score": 2.980998466,
+      "score": 2.730920698,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 3
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_camerastate": {
-      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
+      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
       "label": "CameraState",
-      "last": "2026-08-23T22:47:48.115489+00:00",
+      "last": "2026-08-24T00:44:06.665240+00:00",
       "provenance": [
+        {
+          "date": "2026-08-24T00:44:06.665240+00:00",
+          "outcome": "useful",
+          "q": "do it"
+        },
+        {
+          "date": "2026-08-24T00:11:33.850215+00:00",
+          "outcome": "useful",
+          "q": "whats your detailed plan and hwat is the math to do this as intelligently as possible"
+        },
+        {
+          "date": "2026-08-23T23:45:26.760615+00:00",
+          "outcome": "useful",
+          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
+        },
         {
           "date": "2026-08-23T22:47:48.115489+00:00",
           "outcome": "useful",
           "q": "When the TRACK HEADING menu option is open the Depth/heading/arrow/temperature are higher up than when it is closed. I need that fixed. Only menu's that actually interfere with these UI bounding boxes should move them up and just out of the way of the menu's while they are open and then move back when they are closed. The side menu where TRACK HEADING is located does not interfere at all"
         }
       ],
-      "score": 0.999431144,
+      "score": 3.666141867,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
-      "status": "tentative",
-      "uses": 1
+      "status": "preferred",
+      "uses": 4
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_camerauizone": {
-      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
+      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
       "label": "CameraUiZone",
       "last": "2026-08-23T22:47:48.115489+00:00",
       "provenance": [
@@ -269,13 +479,13 @@
           "q": "If I click on the camera mode setting using the Menu/OK button then click track heading, pressing left/right should keep me navigating inside the camera navbar but instead it forces me to navigate in the camera mode UI"
         }
       ],
-      "score": 1.997631427,
+      "score": 1.830048916,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 2
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_gallerycommand": {
-      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
+      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
       "label": "GalleryCommand",
       "last": "2026-08-23T17:07:14.272588+00:00",
       "provenance": [
@@ -290,13 +500,13 @@
           "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
         }
       ],
-      "score": 1.987843716,
+      "score": 1.821082302,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 2
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_gallerystate": {
-      "code_fingerprint": "6196cd432e9a1bcafc39ed9da62962295419ecdd2dded9619375eea96f481683",
+      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
       "label": "GalleryState",
       "last": "2026-08-23T17:26:31.635427+00:00",
       "provenance": [
@@ -311,16 +521,89 @@
           "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
         }
       ],
-      "score": 1.986161505,
+      "score": 1.819541213,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 2
     },
-    "core_src_main_kotlin_com_mobiledivecontrol_core_controlreducer_controlreducer": {
-      "code_fingerprint": "595a944b5c4d0dd2328159807df88ddae951cc87fa661c810600d0f68eeea1e2",
-      "label": "ControlReducer",
-      "last": "2026-08-23T21:30:59.897602+00:00",
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_meteredexposure": {
+      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "label": "MeteredExposure",
+      "last": "2026-08-24T00:44:06.665240+00:00",
       "provenance": [
+        {
+          "date": "2026-08-24T00:44:06.665240+00:00",
+          "outcome": "useful",
+          "q": "do it"
+        },
+        {
+          "date": "2026-08-24T00:11:33.850215+00:00",
+          "outcome": "useful",
+          "q": "whats your detailed plan and hwat is the math to do this as intelligently as possible"
+        },
+        {
+          "date": "2026-08-23T23:45:26.760615+00:00",
+          "outcome": "useful",
+          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
+        }
+      ],
+      "score": 2.750553608,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "preferred",
+      "uses": 3
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_recordingsavelocation": {
+      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "label": "RecordingSaveLocation",
+      "last": "2026-08-23T19:38:10.720088+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T19:38:10.720088+00:00",
+          "outcome": "useful",
+          "q": "Fix the paused recording controls, SAVE TO album workflow, album ordering, empty-grid Back focus, and gallery Back visuals"
+        }
+      ],
+      "score": 0.912806798,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_safetystate": {
+      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "label": "SafetyState",
+      "last": "2026-08-23T23:45:26.760615+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T23:45:26.760615+00:00",
+          "outcome": "useful",
+          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
+        }
+      ],
+      "score": 0.916435482,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_controlreducer_controlreducer": {
+      "code_fingerprint": "f59d0f05a4ca92b1f1e52e565f5ae6f9c01b551e132a5646eb85db73ae62fe0e",
+      "label": "ControlReducer",
+      "last": "2026-08-27T18:19:04.137732+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-27T18:19:04.137732+00:00",
+          "outcome": "useful",
+          "q": "In the other screen on initial startup I saw Barometric reading at 85.2kPa, Water Pressure at 101.2kPa, Vacuum at -16.4kPa. So I need to understand how those variables are used to calculate the depth currently. Also, those settings (from the other state) need to be accessible in the menu below all of the camera modes as the last option and need a way to go into that menu and back out of it"
+        },
+        {
+          "date": "2026-08-23T23:29:16.031535+00:00",
+          "outcome": "useful",
+          "q": "Can Bluetooth be auto turned on if the app detects it is off"
+        },
+        {
+          "date": "2026-08-23T23:26:23.188620+00:00",
+          "outcome": "useful",
+          "q": "write me a github summary of what we made today"
+        },
         {
           "date": "2026-08-23T21:30:59.897602+00:00",
           "outcome": "useful",
@@ -330,48 +613,75 @@
           "date": "2026-08-23T19:38:10.720088+00:00",
           "outcome": "useful",
           "q": "Fix the paused recording controls, SAVE TO album workflow, album ordering, empty-grid Back focus, and gallery Back visuals"
-        },
-        {
-          "date": "2026-08-23T18:13:16.706467+00:00",
-          "outcome": "useful",
-          "q": "How should the paused recording controls and Save To album chooser work?"
-        },
-        {
-          "date": "2026-08-23T17:26:31.635427+00:00",
-          "outcome": "useful",
-          "q": "Implement gallery Back-row navigation with Create Album as the intermediate Right target, add the compact Back arrow and TOP/BOTTOM chevrons, and prevent video autoplay on preview or Next/Previous"
-        },
-        {
-          "date": "2026-08-23T17:07:14.272588+00:00",
-          "outcome": "useful",
-          "q": "The top and bottom chevrons are far too large. The Back button must remain the same thickness vertically as Delete Album is now. Album Grid and Inside an Album Photo/Video Grid. The delete button should not exist in the bottom bar. Instead clicking on an album should give you the option to 1) Preview the album by default selected, 2) Delete the selected album, or go back when a selected album is clicked"
         }
       ],
-      "score": 8.94816241,
+      "score": 11.029767798,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/ControlReducer.kt",
       "status": "preferred",
-      "uses": 9
+      "uses": 12
     },
-    "core_src_main_kotlin_com_mobiledivecontrol_core_protocolparser_sensor": {
-      "code_fingerprint": "e9b7880553072a5937814cec09aba1ee9fa643619745b5312f0c28e5822bf822",
-      "label": "Sensor",
-      "last": "2026-08-23T22:30:51.983660+00:00",
+    "core_src_main_kotlin_com_mobiledivecontrol_core_headingmath_headingmath": {
+      "code_fingerprint": "66bfafd714a8b242d7655b583a246edc16277cc2abecdca6c3e5c23574f63e5a",
+      "label": "HeadingMath",
+      "last": "2026-08-23T21:30:58.649842+00:00",
       "neg": 1,
       "provenance": [
         {
-          "date": "2026-08-23T22:30:51.983660+00:00",
+          "date": "2026-08-23T21:30:58.649842+00:00",
           "outcome": "useful",
-          "q": "try to verify now, camera is facing north"
+          "q": "The Arrow needs to be a triangle like the standard Navigation triangle arrow. Also, check how stable you are holding the compass heading, it appears to drift and I cannot have that be the case. check all of your rotation code and the tilt code to make sure your perspective calculation is correct and intuitive"
+        },
+        {
+          "date": "2026-08-23T21:12:15.434121+00:00",
+          "outcome": "corrected",
+          "q": "phone tilt is not changing the arrow as expected and it should. The arrow should be 3D so that when the phone is perpendicular to the ground and facing the correct heading the arrow points along the camera's perspective towards the heading. I also want the heading moved and placed between the Depth and the temp in the center of their UI and give it a unique colour"
+        },
+        {
+          "date": "2026-08-23T20:57:04.993468+00:00",
+          "outcome": "useful",
+          "q": "How should the compass heading and target arrow adapt to landscape display rotation and phone tilt?"
         }
       ],
-      "score": 0.000723509,
-      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/ProtocolParser.kt",
+      "score": 0.914237803,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/HeadingMath.kt",
       "status": "contested",
-      "uses": 1,
+      "uses": 2,
       "verdict": "useful"
     },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_headingstabilizer_headingstabilizer": {
+      "code_fingerprint": "2b963732b7d236c57bf47b878c1fecfe36c55e8c80fd0a430b42090fc0284377",
+      "label": "HeadingStabilizer",
+      "last": "2026-08-23T21:30:58.649842+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T21:30:58.649842+00:00",
+          "outcome": "useful",
+          "q": "The Arrow needs to be a triangle like the standard Navigation triangle arrow. Also, check how stable you are holding the compass heading, it appears to drift and I cannot have that be the case. check all of your rotation code and the tilt code to make sure your perspective calculation is correct and intuitive"
+        }
+      ],
+      "score": 0.914460351,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/HeadingStabilizer.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_underwaterwhitebalance_underwaterwhitebalanceestimator": {
+      "code_fingerprint": "aacd5fb529c36f4b0c8a8cac59d839eae93d2808d78af174fb0d26c9751ccd3d",
+      "label": "UnderwaterWhiteBalanceEstimator",
+      "last": "2026-08-24T00:44:06.665240+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-24T00:44:06.665240+00:00",
+          "outcome": "useful",
+          "q": "do it"
+        }
+      ],
+      "score": 0.917298515,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/UnderwaterWhiteBalance.kt",
+      "status": "tentative",
+      "uses": 1
+    },
     "core_src_test_kotlin_com_mobiledivecontrol_core_controlcoretest_controlcoretest": {
-      "code_fingerprint": "1fb77ee7600ff6675f59f8a678821e9262b038a4e3452706514f164e57d205cb",
+      "code_fingerprint": "da94d19eff8a6d9641d2c378b2e1c1439f622748e4aa316de58c572102c67f69",
       "label": "ControlCoreTest",
       "last": "2026-08-23T21:30:59.897602+00:00",
       "provenance": [
@@ -381,8 +691,24 @@
           "q": "If I click on the camera mode setting using the Menu/OK button then click track heading, pressing left/right should keep me navigating inside the camera navbar but instead it forces me to navigate in the camera mode UI"
         }
       ],
-      "score": 0.998200283,
+      "score": 0.914460656,
       "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/ControlCoreTest.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "core_src_test_kotlin_com_mobiledivecontrol_core_gallerymenuflowtest_gallerymenuflowtest": {
+      "code_fingerprint": "2ad67e2927521c0241846a00d660d3855fa1cbaffacd6ce36e46e9dfbf813234",
+      "label": "GalleryMenuFlowTest",
+      "last": "2026-08-23T17:26:31.635427+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-23T17:26:31.635427+00:00",
+          "outcome": "useful",
+          "q": "Implement gallery Back-row navigation with Create Album as the intermediate Right target, add the compact Back arrow and TOP/BOTTOM chevrons, and prevent video autoplay on preview or Next/Previous"
+        }
+      ],
+      "score": 0.910880659,
+      "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/GalleryMenuFlowTest.kt",
       "status": "tentative",
       "uses": 1
     },
@@ -397,23 +723,55 @@
           "q": "lets work on the gallery menu: albums grid, navigable media grid, full-screen preview controls, move, rename, and delete"
         }
       ],
-      "score": 0.991368598,
+      "score": 0.908202085,
       "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/InputRouterTest.kt",
       "status": "tentative",
       "uses": 1
     },
-    "surfacetexture": {
+    "recorder": {
       "code_fingerprint": "",
-      "label": "SurfaceTexture",
-      "last": "2026-08-23T14:54:26.242203+00:00",
+      "label": "Recorder",
+      "last": "2026-08-24T02:39:57.571277+00:00",
       "provenance": [
         {
-          "date": "2026-08-23T14:54:26.242203+00:00",
+          "date": "2026-08-24T02:39:57.571277+00:00",
           "outcome": "useful",
-          "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
+          "q": "Fix DiveControl LOG to match Samsung Camera Log and assess additional dynamic range"
         }
       ],
-      "score": 0.991869049,
+      "score": 0.919005172,
+      "source_file": "",
+      "status": "tentative",
+      "uses": 1
+    },
+    "recording": {
+      "code_fingerprint": "",
+      "label": "Recording",
+      "last": "2026-08-24T02:39:57.571277+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-24T02:39:57.571277+00:00",
+          "outcome": "useful",
+          "q": "Fix DiveControl LOG to match Samsung Camera Log and assess additional dynamic range"
+        }
+      ],
+      "score": 0.919005172,
+      "source_file": "",
+      "status": "tentative",
+      "uses": 1
+    },
+    "videocapture": {
+      "code_fingerprint": "",
+      "label": "VideoCapture",
+      "last": "2026-08-24T01:31:25.180327+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-24T01:31:25.180327+00:00",
+          "outcome": "useful",
+          "q": "Is the LOG profile on the app the exact same as the log profile in the native camera app?"
+        }
+      ],
+      "score": 0.917995073,
       "source_file": "",
       "status": "tentative",
       "uses": 1

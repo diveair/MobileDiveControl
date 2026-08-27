@@ -72,7 +72,7 @@ object CameraCatalog {
         CameraRailEntry("night_video", "Night Video", CameraModeId.NightVideo),
         // A state screen rather than a capture profile. Keeping it as an action avoids inventing
         // a camera mode with fake lenses/settings while still placing it last in the Modes menu.
-        CameraRailEntry("diagnostics", "Sensors & App State", action = CameraRailAction.Diagnostics),
+        CameraRailEntry("diagnostics", "Diagnostics", action = CameraRailAction.Diagnostics),
     )
 
     val secondaryModes: List<CameraModeId> = emptyList()

@@ -12,6 +12,11 @@ enum class AppMode {
     Gallery,
 }
 
+enum class DiagnosticsAction {
+    BackToCamera,
+    Export,
+}
+
 enum class BleConnectionState {
     Idle,
     Scanning,
@@ -593,6 +598,8 @@ data class AppState(
     val phoneControl: PhoneControlState = PhoneControlState(),
     val safety: SafetyState = SafetyState(),
     val gallery: GalleryState = GalleryState(),
+    /** Focused action in the bottom diagnostics navigation row. */
+    val diagnosticsAction: DiagnosticsAction = DiagnosticsAction.BackToCamera,
     val permissions: PermissionsState = PermissionsState(),
     /** Phone battery 0–100, or null when not yet read. Null must never render as 0. */
     val phoneBatteryPercent: Int? = null,
@@ -732,6 +739,15 @@ sealed interface SystemCommand : ControlCommand {
     data object ExportDiagnostics : SystemCommand
     data object LockControls : SystemCommand
     data object UnlockControls : SystemCommand
+}
+
+sealed interface DiagnosticsCommand : ControlCommand {
+    data object NavigatePrevious : DiagnosticsCommand
+    data object NavigateNext : DiagnosticsCommand
+    data object Confirm : DiagnosticsCommand
+    data object Back : DiagnosticsCommand
+    /** Touch activation also updates the shared focus state before executing the action. */
+    data class Activate(val action: DiagnosticsAction) : DiagnosticsCommand
 }
 
 sealed interface GalleryCommand : ControlCommand {

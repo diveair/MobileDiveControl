@@ -12,10 +12,10 @@
     "semantic_hash": "7c205a697eba5326ed3bd1ba1dd64b81"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/MainActivity.kt": {
-    "mtime": 1787852736.0303352,
-    "seen": 1787854538.5411382,
-    "ast_hash": "b819fa38639113c49a338e1e9a756523",
-    "semantic_hash": "b819fa38639113c49a338e1e9a756523"
+    "mtime": 1787855237.7068295,
+    "seen": 1787856007.065446,
+    "ast_hash": "5cb92b5a4d8ab5293b4fdfb0dd548128",
+    "semantic_hash": "5cb92b5a4d8ab5293b4fdfb0dd548128"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/GalleryRepository.kt": {
     "mtime": 1787596146.0,
@@ -102,10 +102,10 @@
     "semantic_hash": "3bbd7cb64b2299b510938073b6b2a803"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/CameraHudOverlay.kt": {
-    "mtime": 1787853729.6614308,
-    "seen": 1787854538.5411565,
-    "ast_hash": "38ccfb35aee4c93ec481c6522d2fe960",
-    "semantic_hash": "38ccfb35aee4c93ec481c6522d2fe960"
+    "mtime": 1787855237.7277238,
+    "seen": 1787856007.0654974,
+    "ast_hash": "8087e1f75ebd4888b47393d881b07542",
+    "semantic_hash": "8087e1f75ebd4888b47393d881b07542"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/DebugSimulationPanel.kt": {
     "mtime": 1786118138.0,
@@ -114,10 +114,10 @@
     "semantic_hash": "6851acec5b9519a9861437156865641e"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/DiveControlScreen.kt": {
-    "mtime": 1787853729.6639483,
-    "seen": 1787854538.5411587,
-    "ast_hash": "53b389cac13035c12c0090744b9a4bcf",
-    "semantic_hash": "53b389cac13035c12c0090744b9a4bcf"
+    "mtime": 1787855237.6983495,
+    "seen": 1787856007.0655022,
+    "ast_hash": "b6ffea8537fa6811cd0c398d51815930",
+    "semantic_hash": "b6ffea8537fa6811cd0c398d51815930"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraPreview.kt": {
     "mtime": 1779919436.0,
@@ -216,10 +216,10 @@
     "semantic_hash": "a96e18b199fe4fe6d0fc126a97964282"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/diagnostics/DiagnosticsScreen.kt": {
-    "mtime": 1787854183.2918634,
-    "seen": 1787854538.5411825,
-    "ast_hash": "bf8729c267623915992164a5a5b0eb00",
-    "semantic_hash": "bf8729c267623915992164a5a5b0eb00"
+    "mtime": 1787855829.3651395,
+    "seen": 1787856007.065565,
+    "ast_hash": "cbe203319d4ea5f76e49734868535175",
+    "semantic_hash": "cbe203319d4ea5f76e49734868535175"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/gallery/GalleryScreen.kt": {
     "mtime": 1787514674.0,
@@ -330,16 +330,16 @@
     "semantic_hash": "89a24f68935e11fc07ccd711fde72ba6"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/CameraCatalog.kt": {
-    "mtime": 1787852736.0050633,
-    "seen": 1787854538.541209,
-    "ast_hash": "9d5640e4b73f47ba9e84017f1cc7eddd",
-    "semantic_hash": "9d5640e4b73f47ba9e84017f1cc7eddd"
+    "mtime": 1787855157.65132,
+    "seen": 1787856007.0656435,
+    "ast_hash": "99e5ab32cf6c435c672d6560c209b337",
+    "semantic_hash": "99e5ab32cf6c435c672d6560c209b337"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt": {
-    "mtime": 1787853132.8137143,
-    "seen": 1787854538.5412102,
-    "ast_hash": "823ee963056bda5c6b3ee583d17e4d19",
-    "semantic_hash": "823ee963056bda5c6b3ee583d17e4d19"
+    "mtime": 1787855157.6355746,
+    "seen": 1787856007.0656462,
+    "ast_hash": "e2475e6d3af1d427a9e8eb63b3fdbb6b",
+    "semantic_hash": "e2475e6d3af1d427a9e8eb63b3fdbb6b"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/ControlCore.kt": {
     "mtime": 1786283354.0,
@@ -348,10 +348,10 @@
     "semantic_hash": "0fc062750c164acfb46180c2003f3425"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/ControlReducer.kt": {
-    "mtime": 1787853132.8203514,
-    "seen": 1787854538.5412118,
-    "ast_hash": "6988f18c5f20e2fb41144999ef73e673",
-    "semantic_hash": "6988f18c5f20e2fb41144999ef73e673"
+    "mtime": 1787855237.7277238,
+    "seen": 1787856007.0656507,
+    "ast_hash": "234df113ae221149228765b68ef3f2fc",
+    "semantic_hash": "234df113ae221149228765b68ef3f2fc"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/DiagnosticsStore.kt": {
     "mtime": 1779820066.0,
@@ -390,10 +390,10 @@
     "semantic_hash": "2a3343c7e191835fc4230d5d0477a1ed"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/InputRouter.kt": {
-    "mtime": 1787506594.0,
-    "seen": 1787849166.6133692,
-    "ast_hash": "7f6154bb2316c5c3cb0d9374f3db09a5",
-    "semantic_hash": "7f6154bb2316c5c3cb0d9374f3db09a5"
+    "mtime": 1787855157.6644156,
+    "seen": 1787856007.0656738,
+    "ast_hash": "2836e2d7f30efb3d53977dfa356f9622",
+    "semantic_hash": "2836e2d7f30efb3d53977dfa356f9622"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/JsonSupport.kt": {
     "mtime": 1779794154.0,
@@ -438,16 +438,16 @@
     "semantic_hash": "b918307feb3ada74bbe9e885b3419030"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/CameraCatalogTest.kt": {
-    "mtime": 1787852988.5682092,
-    "seen": 1787854538.5412297,
-    "ast_hash": "90fd82a6f833637332112fa9ce89a4c2",
-    "semantic_hash": "90fd82a6f833637332112fa9ce89a4c2"
+    "mtime": 1787855277.4931388,
+    "seen": 1787856007.0657024,
+    "ast_hash": "02db702f619312b7d4b71edc280e23bc",
+    "semantic_hash": "02db702f619312b7d4b71edc280e23bc"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/ControlCoreTest.kt": {
-    "mtime": 1787853132.8411636,
-    "seen": 1787854538.5412314,
-    "ast_hash": "529ba5ce53787d2117c4d6ca2e4ed57a",
-    "semantic_hash": "529ba5ce53787d2117c4d6ca2e4ed57a"
+    "mtime": 1787855277.4958885,
+    "seen": 1787856007.0657074,
+    "ast_hash": "2bc3cb019f902b9f0aa2e42e20843205",
+    "semantic_hash": "2bc3cb019f902b9f0aa2e42e20843205"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/DiagnosticsStoreTest.kt": {
     "mtime": 1779795120.0,
@@ -474,10 +474,10 @@
     "semantic_hash": "448c32417dddd0f496d2f24a3d796e84"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/InputRouterTest.kt": {
-    "mtime": 1787507078.0,
-    "seen": 1787849166.6134272,
-    "ast_hash": "d0a0a14c2bb64f66c958e64d8efda659",
-    "semantic_hash": "d0a0a14c2bb64f66c958e64d8efda659"
+    "mtime": 1787855277.4958885,
+    "seen": 1787856007.0657277,
+    "ast_hash": "fe950ed31377eeb9d5b7328e986aa479",
+    "semantic_hash": "fe950ed31377eeb9d5b7328e986aa479"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/ProtocolParserTest.kt": {
     "mtime": 1779798946.0,

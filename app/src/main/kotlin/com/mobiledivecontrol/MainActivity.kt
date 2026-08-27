@@ -210,7 +210,7 @@ class MainActivity : ComponentActivity() {
                         onPointingGesture = viewModel::setTargetHeadingFromPoint,
                         onCameraCommand = { command -> viewModel.dispatch(command) },
                         onGalleryCommand = { command -> viewModel.dispatch(command) },
-                        onSystemCommand = { command -> viewModel.dispatch(command) },
+                        onDiagnosticsCommand = { command -> viewModel.dispatch(command) },
                         introVisible = introVisible,
                         onIntroDismiss = viewModel::dismissIntro,
                         // The intro is the app's only honest surface for "why can I not do

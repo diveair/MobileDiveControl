@@ -170,9 +170,17 @@ class InputRouter {
     }
 
     private fun routeDiagnostics(event: HousingButtonEvent): RouteDecision = when (event) {
-        HousingButtonEvent.Ok -> RouteDecision(commands = listOf(SystemCommand.ExportDiagnostics))
-        HousingButtonEvent.BackOrSafety -> RouteDecision(modeOverride = AppMode.CameraLive)
-        else -> RouteDecision(note = "Diagnostics mode ignores $event.")
+        HousingButtonEvent.Up, HousingButtonEvent.Left ->
+            RouteDecision(commands = listOf(DiagnosticsCommand.NavigatePrevious))
+        HousingButtonEvent.Down, HousingButtonEvent.Right ->
+            RouteDecision(commands = listOf(DiagnosticsCommand.NavigateNext))
+        HousingButtonEvent.Ok, HousingButtonEvent.Shutter ->
+            RouteDecision(commands = listOf(DiagnosticsCommand.Confirm))
+        HousingButtonEvent.BackOrSafety ->
+            RouteDecision(commands = listOf(DiagnosticsCommand.Back))
+        HousingButtonEvent.ZoomIn, HousingButtonEvent.ZoomOut ->
+            RouteDecision(note = "Diagnostics mode ignores $event.")
+        is HousingButtonEvent.Unknown -> RouteDecision()
     }
 
     private fun cameraShutterCommand(cameraState: CameraState): CameraCommand {

@@ -46,6 +46,7 @@ class ControlReducer(
         is SafetyCommand -> reduceSafety(state, command)
         is HousingCommand -> reduceHousing(state, command)
         is SystemCommand -> reduceSystem(state, command)
+        is DiagnosticsCommand -> reduceDiagnostics(state, command)
         is GalleryCommand -> reduceGalleryGrid(state, command)
     }
 
@@ -737,13 +738,48 @@ class ControlReducer(
             }
         }
         SystemCommand.SwitchToSafetyMode -> Reduction(state = state.copy(mode = AppMode.Safety))
-        SystemCommand.SwitchToDiagnosticsMode -> Reduction(state = state.copy(mode = AppMode.Diagnostics))
+        SystemCommand.SwitchToDiagnosticsMode -> Reduction(
+            state = state.copy(
+                mode = AppMode.Diagnostics,
+                diagnosticsAction = DiagnosticsAction.BackToCamera,
+            ),
+        )
         SystemCommand.ExportDiagnostics -> Reduction(
             state = state,
             effects = listOf(PlatformEffect.ExportDiagnostics),
         )
         SystemCommand.LockControls -> Reduction(state = state.copy(controlsLocked = true))
         SystemCommand.UnlockControls -> Reduction(state = state.copy(controlsLocked = false))
+    }
+
+    private fun reduceDiagnostics(state: AppState, command: DiagnosticsCommand): Reduction = when (command) {
+        DiagnosticsCommand.NavigatePrevious -> Reduction(
+            state = state.copy(diagnosticsAction = previousDiagnosticsAction(state.diagnosticsAction)),
+        )
+        DiagnosticsCommand.NavigateNext -> Reduction(
+            state = state.copy(diagnosticsAction = nextDiagnosticsAction(state.diagnosticsAction)),
+        )
+        DiagnosticsCommand.Confirm -> activateDiagnosticsAction(state, state.diagnosticsAction)
+        DiagnosticsCommand.Back -> reduceSystem(state, SystemCommand.SwitchToCameraMode)
+        is DiagnosticsCommand.Activate -> activateDiagnosticsAction(
+            state.copy(diagnosticsAction = command.action),
+            command.action,
+        )
+    }
+
+    private fun previousDiagnosticsAction(action: DiagnosticsAction): DiagnosticsAction = when (action) {
+        DiagnosticsAction.BackToCamera -> DiagnosticsAction.Export
+        DiagnosticsAction.Export -> DiagnosticsAction.BackToCamera
+    }
+
+    private fun nextDiagnosticsAction(action: DiagnosticsAction): DiagnosticsAction = when (action) {
+        DiagnosticsAction.BackToCamera -> DiagnosticsAction.Export
+        DiagnosticsAction.Export -> DiagnosticsAction.BackToCamera
+    }
+
+    private fun activateDiagnosticsAction(state: AppState, action: DiagnosticsAction): Reduction = when (action) {
+        DiagnosticsAction.BackToCamera -> reduceSystem(state, SystemCommand.SwitchToCameraMode)
+        DiagnosticsAction.Export -> reduceSystem(state, SystemCommand.ExportDiagnostics)
     }
 
     /**
@@ -1218,7 +1254,7 @@ class ControlReducer(
         }
         if (entry.action == CameraRailAction.Diagnostics) {
             if (camera.recording) {
-                val warning = "Stop recording before opening Sensors & App State."
+                val warning = "Stop recording before opening Diagnostics."
                 return Reduction(
                     state = state.copy(lastWarning = warning),
                     notes = listOf(warning),
@@ -1228,6 +1264,7 @@ class ControlReducer(
                 state = state.copy(
                     mode = AppMode.Diagnostics,
                     camera = exitModeRail(camera),
+                    diagnosticsAction = DiagnosticsAction.BackToCamera,
                     lastWarning = null,
                 ),
             )

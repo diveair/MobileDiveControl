@@ -21,6 +21,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.mobiledivecontrol.core.AppState
+import com.mobiledivecontrol.core.DiagnosticsAction
+import com.mobiledivecontrol.core.DiagnosticsCommand
 import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.ui.components.STANDARD_ATMOSPHERE_KPA
 import com.mobiledivecontrol.ui.components.depthMetersFromPressure
@@ -28,13 +30,12 @@ import com.mobiledivecontrol.ui.components.vacuumReadout
 
 /**
  * Diagnostics screen — device info, sensor readouts, connection stats.
- * Press OK to export diagnostic bundle. Press Back to return to camera.
+ * The bottom action row is shared by touch and the housing-button focus model.
  */
 @Composable
 fun DiagnosticsScreen(
     state: AppState,
-    onBack: () -> Unit = {},
-    onExport: () -> Unit = {},
+    onCommand: (DiagnosticsCommand) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val depthMeters = depthMetersFromPressure(
@@ -46,104 +47,112 @@ fun DiagnosticsScreen(
         water - depthBaselineKpa
     }
     val vacuum = vacuumReadout(state.safety)
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+    Column(
         modifier = modifier
             .fillMaxSize()
             .background(DiveColors.DeepBlack)
             .padding(16.dp),
     ) {
-        // Left column: identity and link health share one compact card so neither clips below HUD.
-        Column(modifier = Modifier.weight(1f)) {
-            SectionHeader("Device & Connection")
-            InfoCard {
-                InfoRow("Manufacturer", state.housing.manufacturerName ?: "—")
-                InfoRow("Firmware", state.housing.firmwareVersion ?: "—")
-                InfoRow("Hardware", state.housing.hardwareVersion ?: "—")
-                InfoRow("Software", state.housing.softwareVersion ?: "—")
-                InfoRow("Serial", state.housing.serialNumber ?: "—")
-                InfoRow("Model", state.housing.modelNumber ?: "—")
-                InfoRow("BLE State", state.bleConnectionState.name)
-                InfoRow("Connected", if (state.housing.connected) "Yes" else "No")
-                InfoRow("Input", if (state.housing.inputEnabled) "Enabled" else "Disabled")
-                InfoRow("Battery", state.housing.batteryPercent?.let { "$it%" } ?: "—")
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+        ) {
+            // Left column: identity and link health share one compact card.
+            Column(modifier = Modifier.weight(1f)) {
+                SectionHeader("Device & Connection")
+                InfoCard {
+                    InfoRow("Manufacturer", state.housing.manufacturerName ?: "—")
+                    InfoRow("Firmware", state.housing.firmwareVersion ?: "—")
+                    InfoRow("Hardware", state.housing.hardwareVersion ?: "—")
+                    InfoRow("Software", state.housing.softwareVersion ?: "—")
+                    InfoRow("Serial", state.housing.serialNumber ?: "—")
+                    InfoRow("Model", state.housing.modelNumber ?: "—")
+                    InfoRow("BLE State", state.bleConnectionState.name)
+                    InfoRow("Connected", if (state.housing.connected) "Yes" else "No")
+                    InfoRow("Input", if (state.housing.inputEnabled) "Enabled" else "Disabled")
+                    InfoRow("Battery", state.housing.batteryPercent?.let { "$it%" } ?: "—")
+                }
+            }
+
+            // Middle column: live pressure inputs and the exact derived depth value.
+            Column(modifier = Modifier.weight(1f)) {
+                SectionHeader("Sensors")
+                InfoCard {
+                    InfoRow("Water Pressure", state.safety.waterPressureKpa?.let { "%.1f kPa".format(it) } ?: "—")
+                    InfoRow(
+                        "Surface Baseline",
+                        if (state.safety.surfaceAmbientKpa != null) {
+                            "%.1f kPa captured".format(depthBaselineKpa)
+                        } else {
+                            "%.1f kPa standard".format(depthBaselineKpa)
+                        },
+                    )
+                    InfoRow("Depth ΔP", pressureDeltaKpa?.let { "%.1f kPa".format(it) } ?: "—")
+                    InfoRow("Calculated Depth", depthMeters?.let { "%.1f m".format(it) } ?: "—")
+                    InfoRow("Water Temp", state.safety.waterTemperatureC?.let { "%.1f°C".format(it) } ?: "—")
+                    InfoRow("Barometric", state.safety.barometricPressureKpa?.let { "%.1f kPa".format(it) } ?: "—")
+                    InfoRow("Vacuum", vacuum?.let { "−%.1f kPa".format(it.kpa) } ?: "—")
+                    InfoRow("Cover", when (state.safety.coverOpen) {
+                        true -> "Open"
+                        false -> "Closed"
+                        null -> "Unknown"
+                    })
+                    InfoRow("Seal State", state.safety.sealState.name)
+                }
+            }
+
+            // Right column: state and the pressure-to-depth explanation.
+            Column(modifier = Modifier.weight(1f)) {
+                SectionHeader("App State")
+                InfoCard {
+                    InfoRow("Mode", state.mode.name)
+                    InfoRow("Controls", if (state.controlsLocked) "Locked" else "Unlocked")
+                    InfoRow("Camera", state.camera.capabilityTier)
+                    InfoRow("Recording", if (state.camera.recording) "Yes" else "No")
+                    InfoRow("Last Button", state.housing.lastButton?.toString() ?: "—")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "DEPTH  max(0, water − surface) ÷ 9.81 kPa/m",
+                        color = DiveColors.DiveCyan,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                    )
+                    Text(
+                        text = "Barometric + vacuum excluded",
+                        color = DiveColors.TextPrimary,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
             }
         }
 
-        // Middle column: live pressure inputs and the exact derived depth value.
-        Column(modifier = Modifier.weight(1f)) {
-            SectionHeader("Sensors")
-            InfoCard {
-                InfoRow("Water Pressure", state.safety.waterPressureKpa?.let { "%.1f kPa".format(it) } ?: "—")
-                InfoRow(
-                    "Surface Baseline",
-                    if (state.safety.surfaceAmbientKpa != null) {
-                        "%.1f kPa captured".format(depthBaselineKpa)
-                    } else {
-                        "%.1f kPa standard".format(depthBaselineKpa)
-                    },
-                )
-                InfoRow("Depth ΔP", pressureDeltaKpa?.let { "%.1f kPa".format(it) } ?: "—")
-                InfoRow("Calculated Depth", depthMeters?.let { "%.1f m".format(it) } ?: "—")
-                InfoRow("Water Temp", state.safety.waterTemperatureC?.let { "%.1f°C".format(it) } ?: "—")
-                InfoRow("Barometric", state.safety.barometricPressureKpa?.let { "%.1f kPa".format(it) } ?: "—")
-                InfoRow("Vacuum", vacuum?.let { "−%.1f kPa".format(it.kpa) } ?: "—")
-                InfoRow("Cover", when (state.safety.coverOpen) {
-                    true -> "Open"
-                    false -> "Closed"
-                    null -> "Unknown"
-                })
-                InfoRow("Seal State", state.safety.sealState.name)
-            }
-        }
-
-        // Right column: state, formula explanation, and both touch navigation actions.
-        Column(modifier = Modifier.weight(1f)) {
-            SectionHeader("App State")
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                DiagnosticsActionTile(
-                    label = "Back to Camera",
-                    primary = false,
-                    onClick = onBack,
-                    modifier = Modifier.weight(1f),
-                )
-                DiagnosticsActionTile(
-                    label = "Export Diagnostics",
-                    primary = true,
-                    onClick = onExport,
-                    modifier = Modifier.weight(1f),
-                )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-            InfoCard {
-                InfoRow("Mode", state.mode.name)
-                InfoRow("Controls", if (state.controlsLocked) "Locked" else "Unlocked")
-                InfoRow("Camera", state.camera.capabilityTier)
-                InfoRow("Recording", if (state.camera.recording) "Yes" else "No")
-                InfoRow("Last Button", state.housing.lastButton?.toString() ?: "—")
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "DEPTH  max(0, water − surface) ÷ 9.81 kPa/m",
-                    color = DiveColors.DiveCyan,
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
-                )
-                Text(
-                    text = "Barometric + vacuum excluded",
-                    color = DiveColors.TextPrimary,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 4.dp),
-                )
-                Text(
-                    text = "Housing: BACK returns · OK exports",
-                    color = DiveColors.TextMuted,
-                    style = MaterialTheme.typography.labelSmall,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
-            }
+        Spacer(modifier = Modifier.height(10.dp))
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                text = "Housing: ←/→ select · OK activate · BACK camera",
+                color = DiveColors.TextSecondary,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.weight(1f),
+            )
+            DiagnosticsActionTile(
+                label = "Back",
+                selected = state.diagnosticsAction == DiagnosticsAction.BackToCamera,
+                onClick = { onCommand(DiagnosticsCommand.Activate(DiagnosticsAction.BackToCamera)) },
+                modifier = Modifier.width(150.dp),
+            )
+            DiagnosticsActionTile(
+                label = "Export",
+                selected = state.diagnosticsAction == DiagnosticsAction.Export,
+                onClick = { onCommand(DiagnosticsCommand.Activate(DiagnosticsAction.Export)) },
+                modifier = Modifier.width(150.dp),
+            )
         }
     }
 }
@@ -151,7 +160,7 @@ fun DiagnosticsScreen(
 @Composable
 private fun DiagnosticsActionTile(
     label: String,
-    primary: Boolean,
+    selected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -159,12 +168,12 @@ private fun DiagnosticsActionTile(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .background(
-                color = if (primary) DiveColors.DiveCyanGlow else DiveColors.SurfaceCard,
+                color = if (selected) DiveColors.DiveCyanGlow else DiveColors.SurfaceCard,
                 shape = RoundedCornerShape(10.dp),
             )
             .border(
-                width = 1.dp,
-                color = DiveColors.DiveCyan,
+                width = if (selected) 2.dp else 1.dp,
+                color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder,
                 shape = RoundedCornerShape(10.dp),
             )
             .clickable(onClick = onClick)
@@ -172,7 +181,7 @@ private fun DiagnosticsActionTile(
     ) {
         Text(
             text = label,
-            color = if (primary) DiveColors.DiveCyan else DiveColors.TextPrimary,
+            color = if (selected) DiveColors.DiveCyan else DiveColors.TextPrimary,
             style = MaterialTheme.typography.labelMedium,
             fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
         )
@@ -210,7 +219,9 @@ private fun InfoRow(label: String, value: String) {
         horizontalArrangement = Arrangement.SpaceBetween,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 3.dp),
+            // Ten device rows must coexist with the persistent bottom navigation bar on the
+            // housing's landscape display. One dp keeps the rows legible without clipping Battery.
+            .padding(vertical = 1.dp),
     ) {
         Text(
             text = label,

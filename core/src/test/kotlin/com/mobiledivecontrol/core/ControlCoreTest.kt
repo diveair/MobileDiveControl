@@ -145,7 +145,7 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `sensors and app state is the final mode entry and back returns to camera`() {
+    fun `diagnostics is the final mode entry and back returns to camera`() {
         val core = ControlCore()
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
@@ -153,7 +153,7 @@ class ControlCoreTest {
 
         core.dispatch(CameraCommand.NavigateRight)
         val lastEntry = core.dispatch(CameraCommand.NavigateUp)
-        assertEquals("Sensors & App State", lastEntry.state.camera.primaryHighlightedEntry.label)
+        assertEquals("Diagnostics", lastEntry.state.camera.primaryHighlightedEntry.label)
         assertEquals(CameraRailAction.Diagnostics, lastEntry.state.camera.primaryHighlightedEntry.action)
 
         val opened = core.dispatch(CameraCommand.Confirm)
@@ -164,6 +164,30 @@ class ControlCoreTest {
         val returned = core.handleButtonPayload(byteArrayOf(0x60))
         assertEquals(AppMode.CameraLive, returned.state.mode)
         assertEquals(originalCameraMode, returned.state.camera.activeMode)
+    }
+
+    @Test
+    fun `housing buttons focus and activate the bottom diagnostics actions`() {
+        val core = ControlCore()
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+        core.dispatch(
+            CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryRailEntries.lastIndex),
+        )
+        assertEquals(DiagnosticsAction.BackToCamera, core.state.diagnosticsAction)
+
+        val exportFocused = core.handleButtonPayload(byteArrayOf(0x10))
+        assertEquals(DiagnosticsAction.Export, exportFocused.state.diagnosticsAction)
+
+        val exported = core.handleButtonPayload(byteArrayOf(0x50))
+        assertEquals(AppMode.Diagnostics, exported.state.mode)
+        assertEquals(listOf(PlatformEffect.ExportDiagnostics), exported.effects)
+
+        val backFocused = core.handleButtonPayload(byteArrayOf(0x40))
+        assertEquals(DiagnosticsAction.BackToCamera, backFocused.state.diagnosticsAction)
+
+        val returned = core.handleButtonPayload(byteArrayOf(0x50))
+        assertEquals(AppMode.CameraLive, returned.state.mode)
     }
 
     @Test

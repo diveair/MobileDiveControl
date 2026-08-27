@@ -483,6 +483,34 @@ class InputRouterTest {
         assertEquals("Housing input is disabled.", noInput.note)
     }
 
+    @Test
+    fun `diagnostics routes the housing dpad confirm shutter and back to its bottom actions`() {
+        val state = readyState(mode = AppMode.Diagnostics)
+
+        for (event in listOf(HousingButtonEvent.Up, HousingButtonEvent.Left)) {
+            assertEquals(
+                listOf(DiagnosticsCommand.NavigatePrevious),
+                router.route(state, event).commands,
+            )
+        }
+        for (event in listOf(HousingButtonEvent.Down, HousingButtonEvent.Right)) {
+            assertEquals(
+                listOf(DiagnosticsCommand.NavigateNext),
+                router.route(state, event).commands,
+            )
+        }
+        for (event in listOf(HousingButtonEvent.Ok, HousingButtonEvent.Shutter)) {
+            assertEquals(
+                listOf(DiagnosticsCommand.Confirm),
+                router.route(state, event).commands,
+            )
+        }
+        assertEquals(
+            listOf(DiagnosticsCommand.Back),
+            router.route(state, HousingButtonEvent.BackOrSafety).commands,
+        )
+    }
+
     private fun readyState(
         mode: AppMode,
         camera: CameraState = CameraState(),

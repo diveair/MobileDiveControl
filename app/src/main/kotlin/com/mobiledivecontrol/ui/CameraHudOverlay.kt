@@ -71,7 +71,7 @@ fun CameraHudOverlay(
     Box(modifier = modifier.fillMaxSize()) {
         content()
 
-        // Full-screen menus such as Sensors & App State already render these values in their own
+        // Full-screen menus such as Diagnostics already render these values in their own
         // layout. Keeping the camera HUD there would cover headings, formulae, and navigation.
         if (!hudVisible) return@Box
 
