@@ -149,6 +149,10 @@ fun CameraShellScreen(
             cameraState = cameraState,
             modifier = Modifier.fillMaxSize(),
         )
+        ModeGuideOverlay(
+            cameraState = cameraState,
+            modifier = Modifier.fillMaxSize(),
+        )
 
         // The runtime only publishes this URI after every paused segment has a complete MP4 index
         // and the cumulative, gap-free review container has been assembled.
@@ -399,6 +403,125 @@ private fun CaptureGuideOverlay(
                 }
             }
         }
+    }
+}
+
+/** Samsung-style capture guides that belong to a mode rather than the global grid setting. */
+@Composable
+private fun ModeGuideOverlay(
+    cameraState: CameraState,
+    modifier: Modifier = Modifier,
+) {
+    val settings = CameraCatalog.settingsFor(cameraState)
+    when (cameraState.activeMode) {
+        CameraModeId.Panorama -> {
+            val guide = settings.firstOrNull { it.id == "panorama.guide" } ?: return
+            if (CameraCatalog.currentValue(cameraState, guide) != "On") return
+            val direction = settings.firstOrNull { it.id == "panorama.direction" }
+                ?.let { CameraCatalog.currentValue(cameraState, it) }
+                ?: "Right"
+            PanoramaGuideOverlay(direction = direction, modifier = modifier)
+        }
+        CameraModeId.Food -> {
+            val blur = settings.firstOrNull { it.id == "food.radial_blur" } ?: return
+            if (CameraCatalog.currentValue(cameraState, blur) != "On") return
+            FoodFocusGuideOverlay(modifier = modifier)
+        }
+        else -> Unit
+    }
+}
+
+/**
+ * Start-frame window and sweep chevrons modelled on Samsung Camera 16.5's Panorama guide.
+ * The live panorama stitcher is vendor-only, but this guide gives a housing user the same
+ * alignment target and an unambiguous direction cue before capture begins.
+ */
+@Composable
+private fun PanoramaGuideOverlay(
+    direction: String,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier = modifier) {
+        val horizontal = direction == "Left" || direction == "Right"
+        val guideWidth = if (horizontal) size.width * 0.36f else size.width * 0.18f
+        val guideHeight = if (horizontal) size.height * 0.28f else size.height * 0.50f
+        val left = (size.width - guideWidth) / 2f
+        val top = (size.height - guideHeight) / 2f
+        val side = if (horizontal) guideWidth * 0.23f else guideWidth
+        val end = if (horizontal) guideHeight else guideHeight * 0.19f
+        val stroke = 2.dp.toPx()
+        val border = Color.White.copy(alpha = 0.90f)
+        val shade = DiveColors.DeepBlack.copy(alpha = 0.48f)
+
+        drawRoundRect(
+            color = border,
+            topLeft = Offset(left, top),
+            size = androidx.compose.ui.geometry.Size(guideWidth, guideHeight),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(7.dp.toPx()),
+            style = Stroke(stroke),
+        )
+        if (horizontal) {
+            drawRect(shade, Offset(left, top), androidx.compose.ui.geometry.Size(side, guideHeight))
+            drawRect(
+                shade,
+                Offset(left + guideWidth - side, top),
+                androidx.compose.ui.geometry.Size(side, guideHeight),
+            )
+            drawLine(border, Offset(left + side, top), Offset(left + side, top + guideHeight), stroke)
+            drawLine(
+                border,
+                Offset(left + guideWidth - side, top),
+                Offset(left + guideWidth - side, top + guideHeight),
+                stroke,
+            )
+            fun chevron(cx: Float, pointsRight: Boolean, emphasized: Boolean) {
+                val dx = 14.dp.toPx() * if (pointsRight) 1f else -1f
+                val dy = 18.dp.toPx()
+                val colour = if (emphasized) DiveColors.DiveCyan else border
+                drawLine(colour, Offset(cx - dx, center.y - dy), Offset(cx, center.y), stroke * 2f)
+                drawLine(colour, Offset(cx, center.y), Offset(cx - dx, center.y + dy), stroke * 2f)
+            }
+            chevron(left + side * 0.52f, pointsRight = false, emphasized = direction == "Left")
+            chevron(left + guideWidth - side * 0.52f, pointsRight = true, emphasized = direction == "Right")
+        } else {
+            drawRect(shade, Offset(left, top), androidx.compose.ui.geometry.Size(guideWidth, end))
+            drawRect(
+                shade,
+                Offset(left, top + guideHeight - end),
+                androidx.compose.ui.geometry.Size(guideWidth, end),
+            )
+            drawLine(border, Offset(left, top + end), Offset(left + guideWidth, top + end), stroke)
+            drawLine(
+                border,
+                Offset(left, top + guideHeight - end),
+                Offset(left + guideWidth, top + guideHeight - end),
+                stroke,
+            )
+            fun chevron(cy: Float, pointsDown: Boolean, emphasized: Boolean) {
+                val dx = 18.dp.toPx()
+                val dy = 14.dp.toPx() * if (pointsDown) 1f else -1f
+                val colour = if (emphasized) DiveColors.DiveCyan else border
+                drawLine(colour, Offset(center.x - dx, cy - dy), Offset(center.x, cy), stroke * 2f)
+                drawLine(colour, Offset(center.x, cy), Offset(center.x + dx, cy - dy), stroke * 2f)
+            }
+            chevron(top + end * 0.52f, pointsDown = false, emphasized = direction == "Up")
+            chevron(top + guideHeight - end * 0.52f, pointsDown = true, emphasized = direction == "Down")
+        }
+    }
+}
+
+/** The movable native Food area is represented by a large, high-contrast radial focus ring. */
+@Composable
+private fun FoodFocusGuideOverlay(modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val radius = minOf(size.width, size.height) * 0.31f
+        val outer = DiveColors.DiveCyan.copy(alpha = 0.90f)
+        val inner = Color.White.copy(alpha = 0.52f)
+        drawCircle(color = outer, radius = radius, style = Stroke(2.dp.toPx()))
+        drawCircle(color = inner, radius = radius - 4.dp.toPx(), style = Stroke(1.dp.toPx()))
+        val tick = 12.dp.toPx()
+        drawLine(outer, Offset(center.x - tick, center.y), Offset(center.x + tick, center.y), 2.dp.toPx())
+        drawLine(outer, Offset(center.x, center.y - tick), Offset(center.x, center.y + tick), 2.dp.toPx())
     }
 }
 

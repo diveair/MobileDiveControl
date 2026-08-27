@@ -17,6 +17,7 @@ class CameraCatalogTest {
                 "Portrait",
                 "Video",
                 "Pro",
+                "Expert RAW",
                 "Food",
                 "Night",
                 "Panorama",
@@ -206,6 +207,7 @@ class CameraCatalogTest {
 
         listOf(
             "panorama.direction",
+            "panorama.guide",
             "panorama.exposure",
         ).forEach { assertContains(ids(CameraModeId.Panorama), it) }
 
@@ -215,7 +217,9 @@ class CameraCatalogTest {
             "hyperlapse.exposure",
             "hyperlapse.recording_time",
             "hyperlapse.speed",
-            "hyperlapse.night_mode",
+            "hyperlapse.day_night",
+            "hyperlapse.manual_focus",
+            "hyperlapse.focus_peaking",
         ).forEach { assertContains(ids(CameraModeId.Hyperlapse), it) }
         assertTrue("hyperlapse.frame_rate" !in ids(CameraModeId.Hyperlapse))
 
@@ -241,6 +245,9 @@ class CameraCatalogTest {
             "portrait_video.exposure",
             "portrait_video.background_effect",
             "portrait_video.effect_strength",
+            "portrait_video.manual_focus",
+            "portrait_video.focus_peaking",
+            "portrait_video.hdr",
         ).forEach { assertContains(ids(CameraModeId.PortraitVideo), it) }
 
         listOf(
@@ -248,8 +255,83 @@ class CameraCatalogTest {
             "slow_motion.frame_rate",
             "slow_motion.flash",
             "slow_motion.exposure",
+            "slow_motion.focus_mode",
+            "slow_motion.hdr",
         ).forEach { assertContains(ids(CameraModeId.SlowMotion), it) }
         assertTrue("slow_motion.microphone" !in ids(CameraModeId.SlowMotion))
+    }
+
+    @Test
+    fun `requested Expert RAW labs controls use Samsung ranges and names`() {
+        val settings = CameraCatalog.settingsFor(CameraModeId.ExpertRaw, GalaxyDeviceVariant.S26Ultra)
+            .associateBy { it.id }
+        listOf(
+            "expert.virtual_aperture",
+            "expert.nd_filter",
+            "expert.astrophotography",
+            "expert.astro_portrait",
+            "expert.multi_exposure",
+            "expert.multi_exposure_shutter",
+            "expert.multi_exposure_overlay",
+            "expert.multi_exposure_frames",
+            "expert.ocean_mode",
+            "expert.aqua_tone",
+            "expert.ocean_capture_interval",
+        ).forEach { assertContains(settings.keys, it) }
+
+        val aperture = settings.getValue("expert.virtual_aperture").options
+        assertEquals(22, aperture.size)
+        assertEquals("F1.4", aperture.first())
+        assertEquals("F16.0", aperture.last())
+        assertEquals(
+            listOf("Add", "Average", "Bright", "Dark"),
+            settings.getValue("expert.multi_exposure_overlay").options,
+        )
+        assertEquals(
+            listOf("Off", "2s", "5s", "10s"),
+            settings.getValue("expert.ocean_capture_interval").options,
+        )
+        val proAperture = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
+            .first { it.id == "pro.virtual_aperture" }
+        assertEquals(aperture, proAperture.options)
+    }
+
+    @Test
+    fun `slow motion promotes FPS to housing quick bar`() {
+        val camera = CameraCatalog.launchCameraState(CameraModeId.SlowMotion)
+        val horizontal = CameraCatalog.settingsBarItems(camera)
+            .filterIsInstance<BottomBarItem.Setting>()
+            .map { it.spec.id }
+        val options = CameraCatalog.optionsMenuSettings(camera).map { it.id }
+
+        assertContains(horizontal, "slow_motion.frame_rate")
+        assertTrue("slow_motion.frame_rate" !in options)
+        assertContains(options, "slow_motion.focus_mode")
+        assertContains(options, "slow_motion.hdr")
+    }
+
+    @Test
+    fun `native special-mode option ladders match the inspected Samsung app`() {
+        val hyperlapse = CameraCatalog.settingsFor(CameraModeId.Hyperlapse, GalaxyDeviceVariant.S26Ultra)
+            .associateBy { it.id }
+        assertEquals(
+            listOf("Night 45x", "Night 15x", "Auto", "5x", "10x", "15x", "30x", "60x"),
+            hyperlapse.getValue("hyperlapse.speed").options,
+        )
+        assertEquals("∞", hyperlapse.getValue("hyperlapse.recording_time").options.first())
+
+        val portraitVideo = CameraCatalog.settingsFor(CameraModeId.PortraitVideo, GalaxyDeviceVariant.S26Ultra)
+            .first { it.id == "portrait_video.background_effect" }
+        assertEquals("Portrait Video Effects", portraitVideo.label)
+        assertEquals(listOf("Blur", "Big circle", "Colour point", "Glitch"), portraitVideo.options)
+
+        val food = CameraCatalog.settingsFor(CameraModeId.Food, GalaxyDeviceVariant.S26Ultra)
+            .associateBy { it.id }
+        assertEquals("Blur effect", food.getValue("food.radial_blur").label)
+        assertEquals(
+            listOf("-4", "-3", "-2", "-1", "0", "+1", "+2", "+3", "+4"),
+            food.getValue("food.color_temperature").options,
+        )
     }
 
     @Test

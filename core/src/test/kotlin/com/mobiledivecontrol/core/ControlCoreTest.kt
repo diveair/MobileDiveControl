@@ -257,6 +257,26 @@ class ControlCoreTest {
     }
 
     @Test
+    fun `slow motion FPS is adjusted directly with housing up and down`() {
+        val reducer = ControlReducer()
+        val initial = CameraCatalog.launchCameraState(CameraModeId.SlowMotion)
+        val fpsIndex = CameraCatalog.settingsBarItems(initial)
+            .indexOfFirst { item ->
+                item is BottomBarItem.Setting && item.spec.id == "slow_motion.frame_rate"
+            }
+        assertTrue(fpsIndex >= 0)
+        val camera = initial.copy(
+            focusedZone = CameraUiZone.SettingsPanel,
+            settingsCursor = fpsIndex,
+        )
+
+        val down = reducer.reduce(AppState(camera = camera), CameraCommand.NavigateDown).state.camera
+        assertEquals("120fps", down.settingValues["slow_motion.frame_rate"])
+        val up = reducer.reduce(AppState(camera = down), CameraCommand.NavigateUp).state.camera
+        assertEquals("240fps", up.settingValues["slow_motion.frame_rate"])
+    }
+
+    @Test
     fun `far left options opens an independent vertical rail`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(

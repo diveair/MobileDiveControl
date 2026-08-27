@@ -50,6 +50,7 @@ internal class Camera2HighSpeedRecorder(
         val exposureCompensationIndex: Int?,
         val zoomRatio: Float,
         val torchEnabled: Boolean,
+        val focusMode: String,
     )
 
     private val handler = Handler(Looper.getMainLooper())
@@ -208,7 +209,12 @@ internal class Camera2HighSpeedRecorder(
                                 set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, supportedRange(request))
                                 set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                                 set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-                                set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                if (request.focusMode == "Single AF") {
+                                    set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+                                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                                } else {
+                                    set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                }
                                 request.exposureCompensationIndex?.let {
                                     set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, it)
                                 }

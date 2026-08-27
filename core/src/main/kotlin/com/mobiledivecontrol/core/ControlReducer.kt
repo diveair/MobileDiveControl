@@ -2544,6 +2544,8 @@ class ControlReducer(
             CameraModeId.Pro -> "pro.lens"
             CameraModeId.ExpertRaw -> "expert.lens"
             CameraModeId.ProVideo -> "pro_video.lens"
+            CameraModeId.PortraitVideo -> "portrait_video.lens"
+            CameraModeId.Hyperlapse -> "hyperlapse.lens"
             else -> return true
         }
         val currentLens = camera.settingValues[lensSettingId] ?: "Auto"
@@ -2612,7 +2614,9 @@ class ControlReducer(
         "photo.manual_focus",
         "pro.manual_focus",
         "expert.manual_focus",
-        "pro_video.manual_focus" -> null
+        "pro_video.manual_focus",
+        "portrait_video.manual_focus",
+        "hyperlapse.manual_focus" -> null
         "photo.exposure_compensation",
         "portrait.exposure",
         "food.exposure",
@@ -2626,16 +2630,23 @@ class ControlReducer(
         "slow_motion.exposure",
         "macro.exposure",
         "pro_video.exposure_value" -> parseExposureCompensation(value)?.let { CameraCommand.SetExposureCompensation(it) }
+        "photo.focus_peaking",
         "expert.focus_peaking",
         "pro.focus_peaking",
-        "pro_video.focus_peaking" -> CameraCommand.ToggleFocusPeaking
+        "pro_video.focus_peaking",
+        "portrait_video.focus_peaking",
+        "hyperlapse.focus_peaking" -> CameraCommand.ToggleFocusPeaking
         "photo.focus_curve",
         "expert.focus_curve",
         "pro.focus_curve",
-        "pro_video.focus_curve" -> null // Focus curve is handled locally in the app, no camera command needed
+        "pro_video.focus_curve",
+        "portrait_video.focus_curve",
+        "hyperlapse.focus_curve" -> null // Focus curve is handled locally in the app, no camera command needed
         "photo.hdr_log" -> CameraCommand.SetHdrLogMode(value)
         "video.hdr",
-        "night_video.hdr" -> CameraCommand.SetHdrLogMode(if (value == "On") "HDR" else "Off")
+        "night_video.hdr",
+        "portrait_video.hdr",
+        "slow_motion.hdr" -> CameraCommand.SetHdrLogMode(if (value == "On") "HDR" else "Off")
         "night_video.log" -> CameraCommand.SetHdrLogMode(if (value == "On") "LOG" else "Off")
         "photo.filters",
         "pro.filters",

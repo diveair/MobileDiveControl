@@ -24,7 +24,10 @@ import kotlin.math.ln
  */
 internal fun snapFocusValuesToLadder(values: Map<String, String>): Map<String, String> {
     val result = values.toMutableMap()
-    listOf("photo.manual_focus", "expert.manual_focus", "pro.manual_focus", "pro_video.manual_focus")
+    listOf(
+        "photo.manual_focus", "expert.manual_focus", "pro.manual_focus", "pro_video.manual_focus",
+        "portrait_video.manual_focus", "hyperlapse.manual_focus",
+    )
         .forEach { key ->
             val value = result[key] ?: return@forEach
             if (value == "AF") return@forEach
@@ -247,7 +250,10 @@ class CameraSessionStore(context: Context) {
     internal fun normalizeRestoredSettingValues(values: Map<String, String>): Map<String, String> {
         val result = values.toMutableMap()
         // Validate focus curve values
-        listOf("photo.focus_curve", "expert.focus_curve", "pro.focus_curve", "pro_video.focus_curve").forEach { key ->
+        listOf(
+            "photo.focus_curve", "expert.focus_curve", "pro.focus_curve", "pro_video.focus_curve",
+            "portrait_video.focus_curve", "hyperlapse.focus_curve",
+        ).forEach { key ->
             val value = result[key]
             if (value != null && value !in listOf("Linear", "SquareRoot", "Logarithmic")) {
                 result[key] = "SquareRoot"

@@ -92,6 +92,27 @@ import kotlin.math.sqrt
 import java.io.File
 import java.util.concurrent.Executors
 
+/** Samsung Food's relative cool/warm dial, mapped onto the app's calibrated Kelvin renderer. */
+internal fun foodColourTemperatureKelvin(value: String?): Int? = value
+    ?.removePrefix("+")
+    ?.toIntOrNull()
+    ?.coerceIn(-4, 4)
+    ?.let { level -> 5_000 + level * 450 }
+
+/** Aqua tone is a deliberately small signed Duv trim around the live underwater estimate. */
+internal fun aquaToneDuv(value: String?): Double = value
+    ?.removePrefix("+")
+    ?.toIntOrNull()
+    ?.coerceIn(-4, 4)
+    ?.times(0.0015)
+    ?: 0.0
+
+internal fun hyperlapseRecordingLimitMillis(value: String?): Long? = value
+    ?.removeSuffix("s")
+    ?.toLongOrNull()
+    ?.takeIf { it in 1..300 }
+    ?.times(1_000L)
+
 @OptIn(ExperimentalSessionConfig::class, ExperimentalHighSpeedVideo::class)
 class CameraRuntimeController(
     private val context: Context,
@@ -240,6 +261,8 @@ class CameraRuntimeController(
         /** AU's high-rate result is transient, so its commandable values belong in this latch. */
         val underwaterKelvin: Int?,
         val underwaterTintTenThousandths: Int?,
+        val oceanMode: Boolean,
+        val aquaTone: String?,
     )
 
     private data class CaptureMetadataSnapshot(val json: String)
@@ -421,6 +444,7 @@ class CameraRuntimeController(
     private var focusPeakingProcessor: FocusPeakingSurfaceProcessor? = null
     private val cameraRequestHandler = Handler(Looper.getMainLooper())
     private var photoTimerGeneration = 0
+    private var recordingLimitGeneration = 0
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     private var focusMotionMonitorRegistered = false
@@ -541,9 +565,7 @@ class CameraRuntimeController(
             }
             val meteredWbKelvin = readVendorResult(result, vendorColorTempResultKey) { vendorColorTempResultKey = null }
             val meteredEvTenths = readVendorResult(result, vendorEvMeterResultKey) { vendorEvMeterResultKey = null }
-            val underwaterTelemetry = underwaterCommandSolution.takeIf {
-                CameraCatalog.isWhiteBalanceAutoUnderwater(currentValue(latestState, ".white_balance"))
-            }
+            val underwaterTelemetry = underwaterCommandSolution.takeIf { underwaterModeEnabled(latestState) }
             onMeteredExposure?.invoke(
                 com.mobiledivecontrol.core.MeteredExposure(
                     iso = lastAeSensitivity,
@@ -816,12 +838,8 @@ class CameraRuntimeController(
         waterTemperatureC: Double? = null,
         headingDegrees: Double? = null,
     ) {
-        val previousUnderwater = CameraCatalog.isWhiteBalanceAutoUnderwater(
-            currentValue(latestState, ".white_balance"),
-        )
-        val underwater = CameraCatalog.isWhiteBalanceAutoUnderwater(
-            currentValue(cameraState, ".white_balance"),
-        )
+        val previousUnderwater = underwaterModeEnabled(latestState)
+        val underwater = underwaterModeEnabled(cameraState)
         val now = SystemClock.elapsedRealtime()
         val pressureChanged = waterPressureKpa != latestWaterPressureKpa
         latestState = cameraState
@@ -1027,7 +1045,7 @@ class CameraRuntimeController(
         nowMs: Long,
         analysisMicros: Long? = null,
     ) {
-        if (!CameraCatalog.isWhiteBalanceAutoUnderwater(currentValue(latestState, ".white_balance"))) return
+        if (!underwaterModeEnabled(latestState)) return
         val current = underwaterWbSolution ?: run {
             if (!seedUnderwaterWhiteBalance(latestState, nowMs)) return
             underwaterWbSolution ?: return
@@ -1108,10 +1126,7 @@ class CameraRuntimeController(
         val delay = (lastUnderwaterCommandAtMs + UNDERWATER_REQUEST_INTERVAL_MS - now).coerceAtLeast(0L)
         cameraRequestHandler.postDelayed(underwaterApply@{
             underwaterApplyPosted = false
-            if (!underwaterCaptureFrozen && CameraCatalog.isWhiteBalanceAutoUnderwater(
-                    currentValue(latestState, ".white_balance"),
-                )
-            ) {
+            if (!underwaterCaptureFrozen && underwaterModeEnabled(latestState)) {
                 val estimate = underwaterWbSolution ?: return@underwaterApply
                 val commanded = underwaterCommandSolution
                 val changed = commanded == null ||
@@ -2110,9 +2125,8 @@ class CameraRuntimeController(
             // here. The frame itself is closed immediately; nothing is read or retained.
             it.setAnalyzer(focusAssistExecutor) { image ->
                 val now = SystemClock.elapsedRealtime()
-                if (CameraCatalog.isWhiteBalanceAutoUnderwater(
-                        currentValue(latestState, ".white_balance"),
-                    ) && now - lastUnderwaterAnalysisAtMs >= UNDERWATER_ANALYSIS_INTERVAL_MS
+                if (underwaterModeEnabled(latestState) &&
+                    now - lastUnderwaterAnalysisAtMs >= UNDERWATER_ANALYSIS_INTERVAL_MS
                 ) {
                     lastUnderwaterAnalysisAtMs = now
                     val analysisStartedNs = SystemClock.elapsedRealtimeNanos()
@@ -2403,6 +2417,21 @@ class CameraRuntimeController(
         RecordingClock.reviewUri.value = null
         RecordingClock.reviewFinalizing.value = false
         startRecordingSegment()
+        scheduleHyperlapseRecordingLimit()
+    }
+
+    /** The selected Hyperlapse limit is elapsed recording time; ∞ leaves it unbounded. */
+    private fun scheduleHyperlapseRecordingLimit() {
+        val generation = ++recordingLimitGeneration
+        if (latestState.activeMode != com.mobiledivecontrol.core.CameraModeId.Hyperlapse) return
+        val limitMs = hyperlapseRecordingLimitMillis(currentValue(latestState, ".recording_time"))
+            ?: return
+        cameraRequestHandler.postDelayed({
+            if (generation == recordingLimitGeneration && recordingSessionActive) {
+                Log.i(TAG, "Hyperlapse recording limit reached: ${limitMs / 1_000L}s")
+                stopVideoRecording()
+            }
+        }, limitMs)
     }
 
     /**
@@ -2573,6 +2602,7 @@ class CameraRuntimeController(
                     exposureCompensationIndex = evIndex,
                     zoomRatio = latestState.zoomFactor.toFloat().coerceAtLeast(1f),
                     torchEnabled = currentValue(latestState, ".flash") in setOf("On", "Torch"),
+                    focusMode = currentValue(latestState, ".focus_mode") ?: "Continuous AF",
                 ),
                 onStarted = {
                     currentRecordingSegmentDurationMs = 0L
@@ -2752,6 +2782,7 @@ class CameraRuntimeController(
 
     private fun finishRecordingSession(deleteLatest: Boolean) {
         recordingSegmentStartGeneration++
+        recordingLimitGeneration++
         val sessionDirectory = recordingSessionDirectory
         val segments = recordingSegmentFiles.toList()
         val preparedReview = recordingReviewFile
@@ -3280,16 +3311,14 @@ class CameraRuntimeController(
         }
         val boundCamera = camera ?: return
         val filterValue = currentValue(cameraState, ".filters")
-        val underwater = CameraCatalog.isWhiteBalanceAutoUnderwater(
-            currentValue(cameraState, ".white_balance"),
-        )
+        val underwater = underwaterModeEnabled(cameraState)
         val underwaterSolution = underwaterCommandSolution.takeIf { underwater }
         val signature = SessionSignature(
             flash = currentValue(cameraState, ".flash"),
             exposure = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure"),
             lens = currentValue(cameraState, ".lens"),
             hdrLog = resolvedHdrLogMode(cameraState),
-            whiteBalance = currentValue(cameraState, ".white_balance"),
+            whiteBalance = resolvedWhiteBalanceValue(cameraState),
             filter = filterValue,
             manualFocus = currentValue(cameraState, ".manual_focus"),
             iso = currentValue(cameraState, ".iso"),
@@ -3304,6 +3333,8 @@ class CameraRuntimeController(
             underwaterTintTenThousandths = underwaterSolution?.let {
                 (it.tintDuv * 10_000.0).roundToInt()
             },
+            oceanMode = oceanModeEnabled(cameraState),
+            aquaTone = currentValue(cameraState, ".aqua_tone"),
         )
         if (!force && signature == lastAppliedSessionSignature) {
             return
@@ -3463,8 +3494,8 @@ class CameraRuntimeController(
         applyRequestedVideoStabilization(builder, cameraState, boundCamera)
 
         // ── White Balance ──
-        val wbValue = currentValue(cameraState, ".white_balance")
-        val autoUnderwater = CameraCatalog.isWhiteBalanceAutoUnderwater(wbValue)
+        val wbValue = resolvedWhiteBalanceValue(cameraState)
+        val autoUnderwater = underwaterModeEnabled(cameraState)
         val filterProfile = if (autoUnderwater) null else underwaterFilterProfile(
             value = currentValue(cameraState, ".filters"),
             depthMeters = currentDepthMeters(),
@@ -3989,9 +4020,7 @@ class CameraRuntimeController(
     }
 
     private fun beginPhotoCapture() {
-        underwaterCaptureFrozen = CameraCatalog.isWhiteBalanceAutoUnderwater(
-            currentValue(latestState, ".white_balance"),
-        )
+        underwaterCaptureFrozen = underwaterModeEnabled(latestState)
         withShutterWhiteBalance(::capturePhotoNow)
     }
 
@@ -4082,7 +4111,7 @@ class CameraRuntimeController(
             currentValue(latestState, ".shutter_speed")?.let { values.put("shutter_setting", it) }
             currentValue(latestState, ".exposure_value", ".exposure_compensation")
                 ?.let { values.put("ev_setting", it) }
-            currentValue(latestState, ".white_balance")?.let { values.put("white_balance_setting", it) }
+            resolvedWhiteBalanceValue(latestState)?.let { values.put("white_balance_setting", it) }
             latestState.meteredExposure.iso?.let { values.put("metered_iso", it) }
             latestState.meteredExposure.shutterNs?.let { values.put("metered_shutter_ns", it) }
             latestState.meteredExposure.wbKelvin?.let { values.put("metered_wb_kelvin", it) }
@@ -4235,8 +4264,8 @@ class CameraRuntimeController(
         applyRequestedVideoStabilization(builder, cameraState, boundCamera)
 
         // --- White Balance ---
-        val wbValue = currentValue(cameraState, ".white_balance")
-        val autoUnderwater = CameraCatalog.isWhiteBalanceAutoUnderwater(wbValue)
+        val wbValue = resolvedWhiteBalanceValue(cameraState)
+        val autoUnderwater = underwaterModeEnabled(cameraState)
         val filterProfile = if (autoUnderwater) null else underwaterFilterProfile(
             value = currentValue(cameraState, ".filters"),
             depthMeters = currentDepthMeters(),
@@ -4482,6 +4511,20 @@ class CameraRuntimeController(
             ?: return null
         return CameraCatalog.currentValue(cameraState, spec)
     }
+
+    private fun oceanModeEnabled(cameraState: CameraState): Boolean =
+        currentValue(cameraState, ".ocean_mode") == "On"
+
+    private fun underwaterModeEnabled(cameraState: CameraState): Boolean =
+        oceanModeEnabled(cameraState) || CameraCatalog.isWhiteBalanceAutoUnderwater(
+            currentValue(cameraState, ".white_balance"),
+        )
+
+    /** Food has a relative tone control instead of a Kelvin dial; both use one renderer. */
+    private fun resolvedWhiteBalanceValue(cameraState: CameraState): String? =
+        currentValue(cameraState, ".white_balance")
+            ?: foodColourTemperatureKelvin(currentValue(cameraState, ".color_temperature"))
+                ?.let { "${it}K" }
 
     private fun assignBackLensLabels(profile: BackCameraProfile): Map<String, PhysicalLensProfile> {
         val sortedLenses = profile.physicalLenses.sortedBy { lens -> lens.focalLengthMm }
@@ -5077,6 +5120,8 @@ class CameraRuntimeController(
             com.mobiledivecontrol.core.CameraModeId.Pro -> "pro.focus_curve"
             com.mobiledivecontrol.core.CameraModeId.ExpertRaw -> "expert.focus_curve"
             com.mobiledivecontrol.core.CameraModeId.ProVideo -> "pro_video.focus_curve"
+            com.mobiledivecontrol.core.CameraModeId.PortraitVideo -> "portrait_video.focus_curve"
+            com.mobiledivecontrol.core.CameraModeId.Hyperlapse -> "hyperlapse.focus_curve"
             else -> return FocusCurveMode.SquareRoot
         }
         val curveValue = latestState.settingValues[focusCurveSettingId] ?: "SquareRoot"
@@ -5392,7 +5437,7 @@ class CameraRuntimeController(
 
     /** The mode's manual kelvin, or null when white balance sits on Auto (or has no dial). */
     private fun manualWbKelvin(cameraState: CameraState): Int? {
-        val wb = currentValue(cameraState, ".white_balance") ?: return null
+        val wb = resolvedWhiteBalanceValue(cameraState) ?: return null
         if (CameraCatalog.isWhiteBalanceAuto(wb)) return null
         return wb.removeSuffix("K").toIntOrNull()
     }
@@ -5401,8 +5446,8 @@ class CameraRuntimeController(
     private fun wbIsAuto(cameraState: CameraState): Boolean {
         val filters = currentValue(cameraState, ".filters")
         if (filters != null && filters != "Off") return false
-        val wb = currentValue(cameraState, ".white_balance")
-        if (CameraCatalog.isWhiteBalanceAutoUnderwater(wb)) return underwaterCommandSolution == null
+        val wb = resolvedWhiteBalanceValue(cameraState)
+        if (underwaterModeEnabled(cameraState)) return underwaterCommandSolution == null
         return wb == null || CameraCatalog.isWhiteBalanceOemAuto(wb)
     }
 
@@ -5423,7 +5468,9 @@ class CameraRuntimeController(
                 0.0,
             )
         }
-        return computedWbColour(solution.kelvin, solution.tintDuv)
+        val tint = (solution.tintDuv + aquaToneDuv(currentValue(cameraState, ".aqua_tone")))
+            .coerceIn(-0.02, 0.02)
+        return computedWbColour(solution.kelvin, tint)
             ?: manualWbColour(solution.kelvin)
     }
 
