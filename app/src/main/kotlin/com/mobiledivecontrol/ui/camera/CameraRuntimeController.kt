@@ -420,6 +420,7 @@ class CameraRuntimeController(
     // Replaces the old CPU bitmap overlay approach which caused jitter and drift.
     private var focusPeakingProcessor: FocusPeakingSurfaceProcessor? = null
     private val cameraRequestHandler = Handler(Looper.getMainLooper())
+    private var photoTimerGeneration = 0
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     private var focusMotionMonitorRegistered = false
@@ -740,6 +741,7 @@ class CameraRuntimeController(
     }
 
     fun detach() {
+        photoTimerGeneration++
         stopFocusMotionMonitor()
         resumeObserver?.let { observer -> lifecycleOwner?.lifecycle?.removeObserver(observer) }
         resumeObserver = null
@@ -3690,7 +3692,10 @@ class CameraRuntimeController(
         val supported = Camera2CameraInfo.from(boundCamera.cameraInfo).getCameraCharacteristic(
             CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES,
         )?.toSet().orEmpty()
-        val requested = if (currentValue(cameraState, ".video_stabilization") == "Standard") {
+        val requested = if (
+            currentValue(cameraState, ".video_stabilization") == "Standard" ||
+            currentValue(cameraState, ".super_steady") == "On"
+        ) {
             CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
         } else {
             CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
@@ -3965,6 +3970,25 @@ class CameraRuntimeController(
     }
 
     private fun capturePhoto() {
+        val requestedMode = latestState.activeMode
+        val delayMs = currentValue(latestState, ".timer")
+            ?.removeSuffix("s")
+            ?.toLongOrNull()
+            ?.times(1_000L)
+            ?: 0L
+        if (delayMs > 0L) {
+            val generation = photoTimerGeneration
+            cameraRequestHandler.postDelayed({
+                if (generation == photoTimerGeneration && latestState.activeMode == requestedMode) {
+                    beginPhotoCapture()
+                }
+            }, delayMs)
+        } else {
+            beginPhotoCapture()
+        }
+    }
+
+    private fun beginPhotoCapture() {
         underwaterCaptureFrozen = CameraCatalog.isWhiteBalanceAutoUnderwater(
             currentValue(latestState, ".white_balance"),
         )

@@ -55,7 +55,15 @@ private val EXPOSURE_PRO_KEYS = listOf(
     "expert.exposure_value", "pro.exposure_value", "pro_video.exposure_value",
 )
 private val EXPOSURE_QUICK_KEYS = listOf(
-    "photo.exposure_compensation", "night.exposure",
+    "photo.exposure_compensation",
+    "portrait.exposure",
+    "food.exposure",
+    "night.exposure",
+    "panorama.exposure",
+    "hyperlapse.exposure",
+    "video.exposure",
+    "portrait_video.exposure",
+    "slow_motion.exposure",
 )
 
 /**

@@ -2558,15 +2558,19 @@ class ControlReducer(
 
     private fun cameraEffectForSetting(settingId: String, value: String): CameraCommand? = when (settingId) {
         "photo.flash",
+        "portrait.flash",
         "expert.flash",
         "pro.flash",
         "night.flash",
         "burst.flash",
         "video.flash",
         "pro_video.flash",
-        "portrait_video.flash" -> CameraCommand.SetFlashMode(value)
+        "hyperlapse.flash",
+        "portrait_video.flash",
+        "slow_motion.flash" -> CameraCommand.SetFlashMode(value)
         "photo.lens",
         "portrait.lens",
+        "food.lens",
         "pro.lens",
         "expert.lens",
         "video.lens",
@@ -2611,10 +2615,15 @@ class ControlReducer(
         "pro_video.manual_focus" -> null
         "photo.exposure_compensation",
         "portrait.exposure",
+        "food.exposure",
+        "panorama.exposure",
+        "hyperlapse.exposure",
         "pro.exposure_value",
         "expert.exposure_value",
         "video.exposure",
         "night.exposure",
+        "portrait_video.exposure",
+        "slow_motion.exposure",
         "macro.exposure",
         "pro_video.exposure_value" -> parseExposureCompensation(value)?.let { CameraCommand.SetExposureCompensation(it) }
         "expert.focus_peaking",
@@ -2629,6 +2638,7 @@ class ControlReducer(
         "night_video.hdr" -> CameraCommand.SetHdrLogMode(if (value == "On") "HDR" else "Off")
         "night_video.log" -> CameraCommand.SetHdrLogMode(if (value == "On") "LOG" else "Off")
         "photo.filters",
+        "pro.filters",
         "video.filters" -> CameraCommand.SetFilter(value)
         else -> null
     }

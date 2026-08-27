@@ -56,20 +56,21 @@ object CameraCatalog {
     val primaryRailEntries: List<CameraRailEntry> = listOf(
         // An overlay action, not a capture mode: it never tears down or rebinds CameraX.
         CameraRailEntry("track_heading", "Track Heading", action = CameraRailAction.TrackHeading),
+        // Samsung Camera 16.5.02.36 on the reference Galaxy S24 exposes these three modes on
+        // its primary rail, followed by the modes in More. Keep this list tied to what is
+        // actually installed: Expert RAW is only a download tile on this phone, while Burst,
+        // Single Take, Dual Record and Night Video are not modes in the installed camera build.
         CameraRailEntry("photo", "Photo", CameraModeId.Photo),
-        CameraRailEntry("expert_raw", "Expert RAW", CameraModeId.ExpertRaw),
-        CameraRailEntry("pro", "Pro", CameraModeId.Pro),
-        CameraRailEntry("panorama", "Panorama", CameraModeId.Panorama),
-        CameraRailEntry("night", "Night", CameraModeId.Night),
-        CameraRailEntry("burst", "Burst", CameraModeId.Burst),
-        CameraRailEntry("single_take", "Single Take", CameraModeId.SingleTake),
-        CameraRailEntry("hyperlapse", "Hyperlapse", CameraModeId.Hyperlapse),
+        CameraRailEntry("portrait", "Portrait", CameraModeId.Portrait),
         CameraRailEntry("video", "Video", CameraModeId.Video),
+        CameraRailEntry("pro", "Pro", CameraModeId.Pro),
+        CameraRailEntry("food", "Food", CameraModeId.Food),
+        CameraRailEntry("night", "Night", CameraModeId.Night),
+        CameraRailEntry("panorama", "Panorama", CameraModeId.Panorama),
         CameraRailEntry("pro_video", "Pro Video", CameraModeId.ProVideo),
-        CameraRailEntry("portrait_video", "Portrait Video", CameraModeId.PortraitVideo),
+        CameraRailEntry("hyperlapse", "Hyperlapse", CameraModeId.Hyperlapse),
         CameraRailEntry("slow_motion", "Slow Motion", CameraModeId.SlowMotion),
-        CameraRailEntry("dual_record", "Dual Record", CameraModeId.DualRecording),
-        CameraRailEntry("night_video", "Night Video", CameraModeId.NightVideo),
+        CameraRailEntry("portrait_video", "Portrait Video", CameraModeId.PortraitVideo),
         // A state screen rather than a capture profile. Keeping it as an action avoids inventing
         // a camera mode with fake lenses/settings while still placing it last in the Modes menu.
         CameraRailEntry("diagnostics", "Diagnostics", action = CameraRailAction.Diagnostics),
@@ -118,8 +119,10 @@ object CameraCatalog {
 
     private fun buildProfile(mode: CameraModeId, variant: GalaxyDeviceVariant): CameraModeProfile = when (mode) {
         CameraModeId.Photo -> photoProfile(variant)
+        CameraModeId.Portrait -> portraitProfile()
         CameraModeId.ExpertRaw -> expertRawProfile(variant)
         CameraModeId.Pro -> proProfile(variant)
+        CameraModeId.Food -> foodProfile()
         CameraModeId.Panorama -> panoramaProfile(variant)
         CameraModeId.Night -> nightProfile(variant)
         CameraModeId.Burst -> burstProfile(variant)
@@ -131,8 +134,6 @@ object CameraCatalog {
         CameraModeId.SlowMotion -> slowMotionProfile(variant)
         CameraModeId.DualRecording -> dualRecordProfile(variant)
         CameraModeId.NightVideo -> nightVideoProfile(variant)
-        CameraModeId.Portrait,
-        CameraModeId.Food,
         CameraModeId.SuperSlowMotion,
         CameraModeId.DirectorsView,
         CameraModeId.Macro,
@@ -183,7 +184,14 @@ object CameraCatalog {
         } else {
             baseSettings.map { spec ->
                 if (spec.id.endsWith(".lens")) {
-                    spec.copy(options = detectedLenses)
+                    // A mode can expose only a subset of the phone's lenses (Portrait is 1x/2x,
+                    // Panorama is 0.6x/1x, Slow Motion is 0.6x/1x/3x on the reference S24).
+                    // Replacing that subset with every detected lens made the menu disagree with
+                    // Samsung immediately after the capability probe completed.
+                    val supportedForMode = spec.options.filter { it in detectedLenses }
+                    val options = supportedForMode.ifEmpty { spec.options }
+                    val default = spec.defaultValue.takeIf { it in options } ?: options.first()
+                    spec.copy(options = options, defaultValue = default)
                 } else {
                     spec
                 }
@@ -867,23 +875,133 @@ object CameraCatalog {
             captureType = CameraCaptureType.Photo,
             availableLenses = lenses,
             availableResolutions = megapixels,
-            availableFormatOptions = listOf("JPEG", "RAW", "RAW + JPEG"),
-            availableExposureControls = listOf("Flash", "Lens", "Focus", "Exposure Value"),
-            availableAssistTools = listOf("HDR / LOG", "Filters", "Gallery"),
+            availableFormatOptions = listOf("JPEG", "HEIF"),
+            availableExposureControls = listOf("Flash", "Lens", "Exposure Value"),
+            availableAssistTools = listOf("Motion photo", "Timer", "Filters", "Grid"),
             settings = listOf(
                 choice("photo.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Auto"),
                 choice("photo.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
-                choice("photo.save_format", "RAW / JPEG", "Core", listOf("JPEG", "RAW", "RAW + JPEG"), "JPEG"),
+                choice(
+                    "photo.save_format",
+                    "Photo format",
+                    "File",
+                    listOf("JPEG", "HEIF"),
+                    "JPEG",
+                    CameraFeatureStatus.NeedsVerification,
+                    "HEIF output needs the Samsung vendor capture pipeline.",
+                ),
+                choice("photo.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3"),
+                choice("photo.timer", "Timer", "Core", timerOptions(), "Off"),
+                toggle(
+                    "photo.motion_photo",
+                    "Motion photo",
+                    "Core",
+                    status = CameraFeatureStatus.NeedsVerification,
+                    note = "Motion Photo packaging needs the Samsung vendor capture pipeline.",
+                ),
                 choice("photo.lens", "Lens", "Core", lenses, "Auto"),
-                slider("photo.manual_focus", "Focus", "Core", focusOptions, "AF"),
-                toggle("photo.focus_peaking", "Focus Assist", "Assist"),
-                choice("photo.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
+                // DiveControl housing enhancement: Samsung keeps these in Pro, but retaining
+                // them here preserves the underwater focus workflow without hiding any native
+                // Photo control added above.
+                slider("photo.manual_focus", "Focus", "DiveControl", focusOptions, "AF"),
+                toggle("photo.focus_peaking", "Focus Assist", "DiveControl"),
+                choice("photo.focus_curve", "Focus Curve", "DiveControl", focusCurveOptions(), "SquareRoot"),
                 slider("photo.exposure_compensation", "EV", "Core", evQuickOptions, "0.0"),
-                choice("photo.hdr_log", "HDR / LOG", "Assist", listOf("HDR", "LOG", "Off"), "HDR"),
                 choice("photo.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
+                choice("photo.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
             ),
         )
     }
+
+    private fun portraitProfile(): CameraModeProfile = CameraModeProfile(
+        mode = CameraModeId.Portrait,
+        modeName = CameraModeId.Portrait.label,
+        captureType = CameraCaptureType.Photo,
+        availableLenses = listOf("1x", "2x", "3x"),
+        availableResolutions = listOf("Auto"),
+        availableExposureControls = listOf("Flash", "Lens", "Exposure Value"),
+        availableAssistTools = listOf("Timer", "Beauty", "Lighting", "Background effects", "Grid"),
+        settings = listOf(
+            choice("portrait.flash", "Flash", "Core", listOf("Off", "On"), "Off"),
+            choice("portrait.lens", "Lens", "Core", listOf("1x", "2x", "3x"), "1x"),
+            choice("portrait.timer", "Timer", "Core", timerOptions(), "Off"),
+            choice("portrait.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3"),
+            slider("portrait.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+            choice(
+                "portrait.background_effect",
+                "Background effect",
+                "Portrait",
+                listOf("Blur", "Studio", "High-key mono", "Low-key mono", "Backdrop", "Color point"),
+                "Blur",
+                CameraFeatureStatus.NeedsVerification,
+                "Samsung computational portrait effects are vendor-only.",
+            ),
+            slider(
+                "portrait.effect_strength",
+                "Effect strength",
+                "Portrait",
+                (0..7).map(Int::toString),
+                "4",
+                CameraFeatureStatus.NeedsVerification,
+                "The native eight-step control is catalogued; rendering is vendor-only.",
+                supportsSensitivity = false,
+            ),
+            choice(
+                "portrait.beauty",
+                "Skin smoothness",
+                "Portrait",
+                listOf("Off") + (1..8).map(Int::toString),
+                "Off",
+                CameraFeatureStatus.NeedsVerification,
+                "Samsung face-retouch processing is vendor-only.",
+            ),
+            slider(
+                "portrait.lighting",
+                "Lighting",
+                "Portrait",
+                (0..7).map(Int::toString),
+                "4",
+                CameraFeatureStatus.NeedsVerification,
+                "The native eight-step lighting control is catalogued; rendering is vendor-only.",
+                supportsSensitivity = false,
+            ),
+            choice("portrait.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+        ),
+    )
+
+    private fun foodProfile(): CameraModeProfile = CameraModeProfile(
+        mode = CameraModeId.Food,
+        modeName = CameraModeId.Food.label,
+        captureType = CameraCaptureType.Photo,
+        availableLenses = listOf("1x", "2x", "3x"),
+        availableResolutions = listOf("Auto"),
+        availableExposureControls = listOf("Colour temperature", "Exposure Value"),
+        availableAssistTools = listOf("Radial blur", "Grid"),
+        settings = listOf(
+            choice("food.lens", "Lens", "Core", listOf("1x", "2x", "3x"), "1x"),
+            slider(
+                "food.color_temperature",
+                "Colour temperature",
+                "Food",
+                (-4..4).map { if (it > 0) "+$it" else it.toString() },
+                "0",
+                CameraFeatureStatus.NeedsVerification,
+                "Samsung's relative warm/cool food adjustment is vendor-only.",
+                supportsSensitivity = false,
+            ),
+            toggle(
+                "food.radial_blur",
+                "Radial blur",
+                "Food",
+                "On",
+                CameraFeatureStatus.NeedsVerification,
+                "The movable food focus area is a Samsung computational effect.",
+            ),
+            slider("food.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+            choice("food.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3"),
+            choice("food.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+        ),
+    )
 
     private fun expertRawProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
@@ -926,7 +1044,7 @@ object CameraCatalog {
             captureType = CameraCaptureType.Photo,
             availableLenses = lenses,
             availableResolutions = megapixels,
-            availableFormatOptions = listOf("JPEG", "Ultra HDR JPEG"),
+            availableFormatOptions = listOf("JPEG", "RAW + JPEG"),
             availableExposureControls = listOf("White balance", "ISO", "Focus", "Shutter", "Exposure value"),
             availableAssistTools = listOf("Zebra", "False colour", "Guides", "HDR"),
             settings = listOf(
@@ -942,19 +1060,24 @@ object CameraCatalog {
                     "pro.save_format",
                     "Photo format",
                     "File",
-                    listOf("JPEG", "Ultra HDR JPEG"),
+                    listOf("JPEG", "RAW + JPEG"),
                     "JPEG",
+                    CameraFeatureStatus.NeedsVerification,
+                    "RAW output needs the Samsung vendor capture pipeline.",
                 ),
                 choice(
                     "pro.aspect_ratio",
                     "Aspect ratio",
                     "File",
-                    listOf("4:3", "16:9", "1:1"),
+                    photoAspectRatios(),
                     "4:3",
                 ),
+                choice("pro.timer", "Timer", "Core", timerOptions(), "Off"),
                 choice("pro.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
                 choice("pro.lens", "Lens", "Core", lenses, "Auto"),
                 choice("pro.metering", "Metering", "Exposure", meteringOptions(), "Matrix"),
+                toggle("pro.histogram", "Histogram", "Assist", "On"),
+                choice("pro.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
                 choice("pro.guides", "Guides", "Assist", guideOptions(), "3×3 Grid"),
                 choice("pro.exposure_display", "Exposure display", "Assist", exposureDisplayOptions(), "Off"),
                 choice("pro.hdr", "HDR photo", "Dynamic range", listOf("Off", "On"), "On"),
@@ -967,33 +1090,50 @@ object CameraCatalog {
         mode = CameraModeId.Panorama,
         modeName = CameraModeId.Panorama.label,
         captureType = CameraCaptureType.Photo,
-        availableLenses = listOf("1x"),
+        availableLenses = listOf("0.6x", "1x"),
         availableResolutions = listOf("Auto"),
         availableAssistTools = listOf("Guidelines", "Grid"),
         settings = listOf(
-            choice("panorama.lens", "Lens", "Core", listOf("1x"), "1x"),
-            choice("panorama.direction", "Sweep", "Core", listOf("Horizontal", "Vertical"), "Horizontal"),
-            choice("panorama.grid", "Grid", "Assist", gridOptions(), "3x3"),
+            choice("panorama.lens", "Lens", "Core", listOf("0.6x", "1x"), "1x"),
+            choice(
+                "panorama.direction",
+                "Sweep direction",
+                "Core",
+                listOf("Left", "Right", "Up", "Down"),
+                "Right",
+                CameraFeatureStatus.NeedsVerification,
+                "Panorama stitching is supplied by Samsung's vendor pipeline.",
+            ),
+            slider("panorama.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+            choice("panorama.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
         ),
     )
 
     private fun nightProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
-        val megapixels = photoMegapixels(variant)
         return CameraModeProfile(
             mode = CameraModeId.Night,
             modeName = CameraModeId.Night.label,
             captureType = CameraCaptureType.Photo,
             availableLenses = lenses,
-            availableResolutions = megapixels,
+            availableResolutions = listOf("Auto"),
             availableExposureControls = listOf("Exposure value"),
             availableAssistTools = listOf("Grid"),
             settings = listOf(
-                choice("night.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Auto"),
-                choice("night.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
                 choice("night.lens", "Lens", "Core", lenses, "1x"),
                 slider("night.exposure", "Exposure Value", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
-                choice("night.grid", "Grid", "Assist", gridOptions(), "3x3"),
+                choice("night.timer", "Timer", "Core", timerOptions(), "Off"),
+                choice("night.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3"),
+                choice(
+                    "night.capture_time",
+                    "Capture time",
+                    "Night",
+                    listOf("Auto", "Max"),
+                    "Auto",
+                    CameraFeatureStatus.NeedsVerification,
+                    "Samsung's multi-frame Night exposure is vendor-only.",
+                ),
+                choice("night.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
             ),
         )
     }
@@ -1043,45 +1183,88 @@ object CameraCatalog {
             captureType = CameraCaptureType.Video,
             availableLenses = lenses,
             availableResolutions = listOf("FHD", "UHD 4K"),
-            availableFrameRates = listOf("15x", "30x", "60x", "Auto"),
+            availableFrameRates = listOf("Auto", "5x", "10x", "15x", "30x", "45x", "60x", "300x"),
             availableAssistTools = listOf("Grid"),
             settings = listOf(
-                choice("hyperlapse.speed", "Speed", "Core", listOf("15x", "30x", "60x", "Auto"), "Auto"),
-                choice("hyperlapse.frame_rate", "Frame rate", "Core", listOf("24fps", "30fps"), "30fps"),
+                choice("hyperlapse.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
+                choice("hyperlapse.resolution", "Video size", "Core", listOf("FHD", "UHD 4K"), "FHD"),
                 choice("hyperlapse.lens", "Lens", "Core", lenses, "1x"),
-                choice("hyperlapse.grid", "Grid", "Assist", gridOptions(), "3x3"),
+                slider("hyperlapse.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+                choice(
+                    "hyperlapse.recording_time",
+                    "Recording time",
+                    "Core",
+                    listOf("Unlimited", "10s", "30s", "60s", "120s", "180s", "300s"),
+                    "Unlimited",
+                    CameraFeatureStatus.NeedsVerification,
+                    "The native recording limit is catalogued; timed stop needs the Samsung mode engine.",
+                ),
+                choice(
+                    "hyperlapse.speed",
+                    "Speed",
+                    "Core",
+                    listOf("Auto", "5x", "10x", "15x", "30x", "45x", "60x", "300x"),
+                    "Auto",
+                    CameraFeatureStatus.NeedsVerification,
+                    "5x-60x are normal speeds; 15x/45x/300x are Night Hyperlapse speeds.",
+                ),
+                toggle(
+                    "hyperlapse.night_mode",
+                    "Night Hyperlapse",
+                    "Core",
+                    status = CameraFeatureStatus.NeedsVerification,
+                    note = "Samsung's night time-lapse processing is vendor-only.",
+                ),
+                choice("hyperlapse.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
             ),
         )
     }
 
     private fun videoProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
-        val frameRates = videoFrameRates(variant)
+        val resolutions = listOf("8K", "UHD 4K", "FHD", "HD 720p", "QHD")
+        val frameRates = listOf("30fps", "60fps")
         return CameraModeProfile(
             mode = CameraModeId.Video,
             modeName = CameraModeId.Video.label,
             captureType = CameraCaptureType.Video,
             availableLenses = lenses,
-            availableResolutions = videoResolutionOptions,
+            availableResolutions = resolutions,
             availableFrameRates = frameRates,
-            availableFormatOptions = listOf("Standard", "HDR", "10-bit HLG / Log grade"),
-            availableAudioControls = listOf("Microphone"),
-            availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid"),
+            availableFormatOptions = listOf("H.264", "HEVC", "HDR10+", "Log"),
+            availableAudioControls = listOf("Audio recording"),
+            availableAssistTools = listOf("Auto FPS", "Video stabilization", "Super Steady", "Filters", "Grid"),
             settings = listOf(
-                choice("video.resolution", "Resolution", "Core", videoResolutionOptions, "UHD 4K"),
+                choice(
+                    "video.resolution",
+                    "Video size",
+                    "Core",
+                    resolutions,
+                    "UHD 4K",
+                    CameraFeatureStatus.NeedsVerification,
+                    "8K and Super Steady QHD depend on Samsung encoder profiles not exposed by CameraX.",
+                ),
                 choice("video.frame_rate", "Frame rate", "Core", frameRates, "30fps"),
+                choice("video.aspect_ratio", "Aspect ratio", "Core", videoAspectRatios(), "16:9"),
                 choice("video.lens", "Lens", "Core", lenses, "1x"),
                 choice("video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
-                choice("video.microphone", "Microphone", "Audio", microphoneSources(), "Auto"),
-                toggle("video.exposure_monitor", "Exposure monitor", "Assist"),
-                choice("video.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
-                choice("video.grid", "Grid", "Assist", gridOptions(), "3x3"),
-                choice("video.hdr", "HDR", "Assist", listOf("Off", "On"), "On"),
-                choice("video.log", "10-bit HLG", "Assist", listOf("Off", "On"), "Off"),
-                toggle("video.super_steady", "Super Steady", "Core", "Off"),
+                slider("video.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+                toggle("video.auto_fps", "Auto FPS", "Video", "Off"),
+                choice("video.video_format", "Video format", "File", listOf("H.264", "HEVC"), "H.264"),
+                choice("video.video_stabilization", "Video stabilization", "Stabilization", listOf("Off", "Standard"), "Standard"),
+                toggle(
+                    "video.super_steady",
+                    "Super Steady",
+                    "Stabilization",
+                    "Off",
+                    CameraFeatureStatus.NeedsVerification,
+                    "Standard stabilization is applied; Samsung's wide-crop Super Steady path is vendor-only.",
+                ),
+                choice("video.hdr", "HDR10+", "Dynamic range", listOf("Off", "On"), "Off"),
+                choice("video.log", "Log", "Dynamic range", listOf("Off", "On"), "Off"),
+                toggle("video.audio_recording", "Audio recording", "Audio", "On"),
                 choice("video.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
-                choice("video.megapixels", "Video MP", "Core", listOf("Auto", "12MP", "24MP", "50MP"), "Auto"),
-                toggle("video.motion_photo", "Motion Photo", "Core", "Off"),
+                choice("video.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
             ),
         )
     }
@@ -1136,17 +1319,38 @@ object CameraCatalog {
         mode = CameraModeId.PortraitVideo,
         modeName = CameraModeId.PortraitVideo.label,
         captureType = CameraCaptureType.Video,
-        availableLenses = listOf("1x", "2x", "3x"),
+        availableLenses = listOf("1x", "2x"),
         availableResolutions = listOf("FHD", "UHD 4K"),
-        availableFrameRates = listOf("24fps", "30fps", "60fps"),
-        availableAudioControls = listOf("Microphone"),
-        availableAssistTools = listOf("Grid"),
+        availableFrameRates = listOf("30fps"),
+        availableAudioControls = listOf("Audio recording"),
+        availableAssistTools = listOf("Background effects", "Grid"),
         settings = listOf(
-            choice("portrait_video.lens", "Lens", "Core", listOf("1x", "2x", "3x"), "1x"),
-            choice("portrait_video.frame_rate", "Frame rate", "Core", listOf("24fps", "30fps", "60fps"), "30fps"),
+            choice("portrait_video.lens", "Lens", "Core", listOf("1x", "2x"), "1x"),
+            choice("portrait_video.resolution", "Video size", "Core", listOf("FHD", "UHD 4K"), "FHD"),
+            choice("portrait_video.frame_rate", "Frame rate", "Core", listOf("30fps"), "30fps"),
             choice("portrait_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
-            choice("portrait_video.microphone", "Microphone", "Audio", microphoneSources(), "Auto"),
-            choice("portrait_video.grid", "Grid", "Assist", gridOptions(), "3x3"),
+            slider("portrait_video.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+            choice(
+                "portrait_video.background_effect",
+                "Background effect",
+                "Portrait",
+                listOf("Blur", "Big bokeh", "Color point", "Glitch"),
+                "Blur",
+                CameraFeatureStatus.NeedsVerification,
+                "Samsung computational portrait-video effects are vendor-only.",
+            ),
+            slider(
+                "portrait_video.effect_strength",
+                "Effect strength",
+                "Portrait",
+                (0..7).map(Int::toString),
+                "4",
+                CameraFeatureStatus.NeedsVerification,
+                "The native eight-step control is catalogued; rendering is vendor-only.",
+                supportsSensitivity = false,
+            ),
+            toggle("portrait_video.audio_recording", "Audio recording", "Audio", "On"),
+            choice("portrait_video.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
         ),
     )
 
@@ -1154,16 +1358,17 @@ object CameraCatalog {
         mode = CameraModeId.SlowMotion,
         modeName = CameraModeId.SlowMotion.label,
         captureType = CameraCaptureType.Video,
-        availableLenses = listOf("1x"),
-        availableResolutions = listOf("HD", "FHD"),
+        availableLenses = listOf("0.6x", "1x", "3x"),
+        availableResolutions = listOf("FHD", "UHD 4K"),
         availableFrameRates = listOf("120fps", "240fps"),
-        availableAudioControls = listOf("Microphone"),
         availableAssistTools = listOf("Grid"),
         settings = listOf(
+            choice("slow_motion.resolution", "Video size", "Core", listOf("FHD", "UHD 4K"), "FHD"),
             choice("slow_motion.frame_rate", "Frame rate", "Core", listOf("120fps", "240fps"), "240fps"),
-            choice("slow_motion.lens", "Lens", "Core", listOf("1x"), "1x"),
-            choice("slow_motion.microphone", "Microphone", "Audio", listOf("Off", "On"), "On"),
-            choice("slow_motion.grid", "Grid", "Assist", gridOptions(), "3x3"),
+            choice("slow_motion.lens", "Lens", "Core", listOf("0.6x", "1x", "3x"), "1x"),
+            choice("slow_motion.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
+            slider("slow_motion.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+            choice("slow_motion.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
         ),
     )
 
@@ -1232,9 +1437,15 @@ object CameraCatalog {
 
     private fun photoMegapixels(variant: GalaxyDeviceVariant): List<String> = when (variant) {
         GalaxyDeviceVariant.S26,
-        GalaxyDeviceVariant.S26Plus -> listOf("12MP", "24MP", "50MP")
-        GalaxyDeviceVariant.S26Ultra -> listOf("12MP", "24MP", "50MP", "200MP")
+        GalaxyDeviceVariant.S26Plus -> listOf("12MP", "50MP")
+        GalaxyDeviceVariant.S26Ultra -> listOf("12MP", "50MP", "200MP")
     }
+
+    private fun timerOptions(): List<String> = listOf("Off", "2s", "5s", "10s")
+
+    private fun photoAspectRatios(): List<String> = listOf("4:3", "16:9", "1:1", "Full")
+
+    private fun videoAspectRatios(): List<String> = listOf("16:9", "1:1", "Full")
 
     private fun videoFrameRates(_variant: GalaxyDeviceVariant): List<String> =
         listOf(24, 25, 30, 48, 50, 60, 90, 100, 120, 240).map { "${it}fps" }

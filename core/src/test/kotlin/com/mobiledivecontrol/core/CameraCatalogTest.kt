@@ -14,19 +14,16 @@ class CameraCatalogTest {
             listOf(
                 "Track Heading",
                 "Photo",
-                "Expert RAW",
-                "Pro",
-                "Panorama",
-                "Night",
-                "Burst",
-                "Single Take",
-                "Hyperlapse",
+                "Portrait",
                 "Video",
+                "Pro",
+                "Food",
+                "Night",
+                "Panorama",
                 "Pro Video",
-                "Portrait Video",
+                "Hyperlapse",
                 "Slow Motion",
-                "Dual Record",
-                "Night Video",
+                "Portrait Video",
                 "Diagnostics",
             ),
             labels,
@@ -44,12 +41,16 @@ class CameraCatalogTest {
         assertContains(settings, "photo.flash")
         assertContains(settings, "photo.megapixels")
         assertContains(settings, "photo.save_format")
+        assertContains(settings, "photo.aspect_ratio")
+        assertContains(settings, "photo.timer")
+        assertContains(settings, "photo.motion_photo")
         assertContains(settings, "photo.lens")
         assertContains(settings, "photo.manual_focus")
         assertContains(settings, "photo.focus_peaking")
         assertContains(settings, "photo.exposure_compensation")
-        assertContains(settings, "photo.hdr_log")
         assertContains(settings, "photo.filters")
+        assertContains(settings, "photo.grid")
+        assertTrue("photo.hdr_log" !in settings)
     }
 
     @Test
@@ -173,6 +174,99 @@ class CameraCatalogTest {
     }
 
     @Test
+    fun `installed Samsung modes expose their native quick controls`() {
+        fun ids(mode: CameraModeId) =
+            CameraCatalog.settingsFor(mode, GalaxyDeviceVariant.S26Ultra).map { it.id }.toSet()
+
+        listOf(
+            "portrait.timer",
+            "portrait.aspect_ratio",
+            "portrait.exposure",
+            "portrait.background_effect",
+            "portrait.effect_strength",
+            "portrait.beauty",
+            "portrait.lighting",
+        ).forEach { assertContains(ids(CameraModeId.Portrait), it) }
+
+        listOf(
+            "food.color_temperature",
+            "food.radial_blur",
+            "food.exposure",
+            "food.aspect_ratio",
+        ).forEach { assertContains(ids(CameraModeId.Food), it) }
+
+        listOf(
+            "night.timer",
+            "night.aspect_ratio",
+            "night.exposure",
+            "night.capture_time",
+        ).forEach { assertContains(ids(CameraModeId.Night), it) }
+        assertTrue("night.flash" !in ids(CameraModeId.Night))
+        assertTrue("night.megapixels" !in ids(CameraModeId.Night))
+
+        listOf(
+            "panorama.direction",
+            "panorama.exposure",
+        ).forEach { assertContains(ids(CameraModeId.Panorama), it) }
+
+        listOf(
+            "hyperlapse.flash",
+            "hyperlapse.resolution",
+            "hyperlapse.exposure",
+            "hyperlapse.recording_time",
+            "hyperlapse.speed",
+            "hyperlapse.night_mode",
+        ).forEach { assertContains(ids(CameraModeId.Hyperlapse), it) }
+        assertTrue("hyperlapse.frame_rate" !in ids(CameraModeId.Hyperlapse))
+
+        listOf(
+            "video.resolution",
+            "video.frame_rate",
+            "video.aspect_ratio",
+            "video.exposure",
+            "video.auto_fps",
+            "video.video_format",
+            "video.video_stabilization",
+            "video.super_steady",
+            "video.hdr",
+            "video.log",
+            "video.audio_recording",
+        ).forEach { assertContains(ids(CameraModeId.Video), it) }
+        assertTrue("video.megapixels" !in ids(CameraModeId.Video))
+        assertTrue("video.motion_photo" !in ids(CameraModeId.Video))
+
+        listOf(
+            "portrait_video.resolution",
+            "portrait_video.frame_rate",
+            "portrait_video.exposure",
+            "portrait_video.background_effect",
+            "portrait_video.effect_strength",
+        ).forEach { assertContains(ids(CameraModeId.PortraitVideo), it) }
+
+        listOf(
+            "slow_motion.resolution",
+            "slow_motion.frame_rate",
+            "slow_motion.flash",
+            "slow_motion.exposure",
+        ).forEach { assertContains(ids(CameraModeId.SlowMotion), it) }
+        assertTrue("slow_motion.microphone" !in ids(CameraModeId.SlowMotion))
+    }
+
+    @Test
+    fun `detected lenses never widen a mode beyond Samsungs supported lens subset`() {
+        val detected = listOf("Auto", "0.6x", "1x", "2x", "3x", "5x", "front")
+        fun lenses(mode: CameraModeId) = CameraCatalog.settingsFor(mode, GalaxyDeviceVariant.S26Ultra, detected)
+            .first { it.id.endsWith(".lens") }
+            .options
+
+        assertEquals(listOf("1x", "2x", "3x"), lenses(CameraModeId.Portrait))
+        assertEquals(listOf("1x", "2x", "3x"), lenses(CameraModeId.Food))
+        assertEquals(listOf("0.6x", "1x"), lenses(CameraModeId.Panorama))
+        assertEquals(listOf("1x", "2x"), lenses(CameraModeId.PortraitVideo))
+        assertEquals(listOf("0.6x", "1x", "3x"), lenses(CameraModeId.SlowMotion))
+    }
+
+    @Test
     fun `pro options contain only controls absent from the horizontal spine`() {
         val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo)
         val horizontalIds = CameraCatalog.settingsBarItems(camera)
@@ -224,7 +318,7 @@ class CameraCatalogTest {
 
         val pro = CameraCatalog.launchCameraState(CameraModeId.Pro).copy(capabilities = caps)
         assertEquals(
-            listOf("JPEG"),
+            listOf("JPEG", "RAW + JPEG"),
             CameraCatalog.settingsFor(pro).first { it.id == "pro.save_format" }.options,
         )
     }

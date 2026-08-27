@@ -469,8 +469,7 @@ class ControlCoreTest {
 
         // Force mode to Pro and open settings panel
         core.forceMode(AppMode.CameraLive)
-        core.dispatch(CameraCommand.NavigateDown) // Photo -> Expert RAW
-        core.dispatch(CameraCommand.NavigateDown) // Expert RAW -> Pro
+        repeat(3) { core.dispatch(CameraCommand.NavigateDown) } // Photo -> Portrait -> Video -> Pro
         val modeOutcome = core.dispatch(CameraCommand.Confirm)
         assertEquals(CameraModeId.Pro, modeOutcome.state.camera.activeMode)
         assertEquals(CameraUiZone.SettingsPanel, modeOutcome.state.camera.focusedZone)
@@ -584,8 +583,7 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
 
         core.forceMode(AppMode.CameraLive)
-        core.dispatch(CameraCommand.NavigateDown) // Photo -> Expert RAW
-        core.dispatch(CameraCommand.NavigateDown) // Expert RAW -> Pro
+        repeat(3) { core.dispatch(CameraCommand.NavigateDown) } // Photo -> Portrait -> Video -> Pro
         val modeOutcome = core.dispatch(CameraCommand.Confirm)
         assertEquals(CameraModeId.Pro, modeOutcome.state.camera.activeMode)
         assertEquals(CameraUiZone.SettingsPanel, modeOutcome.state.camera.focusedZone)
@@ -632,8 +630,7 @@ class ControlCoreTest {
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
         core.forceMode(AppMode.CameraLive)
-        core.dispatch(CameraCommand.NavigateDown)
-        core.dispatch(CameraCommand.NavigateDown)
+        repeat(3) { core.dispatch(CameraCommand.NavigateDown) }
         core.dispatch(CameraCommand.Confirm) // Pro mode, settings panel
         core.updateMeteredExposure(MeteredExposure(iso = 137, shutterNs = 5_000_000L, wbKelvin = 5_649))
 
@@ -649,8 +646,7 @@ class ControlCoreTest {
         blind.advanceBle(BleSignal.Ready)
         blind.updatePermission(PermissionKind.Camera, true)
         blind.forceMode(AppMode.CameraLive)
-        blind.dispatch(CameraCommand.NavigateDown)
-        blind.dispatch(CameraCommand.NavigateDown)
+        repeat(3) { blind.dispatch(CameraCommand.NavigateDown) }
         blind.dispatch(CameraCommand.Confirm)
         val stepped = blind.dispatch(CameraCommand.NudgeSetting("pro.iso", +1))
         assertEquals("50", stepped.state.camera.settingValues["pro.iso"])
@@ -668,8 +664,7 @@ class ControlCoreTest {
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
         core.forceMode(AppMode.CameraLive)
-        core.dispatch(CameraCommand.NavigateDown)
-        core.dispatch(CameraCommand.NavigateDown)
+        repeat(3) { core.dispatch(CameraCommand.NavigateDown) }
         core.dispatch(CameraCommand.Confirm) // Pro mode
 
         // EV is live while everything is Auto...
