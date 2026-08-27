@@ -1,446 +1,529 @@
 {
-  ".claude/settings.local.json": {
-    "mtime": 1785895888.7865884,
-    "ast_hash": "73c482470480df15b1ceb70dc062fe34",
-    "semantic_hash": "73c482470480df15b1ceb70dc062fe34"
-  },
   "app/build.gradle.kts": {
-    "mtime": 1786216652.3644958,
-    "ast_hash": "edda29407357d58247455fdc24b19578",
-    "semantic_hash": "edda29407357d58247455fdc24b19578"
+    "mtime": 1787515864.0,
+    "seen": 1787849166.6130507,
+    "ast_hash": "03dd55ed3d795437158422ec2c88421b",
+    "semantic_hash": "03dd55ed3d795437158422ec2c88421b"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/DiveControlApp.kt": {
-    "mtime": 1785940928.6036077,
+    "mtime": 1785940930.0,
+    "seen": 1787849166.6130662,
     "ast_hash": "7c205a697eba5326ed3bd1ba1dd64b81",
     "semantic_hash": "7c205a697eba5326ed3bd1ba1dd64b81"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/MainActivity.kt": {
-    "mtime": 1786281256.7412534,
-    "ast_hash": "49657ba7aca5c7c3262a54a5027ff050",
-    "semantic_hash": "49657ba7aca5c7c3262a54a5027ff050"
+    "mtime": 1787516744.0,
+    "seen": 1787849166.613073,
+    "ast_hash": "f5c8a3d54c6b8709577b5742e0cd1c04",
+    "semantic_hash": "f5c8a3d54c6b8709577b5742e0cd1c04"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/GalleryRepository.kt": {
-    "mtime": 1779929376.058202,
-    "ast_hash": "bc49158f1feb44b9edb89186338375b9",
-    "semantic_hash": "bc49158f1feb44b9edb89186338375b9"
+    "mtime": 1787596146.0,
+    "seen": 1787849166.613083,
+    "ast_hash": "f0413e5019568b0b1d59291ce8b6890f",
+    "semantic_hash": "f0413e5019568b0b1d59291ce8b6890f"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/PhoneBatteryMonitor.kt": {
-    "mtime": 1785901588.185218,
+    "mtime": 1785901590.0,
+    "seen": 1787849166.6130903,
     "ast_hash": "2fe96000c0c5516f4226cbf46a09f2f3",
     "semantic_hash": "2fe96000c0c5516f4226cbf46a09f2f3"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/VacuumStore.kt": {
-    "mtime": 1786045131.976941,
+    "mtime": 1786045132.0,
+    "seen": 1787849166.6130939,
     "ast_hash": "f7a0dd75cf8a68dad31bed3c3d31ec98",
     "semantic_hash": "f7a0dd75cf8a68dad31bed3c3d31ec98"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/AndroidBleTransport.kt": {
-    "mtime": 1787466604.6948287,
+    "mtime": 1787466606.0,
+    "seen": 1787849166.6130974,
     "ast_hash": "60916a675d6633749417b39e970112c4",
     "semantic_hash": "60916a675d6633749417b39e970112c4"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/BlePermissions.kt": {
-    "mtime": 1785894245.7033162,
+    "mtime": 1785894246.0,
+    "seen": 1787849166.6131005,
     "ast_hash": "423b874816c23f11ad83cdd2d1efb8eb",
     "semantic_hash": "423b874816c23f11ad83cdd2d1efb8eb"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/GattQueue.kt": {
-    "mtime": 1785894840.8381002,
+    "mtime": 1785894842.0,
+    "seen": 1787849166.6131036,
     "ast_hash": "09160c88379a68bf783fa74001a9d875",
     "semantic_hash": "09160c88379a68bf783fa74001a9d875"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingFeatureFlags.kt": {
-    "mtime": 1785901909.005011,
+    "mtime": 1785901910.0,
+    "seen": 1787849166.613107,
     "ast_hash": "ef536504ec99eda77ae3462227a31fce",
     "semantic_hash": "ef536504ec99eda77ae3462227a31fce"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingLink.kt": {
-    "mtime": 1785949197.5556178,
+    "mtime": 1785949198.0,
+    "seen": 1787849166.6131103,
     "ast_hash": "7779e14455f09578de5f8ab5920e36d7",
     "semantic_hash": "7779e14455f09578de5f8ab5920e36d7"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingStore.kt": {
-    "mtime": 1785894268.0632045,
+    "mtime": 1785894270.0,
+    "seen": 1787849166.6131136,
     "ast_hash": "de8c94c0e547a4d9bf547293c395fd0d",
     "semantic_hash": "de8c94c0e547a4d9bf547293c395fd0d"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingTransport.kt": {
-    "mtime": 1785893859.29247,
+    "mtime": 1785893860.0,
+    "seen": 1787849166.6131165,
     "ast_hash": "79c4b67e95ef6ae6ba97e81c900441a6",
     "semantic_hash": "79c4b67e95ef6ae6ba97e81c900441a6"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/platform/ble/HousingUuidResolver.kt": {
-    "mtime": 1785894796.0515144,
+    "mtime": 1785894798.0,
+    "seen": 1787849166.6131196,
     "ast_hash": "b4107730a97e455946a884bfa5c59037",
     "semantic_hash": "b4107730a97e455946a884bfa5c59037"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/service/HousingLinkService.kt": {
-    "mtime": 1785894904.7716343,
+    "mtime": 1785894906.0,
+    "seen": 1787849166.6131225,
     "ast_hash": "b57f013438cc9e2792ec4287ec84b4eb",
     "semantic_hash": "b57f013438cc9e2792ec4287ec84b4eb"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/theme/DiveColors.kt": {
-    "mtime": 1779815450.6472948,
-    "ast_hash": "d89ecb94562817c5e5a28d563e8c6d4f",
-    "semantic_hash": "d89ecb94562817c5e5a28d563e8c6d4f"
+    "mtime": 1787519314.0,
+    "seen": 1787849166.6131258,
+    "ast_hash": "d096e21db26c83d4b0fbfbb6594c2cc6",
+    "semantic_hash": "d096e21db26c83d4b0fbfbb6594c2cc6"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/theme/DiveTheme.kt": {
-    "mtime": 1779811854.8296025,
+    "mtime": 1779811856.0,
+    "seen": 1787849166.6131291,
     "ast_hash": "3bbd7cb64b2299b510938073b6b2a803",
     "semantic_hash": "3bbd7cb64b2299b510938073b6b2a803"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/CameraHudOverlay.kt": {
-    "mtime": 1786140395.8170493,
-    "ast_hash": "abb7b3e738922d2535f4cf7e64acc293",
-    "semantic_hash": "abb7b3e738922d2535f4cf7e64acc293"
+    "mtime": 1787590400.0,
+    "seen": 1787849166.6131322,
+    "ast_hash": "ee8f8dc8e1cecfa6dd4a2812d624dd46",
+    "semantic_hash": "ee8f8dc8e1cecfa6dd4a2812d624dd46"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/DebugSimulationPanel.kt": {
-    "mtime": 1786118136.4542885,
+    "mtime": 1786118138.0,
+    "seen": 1787849166.6131353,
     "ast_hash": "6851acec5b9519a9861437156865641e",
     "semantic_hash": "6851acec5b9519a9861437156865641e"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/DiveControlScreen.kt": {
-    "mtime": 1786281254.3906677,
-    "ast_hash": "6c00113a113825d11cf1f503aecf582c",
-    "semantic_hash": "6c00113a113825d11cf1f503aecf582c"
+    "mtime": 1787587252.0,
+    "seen": 1787849166.6131387,
+    "ast_hash": "272ac348f722cf99c86b8d5f713c5c32",
+    "semantic_hash": "272ac348f722cf99c86b8d5f713c5c32"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraPreview.kt": {
-    "mtime": 1779919434.1722887,
+    "mtime": 1779919436.0,
+    "seen": 1787849166.6131449,
     "ast_hash": "e484fb69be132b76e2ed6c0992fd77c3",
     "semantic_hash": "e484fb69be132b76e2ed6c0992fd77c3"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt": {
-    "mtime": 1786305760.159155,
-    "ast_hash": "50c1d441179f4f55e94b6d4687229bf4",
-    "semantic_hash": "50c1d441179f4f55e94b6d4687229bf4"
+    "mtime": 1787594164.0,
+    "seen": 1787849166.613148,
+    "ast_hash": "b7dbc7ec75c905499129583e7bf8ac13",
+    "semantic_hash": "b7dbc7ec75c905499129583e7bf8ac13"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraShellScreen.kt": {
-    "mtime": 1786303251.123269,
-    "ast_hash": "74dc84610961a58a650c6d65e67bebb3",
-    "semantic_hash": "74dc84610961a58a650c6d65e67bebb3"
+    "mtime": 1787596332.0,
+    "seen": 1787849166.613151,
+    "ast_hash": "463103f12e542a03ffe63c29964ab103",
+    "semantic_hash": "463103f12e542a03ffe63c29964ab103"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/FocusPeakingSurfaceProcessor.kt": {
-    "mtime": 1786215824.7331474,
-    "ast_hash": "7f9efb77a7dce18fb4922a7af97f97d5",
-    "semantic_hash": "7f9efb77a7dce18fb4922a7af97f97d5"
+    "mtime": 1787586790.0,
+    "seen": 1787849166.6131577,
+    "ast_hash": "3e3896ef491781b59d0fc92f9383e1f8",
+    "semantic_hash": "3e3896ef491781b59d0fc92f9383e1f8"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/RecordingClock.kt": {
-    "mtime": 1786053885.1683483,
-    "ast_hash": "468fe9b834640851aeb7dee976334b30",
-    "semantic_hash": "468fe9b834640851aeb7dee976334b30"
+    "mtime": 1787507108.0,
+    "seen": 1787849166.613184,
+    "ast_hash": "d9108789ff6d131f3dd961fbbe966547",
+    "semantic_hash": "d9108789ff6d131f3dd961fbbe966547"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/StateDrivenCameraPreview.kt": {
-    "mtime": 1786281192.6967235,
-    "ast_hash": "64430a8debbc81aafe806ac7beb88ce4",
-    "semantic_hash": "64430a8debbc81aafe806ac7beb88ce4"
+    "mtime": 1787587252.0,
+    "seen": 1787849166.613192,
+    "ast_hash": "0a0936043f63a835da8e6c76e04f66f8",
+    "semantic_hash": "0a0936043f63a835da8e6c76e04f66f8"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/AutoShrinkText.kt": {
-    "mtime": 1786025807.0253327,
+    "mtime": 1786025808.0,
+    "seen": 1787849166.6132047,
     "ast_hash": "7958e37c779e19b2646e32d89e5677ae",
     "semantic_hash": "7958e37c779e19b2646e32d89e5677ae"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/BatteryIndicator.kt": {
-    "mtime": 1785901609.720062,
+    "mtime": 1785901610.0,
+    "seen": 1787849166.613208,
     "ast_hash": "360ac9d688b7e34ae9e4b8bcfd4f325e",
     "semantic_hash": "360ac9d688b7e34ae9e4b8bcfd4f325e"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/ConnectionStatus.kt": {
-    "mtime": 1779815817.0904284,
+    "mtime": 1779815818.0,
+    "seen": 1787849166.613211,
     "ast_hash": "6a1518e1e9f6323ae0f224bc581c07e2",
     "semantic_hash": "6a1518e1e9f6323ae0f224bc581c07e2"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/DepthGauge.kt": {
-    "mtime": 1785973605.2697537,
-    "ast_hash": "870ba214ad51537c2248d328b3bae01f",
-    "semantic_hash": "870ba214ad51537c2248d328b3bae01f"
+    "mtime": 1787525116.0,
+    "seen": 1787849166.6132143,
+    "ast_hash": "76043d9c34b8134ad3d6b6923ad9e691",
+    "semantic_hash": "76043d9c34b8134ad3d6b6923ad9e691"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/HousingLinkBanner.kt": {
-    "mtime": 1786140375.429282,
-    "ast_hash": "1c033c64ce081ce0fed973bb465f28bd",
-    "semantic_hash": "1c033c64ce081ce0fed973bb465f28bd"
+    "mtime": 1787515694.0,
+    "seen": 1787849166.6132176,
+    "ast_hash": "ed951c929dcf380890d3ae55262b3ded",
+    "semantic_hash": "ed951c929dcf380890d3ae55262b3ded"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/ModeIndicator.kt": {
-    "mtime": 1779929364.3645072,
+    "mtime": 1779929366.0,
+    "seen": 1787849166.6132207,
     "ast_hash": "b5096514bb58d5c576d5a6755968276d",
     "semantic_hash": "b5096514bb58d5c576d5a6755968276d"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/SealCheckIndicator.kt": {
-    "mtime": 1786045794.8095124,
-    "ast_hash": "e6c65dc973c4a01c324afdb8fe60a101",
-    "semantic_hash": "e6c65dc973c4a01c324afdb8fe60a101"
+    "mtime": 1787517474.0,
+    "seen": 1787849166.613224,
+    "ast_hash": "a0227b0cebdae9b3d7c0c9962504d0b1",
+    "semantic_hash": "a0227b0cebdae9b3d7c0c9962504d0b1"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/SealStatusBadge.kt": {
-    "mtime": 1779815352.17399,
+    "mtime": 1779815354.0,
+    "seen": 1787849166.613227,
     "ast_hash": "83f7fcd9f1888fa3113a367dac8865eb",
     "semantic_hash": "83f7fcd9f1888fa3113a367dac8865eb"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/TemperatureDisplay.kt": {
-    "mtime": 1779815303.2514083,
+    "mtime": 1779815304.0,
+    "seen": 1787849166.61323,
     "ast_hash": "c181e06fe3c324fb4c382cc536e2efeb",
     "semantic_hash": "c181e06fe3c324fb4c382cc536e2efeb"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/components/VacuumTimerIndicator.kt": {
-    "mtime": 1779815381.6494474,
+    "mtime": 1779815382.0,
+    "seen": 1787849166.6132329,
     "ast_hash": "a96e18b199fe4fe6d0fc126a97964282",
     "semantic_hash": "a96e18b199fe4fe6d0fc126a97964282"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/diagnostics/DiagnosticsScreen.kt": {
-    "mtime": 1779812115.499259,
+    "mtime": 1779812116.0,
+    "seen": 1787849166.613236,
     "ast_hash": "01e0e4c853d7bd7a2659400042b328a0",
     "semantic_hash": "01e0e4c853d7bd7a2659400042b328a0"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/gallery/GalleryScreen.kt": {
-    "mtime": 1779935482.0822988,
-    "ast_hash": "c8bce38c555a624450cf32c6982f7dbc",
-    "semantic_hash": "c8bce38c555a624450cf32c6982f7dbc"
+    "mtime": 1787514674.0,
+    "seen": 1787849166.613239,
+    "ast_hash": "5052d98c97da14b29330b654217786c2",
+    "semantic_hash": "5052d98c97da14b29330b654217786c2"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/safety/SafetyScreen.kt": {
-    "mtime": 1779815624.9440475,
+    "mtime": 1779815626.0,
+    "seen": 1787849166.6132421,
     "ast_hash": "67c76568da82be8b339e7f2e688179ca",
     "semantic_hash": "67c76568da82be8b339e7f2e688179ca"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/tutorial/ButtonTutorialScreen.kt": {
-    "mtime": 1786050489.1625886,
+    "mtime": 1786050490.0,
+    "seen": 1787849166.613245,
     "ast_hash": "3b1868d57478c3170fa05291ab477994",
     "semantic_hash": "3b1868d57478c3170fa05291ab477994"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/tutorial/HousingDiagram.kt": {
-    "mtime": 1786050122.9860098,
+    "mtime": 1786050124.0,
+    "seen": 1787849166.613248,
     "ast_hash": "89fc11cb20735cd70f1731f0ed522ec7",
     "semantic_hash": "89fc11cb20735cd70f1731f0ed522ec7"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/ui/tutorial/HousingPlates.kt": {
-    "mtime": 1785923920.4052792,
+    "mtime": 1785923922.0,
+    "seen": 1787849166.6132507,
     "ast_hash": "03676504fa731e72aa69ed256ed76d5b",
     "semantic_hash": "03676504fa731e72aa69ed256ed76d5b"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/viewmodel/CameraSessionStore.kt": {
-    "mtime": 1786283377.017524,
-    "ast_hash": "dfaccad55a5201deb8dba3464a46fe15",
-    "semantic_hash": "dfaccad55a5201deb8dba3464a46fe15"
+    "mtime": 1787470340.0,
+    "seen": 1787849166.6132538,
+    "ast_hash": "e7fa0fcf7927d3e8310cdfc79d32539d",
+    "semantic_hash": "e7fa0fcf7927d3e8310cdfc79d32539d"
   },
   "app/src/main/kotlin/com/mobiledivecontrol/viewmodel/DiveViewModel.kt": {
-    "mtime": 1786283360.6918519,
-    "ast_hash": "3b9c9c76fe717e94dc6e7bc77a1ac4e1",
-    "semantic_hash": "3b9c9c76fe717e94dc6e7bc77a1ac4e1"
+    "mtime": 1787523560.0,
+    "seen": 1787849166.6132572,
+    "ast_hash": "c8773ab37cdf8dcc94d8fd871b42e424",
+    "semantic_hash": "c8773ab37cdf8dcc94d8fd871b42e424"
   },
   "app/src/test/kotlin/com/mobiledivecontrol/platform/ble/HousingUuidResolverTest.kt": {
-    "mtime": 1785894805.183149,
+    "mtime": 1785894806.0,
+    "seen": 1787849166.6132638,
     "ast_hash": "f28e60db4711a69bd37e4edb90d685c3",
     "semantic_hash": "f28e60db4711a69bd37e4edb90d685c3"
   },
   "app/src/test/kotlin/com/mobiledivecontrol/viewmodel/FocusLadderMigrationTest.kt": {
-    "mtime": 1786196927.9901574,
+    "mtime": 1786196928.0,
+    "seen": 1787849166.6132903,
     "ast_hash": "d20cfbe7a30474304ec16d57863f8d47",
     "semantic_hash": "d20cfbe7a30474304ec16d57863f8d47"
   },
   "app/src/test/kotlin/com/mobiledivecontrol/viewmodel/ScaleLadderMigrationTest.kt": {
-    "mtime": 1786303735.3935685,
-    "ast_hash": "3365ddc94666aba0c0d9465e5a9e9576",
-    "semantic_hash": "3365ddc94666aba0c0d9465e5a9e9576"
+    "mtime": 1787470610.0,
+    "seen": 1787849166.6132934,
+    "ast_hash": "cb19283f9dee24ead78333f5e818d7cd",
+    "semantic_hash": "cb19283f9dee24ead78333f5e818d7cd"
   },
   "build.gradle.kts": {
-    "mtime": 1779811765.8302116,
+    "mtime": 1779811766.0,
+    "seen": 1787849166.6132963,
     "ast_hash": "f2207d547d65f957113ee2af36843005",
     "semantic_hash": "f2207d547d65f957113ee2af36843005"
   },
   "core/build.gradle.kts": {
-    "mtime": 1779893382.8697925,
+    "mtime": 1779893384.0,
+    "seen": 1787849166.6132994,
     "ast_hash": "4a671873cc51bf8b89227271fa388460",
     "semantic_hash": "4a671873cc51bf8b89227271fa388460"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/app/Main.kt": {
-    "mtime": 1779794608.271585,
+    "mtime": 1779794610.0,
+    "seen": 1787849166.6133025,
     "ast_hash": "9ed1453a8eb7ca600f214fdaa69ca826",
     "semantic_hash": "9ed1453a8eb7ca600f214fdaa69ca826"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/app/ScenarioScriptRunner.kt": {
-    "mtime": 1779820074.3194914,
+    "mtime": 1779820076.0,
+    "seen": 1787849166.6133056,
     "ast_hash": "6b016d25c975e77b4fe86413cc0e3445",
     "semantic_hash": "6b016d25c975e77b4fe86413cc0e3445"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/BleConnectionMachine.kt": {
-    "mtime": 1779800707.4477506,
+    "mtime": 1779800708.0,
+    "seen": 1787849166.6133115,
     "ast_hash": "987998e460deb8b5412cab60a10a32ac",
     "semantic_hash": "987998e460deb8b5412cab60a10a32ac"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/BleTransport.kt": {
-    "mtime": 1779800752.800737,
+    "mtime": 1779800754.0,
+    "seen": 1787849166.6133146,
     "ast_hash": "6dcc72c22e595a13d7ce685b332ba5d6",
     "semantic_hash": "6dcc72c22e595a13d7ce685b332ba5d6"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/BleTransportOrchestrator.kt": {
-    "mtime": 1779801039.4043117,
+    "mtime": 1779801040.0,
+    "seen": 1787849166.6133175,
     "ast_hash": "4fe03e97ac30f7645c3209c2dc7fe43d",
     "semantic_hash": "4fe03e97ac30f7645c3209c2dc7fe43d"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/ButtonEventNormalizer.kt": {
-    "mtime": 1786059763.6557393,
+    "mtime": 1786059764.0,
+    "seen": 1787849166.6133204,
     "ast_hash": "89a24f68935e11fc07ccd711fde72ba6",
     "semantic_hash": "89a24f68935e11fc07ccd711fde72ba6"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/CameraCatalog.kt": {
-    "mtime": 1786303140.4292657,
-    "ast_hash": "69d1d46ee6f33b4350d0fa8664659edf",
-    "semantic_hash": "69d1d46ee6f33b4350d0fa8664659edf"
+    "mtime": 1787594578.0,
+    "seen": 1787849166.6133235,
+    "ast_hash": "888abf8c294e4d0b50c77502646b2f96",
+    "semantic_hash": "888abf8c294e4d0b50c77502646b2f96"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt": {
-    "mtime": 1786280477.8010528,
-    "ast_hash": "2c62b0f0937302f9e41abf0fe259a5fe",
-    "semantic_hash": "2c62b0f0937302f9e41abf0fe259a5fe"
+    "mtime": 1787596144.0,
+    "seen": 1787849166.613327,
+    "ast_hash": "6c9d7a4bba902a579d4628f9adae6889",
+    "semantic_hash": "6c9d7a4bba902a579d4628f9adae6889"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/ControlCore.kt": {
-    "mtime": 1786283353.9331336,
+    "mtime": 1786283354.0,
+    "seen": 1787849166.6133304,
     "ast_hash": "0fc062750c164acfb46180c2003f3425",
     "semantic_hash": "0fc062750c164acfb46180c2003f3425"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/ControlReducer.kt": {
-    "mtime": 1786303946.506516,
-    "ast_hash": "a017c8634548ebd0fea0d3dffc163b93",
-    "semantic_hash": "a017c8634548ebd0fea0d3dffc163b93"
+    "mtime": 1787596356.0,
+    "seen": 1787849166.6133337,
+    "ast_hash": "ff568c59ae71dc0ca383f6129dd46a52",
+    "semantic_hash": "ff568c59ae71dc0ca383f6129dd46a52"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/DiagnosticsStore.kt": {
-    "mtime": 1779820065.6628828,
+    "mtime": 1779820066.0,
+    "seen": 1787849166.6133368,
     "ast_hash": "66a4c2f83b210f33a090466214599450",
     "semantic_hash": "66a4c2f83b210f33a090466214599450"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/HexEncoding.kt": {
-    "mtime": 1779798556.6092756,
+    "mtime": 1779798558.0,
+    "seen": 1787849166.613354,
     "ast_hash": "f04b6ec13cdea1012ee03dafa47a96da",
     "semantic_hash": "f04b6ec13cdea1012ee03dafa47a96da"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/HousingBleProfile.kt": {
-    "mtime": 1785898125.8727262,
+    "mtime": 1785898126.0,
+    "seen": 1787849166.613357,
     "ast_hash": "64328d338bd2658396f782692ee05e3e",
     "semantic_hash": "64328d338bd2658396f782692ee05e3e"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/HousingCommandEncoder.kt": {
-    "mtime": 1779798944.8987448,
+    "mtime": 1779798946.0,
+    "seen": 1787849166.6133602,
     "ast_hash": "51fef0bf96b9182701c3d63e826217a5",
     "semantic_hash": "51fef0bf96b9182701c3d63e826217a5"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/HousingIdentityVerifier.kt": {
-    "mtime": 1785898139.5030205,
+    "mtime": 1785898140.0,
+    "seen": 1787849166.6133633,
     "ast_hash": "a1c007fa9f02d376faec101a0c63f336",
     "semantic_hash": "a1c007fa9f02d376faec101a0c63f336"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/HousingProtocolAdapter.kt": {
-    "mtime": 1779798614.8634214,
+    "mtime": 1779798616.0,
+    "seen": 1787849166.6133664,
     "ast_hash": "2a3343c7e191835fc4230d5d0477a1ed",
     "semantic_hash": "2a3343c7e191835fc4230d5d0477a1ed"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/InputRouter.kt": {
-    "mtime": 1786052858.5677776,
-    "ast_hash": "e6cb859617620e06fb47bc7b39989004",
-    "semantic_hash": "e6cb859617620e06fb47bc7b39989004"
+    "mtime": 1787506594.0,
+    "seen": 1787849166.6133692,
+    "ast_hash": "7f6154bb2316c5c3cb0d9374f3db09a5",
+    "semantic_hash": "7f6154bb2316c5c3cb0d9374f3db09a5"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/JsonSupport.kt": {
-    "mtime": 1779794152.4972296,
+    "mtime": 1779794154.0,
+    "seen": 1787849166.6133723,
     "ast_hash": "fa68d8dd9954e49da1b79e25cb0e921e",
     "semantic_hash": "fa68d8dd9954e49da1b79e25cb0e921e"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/ProtocolParser.kt": {
-    "mtime": 1779798695.826638,
+    "mtime": 1779798696.0,
+    "seen": 1787849166.6133754,
     "ast_hash": "13d66d0243fd0eb266c7396741ec9f03",
     "semantic_hash": "13d66d0243fd0eb266c7396741ec9f03"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/SafetyStateMachine.kt": {
-    "mtime": 1786045131.9749398,
+    "mtime": 1786045132.0,
+    "seen": 1787849166.6133788,
     "ast_hash": "beb0718cf58c895b45600bb382a78322",
     "semantic_hash": "beb0718cf58c895b45600bb382a78322"
   },
   "core/src/main/kotlin/com/mobiledivecontrol/core/SimulatedBleTransport.kt": {
-    "mtime": 1779800855.9557276,
+    "mtime": 1779800856.0,
+    "seen": 1787849166.6133852,
     "ast_hash": "329cedabf3b64b6d1b6a5e46cbaecdd7",
     "semantic_hash": "329cedabf3b64b6d1b6a5e46cbaecdd7"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/BleConnectionMachineTest.kt": {
-    "mtime": 1779795118.3178978,
+    "mtime": 1779795120.0,
+    "seen": 1787849166.6133952,
     "ast_hash": "61842fa1972132b1733e5ac9e6921243",
     "semantic_hash": "61842fa1972132b1733e5ac9e6921243"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/BleTransportOrchestratorTest.kt": {
-    "mtime": 1779801149.7367423,
+    "mtime": 1779801150.0,
+    "seen": 1787849166.613398,
     "ast_hash": "114fea9051052620727bfc4a0ac28920",
     "semantic_hash": "114fea9051052620727bfc4a0ac28920"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/ButtonEventNormalizerTest.kt": {
-    "mtime": 1786059763.6557393,
+    "mtime": 1786059764.0,
+    "seen": 1787849166.6134012,
     "ast_hash": "b918307feb3ada74bbe9e885b3419030",
     "semantic_hash": "b918307feb3ada74bbe9e885b3419030"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/CameraCatalogTest.kt": {
-    "mtime": 1786303388.7522633,
-    "ast_hash": "6b9ae64262c373e906ff96aa0566b3c7",
-    "semantic_hash": "6b9ae64262c373e906ff96aa0566b3c7"
+    "mtime": 1787594534.0,
+    "seen": 1787849166.613403,
+    "ast_hash": "ad19229bd1beea524fbe47a6c17e92ea",
+    "semantic_hash": "ad19229bd1beea524fbe47a6c17e92ea"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/ControlCoreTest.kt": {
-    "mtime": 1786303653.582942,
-    "ast_hash": "d033f34302e0782003e94903b07bf888",
-    "semantic_hash": "d033f34302e0782003e94903b07bf888"
+    "mtime": 1787594536.0,
+    "seen": 1787849166.6134083,
+    "ast_hash": "57460adb9d75af442cce8486266384d9",
+    "semantic_hash": "57460adb9d75af442cce8486266384d9"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/DiagnosticsStoreTest.kt": {
-    "mtime": 1779795118.3178978,
+    "mtime": 1779795120.0,
+    "seen": 1787849166.6134107,
     "ast_hash": "947f59f63766e2044c784f7888786803",
     "semantic_hash": "947f59f63766e2044c784f7888786803"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/HousingCommandEncoderTest.kt": {
-    "mtime": 1779798944.8987448,
+    "mtime": 1779798946.0,
+    "seen": 1787849166.6134202,
     "ast_hash": "c950fe2ecd089a6b00f61c4ee172ec73",
     "semantic_hash": "c950fe2ecd089a6b00f61c4ee172ec73"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/HousingIdentityVerifierTest.kt": {
-    "mtime": 1779801112.4895258,
+    "mtime": 1779801114.0,
+    "seen": 1787849166.6134226,
     "ast_hash": "d7144fe77dde88f3ec2a4fb50011e4a5",
     "semantic_hash": "d7144fe77dde88f3ec2a4fb50011e4a5"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/HousingProtocolAdapterTest.kt": {
-    "mtime": 1779798944.8987448,
+    "mtime": 1779798946.0,
+    "seen": 1787849166.6134248,
     "ast_hash": "448c32417dddd0f496d2f24a3d796e84",
     "semantic_hash": "448c32417dddd0f496d2f24a3d796e84"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/InputRouterTest.kt": {
-    "mtime": 1785968822.9025576,
-    "ast_hash": "004963cfef2a5f7737b629616d9843f5",
-    "semantic_hash": "004963cfef2a5f7737b629616d9843f5"
+    "mtime": 1787507078.0,
+    "seen": 1787849166.6134272,
+    "ast_hash": "d0a0a14c2bb64f66c958e64d8efda659",
+    "semantic_hash": "d0a0a14c2bb64f66c958e64d8efda659"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/ProtocolParserTest.kt": {
-    "mtime": 1779798944.8987448,
+    "mtime": 1779798946.0,
+    "seen": 1787849166.6134295,
     "ast_hash": "9292fd1615d8d402a4d1fe050a2285e3",
     "semantic_hash": "9292fd1615d8d402a4d1fe050a2285e3"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/SafetyStateMachineTest.kt": {
-    "mtime": 1786045595.3708389,
+    "mtime": 1786045596.0,
+    "seen": 1787849166.6134346,
     "ast_hash": "1e533e21084158b4d38ade1df19c6c96",
     "semantic_hash": "1e533e21084158b4d38ade1df19c6c96"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/ValueLadderGearingTest.kt": {
-    "mtime": 1786281567.0410924,
+    "mtime": 1786281568.0,
+    "seen": 1787849166.613442,
     "ast_hash": "ea75039b4f051d9fb1f81c553ded3c30",
     "semantic_hash": "ea75039b4f051d9fb1f81c553ded3c30"
   },
   "core/src/test/kotlin/com/mobiledivecontrol/core/WbAutoGateTest.kt": {
-    "mtime": 1786303950.42417,
-    "ast_hash": "685ebe11e4ab0936eeb43332569a51da",
-    "semantic_hash": "685ebe11e4ab0936eeb43332569a51da"
+    "mtime": 1787531302.0,
+    "seen": 1787849166.6134443,
+    "ast_hash": "3bf143aa20d6e990706eaabad27ab903",
+    "semantic_hash": "3bf143aa20d6e990706eaabad27ab903"
   },
   "gradlew": {
-    "mtime": 1779795719.2036407,
+    "mtime": 1779795720.0,
+    "seen": 1787849166.613447,
     "ast_hash": "794669d78aef1dd5c7d889ef618b311a",
     "semantic_hash": "794669d78aef1dd5c7d889ef618b311a"
   },
   "run-gradle.ps1": {
-    "mtime": 1779796491.73899,
+    "mtime": 1779796492.0,
+    "seen": 1787849166.6134493,
     "ast_hash": "770aac491da91802137a0407a375a385",
     "semantic_hash": "770aac491da91802137a0407a375a385"
   },
   "settings.gradle.kts": {
-    "mtime": 1779812195.4432926,
+    "mtime": 1779812196.0,
+    "seen": 1787849166.6134515,
     "ast_hash": "054ceec57fac7a97485d5551b55d7e37",
     "semantic_hash": "054ceec57fac7a97485d5551b55d7e37"
   },
   "test.ps1": {
-    "mtime": 1779904072.2810166,
+    "mtime": 1779904074.0,
+    "seen": 1787849166.613454,
     "ast_hash": "17c2430f189f59327e5ffa4d5dd31c49",
     "semantic_hash": "17c2430f189f59327e5ffa4d5dd31c49"
   },
@@ -758,5 +841,197 @@
     "mtime": 1779825858.1390936,
     "ast_hash": "8f8773d77b51c2ae977ab73e9c0c8012",
     "semantic_hash": "8f8773d77b51c2ae977ab73e9c0c8012"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/CompassHeadingMonitor.kt": {
+    "mtime": 1787524760.0,
+    "seen": 1787849166.6130779,
+    "ast_hash": "21ec707e2e6fa6b3799ca1f7175daf4e",
+    "semantic_hash": "21ec707e2e6fa6b3799ca1f7175daf4e"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/platform/HeadingStore.kt": {
+    "mtime": 1787515982.0,
+    "seen": 1787849166.6130867,
+    "ast_hash": "2ea2d843003ca94e9ddc1261272f2e85",
+    "semantic_hash": "2ea2d843003ca94e9ddc1261272f2e85"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/Camera2HighSpeedRecorder.kt": {
+    "mtime": 1787593842.0,
+    "seen": 1787849166.6131415,
+    "ast_hash": "e85da760c53232883c3248eed8ec3ab6",
+    "semantic_hash": "e85da760c53232883c3248eed8ec3ab6"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CaptureGuideGeometry.kt": {
+    "mtime": 1787596232.0,
+    "seen": 1787849166.6131544,
+    "ast_hash": "9264cbaa1a130feee9641307d8c01e61",
+    "semantic_hash": "9264cbaa1a130feee9641307d8c01e61"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/LoopingVideoTextureView.kt": {
+    "mtime": 1787496130.0,
+    "seen": 1787849166.6131613,
+    "ast_hash": "766c601a05b6823272b6f8b1ab081f64",
+    "semantic_hash": "766c601a05b6823272b6f8b1ab081f64"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/PointingGestureRecognizer.kt": {
+    "mtime": 1787527040.0,
+    "seen": 1787849166.6131651,
+    "ast_hash": "547b0738f9d90dd72dd7998465fb5f48",
+    "semantic_hash": "547b0738f9d90dd72dd7998465fb5f48"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/RecordingSessionMuxer.kt": {
+    "mtime": 1787584122.0,
+    "seen": 1787849166.613189,
+    "ast_hash": "ec28d75dbf9ff7bc1b5679573b322187",
+    "semantic_hash": "ec28d75dbf9ff7bc1b5679573b322187"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/UnderwaterFrameAnalyzer.kt": {
+    "mtime": 1787538656.0,
+    "seen": 1787849166.6131954,
+    "ast_hash": "177af778847363325e56aa1cd88b8560",
+    "semantic_hash": "177af778847363325e56aa1cd88b8560"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/UnderwaterWhiteBalanceTrace.kt": {
+    "mtime": 1787533698.0,
+    "seen": 1787849166.6131985,
+    "ast_hash": "12656bb17414a65232c6d67f887f2603",
+    "semantic_hash": "12656bb17414a65232c6d67f887f2603"
+  },
+  "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/VideoDynamicRangePolicy.kt": {
+    "mtime": 1787583214.0,
+    "seen": 1787849166.6132016,
+    "ast_hash": "f7d797a0ea27a628c50a2c8a68117e54",
+    "semantic_hash": "f7d797a0ea27a628c50a2c8a68117e54"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/platform/GalleryRepositoryOrderingTest.kt": {
+    "mtime": 1787513448.0,
+    "seen": 1787849166.6132605,
+    "ast_hash": "2b0ced9e8eb9455bef6cc504f9b74d98",
+    "semantic_hash": "2b0ced9e8eb9455bef6cc504f9b74d98"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/ui/CameraHudOverlayLayoutTest.kt": {
+    "mtime": 1787590400.0,
+    "seen": 1787849166.6132672,
+    "ast_hash": "8d8e42e8a2858bdc7196acbce63fff67",
+    "semantic_hash": "8d8e42e8a2858bdc7196acbce63fff67"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/ui/camera/CaptureGuideGeometryTest.kt": {
+    "mtime": 1787596416.0,
+    "seen": 1787849166.613271,
+    "ast_hash": "38c42a474957491e1e545ed789bc71d6",
+    "semantic_hash": "38c42a474957491e1e545ed789bc71d6"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/ui/camera/PointingGestureMathTest.kt": {
+    "mtime": 1787527152.0,
+    "seen": 1787849166.613274,
+    "ast_hash": "fc604acecd4da8068c5c9e3b0fac775e",
+    "semantic_hash": "fc604acecd4da8068c5c9e3b0fac775e"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/ui/camera/UnderwaterFrameAnalyzerTest.kt": {
+    "mtime": 1787538680.0,
+    "seen": 1787849166.6132777,
+    "ast_hash": "c0cb59a5fa7df1e1f1da2e7c8618792f",
+    "semantic_hash": "c0cb59a5fa7df1e1f1da2e7c8618792f"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/ui/camera/UnderwaterWhiteBalanceTraceTest.kt": {
+    "mtime": 1787533628.0,
+    "seen": 1787849166.6132808,
+    "ast_hash": "f33b0d10f1436adb9e4090af4d6bbe3d",
+    "semantic_hash": "f33b0d10f1436adb9e4090af4d6bbe3d"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/ui/camera/VideoDynamicRangePolicyTest.kt": {
+    "mtime": 1787583234.0,
+    "seen": 1787849166.613284,
+    "ast_hash": "f974ece137ee222b89f6e2b2da55a40c",
+    "semantic_hash": "f974ece137ee222b89f6e2b2da55a40c"
+  },
+  "app/src/test/kotlin/com/mobiledivecontrol/ui/components/DepthGaugeColorTest.kt": {
+    "mtime": 1787525116.0,
+    "seen": 1787849166.6132872,
+    "ast_hash": "5ad61369436fc6be4b201de9a69bc220",
+    "semantic_hash": "5ad61369436fc6be4b201de9a69bc220"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/AutofocusHoldPolicy.kt": {
+    "mtime": 1787525810.0,
+    "seen": 1787849166.6133084,
+    "ast_hash": "4c51256bb749f560ae72ffdaa8608c6a",
+    "semantic_hash": "4c51256bb749f560ae72ffdaa8608c6a"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/HeadingMath.kt": {
+    "mtime": 1787525062.0,
+    "seen": 1787849166.6133404,
+    "ast_hash": "aa3736910f4fd12aeecfa16743409b40",
+    "semantic_hash": "aa3736910f4fd12aeecfa16743409b40"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/HeadingStabilizer.kt": {
+    "mtime": 1787520224.0,
+    "seen": 1787849166.6133504,
+    "ast_hash": "1e505974288e0edac318bcc5f7a29803",
+    "semantic_hash": "1e505974288e0edac318bcc5f7a29803"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/SamsungLogProfile.kt": {
+    "mtime": 1787580432.0,
+    "seen": 1787849166.6133819,
+    "ast_hash": "1da41e6c70a45e95676f3671d7e638aa",
+    "semantic_hash": "1da41e6c70a45e95676f3671d7e638aa"
+  },
+  "core/src/main/kotlin/com/mobiledivecontrol/core/UnderwaterWhiteBalance.kt": {
+    "mtime": 1787533524.0,
+    "seen": 1787849166.6133883,
+    "ast_hash": "7c2cdd825d68dbccde1544e03fbf4391",
+    "semantic_hash": "7c2cdd825d68dbccde1544e03fbf4391"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/AutofocusHoldPolicyTest.kt": {
+    "mtime": 1787525810.0,
+    "seen": 1787849166.6133919,
+    "ast_hash": "ebc56ca8231bcf9da40372e36e0c1a3a",
+    "semantic_hash": "ebc56ca8231bcf9da40372e36e0c1a3a"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/CircularScaleTest.kt": {
+    "mtime": 1787470658.0,
+    "seen": 1787849166.6134057,
+    "ast_hash": "206a7c81b5f6eeb41aba58e7a01db007",
+    "semantic_hash": "206a7c81b5f6eeb41aba58e7a01db007"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/GalleryMenuFlowTest.kt": {
+    "mtime": 1787514676.0,
+    "seen": 1787849166.613413,
+    "ast_hash": "ffe658838652266f900a5e5be583838d",
+    "semantic_hash": "ffe658838652266f900a5e5be583838d"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/HeadingMathTest.kt": {
+    "mtime": 1787525064.0,
+    "seen": 1787849166.6134155,
+    "ast_hash": "103eb2fbbb91c154f796428a985c1340",
+    "semantic_hash": "103eb2fbbb91c154f796428a985c1340"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/HeadingStabilizerTest.kt": {
+    "mtime": 1787520226.0,
+    "seen": 1787849166.613418,
+    "ast_hash": "fb373ffdf63d8818c920a935a5cb1328",
+    "semantic_hash": "fb373ffdf63d8818c920a935a5cb1328"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/RecordingReviewFlowTest.kt": {
+    "mtime": 1787596356.0,
+    "seen": 1787849166.6134322,
+    "ast_hash": "93ceb17978e88bd2e49d6f1b303b6de5",
+    "semantic_hash": "93ceb17978e88bd2e49d6f1b303b6de5"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/SamsungLogProfileTest.kt": {
+    "mtime": 1787580434.0,
+    "seen": 1787849166.6134372,
+    "ast_hash": "2fa70ca6c0a162e057fc475017d6e632",
+    "semantic_hash": "2fa70ca6c0a162e057fc475017d6e632"
+  },
+  "core/src/test/kotlin/com/mobiledivecontrol/core/UnderwaterWhiteBalanceTest.kt": {
+    "mtime": 1787533670.0,
+    "seen": 1787849166.6134398,
+    "ast_hash": "b67b53b09509e14b155791ba53abd2c3",
+    "semantic_hash": "b67b53b09509e14b155791ba53abd2c3"
+  },
+  "docs/COLOR_WORKFLOW.md": {
+    "mtime": 1787584718.0,
+    "seen": 1787849166.6134565,
+    "ast_hash": "2744df4a8e6f1e29a9d5f741b34b5f11",
+    "semantic_hash": "2744df4a8e6f1e29a9d5f741b34b5f11"
   }
 }
