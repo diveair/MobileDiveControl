@@ -45,6 +45,7 @@ fun StateDrivenCameraPreview(
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     onPointingGesture: ((PointingGesture) -> Unit)? = null,
+    headingDegrees: Double? = null,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -81,12 +82,14 @@ fun StateDrivenCameraPreview(
         }
     }
 
-    LaunchedEffect(cameraState, safetyState) {
+    LaunchedEffect(cameraState, safetyState, headingDegrees) {
         controller.applyState(
             cameraState = cameraState,
             waterPressureKpa = safetyState.waterPressureKpa,
             atmosphericPressureKpa = safetyState.barometricPressureKpa,
             surfaceAmbientKpa = safetyState.surfaceAmbientKpa,
+            waterTemperatureC = safetyState.waterTemperatureC,
+            headingDegrees = headingDegrees,
         )
     }
 

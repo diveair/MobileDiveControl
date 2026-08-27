@@ -361,9 +361,10 @@ class ControlReducer(
             if (!state.camera.recording || !state.camera.recordingPaused) {
                 Reduction(state = state)
             } else {
-                val selectedIndex = state.camera.recordingSaveLocations
-                    .indexOf(state.camera.recordingSaveLocation)
-                    .coerceAtLeast(0)
+                val selectedIndex = recordingSaveLocationIndex(
+                    state.camera.recordingSaveLocations,
+                    state.camera.recordingSaveLocation,
+                ).coerceAtLeast(0)
                 Reduction(
                     state = state.copy(
                         camera = state.camera.copy(
@@ -383,13 +384,16 @@ class ControlReducer(
             val locations = command.locations
                 .distinctBy { it.relativePath.trimEnd('/').lowercase() }
                 .ifEmpty { listOf(RecordingSaveLocation.Default) }
-            val selectedIndex = locations.indexOf(state.camera.recordingSaveLocation).let { index ->
-                if (index >= 0) index else 0
-            }
+            val selectedIndex = recordingSaveLocationIndex(
+                locations,
+                state.camera.recordingSaveLocation,
+            ).coerceAtLeast(0)
             Reduction(
                 state = state.copy(
                     camera = state.camera.copy(
                         recordingSaveLocations = locations,
+                        // Refresh cover/count metadata while retaining the selected path.
+                        recordingSaveLocation = locations[selectedIndex],
                         recordingSaveLocationIndex = selectedIndex,
                     ),
                 ),
@@ -440,7 +444,7 @@ class ControlReducer(
                             recordingSaveLocationIndex = command.index,
                             recordingLocationChooserVisible = false,
                             recordingSaveConfirmationVisible = false,
-                            recordingLocationFocused = true,
+                            recordingLocationFocused = state.camera.recording && state.camera.recordingPaused,
                         ),
                     ),
                 )
@@ -452,8 +456,14 @@ class ControlReducer(
         CameraCommand.NavigateRight -> navigateCameraRight(state, repeatCount)
         CameraCommand.Confirm -> confirmCameraSelection(state)
         CameraCommand.Back -> backOutCameraUi(state)
-        CameraCommand.ZoomIn -> handleWheel(state, +1, repeatCount)
-        CameraCommand.ZoomOut -> handleWheel(state, -1, repeatCount)
+        CameraCommand.ToggleOptionsMenu -> toggleOptionsMenu(state)
+        is CameraCommand.SelectOptionsItem -> selectOptionsItem(state, command.index)
+        is CameraCommand.AdjustOptionsItem -> {
+            val selected = selectOptionsItem(state, command.index).state
+            adjustSelectedOptionsSetting(selected, command.step)
+        }
+        CameraCommand.ZoomIn -> handleWheel(state, +1)
+        CameraCommand.ZoomOut -> handleWheel(state, -1)
         is CameraCommand.SetZoom -> {
             val zoom = command.value.coerceIn(1.0, state.camera.capabilities?.zoomMaxRatio ?: 8.0)
             Reduction(
@@ -733,8 +743,8 @@ class ControlReducer(
      * always takes the fresh-press path and its gearing. D-pad callers keep their real repeat
      * count, because a held button genuinely is a hold.
      */
-    private fun handleWheel(state: AppState, step: Int, repeatCount: Int): Reduction {
-        @Suppress("NAME_SHADOWING") val repeatCount = 0
+    private fun handleWheel(state: AppState, step: Int): Reduction {
+        val repeatCount = 0
         val camera = state.camera
         if (camera.recording && camera.recordingPaused) {
             return Reduction(state = state)
@@ -751,6 +761,9 @@ class ControlReducer(
                 -step
             }
             return adjustSelectedSetting(state, menuStep, repeatCount)
+        }
+        if (camera.focusedZone == CameraUiZone.SettingsPanel && camera.showMoreSettings) {
+            return adjustSelectedOptionsSetting(state, step)
         }
         if (camera.focusedZone == CameraUiZone.SettingsPanel) {
             val selected = camera.selectedSetting
@@ -792,7 +805,9 @@ class ControlReducer(
             }
             if (verticalStep == 0 && horizontalStep == 0) return Reduction(state = state)
             val count = camera.recordingSaveLocations.size
-            val step = if (verticalStep != 0) verticalStep * RECORDING_LOCATION_GRID_COLUMNS else horizontalStep
+            // The destination chooser is a one-dimensional album rail. Both housing axes move
+            // one album so the highlighted card and the navigation model cannot diverge.
+            val step = if (horizontalStep != 0) horizontalStep else verticalStep
             val next = if (count > 0) {
                 ((camera.recordingSaveLocationIndex + step) % count + count) % count
             } else {
@@ -846,7 +861,9 @@ class ControlReducer(
                 Reduction(state = state.copy(camera = nextCamera))
             }
             CameraUiZone.SettingsPanel -> {
-                if (camera.settingsEditing) {
+                if (camera.showMoreSettings) {
+                    moveOptionsCursor(state, -1)
+                } else if (camera.settingsEditing) {
                     moveSliderEditTarget(state, -1)
                 } else {
                     when (selectedBottomBarItem(camera)) {
@@ -879,7 +896,9 @@ class ControlReducer(
                 Reduction(state = state.copy(camera = nextCamera))
             }
             CameraUiZone.SettingsPanel -> {
-                if (camera.settingsEditing) {
+                if (camera.showMoreSettings) {
+                    moveOptionsCursor(state, +1)
+                } else if (camera.settingsEditing) {
                     moveSliderEditTarget(state, +1)
                 } else {
                     when (selectedBottomBarItem(camera)) {
@@ -912,7 +931,9 @@ class ControlReducer(
                 }
             }
             CameraUiZone.SettingsPanel -> {
-                if (camera.settingsEditing) {
+                if (camera.showMoreSettings) {
+                    adjustSelectedOptionsSetting(state, -1, repeatCount)
+                } else if (camera.settingsEditing) {
                     adjustSelectedSetting(state, -1, repeatCount)
                 } else {
                     moveSettingsCursor(state, -1)
@@ -930,7 +951,9 @@ class ControlReducer(
             )
             CameraUiZone.ModeRail -> enterFromModeRail(state)
             CameraUiZone.SettingsPanel -> {
-                if (camera.settingsEditing) {
+                if (camera.showMoreSettings) {
+                    adjustSelectedOptionsSetting(state, +1, repeatCount)
+                } else if (camera.settingsEditing) {
                     adjustSelectedSetting(state, +1, repeatCount)
                 } else {
                     moveSettingsCursor(state, +1)
@@ -978,7 +1001,11 @@ class ControlReducer(
             CameraUiZone.LiveView -> openSettingsPanel(state, camera.activeMode)
             CameraUiZone.ModeRail -> confirmModeSelection(state)
             CameraUiZone.SettingsPanel -> {
-                if (camera.settingsEditing) {
+                if (camera.showMoreSettings) {
+                    // Options is an editor, just like the Focus OK-menu: OK commits the
+                    // current state and returns to the unchanged horizontal settings rail.
+                    toggleOptionsMenu(state)
+                } else if (camera.settingsEditing) {
                     confirmSettingEdit(state)
                 } else {
                     activateHighlightedItem(state)
@@ -1018,6 +1045,9 @@ class ControlReducer(
         }
         val camera = state.camera
         return when {
+            camera.focusedZone == CameraUiZone.SettingsPanel && camera.showMoreSettings -> Reduction(
+                state = state.copy(camera = camera.copy(showMoreSettings = false)),
+            )
             camera.focusedZone == CameraUiZone.SettingsPanel && camera.settingsEditing -> {
                 if (camera.sliderEditTarget != SliderEditTarget.Value) {
                     Reduction(
@@ -1307,20 +1337,11 @@ class ControlReducer(
                 effects = listOf(PlatformEffect.LoadGalleryItems),
             )
             is BottomBarItem.MoreSettings -> {
-                val nextShowMore = !state.camera.showMoreSettings
-                val nextItems = CameraCatalog.settingsBarItems(
-                    state.camera.copy(showMoreSettings = nextShowMore),
-                )
-                val nextCursor = state.camera.settingsCursor.coerceAtMost(nextItems.lastIndex)
-                val nextCamera = state.camera.copy(
-                    showMoreSettings = nextShowMore,
-                    settingsCursor = nextCursor
-                )
-                Reduction(state = state.copy(camera = nextCamera))
+                toggleOptionsMenu(state)
             }
             is BottomBarItem.Setting -> {
                 val preparation = if (item.spec.id.endsWith(".manual_focus")) {
-                    prepareStateForManualFocus(state, item.spec)
+                    prepareStateForManualFocus(state)
                 } else {
                     ManualFocusPreparation(state)
                 }
@@ -1343,6 +1364,95 @@ class ControlReducer(
             return null
         }
         return items.getOrNull(camera.settingsCursor.coerceIn(0, items.lastIndex))
+    }
+
+    private fun toggleOptionsMenu(state: AppState): Reduction {
+        val opening = !state.camera.showMoreSettings
+        val optionCount = CameraCatalog.optionsMenuSettings(state.camera).size
+        val nextCursor = if (optionCount == 0) 0 else {
+            state.camera.optionsMenuCursor.coerceIn(0, optionCount - 1)
+        }
+        val optionsTileIndex = CameraCatalog.settingsBarItems(state.camera)
+            .indexOfFirst { it is BottomBarItem.MoreSettings }
+        return Reduction(
+            state = state.copy(
+                camera = state.camera.copy(
+                    showMoreSettings = opening,
+                    optionsMenuCursor = nextCursor,
+                    // Touch and housing entry converge here. Focus editing leaves Focus selected;
+                    // Options likewise owns and returns to its original far-left tile.
+                    settingsCursor = if (opening && optionsTileIndex >= 0) {
+                        optionsTileIndex
+                    } else {
+                        state.camera.settingsCursor
+                    },
+                    settingsEditing = false,
+                    sliderEditTarget = SliderEditTarget.Value,
+                ),
+            ),
+            effects = if (opening && state.camera.activeMode in setOf(CameraModeId.Pro, CameraModeId.ProVideo)) {
+                listOf(PlatformEffect.LoadRecordingSaveLocations)
+            } else {
+                emptyList()
+            },
+        )
+    }
+
+    private fun selectOptionsItem(state: AppState, index: Int): Reduction {
+        if (!state.camera.showMoreSettings) return Reduction(state = state)
+        val lastIndex = CameraCatalog.optionsMenuSettings(state.camera).lastIndex
+        if (lastIndex < 0) return Reduction(state = state)
+        return Reduction(
+            state = state.copy(
+                camera = state.camera.copy(optionsMenuCursor = index.coerceIn(0, lastIndex)),
+            ),
+        )
+    }
+
+    private fun moveOptionsCursor(state: AppState, delta: Int): Reduction {
+        val settings = CameraCatalog.optionsMenuSettings(state.camera)
+        if (settings.size <= 1) return Reduction(state = state)
+        // Match the Focus editor: the highlighted card stops at either end instead of
+        // unexpectedly wrapping a diver from the first setting to the last.
+        val next = (state.camera.optionsMenuCursor + delta).coerceIn(0, settings.lastIndex)
+        return Reduction(
+            state = state.copy(camera = state.camera.copy(optionsMenuCursor = next)),
+        )
+    }
+
+    private fun adjustSelectedOptionsSetting(
+        state: AppState,
+        step: Int,
+        repeatCount: Int = 0,
+    ): Reduction {
+        val spec = CameraCatalog.selectedOptionsSetting(state.camera) ?: return Reduction(state = state)
+        if (spec.id.endsWith(".save_location")) {
+            val locations = state.camera.recordingSaveLocations
+            if (locations.isEmpty()) return Reduction(state = state)
+            val current = recordingSaveLocationIndex(locations, state.camera.recordingSaveLocation)
+                .takeIf { it >= 0 }
+                ?: state.camera.recordingSaveLocationIndex.coerceIn(0, locations.lastIndex)
+            val next = ((current + step) % locations.size + locations.size) % locations.size
+            return Reduction(
+                state = state.copy(
+                    camera = state.camera.copy(
+                        recordingSaveLocation = locations[next],
+                        recordingSaveLocationIndex = next,
+                    ),
+                ),
+            )
+        }
+        return adjustSetting(state, spec, step, repeatCount)
+    }
+
+    private fun recordingSaveLocationIndex(
+        locations: List<RecordingSaveLocation>,
+        selected: RecordingSaveLocation,
+    ): Int {
+        val selectedPath = selected.relativePath.trimEnd('/')
+        return locations.indexOfFirst {
+            it.relativePath.trimEnd('/').equals(selectedPath, ignoreCase = true)
+        }
     }
 
     private fun cycleModeFromSettingsBar(state: AppState, step: Int): Reduction {
@@ -1401,7 +1511,7 @@ class ControlReducer(
     /** [adjustSelectedSetting] with the spec chosen by the caller — the wheel resolves its own. */
     private fun adjustSetting(state: AppState, spec: CameraSettingSpec, step: Int, repeatCount: Int = 0): Reduction {
         val manualFocusPreparation = if (spec.id.endsWith(".manual_focus")) {
-            prepareStateForManualFocus(state, spec)
+            prepareStateForManualFocus(state)
         } else {
             ManualFocusPreparation(state)
         }
@@ -1807,13 +1917,76 @@ class ControlReducer(
         }
     }
 
-    private fun prepareStateForManualFocus(
-        state: AppState,
-        focusSpec: CameraSettingSpec,
-    ): ManualFocusPreparation = ManualFocusPreparation(state)
+    private fun prepareStateForManualFocus(state: AppState): ManualFocusPreparation =
+        ManualFocusPreparation(state)
 
     private fun applySettingValue(camera: CameraState, settingId: String, value: String): CameraState {
-        val updatedValues = camera.settingValues + (settingId to value)
+        val prefix = settingId.substringBeforeLast('.', "")
+        var updatedValues = camera.settingValues + (settingId to value)
+        var selectedFps = updatedValues["$prefix.frame_rate"]
+            ?.removeSuffix("fps")
+            ?.toIntOrNull()
+        if (settingId.endsWith(".resolution")) {
+            val compatibleRates = camera.capabilities?.videoFrameRatesByResolution
+                ?.get(value)
+                .orEmpty()
+                .sorted()
+            if (selectedFps != null && compatibleRates.isNotEmpty() && selectedFps !in compatibleRates) {
+                // Preserve the user's temporal intent where possible: take the highest rate no
+                // faster than the current selection, otherwise the slowest real rate available.
+                val compatibleFps = compatibleRates.lastOrNull { it <= selectedFps!! }
+                    ?: compatibleRates.first()
+                selectedFps = compatibleFps
+                updatedValues = updatedValues + ("$prefix.frame_rate" to "${compatibleFps}fps")
+            }
+        }
+        val highSpeedSelected = selectedFps != null && selectedFps >= HIGH_SPEED_FPS_MIN
+        if ((settingId.endsWith(".frame_rate") || settingId.endsWith(".resolution")) && highSpeedSelected) {
+            // Android constrained-high-speed sessions force AE/AWB/AF automation and cannot
+            // carry CameraEffect or stabilization use cases. Persist the state the session can
+            // really honour; leaving manual labels visible here would be a dead-control lie.
+            updatedValues = updatedValues +
+                ("$prefix.log" to "Off") +
+                ("$prefix.hdr" to "Off") +
+                ("$prefix.video_stabilization" to "Off") +
+                ("$prefix.super_steady" to "Off") +
+                ("$prefix.iso" to "Auto") +
+                ("$prefix.shutter_speed" to "Auto") +
+                ("$prefix.manual_focus" to "AF") +
+                ("$prefix.white_balance" to CameraCatalog.WB_AUTO_CONTINUOUS) +
+                ("$prefix.focus_peaking" to "Off") +
+                ("$prefix.exposure_display" to "Off")
+        } else if (settingId.endsWith(".log") && value == "On") {
+            updatedValues = updatedValues +
+                (prefix + ".hdr" to "Off") +
+                (prefix + ".video_stabilization" to "Off") +
+                (prefix + ".super_steady" to "Off")
+        } else if (settingId.endsWith(".hdr") && value == "On") {
+            updatedValues = updatedValues + (prefix + ".log" to "Off")
+        } else if (
+            (settingId.endsWith(".video_stabilization") && value != "Off") ||
+            (settingId.endsWith(".super_steady") && value == "On")
+        ) {
+            updatedValues = updatedValues + (prefix + ".log" to "Off")
+        }
+        val incompatibleWithHighSpeed = when {
+            settingId.endsWith(".log") && value == "On" -> true
+            settingId.endsWith(".hdr") && value == "On" -> true
+            settingId.endsWith(".video_stabilization") && value != "Off" -> true
+            settingId.endsWith(".super_steady") && value == "On" -> true
+            settingId.endsWith(".iso") && value != "Auto" -> true
+            settingId.endsWith(".shutter_speed") && value != "Auto" -> true
+            settingId.endsWith(".manual_focus") && value != "AF" -> true
+            settingId.endsWith(".white_balance") &&
+                value != CameraCatalog.WB_AUTO_CONTINUOUS && value != "Auto" -> true
+            settingId.endsWith(".focus_peaking") && value == "On" -> true
+            settingId.endsWith(".exposure_display") && value != "Off" -> true
+            else -> false
+        }
+        if (incompatibleWithHighSpeed && highSpeedSelected) {
+            updatedValues = updatedValues +
+                ("$prefix.frame_rate" to preferredNormalFrameRate(camera, prefix))
+        }
         val next = if (settingId == "photo.zoom_level" || settingId == "video.zoom") {
             camera.copy(
                 zoomFactor = parseZoom(value) ?: camera.zoomFactor,
@@ -1822,7 +1995,22 @@ class ControlReducer(
         } else {
             camera.copy(settingValues = updatedValues)
         }
-        return if (settingId.endsWith(".frame_rate")) demoteShutterToFramePeriod(next, settingId) else next
+        return if (settingId.endsWith(".frame_rate") || settingId.endsWith(".resolution")) {
+            demoteShutterToFramePeriod(next, "$prefix.frame_rate")
+        } else {
+            next
+        }
+    }
+
+    private fun preferredNormalFrameRate(camera: CameraState, prefix: String): String {
+        val capabilities = camera.capabilities
+        val resolution = camera.settingValues["$prefix.resolution"]
+        val rates = capabilities?.videoFrameRatesByResolution
+            ?.get(resolution)
+            ?.takeIf { it.isNotEmpty() }
+            ?: capabilities?.availableVideoFrameRates.orEmpty()
+        val normal = rates.filter { it in 1 until HIGH_SPEED_FPS_MIN }.maxOrNull() ?: 30
+        return "${normal}fps"
     }
 
     /**
@@ -1873,9 +2061,9 @@ class ControlReducer(
     }
 
     internal companion object {
+        const val HIGH_SPEED_FPS_MIN = 100
         const val ALBUM_GRID_COLUMNS = GALLERY_ALBUM_COLUMNS
         const val MEDIA_GRID_COLUMNS = GALLERY_MEDIA_COLUMNS
-        const val RECORDING_LOCATION_GRID_COLUMNS = 3
         const val MAX_RENAME_LENGTH = 96
 
         /** Fastest ramp cadence: one frame. Slower ladders stretch the interval instead. */

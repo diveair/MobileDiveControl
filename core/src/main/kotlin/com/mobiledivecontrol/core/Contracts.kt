@@ -225,6 +225,10 @@ enum class RecordingSaveConfirmationAction {
 data class RecordingSaveLocation(
     val name: String,
     val relativePath: String,
+    /** MediaStore URI for the album's newest item. Empty for a newly-created empty album. */
+    val coverContentUri: String = "",
+    val mediaCount: Int = 0,
+    val coverIsVideo: Boolean = false,
 ) {
     companion object {
         val Default = RecordingSaveLocation(
@@ -270,6 +274,8 @@ data class CameraState(
     val highlightedPrimaryIndex: Int = 0,
     val highlightedSecondaryIndex: Int = 0,
     val settingsCursor: Int = 0,
+    /** Selected row in the vertical Options panel. Independent of [settingsCursor]. */
+    val optionsMenuCursor: Int = 0,
     val settingsEditing: Boolean = false,
     val sliderEditTarget: SliderEditTarget = SliderEditTarget.Value,
     val settingValues: Map<String, String> = CameraCatalog.defaultSettingValues,
@@ -315,6 +321,10 @@ data class MeteredExposure(
     val iso: Int? = null,
     val shutterNs: Long? = null,
     val wbKelvin: Int? = null,
+    /** AU's signed CIE 1960 tint distance. Null while the OEM or a manual rung owns WB. */
+    val wbTintDuv: Double? = null,
+    /** Confidence in AU's physical white-point estimate, in [0, 1]. */
+    val wbConfidence: Double? = null,
     /** Metered EV deviation in tenths of a stop — the read-only meter the native app shows while both ISO and shutter are manual. */
     val evTenths: Int? = null,
 )
@@ -625,6 +635,12 @@ sealed interface CameraCommand : ControlCommand {
     data object NavigateRight : CameraCommand
     data object Confirm : CameraCommand
     data object Back : CameraCommand
+    /** Touch-accessible equivalent of activating the far-left Options tile. */
+    data object ToggleOptionsMenu : CameraCommand
+    /** Selects a vertical Options row without disturbing the horizontal settings cursor. */
+    data class SelectOptionsItem(val index: Int) : CameraCommand
+    /** Selects and advances a vertical Options row; used by direct touch interaction. */
+    data class AdjustOptionsItem(val index: Int, val step: Int) : CameraCommand
     data object ZoomIn : CameraCommand
     data object ZoomOut : CameraCommand
     data class SetZoom(val value: Double) : CameraCommand
@@ -830,6 +846,17 @@ data class CameraCapabilities(
     val evMax: Double? = null,
     val manualFocusSupported: Boolean? = null,
     val zoomMaxRatio: Double? = null,
+    /** Empty until probed; otherwise only FPS values the active recording pipeline can schedule. */
+    val availableVideoFrameRates: List<Int> = emptyList(),
+    /** Empty until probed; exact CameraX Recorder quality labels for the active lens. */
+    val availableVideoResolutions: List<String> = emptyList(),
+    /**
+     * Recorder-compatible FPS values per quality label. This is deliberately a pair map rather
+     * than two independent lists: a lens may offer 240 fps at HD but only 60 fps at UHD.
+     */
+    val videoFrameRatesByResolution: Map<String, List<Int>> = emptyMap(),
+    val videoStabilizationSupported: Boolean? = null,
+    val ultraHdrJpegSupported: Boolean? = null,
 )
 
 sealed interface BottomBarItem {

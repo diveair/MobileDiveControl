@@ -64,10 +64,35 @@ uniform samplerExternalOES uSamp;
 uniform vec2  uStep;
 uniform float uOn;
 uniform float uThr;
+uniform float uExposure;
 
 void main() {
     vec4 c = texture2D(uSamp, vTex);
-    if (uOn < 0.5) { gl_FragColor = c; return; }
+    vec3 signalWeights = vec3(0.2627, 0.6780, 0.0593);
+    float signal = dot(c.rgb, signalWeights);
+    vec4 display = c;
+
+    // Preview-signal exposure aids. This is an IRE estimate of the encoded preview signal,
+    // never a claim about sensor RAW and never written to the recording surface.
+    if (uExposure > 0.5 && uExposure < 2.5) {
+        float threshold = uExposure < 1.5 ? 0.70 : 0.95;
+        float stripe = step(6.0, mod(gl_FragCoord.x + gl_FragCoord.y, 12.0));
+        float active = smoothstep(threshold - 0.015, threshold + 0.015, signal);
+        vec4 zebra = mix(vec4(0.05, 0.05, 0.05, 1.0), vec4(1.0), stripe);
+        display = mix(display, zebra, active * 0.78);
+    } else if (uExposure > 2.5) {
+        vec3 falseColour;
+        if (signal < 0.03) falseColour = vec3(0.35, 0.0, 0.45);
+        else if (signal < 0.10) falseColour = vec3(0.05, 0.1, 0.95);
+        else if (signal < 0.42) falseColour = vec3(0.05, 0.65, 0.95);
+        else if (signal < 0.58) falseColour = vec3(0.18, 0.72, 0.22);
+        else if (signal < 0.70) falseColour = vec3(0.55, 0.55, 0.55);
+        else if (signal < 0.90) falseColour = vec3(1.0, 0.78, 0.0);
+        else falseColour = vec3(0.95, 0.05, 0.05);
+        display = vec4(falseColour, 1.0);
+    }
+
+    if (uOn < 0.5) { gl_FragColor = display; return; }
 
     vec3 w = vec3(0.299, 0.587, 0.114);
     float tl = dot(texture2D(uSamp, vTex + uStep*vec2(-1,-1)).rgb, w);
@@ -139,7 +164,7 @@ void main() {
     float safe     = (1.0 - smoothstep(0.92, 0.97, lc)) * (1.0 - smoothstep(0.92, 0.97, mean));
     float amount   = edgeAmt * focused * solid * safe;
 
-    gl_FragColor = mix(c, vec4(0.0, 0.9, 0.0, 1.0), amount);
+    gl_FragColor = mix(display, vec4(0.0, 0.9, 0.0, 1.0), amount);
 }
 """
 
@@ -149,6 +174,8 @@ void main() {
 
     // ── Public knobs ──────────────────────────────────────────────────
     @Volatile var peakingEnabled = false
+    /** 0 off, 1 zebra 70 IRE, 2 zebra 95 IRE, 3 false colour. */
+    @Volatile var exposureAssistMode = 0
 
     /**
      * Timestamp of the last frame that actually reached the display surface. This is the
@@ -187,6 +214,7 @@ void main() {
     private var lPos = -1; private var lTex = -1
     private var lSTM = -1; private var lSamp = -1
     private var lStep = -1; private var lOn = -1; private var lThr = -1
+    private var lExposure = -1
     private var vb: FloatBuffer? = null
     private var tb: FloatBuffer? = null
     private var lastSwapFailLogAtMs = 0L
@@ -282,6 +310,7 @@ void main() {
             GLES20.glUniform2f(lStep, 1f / maxOf(inW, 1), 1f / maxOf(inH, 1))
             GLES20.glUniform1f(lOn, if (peakingEnabled) 1f else 0f)
             GLES20.glUniform1f(lThr, peakingThreshold)
+            GLES20.glUniform1f(lExposure, exposureAssistMode.toFloat())
 
             vb!!.position(0)
             GLES20.glVertexAttribPointer(lPos, 2, GLES20.GL_FLOAT, false, 0, vb)
@@ -353,6 +382,7 @@ void main() {
         lStep = GLES20.glGetUniformLocation(prog, "uStep")
         lOn   = GLES20.glGetUniformLocation(prog, "uOn")
         lThr  = GLES20.glGetUniformLocation(prog, "uThr")
+        lExposure = GLES20.glGetUniformLocation(prog, "uExposure")
     }
 
     private fun bufInit() {

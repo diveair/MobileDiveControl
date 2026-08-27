@@ -49,6 +49,7 @@ object CameraCatalog {
      * and use these constants everywhere instead of open-coded strings.
      */
     const val WB_AUTO_CONTINUOUS = "Auto Continuous"
+    const val WB_AUTO_UNDERWATER = "Auto Underwater"
     const val WB_AUTO_SHUTTER = "Auto Shutter"
 
     val primaryRailEntries: List<CameraRailEntry> = listOf(
@@ -145,6 +146,7 @@ object CameraCatalog {
         val lenses: List<String>,
         val capabilities: CameraCapabilities?,
         val videoShutterCapNs: Long? = null,
+        val selectedResolution: String? = null,
     )
 
     /**
@@ -197,13 +199,30 @@ object CameraCatalog {
         detectedLenses: List<String>,
         capabilities: CameraCapabilities?,
         videoShutterCapNs: Long? = null,
+        selectedResolution: String? = null,
     ): List<CameraSettingSpec> {
         val base = settingsFor(mode, variant, detectedLenses)
         if (capabilities == null && videoShutterCapNs == null) return base
         // This is the reducer's per-tick call. Uncached it re-filtered every ladder on every
         // focus nudge, each option running a parse.
-        return cachedSettings(SettingsKey(mode, variant, detectedLenses, capabilities, videoShutterCapNs)) {
-            base.mapNotNull { spec -> applyCapabilities(spec, capabilities, videoShutterCapNs) }
+        return cachedSettings(
+            SettingsKey(
+                mode,
+                variant,
+                detectedLenses,
+                capabilities,
+                videoShutterCapNs,
+                selectedResolution,
+            ),
+        ) {
+            base.mapNotNull { spec ->
+                applyCapabilities(
+                    spec,
+                    capabilities,
+                    videoShutterCapNs,
+                    selectedResolution,
+                )
+            }
         }
     }
 
@@ -230,18 +249,23 @@ object CameraCatalog {
     }
 
     /** [settingsFor] with every clamp the CameraState itself implies — the one call the reducer and UI share. */
-    fun settingsFor(camera: CameraState): List<CameraSettingSpec> = settingsFor(
-        camera.activeMode,
-        camera.deviceVariant,
-        camera.detectedLenses,
-        camera.capabilities,
-        videoShutterCapNs(camera),
-    )
+    fun settingsFor(camera: CameraState): List<CameraSettingSpec> {
+        val prefix = modeKey(camera.activeMode)
+        return settingsFor(
+            camera.activeMode,
+            camera.deviceVariant,
+            camera.detectedLenses,
+            camera.capabilities,
+            videoShutterCapNs(camera),
+            camera.settingValues["$prefix.resolution"] ?: defaultSettingValues["$prefix.resolution"],
+        )
+    }
 
     private fun applyCapabilities(
         spec: CameraSettingSpec,
         caps: CameraCapabilities?,
         videoShutterCapNs: Long? = null,
+        selectedResolution: String? = null,
     ): CameraSettingSpec? {
         fun clip(keep: (String) -> Boolean): CameraSettingSpec? {
             val kept = spec.options.filter(keep)
@@ -275,6 +299,21 @@ object CameraCatalog {
                     val ev = option.replace("+", "").toDoubleOrNull()
                     ev == null || ev in caps.evMin..caps.evMax
                 }
+            spec.id.endsWith(".frame_rate") && !caps?.availableVideoFrameRates.isNullOrEmpty() -> {
+                val rates = caps?.videoFrameRatesByResolution
+                    ?.get(selectedResolution)
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: caps!!.availableVideoFrameRates
+                clip { option -> option.removeSuffix("fps").toIntOrNull() in rates }
+            }
+            spec.id.endsWith(".resolution") && !caps?.availableVideoResolutions.isNullOrEmpty() ->
+                // Keep every resolution exposed for the selected camera. If the current FPS is
+                // incompatible, the reducer moves it to the closest supported rate as the user
+                // selects this resolution; hiding valid resolutions made the menu look incomplete.
+                clip { option -> option in caps!!.availableVideoResolutions }
+            spec.id.endsWith(".video_stabilization") && caps?.videoStabilizationSupported == false -> null
+            spec.id.endsWith(".save_format") && caps?.ultraHdrJpegSupported == false ->
+                clip { option -> option != "Ultra HDR JPEG" }
             // No .white_balance branch by design: kelvin WB is applied app-side through
             // COLOR_CORRECTION_GAINS, not through a CameraCharacteristics range, the ladder's
             // 2300..10000 bounds already match colorGainsForKelvin's own clamp, and the native
@@ -475,14 +514,13 @@ object CameraCatalog {
     }
 
     /**
-     * The one bar template, identical for every mode:
+     * The persistent horizontal bar template, identical whether Options is open or closed:
      *
-     *   [More] · extras… · Lens · Exposure · Shutter · ISO · [MODE] · Focus · WB · Slider · Gallery
+     *   [Options] · Lens · Exposure · Shutter · ISO · [MODE] · Focus · WB · Slider · Gallery
      *
-     * Mode-specific extras live at the far left behind the More toggle; the six-spec spine and
-     * the two shortcut tiles are fixed, and a mode that lacks a spine setting simply skips that
-     * tile. The mode token is anchored after ISO by construction — no midpoint arithmetic — so
-     * the diver's muscle memory holds across every mode.
+     * Every other mode setting lives in [optionsMenuSettings]. Keeping the two collections
+     * independent is deliberate: opening the vertical Options panel must never reflow this bar,
+     * move its cursor, or replace controls the diver is operating by muscle memory.
      */
     fun settingsBarItems(
         mode: CameraModeId,
@@ -511,7 +549,6 @@ object CameraCatalog {
         return buildList {
             if (extras.isNotEmpty()) {
                 add(BottomBarItem.MoreSettings)
-                if (showMore) extras.forEach { add(BottomBarItem.Setting(it)) }
             }
             listOfNotNull(lens, ev, shutter, iso).forEach { add(BottomBarItem.Setting(it)) }
             add(BottomBarItem.ModesButton)
@@ -530,6 +567,48 @@ object CameraCatalog {
         capabilities = camera.capabilities,
         videoShutterCapNs = videoShutterCapNs(camera),
     )
+
+    /**
+     * Settings owned by the vertical Options panel. The six manual controls already present on
+     * the horizontal bar are excluded by identity, not by group name, so FPS, resolution, audio,
+     * assist tools and metadata remain available even when they are capture-critical controls.
+     */
+    fun optionsMenuSettings(camera: CameraState): List<CameraSettingSpec> {
+        val allSettings = settingsFor(camera)
+        fun isHorizontalSpine(spec: CameraSettingSpec): Boolean =
+            spec.id.endsWith(".lens") ||
+                spec.id.endsWith(".exposure_value") ||
+                spec.id.endsWith(".exposure_compensation") ||
+                spec.id.endsWith(".shutter_speed") ||
+                spec.id.endsWith(".iso") ||
+                spec.id.endsWith(".manual_focus") ||
+                spec.id.endsWith(".white_balance") ||
+                spec.id.endsWith(".focus_peaking") ||
+                spec.id.endsWith(".focus_curve")
+
+        val extras = allSettings.filterNot(::isHorizontalSpine)
+        if (camera.activeMode !in setOf(CameraModeId.Pro, CameraModeId.ProVideo)) return extras
+
+        val locations = camera.recordingSaveLocations.ifEmpty { listOf(RecordingSaveLocation.Default) }
+        val saveLocation = CameraSettingSpec(
+            id = modeKey(camera.activeMode) + ".save_location",
+            label = "Save location",
+            group = "File",
+            kind = CameraSettingKind.Choice,
+            options = locations.map { it.name },
+            defaultValue = camera.recordingSaveLocation.name,
+            note = "MediaStore album; available albums are loaded when Options opens.",
+        )
+        val fileInsert = extras.indexOfFirst {
+            it.id.endsWith(".save_format") || it.id.endsWith(".aspect_ratio")
+        }.let { if (it < 0) 0 else it + 1 }
+        return extras.toMutableList().apply { add(fileInsert.coerceIn(0, size), saveLocation) }
+    }
+
+    fun selectedOptionsSetting(camera: CameraState): CameraSettingSpec? {
+        val settings = optionsMenuSettings(camera)
+        return settings.getOrNull(camera.optionsMenuCursor.coerceIn(0, settings.lastIndex))
+    }
 
     /**
      * Modes whose profile carries no `.lens` choice still get the Lens tile — built from the
@@ -553,11 +632,19 @@ object CameraCatalog {
     }
 
     fun currentValue(camera: CameraState, spec: CameraSettingSpec): String {
+        if (spec.id.endsWith(".save_location")) return camera.recordingSaveLocation.name
         return camera.settingValues[spec.id] ?: spec.defaultValue
     }
 
     fun isWhiteBalanceAuto(value: String?): Boolean =
+        value == WB_AUTO_CONTINUOUS || value == WB_AUTO_UNDERWATER ||
+            value == WB_AUTO_SHUTTER || value == "Auto"
+
+    /** Modes in which the phone HAL, rather than DiveControl's AU estimator, owns AWB. */
+    fun isWhiteBalanceOemAuto(value: String?): Boolean =
         value == WB_AUTO_CONTINUOUS || value == WB_AUTO_SHUTTER || value == "Auto"
+
+    fun isWhiteBalanceAutoUnderwater(value: String?): Boolean = value == WB_AUTO_UNDERWATER
 
     fun isWhiteBalanceAutoShutter(value: String?): Boolean = value == WB_AUTO_SHUTTER
 
@@ -608,7 +695,8 @@ object CameraCatalog {
     fun resnapToClippedLadders(camera: CameraState): CameraState {
         var values = camera.settingValues
         CameraModeId.entries.forEach { mode ->
-            settingsFor(camera.copy(activeMode = mode))
+            val clippedSettings = settingsFor(camera.copy(activeMode = mode))
+            clippedSettings
                 .filter { spec -> spec.kind == CameraSettingKind.Slider }
                 .forEach specLoop@{ spec ->
                     val magnitude: (String) -> Double? = when {
@@ -634,6 +722,14 @@ object CameraCatalog {
                         .minByOrNull { (_, value) -> kotlin.math.abs(value - target) }
                         ?.first ?: return@specLoop
                     values = values + (spec.id to nearest)
+                }
+            clippedSettings
+                .filter { spec -> spec.kind != CameraSettingKind.Slider }
+                .forEach { spec ->
+                    val stored = values[spec.id] ?: return@forEach
+                    if (stored !in spec.options) {
+                        values = values + (spec.id to spec.defaultValue)
+                    }
                 }
         }
         return if (values === camera.settingValues) camera else camera.copy(settingValues = values)
@@ -819,14 +915,16 @@ object CameraCatalog {
 
     private fun proProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
+        val megapixels = photoMegapixels(variant)
         return CameraModeProfile(
             mode = CameraModeId.Pro,
             modeName = CameraModeId.Pro.label,
             captureType = CameraCaptureType.Photo,
             availableLenses = lenses,
-            availableResolutions = photoMegapixels(variant),
+            availableResolutions = megapixels,
+            availableFormatOptions = listOf("JPEG", "Ultra HDR JPEG"),
             availableExposureControls = listOf("White balance", "ISO", "Focus", "Shutter", "Exposure value"),
-            availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid", "HDR"),
+            availableAssistTools = listOf("Zebra", "False colour", "Guides", "HDR"),
             settings = listOf(
                 slider("pro.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
                 slider("pro.iso", "ISO", "Manual", isoOptions, "Auto"),
@@ -835,12 +933,28 @@ object CameraCatalog {
                 choice("pro.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("pro.shutter_speed", "Shutter", "Manual", shutterOptions, "Auto"),
                 slider("pro.exposure_value", "Exposure Value", "Manual", evProOptions, "0.0"),
+                choice("pro.megapixels", "Photo resolution", "File", megapixels, megapixels.first()),
+                choice(
+                    "pro.save_format",
+                    "Photo format",
+                    "File",
+                    listOf("JPEG", "Ultra HDR JPEG"),
+                    "JPEG",
+                ),
+                choice(
+                    "pro.aspect_ratio",
+                    "Aspect ratio",
+                    "File",
+                    listOf("4:3", "16:9", "1:1"),
+                    "4:3",
+                ),
                 choice("pro.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
                 choice("pro.lens", "Lens", "Core", lenses, "Auto"),
-                toggle("pro.exposure_monitor", "Exposure monitor", "Assist"),
-                choice("pro.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
-                choice("pro.grid", "Grid", "Assist", gridOptions(), "3x3"),
-                choice("pro.hdr", "HDR", "Assist", listOf("Off", "On"), "On"),
+                choice("pro.metering", "Metering", "Exposure", meteringOptions(), "Matrix"),
+                choice("pro.guides", "Guides", "Assist", guideOptions(), "3×3 Grid"),
+                choice("pro.exposure_display", "Exposure display", "Assist", exposureDisplayOptions(), "Off"),
+                choice("pro.hdr", "HDR photo", "Dynamic range", listOf("Off", "On"), "On"),
+                *metadataSettings("pro").toTypedArray(),
             ),
         )
     }
@@ -944,13 +1058,13 @@ object CameraCatalog {
             modeName = CameraModeId.Video.label,
             captureType = CameraCaptureType.Video,
             availableLenses = lenses,
-            availableResolutions = listOf("FHD", "UHD 4K", "8K"),
+            availableResolutions = videoResolutionOptions,
             availableFrameRates = frameRates,
-            availableFormatOptions = listOf("Standard", "HDR", "LOG"),
+            availableFormatOptions = listOf("Standard", "HDR", "10-bit HLG / Log grade"),
             availableAudioControls = listOf("Microphone"),
             availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid"),
             settings = listOf(
-                choice("video.resolution", "Resolution", "Core", listOf("FHD", "UHD 4K", "8K"), "UHD 4K"),
+                choice("video.resolution", "Resolution", "Core", videoResolutionOptions, "UHD 4K"),
                 choice("video.frame_rate", "Frame rate", "Core", frameRates, "30fps"),
                 choice("video.lens", "Lens", "Core", lenses, "1x"),
                 choice("video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
@@ -959,7 +1073,7 @@ object CameraCatalog {
                 choice("video.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
                 choice("video.grid", "Grid", "Assist", gridOptions(), "3x3"),
                 choice("video.hdr", "HDR", "Assist", listOf("Off", "On"), "On"),
-                choice("video.log", "LOG", "Assist", listOf("Off", "On"), "Off"),
+                choice("video.log", "10-bit HLG", "Assist", listOf("Off", "On"), "Off"),
                 toggle("video.super_steady", "Super Steady", "Core", "Off"),
                 choice("video.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
                 choice("video.megapixels", "Video MP", "Core", listOf("Auto", "12MP", "24MP", "50MP"), "Auto"),
@@ -978,10 +1092,10 @@ object CameraCatalog {
             availableLenses = lenses,
             availableResolutions = listOf("FHD", "UHD 4K", "8K"),
             availableFrameRates = frameRates,
-            availableFormatOptions = listOf("Standard", "HDR", "LOG"),
+            availableFormatOptions = listOf("Standard", "HDR", "10-bit HLG"),
             availableExposureControls = listOf("White balance", "ISO", "Focus", "Shutter", "Exposure value", "Frame rate"),
-            availableAudioControls = listOf("Microphone", "Microphone gain"),
-            availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid", "HDR", "LOG"),
+            availableAudioControls = listOf("Microphone audio"),
+            availableAssistTools = listOf("Zebra", "False colour", "Guides", "HDR", "10-bit HLG / Log grade"),
             settings = listOf(
                 slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
                 slider("pro_video.iso", "ISO", "Manual", isoOptions, "Auto"),
@@ -990,18 +1104,26 @@ object CameraCatalog {
                 choice("pro_video.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
                 slider("pro_video.shutter_speed", "Shutter", "Manual", shutterOptions, "Auto"),
                 slider("pro_video.exposure_value", "Exposure Value", "Manual", evProOptions, "0.0"),
-                slider("pro_video.frame_rate", "Frame rate", "Manual", frameRates, "30fps"),
+                choice("pro_video.resolution", "Resolution", "File", videoResolutionOptions, "UHD 4K"),
+                choice("pro_video.frame_rate", "FPS", "File", frameRates, "30fps"),
+                choice(
+                    "pro_video.aspect_ratio",
+                    "Aspect ratio",
+                    "File",
+                    listOf("16:9", "4:3"),
+                    "16:9",
+                ),
                 choice("pro_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
-                choice("pro_video.lens", "Lens", "Core", lenses, "auto"),
-                choice("pro_video.microphone_source", "Microphone", "Audio", microphoneSources(), "Auto"),
-                slider("pro_video.microphone_gain", "Microphone gain", "Audio", microphoneGainOptions(), "0dB"),
-                toggle("pro_video.exposure_monitor", "Exposure monitor", "Assist"),
-                choice("pro_video.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
-                choice("pro_video.grid", "Grid", "Assist", gridOptions(), "3x3"),
-                // Both default OFF: LOG is a deliberate grading workflow, not a default look,
-                // and shipping it on silently cost the field ~2 stops of apparent brightness.
-                choice("pro_video.hdr", "HDR", "Assist", listOf("Off", "On"), "Off"),
-                choice("pro_video.log", "LOG", "Assist", listOf("Off", "On"), "Off"),
+                choice("pro_video.lens", "Lens", "Core", lenses, "Auto"),
+                choice("pro_video.metering", "Metering", "Exposure", meteringOptions(), "Matrix"),
+                choice("pro_video.guides", "Guides", "Assist", guideOptions(), "3×3 Grid"),
+                choice("pro_video.exposure_display", "Exposure display", "Assist", exposureDisplayOptions(), "Off"),
+                // Both default OFF: wide-dynamic-range capture is a deliberate grading workflow.
+                choice("pro_video.hdr", "HDR video", "Dynamic range", listOf("Off", "On"), "Off"),
+                choice("pro_video.log", "10-bit HLG / Log grade", "Dynamic range", listOf("Off", "On"), "Off"),
+                choice("pro_video.video_stabilization", "Video stabilization", "Stabilization", listOf("Off", "Standard"), "Off"),
+                toggle("pro_video.audio_recording", "Microphone audio", "Audio", "On"),
+                *metadataSettings("pro_video").toTypedArray(),
             ),
         )
     }
@@ -1070,7 +1192,7 @@ object CameraCatalog {
             availableLenses = lenses,
             availableResolutions = listOf("FHD", "UHD 4K"),
             availableFrameRates = frameRates,
-            availableFormatOptions = listOf("HDR", "LOG"),
+            availableFormatOptions = listOf("HDR", "10-bit HLG"),
             availableAudioControls = listOf("Microphone"),
             availableAssistTools = listOf("Exposure monitor", "Guidelines", "Grid"),
             settings = listOf(
@@ -1082,7 +1204,7 @@ object CameraCatalog {
                 choice("night_video.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
                 choice("night_video.grid", "Grid", "Assist", gridOptions(), "3x3"),
                 choice("night_video.hdr", "HDR", "Assist", listOf("Off", "On"), "On"),
-                choice("night_video.log", "LOG", "Assist", listOf("Off", "On"), "Off"),
+                choice("night_video.log", "10-bit HLG", "Assist", listOf("Off", "On"), "Off"),
             ),
         )
     }
@@ -1110,16 +1232,45 @@ object CameraCatalog {
         GalaxyDeviceVariant.S26Ultra -> listOf("12MP", "24MP", "50MP", "200MP")
     }
 
-    private fun videoFrameRates(variant: GalaxyDeviceVariant): List<String> = when (variant) {
-        GalaxyDeviceVariant.S26Ultra -> listOf("24fps", "30fps", "60fps", "120fps")
-        else -> listOf("24fps", "30fps", "60fps")
-    }
+    private fun videoFrameRates(_variant: GalaxyDeviceVariant): List<String> =
+        listOf(24, 25, 30, 48, 50, 60, 90, 100, 120, 240).map { "${it}fps" }
+
+    private val videoResolutionOptions =
+        listOf("SD 480p", "HD 720p", "FHD 1920×824", "FHD", "UHD 4K")
 
     private fun microphoneSources(): List<String> = listOf("Auto", "Front", "Rear", "USB", "Mixed")
 
     private fun microphoneGainOptions(): List<String> = listOf("-12dB", "-6dB", "0dB", "+6dB", "+12dB")
 
     private fun gridOptions(): List<String> = listOf("Off", "3x3", "Square")
+
+    private fun guideOptions(): List<String> = listOf(
+        "Off",
+        "3×3 Grid",
+        "4×4 Grid",
+        "Square",
+        "Diagonal",
+        "Golden Ratio",
+        "Fibonacci Left",
+        "Fibonacci Right",
+    )
+
+    private fun exposureDisplayOptions(): List<String> = listOf(
+        "Off",
+        "Zebra ≥70 IRE",
+        "Zebra ≥95 IRE",
+        "False colour",
+    )
+
+    private fun meteringOptions(): List<String> = listOf("Matrix", "Center", "Spot")
+
+    private fun metadataSettings(prefix: String): List<CameraSettingSpec> = listOf(
+        toggle(prefix + ".metadata_depth", "Dive depth metadata", "Metadata", "On"),
+        toggle(prefix + ".metadata_temperature", "Water temperature metadata", "Metadata", "On"),
+        toggle(prefix + ".metadata_heading", "Heading metadata", "Metadata", "On"),
+        toggle(prefix + ".metadata_pressure", "Pressure metadata", "Metadata", "On"),
+        toggle(prefix + ".metadata_exposure", "Exposure metadata", "Metadata", "On"),
+    )
 
     /**
      * The native camera's ISO table, VERBATIM: MakerParameter.SENSOR_SENSITIVITY_ARRAY minus its
@@ -1217,10 +1368,10 @@ object CameraCatalog {
      * The native Samsung white-balance scale, verbatim: 78 values from 2300 K through 10000 K in
      * flat 100 K steps (`kelvin_value`; MakerParameter.getColorTemperature is `step * 100`).
      *
-     * The two automatic modes follow the cold end. That ordering is the wheel topology the
+     * The three automatic modes follow the cold end. That ordering is the wheel topology the
      * housing exposes:
      *
-     *   10000 K -> Auto Continuous -> Auto Shutter -> 2300 K
+     *   10000 K -> Auto Continuous -> Auto Underwater -> Auto Shutter -> 2300 K
      *
      * and the exact reverse when turned the other way. Continuous leaves Samsung AWB running;
      * Shutter runs it during preview and locks its converged gain-plus-transform solution for the
@@ -1232,6 +1383,7 @@ object CameraCatalog {
         buildList {
             for (kelvin in WB_MIN_KELVIN..WB_MAX_KELVIN step WB_KELVIN_STEP) add("${kelvin}K")
             add(WB_AUTO_CONTINUOUS)
+            add(WB_AUTO_UNDERWATER)
             add(WB_AUTO_SHUTTER)
         }.also { ladder ->
             val kelvin = ladder.mapNotNull { it.removeSuffix("K").toIntOrNull() }

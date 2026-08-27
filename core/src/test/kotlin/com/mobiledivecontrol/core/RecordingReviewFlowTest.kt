@@ -79,7 +79,7 @@ class RecordingReviewFlowTest {
             CameraCommand.LoadRecordingSaveLocations(destinations),
         )
         val moved = reducer.reduce(loaded.state, CameraCommand.NavigateDown)
-        assertEquals(3, moved.state.camera.recordingSaveLocationIndex)
+        assertEquals(1, moved.state.camera.recordingSaveLocationIndex)
 
         val highlighted = reducer.reduce(
             moved.state,
@@ -161,6 +161,35 @@ class RecordingReviewFlowTest {
     fun `Camera is the default recording destination`() {
         assertEquals("Camera", RecordingSaveLocation.Default.name)
         assertEquals("DCIM/Camera/", RecordingSaveLocation.Default.relativePath)
+    }
+
+    @Test
+    fun `album refresh preserves selection by path and updates its cover metadata`() {
+        val selected = RecordingSaveLocation(
+            name = "Dive Archive",
+            relativePath = "DCIM/Dive Archive/",
+        )
+        val refreshed = selected.copy(
+            coverContentUri = "content://media/external/images/media/42",
+            mediaCount = 27,
+        )
+        val state = pausedState().copy(
+            camera = pausedState().camera.copy(
+                recordingSaveLocation = selected,
+                recordingSaveLocations = listOf(RecordingSaveLocation.Default, selected),
+                recordingSaveLocationIndex = 1,
+            ),
+        )
+
+        val loaded = reducer.reduce(
+            state,
+            CameraCommand.LoadRecordingSaveLocations(
+                listOf(RecordingSaveLocation.Default, refreshed),
+            ),
+        )
+
+        assertEquals(1, loaded.state.camera.recordingSaveLocationIndex)
+        assertEquals(refreshed, loaded.state.camera.recordingSaveLocation)
     }
 
     @Test

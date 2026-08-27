@@ -25,7 +25,17 @@ class CameraHudOverlayLayoutTest {
             settingsEditing = true,
         )
 
-        assertEquals(86.dp, cameraReadoutBottomPadding(AppMode.CameraAdjust, bottomEditorOpen))
+        assertEquals(235.dp, cameraReadoutBottomPadding(AppMode.CameraAdjust, bottomEditorOpen))
+    }
+
+    @Test
+    fun `options editor lifts the complete dive readout like focus`() {
+        val optionsOpen = CameraState(
+            focusedZone = CameraUiZone.SettingsPanel,
+            showMoreSettings = true,
+        )
+
+        assertEquals(235.dp, cameraReadoutBottomPadding(AppMode.CameraLive, optionsOpen))
     }
 
     @Test

@@ -1,5 +1,6 @@
 # Gradle
 .gradle/
+.gradle-user-home/
 build/
 **/bin/
 !gradle/wrapper/gradle-wrapper.jar
@@ -32,6 +33,24 @@ desktop.ini
 
 # Editor / IDE extras
 .vscode/
+.claude/
+
+# Local recovery and analysis scratch data
+.codex-tmp/
+/tmp/
+
+# Graphify machine-local caches, intermediates, and conversation memory
+/graphify-out/cache/
+/graphify-out/memory/
+/graphify-out/.graphify_analysis.json
+/graphify-out/.graphify_ast.json
+/graphify-out/.graphify_chunk_*.json
+/graphify-out/.graphify_detect.json
+/graphify-out/.graphify_extract.json
+/graphify-out/.graphify_incremental.json
+/graphify-out/.graphify_old.json
+/graphify-out/.graphify_semantic*.json
+/graphify-out/.graphify_uncached.txt
 
 # Office temp files
 ~$*

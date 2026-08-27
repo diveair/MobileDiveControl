@@ -10,6 +10,9 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.CamcorderProfile
+import android.media.MediaCodecList
+import android.media.MediaFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -18,16 +21,17 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.RggbChannelVector
-import android.hardware.camera2.params.TonemapCurve
 import android.os.Build
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
+import android.util.Rational
+import android.widget.Toast
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
@@ -36,10 +40,14 @@ import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.DynamicRange
+import androidx.camera.core.ExperimentalSessionConfig
+import androidx.camera.core.AspectRatio
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.SessionConfig
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -49,6 +57,8 @@ import androidx.camera.extensions.ExtensionsManager
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.HighSpeedVideoSessionConfig
+import androidx.camera.video.ExperimentalHighSpeedVideo
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
@@ -66,7 +76,14 @@ import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.CameraState
 import com.mobiledivecontrol.core.AutofocusHoldPolicy
 import com.mobiledivecontrol.core.FocusCurveMode
+import com.mobiledivecontrol.core.SamsungLogProfile
+import com.mobiledivecontrol.core.UnderwaterFrameObservation
+import com.mobiledivecontrol.core.UnderwaterWhiteBalanceEstimator
+import com.mobiledivecontrol.core.UnderwaterWhiteBalanceInput
+import com.mobiledivecontrol.core.UnderwaterWhiteBalanceSolution
+import com.mobiledivecontrol.core.WhiteBalanceChromaticity
 import com.mobiledivecontrol.ui.components.STANDARD_ATMOSPHERE_KPA
+import org.json.JSONObject
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.atan
@@ -75,11 +92,22 @@ import kotlin.math.sqrt
 import java.io.File
 import java.util.concurrent.Executors
 
+@OptIn(ExperimentalSessionConfig::class, ExperimentalHighSpeedVideo::class)
 class CameraRuntimeController(
     private val context: Context,
 ) {
     companion object {
         private const val TAG = "DiveCameraCtrl"
+        private const val HIGH_SPEED_FPS_MIN = 100
+        private const val METADATA_SIDECAR_RELATIVE_PATH =
+            "Download/Mobile Dive Control/Metadata/"
+        private val recorderFrameRateCandidates = setOf(24, 25, 30, 48, 50, 60, 90)
+        private val recorderQualityLabels = listOf(
+            Quality.SD to "SD 480p",
+            Quality.HD to "HD 720p",
+            Quality.FHD to "FHD",
+            Quality.UHD to "UHD 4K",
+        )
         private const val RESUME_STREAM_CHECK_DELAY_MS = 2_500L
         private const val DEFAULT_HORIZONTAL_FOV_DEGREES = 70.0
 
@@ -129,6 +157,11 @@ class CameraRuntimeController(
         private const val WB_AUTO_SETTLE_MS = 1_500L
         /** Never lose a shutter press if a device fails to acknowledge AWB lock promptly. */
         private const val WB_SHUTTER_LOCK_TIMEOUT_MS = 600L
+        /** AU colour statistics share the analysis stream without contending with gesture work. */
+        private const val UNDERWATER_ANALYSIS_INTERVAL_MS = 125L
+        private const val UNDERWATER_REQUEST_INTERVAL_MS = 250L
+        private const val UNDERWATER_COMMAND_KELVIN_EPSILON = 25
+        private const val UNDERWATER_COMMAND_DUV_EPSILON = 0.00025
         private const val MACRO_STOP_REBIND_DEBOUNCE_MS = 450L
 
         /** How far the probe steps to decide which way the subject lies. */
@@ -200,9 +233,16 @@ class CameraRuntimeController(
          * reads 60fps.
          */
         val frameRate: String?,
+        val metering: String?,
+        val stabilization: String?,
         val waterPressureKpa: Double?,
         val atmosphericPressureKpa: Double?,
+        /** AU's high-rate result is transient, so its commandable values belong in this latch. */
+        val underwaterKelvin: Int?,
+        val underwaterTintTenThousandths: Int?,
     )
+
+    private data class CaptureMetadataSnapshot(val json: String)
 
     private data class PhysicalLensProfile(
         val logicalCameraId: String,
@@ -266,6 +306,16 @@ class CameraRuntimeController(
     private var imageAnalysis: ImageAnalysis? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
+    private val camera2HighSpeedRecorder = Camera2HighSpeedRecorder(context)
+    private val highSpeedClockRunnable = object : Runnable {
+        override fun run() {
+            if (!camera2HighSpeedRecorder.isBusy) return
+            currentRecordingSegmentDurationMs = camera2HighSpeedRecorder.elapsedDurationMs
+            RecordingClock.durationMs.value =
+                completedRecordingDurationMs + currentRecordingSegmentDurationMs
+            cameraRequestHandler.postDelayed(this, 100L)
+        }
+    }
     /** Duration is cumulative across continuation clips within one logical recording session. */
     private var completedRecordingDurationMs = 0L
     private var currentRecordingSegmentDurationMs = 0L
@@ -277,6 +327,7 @@ class CameraRuntimeController(
     private val recordingSegmentFiles = mutableListOf<File>()
     private var activeRecordingSegmentFile: File? = null
     private var recordingReviewFile: File? = null
+    private var recordingMetadataSnapshot: CaptureMetadataSnapshot? = null
     private val recordingFinalizeExecutor = Executors.newSingleThreadExecutor()
     /** Resume/Stop/Delete pressed before CameraX returns the finalised segment URI. */
     private var pendingRecordingAction: CameraCommand? = null
@@ -304,9 +355,16 @@ class CameraRuntimeController(
     private var boundLensFacing: Int? = null
     private var boundLensValue: String? = null
     private var boundResolution: String? = null
+    private var boundFrameRate: String? = null
+    private var boundHdrLogMode: String? = null
+    private var boundCaptureFormat: String? = null
+    private var boundAspectRatio: String? = null
+    private var boundExpectedPhysicalCameraId: String? = null
     private var boundHdrExtension: Boolean = false
+    @Volatile private var boundLogCaptureContractSatisfied: Boolean = false
+    @Volatile private var maximumInformationRequestModes = MaximumInformationRequestModes()
     private var boundFocusMode: Boolean = false // true = manual focus, false = AF
-    private var latestState: CameraState = CameraState()
+    @Volatile private var latestState: CameraState = CameraState()
     /**
      * Transient capture state, deliberately outside persisted [CameraState]. Auto Shutter meters
      * exactly like continuous AWB until the physical shutter is pressed, then this bit is applied
@@ -315,11 +373,13 @@ class CameraRuntimeController(
     @Volatile private var shutterAwbLockActive = false
     private var shutterAwbLockInFlight = false
     private var shutterAwbLockGeneration = 0
-    private var latestWaterPressureKpa: Double? = null
-    private var latestAtmosphericPressureKpa: Double? = null
+    @Volatile private var latestWaterPressureKpa: Double? = null
+    @Volatile private var latestAtmosphericPressureKpa: Double? = null
+    @Volatile private var latestWaterTemperatureC: Double? = null
+    @Volatile private var latestHeadingDegrees: Double? = null
 
     /** Barometric reading captured with the suction cover open. The only valid depth reference. */
-    private var latestSurfaceAmbientKpa: Double? = null
+    @Volatile private var latestSurfaceAmbientKpa: Double? = null
     private var frontCameraId: String? = null
     private var frontCameraMinFocusDistance: Float = 0f
     private var backCameraProfile: BackCameraProfile? = null
@@ -338,6 +398,20 @@ class CameraRuntimeController(
     private var lastFocusResultLogAtMs: Long = 0L
     private var lastAppliedSessionSignature: SessionSignature? = null
     private val focusAssistExecutor = Executors.newSingleThreadExecutor()
+    private val underwaterTraceExecutor = Executors.newSingleThreadExecutor()
+    private val underwaterTrace = UnderwaterWhiteBalanceTrace(
+        File(context.getExternalFilesDir(null) ?: context.filesDir, "diagnostics"),
+    )
+    private val underwaterFrameAnalyzer = UnderwaterFrameAnalyzer()
+    private val underwaterWbEstimator = UnderwaterWhiteBalanceEstimator()
+    /** Latest estimate and the separately throttled white point actually commanded to Camera2. */
+    @Volatile private var underwaterWbSolution: UnderwaterWhiteBalanceSolution? = null
+    @Volatile private var underwaterCommandSolution: UnderwaterWhiteBalanceSolution? = null
+    @Volatile private var lastUnderwaterObservation: UnderwaterFrameObservation? = null
+    @Volatile private var underwaterApplyPosted = false
+    @Volatile private var underwaterCaptureFrozen = false
+    private var lastUnderwaterAnalysisAtMs = 0L
+    private var lastUnderwaterCommandAtMs = 0L
     // Callback to report detected lenses back to the ViewModel/state
     private var onDetectedLenses: ((List<String>) -> Unit)? = null
     private var onPointingGesture: ((PointingGesture) -> Unit)? = null
@@ -389,8 +463,12 @@ class CameraRuntimeController(
             result: TotalCaptureResult,
         ) {
             super.onCaptureCompleted(session, request, result)
+            // Constrained high-speed capture owns a separate Camera2 session and forces 3A auto.
+            // Keep harvesting preview telemetry, but never let a late CameraX callback take over
+            // its session or submit a request to a CameraDevice that the rebind already closed.
+            val directHighSpeedSelected = isHighSpeedSelection(latestState)
             // Capture session + surfaces on first callback or session change
-            if (cam2Session !== session) {
+            if (!directHighSpeedSelected && cam2Session !== session) {
                 cam2Session = session
                 try {
                     val m = CaptureRequest::class.java.getDeclaredMethod("getTargets")
@@ -429,9 +507,11 @@ class CameraRuntimeController(
             // AWB truth is latched ONLY while white balance is genuinely auto. While a manual
             // kelvin or the underwater filter drives the request, these results echo our own
             // writes — latching them would poison the anchor with our own output.
+            val observedColorGains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+            observedColorGains?.let { lastObservedColorGains = it }
             if (wbIsAuto(latestState)) {
                 result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { lastAutoColorTransform = it }
-                result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { lastAutoColorGains = it }
+                observedColorGains?.let { lastAutoColorGains = it }
             }
             // The exposure envelope CameraX negotiated. Our own request must inherit it, or the
             // frame rate and flicker bounds change the instant we take over the session and the
@@ -460,11 +540,16 @@ class CameraRuntimeController(
             }
             val meteredWbKelvin = readVendorResult(result, vendorColorTempResultKey) { vendorColorTempResultKey = null }
             val meteredEvTenths = readVendorResult(result, vendorEvMeterResultKey) { vendorEvMeterResultKey = null }
+            val underwaterTelemetry = underwaterCommandSolution.takeIf {
+                CameraCatalog.isWhiteBalanceAutoUnderwater(currentValue(latestState, ".white_balance"))
+            }
             onMeteredExposure?.invoke(
                 com.mobiledivecontrol.core.MeteredExposure(
                     iso = lastAeSensitivity,
                     shutterNs = lastAeExposureNs,
-                    wbKelvin = meteredWbKelvin,
+                    wbKelvin = underwaterTelemetry?.kelvin ?: meteredWbKelvin,
+                    wbTintDuv = underwaterTelemetry?.tintDuv,
+                    wbConfidence = underwaterTelemetry?.confidence,
                     evTenths = meteredEvTenths,
                 ),
             )
@@ -477,7 +562,7 @@ class CameraRuntimeController(
             } else if (now - wbManualSeenAtMs > WB_AUTO_SETTLE_MS) {
                 val gains = lastAutoColorGains
                 if (meteredWbKelvin != null && gains != null) {
-                    lastAutoWbAnchor = WbAnchor(meteredWbKelvin, gains, lastAutoColorTransform)
+                    lastAutoWbAnchor = WbAnchor(meteredWbKelvin, gains, lastAutoColorTransform, now)
                     harvestAwbCurvePoint(meteredWbKelvin, gains, lastAutoColorTransform, now)
                 }
             }
@@ -487,6 +572,21 @@ class CameraRuntimeController(
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
             val lp = samsungFocusLensPosition(result)
             val physicalId = runningPhysicalCameraId(result)
+            val noiseReductionMode = result.get(CaptureResult.NOISE_REDUCTION_MODE)
+            val edgeMode = result.get(CaptureResult.EDGE_MODE)
+            val videoStabilizationMode = result.get(
+                CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE,
+            )
+            val expectedPhysicalId = boundExpectedPhysicalCameraId
+            if (activeRecording != null && boundHdrLogMode == "LOG" &&
+                physicalId != null && expectedPhysicalId != null && physicalId != expectedPhysicalId
+            ) {
+                Log.e(
+                    TAG,
+                    "Log physical-camera contract changed while recording: " +
+                        "expected=$expectedPhysicalId actual=$physicalId",
+                )
+            }
             // evIdx is the HAL's echo of CONTROL_AE_EXPOSURE_COMPENSATION — the on-metal proof
             // line for the +/-4.0 EV window: past index +/-20 the echo AND the iso x expNs
             // product must keep moving, or the wider dial saturates and must be pulled back.
@@ -500,7 +600,8 @@ class CameraRuntimeController(
                     "wanted=$lastCommandedLensPos physical=$physicalId native=$nativeFocusActive " +
                     "iso=$lastAeSensitivity expNs=$lastAeExposureNs evIdx=$evEcho " +
                     "wbK=$meteredWbKelvin evMeter=$meteredEvTenths " +
-                    "wbAnchor=${lastAutoWbAnchor?.kelvin} gains=$resultGains",
+                    "wbAnchor=${lastAutoWbAnchor?.kelvin} gains=$resultGains " +
+                    "nr=$noiseReductionMode edge=$edgeMode eis=$videoStabilizationMode",
             )
         }
     }
@@ -643,6 +744,8 @@ class CameraRuntimeController(
         resumeObserver?.let { observer -> lifecycleOwner?.lifecycle?.removeObserver(observer) }
         resumeObserver = null
         cameraProvider?.unbindAll()
+        camera2HighSpeedRecorder.release()
+        cameraRequestHandler.removeCallbacks(highSpeedClockRunnable)
         camera = null
         imageCapture = null
         imageAnalysis = null
@@ -651,7 +754,14 @@ class CameraRuntimeController(
         boundLensFacing = null
         boundLensValue = null
         boundResolution = null
+        boundFrameRate = null
+        boundHdrLogMode = null
+        boundCaptureFormat = null
+        boundAspectRatio = null
+        boundExpectedPhysicalCameraId = null
         boundHdrExtension = false
+        boundLogCaptureContractSatisfied = false
+        maximumInformationRequestModes = MaximumInformationRequestModes()
         boundFocusMode = false
         cam2Session = null
         cam2Surfaces = emptyList()
@@ -667,6 +777,14 @@ class CameraRuntimeController(
         shutterAwbLockGeneration++
         shutterAwbLockInFlight = false
         shutterAwbLockActive = false
+        underwaterWbSolution = null
+        underwaterCommandSolution = null
+        lastUnderwaterObservation = null
+        underwaterApplyPosted = false
+        underwaterCaptureFrozen = false
+        lastUnderwaterAnalysisAtMs = 0L
+        lastUnderwaterCommandAtMs = 0L
+        underwaterTraceExecutor.execute { underwaterTrace.close() }
         focusAssistEnabled = false
         lastAppliedSessionSignature = null
         focusPeakingProcessor?.release()
@@ -693,7 +811,17 @@ class CameraRuntimeController(
         waterPressureKpa: Double?,
         atmosphericPressureKpa: Double?,
         surfaceAmbientKpa: Double? = null,
+        waterTemperatureC: Double? = null,
+        headingDegrees: Double? = null,
     ) {
+        val previousUnderwater = CameraCatalog.isWhiteBalanceAutoUnderwater(
+            currentValue(latestState, ".white_balance"),
+        )
+        val underwater = CameraCatalog.isWhiteBalanceAutoUnderwater(
+            currentValue(cameraState, ".white_balance"),
+        )
+        val now = SystemClock.elapsedRealtime()
+        val pressureChanged = waterPressureKpa != latestWaterPressureKpa
         latestState = cameraState
         if ((shutterAwbLockActive || shutterAwbLockInFlight) &&
             !CameraCatalog.isWhiteBalanceAutoShutter(currentValue(cameraState, ".white_balance"))
@@ -705,10 +833,24 @@ class CameraRuntimeController(
         latestWaterPressureKpa = waterPressureKpa
         latestAtmosphericPressureKpa = atmosphericPressureKpa
         latestSurfaceAmbientKpa = surfaceAmbientKpa
+        latestWaterTemperatureC = waterTemperatureC
+        latestHeadingDegrees = headingDegrees
+        when {
+            underwater && !previousUnderwater -> seedUnderwaterWhiteBalance(cameraState, now)
+            !underwater && previousUnderwater -> {
+                underwaterWbSolution = null
+                underwaterCommandSolution = null
+                lastUnderwaterObservation = null
+                underwaterCaptureFrozen = false
+                underwaterTraceExecutor.execute { underwaterTrace.close() }
+            }
+            underwater && pressureChanged -> updateUnderwaterWhiteBalance(lastUnderwaterObservation, now)
+        }
         focusAssistEnabled = isFocusAssistEnabled(cameraState)
         // Toggle GPU shader peaking — no camera rebinding needed.
         // Peaking works in both AF and manual focus modes.
         focusPeakingProcessor?.peakingEnabled = focusAssistEnabled
+        focusPeakingProcessor?.exposureAssistMode = exposureAssistMode(cameraState)
         if (cameraProvider == null || previewView == null || lifecycleOwner == null) {
             Log.d(TAG, "applyState: early return (provider/preview/lifecycle null)")
             return
@@ -717,10 +859,19 @@ class CameraRuntimeController(
         val desiredLensFacing = desiredLensFacing(cameraState)
         val desiredResolution = desiredResolutionValue(cameraState)
         val desiredLens = selectedLensValue(cameraState)
-        // Rebind when lens facing, physical lens, or resolution changes.
+        val desiredFrameRate = currentValue(cameraState, ".frame_rate")
+        val desiredHdrLogMode = resolvedSessionHdrLogMode(cameraState)
+        val desiredCaptureFormat = currentValue(cameraState, ".save_format")
+        val desiredAspectRatio = currentValue(cameraState, ".aspect_ratio")
+        // Dynamic range is a stream property. A repeating CaptureRequest cannot turn an 8-bit
+        // encoder surface into a 10-bit one, so an HDR/LOG change must create a new session.
         val needsRebind = desiredLensFacing != boundLensFacing ||
                 desiredResolution != boundResolution ||
-                desiredLens != boundLensValue
+                desiredFrameRate != boundFrameRate ||
+                desiredLens != boundLensValue ||
+                desiredHdrLogMode != boundHdrLogMode ||
+                desiredCaptureFormat != boundCaptureFormat ||
+                desiredAspectRatio != boundAspectRatio
         if (needsRebind) {
             Log.d(TAG, "applyState: rebinding camera")
             focusSlewGen++
@@ -838,6 +989,143 @@ class CameraRuntimeController(
 
     /** Newest focus measure from the analysis stream: higher means more contrast, i.e. sharper. */
     @Volatile private var latestSharpness: Double = 0.0
+
+    private fun seedUnderwaterWhiteBalance(cameraState: CameraState, nowMs: Long): Boolean {
+        // On a persisted-AU app restart there is no same-session anchor yet. Stay on OEM AWB
+        // until it reports a real value; commanding an arbitrary 6500 K first caused the most
+        // visible colour jump in the device trace and contaminated the estimator's first frame.
+        val anchorKelvin = lastAutoWbAnchor?.kelvin
+        val meteredKelvin = cameraState.meteredExposure.wbKelvin
+        val seedKelvin = (anchorKelvin ?: meteredKelvin)?.coerceIn(
+            CameraCatalog.WB_MIN_KELVIN,
+            CameraCatalog.WB_MAX_KELVIN,
+        ) ?: return false
+        underwaterWbEstimator.reset(seedKelvin, 0.0, nowMs)
+        underwaterWbSolution = UnderwaterWhiteBalanceSolution(
+            kelvin = seedKelvin,
+            tintDuv = 0.0,
+            confidence = if (lastAutoWbAnchor != null) 0.35 else 0.0,
+            diveLightProbability = 0.0,
+        )
+        underwaterCommandSolution = underwaterWbSolution
+        lastUnderwaterAnalysisAtMs = 0L
+        lastUnderwaterCommandAtMs = nowMs
+        underwaterTraceExecutor.execute {
+            underwaterTrace.start(nowMs, System.currentTimeMillis())?.let { file ->
+                Log.i(TAG, "AU trace started: ${file.absolutePath}")
+            }
+        }
+        Log.i(TAG, "AU seeded at ${seedKelvin}K from OEM AWB")
+        return true
+    }
+
+    /** Fuse one fresh frame with the low-confidence depth/range prior, then coalesce request writes. */
+    private fun updateUnderwaterWhiteBalance(
+        observation: UnderwaterFrameObservation?,
+        nowMs: Long,
+        analysisMicros: Long? = null,
+    ) {
+        if (!CameraCatalog.isWhiteBalanceAutoUnderwater(currentValue(latestState, ".white_balance"))) return
+        val current = underwaterWbSolution ?: run {
+            if (!seedUnderwaterWhiteBalance(latestState, nowMs)) return
+            underwaterWbSolution ?: return
+        }
+        val freshObservation = observation?.takeIf { nowMs - it.timestampMillis <= 750L }
+        val anchor = lastAutoWbAnchor
+        val focusCapability = selectedFocusCapability(latestState)
+        val focusDiopters = lastObservedFocusDiopters
+            ?.takeIf { focusCapability?.usesPublicDiopters == true && it > 0.05f }
+        val subjectDistance = focusDiopters?.let { (1.0 / it).coerceIn(0.2, 5.0) }
+        val depth = currentDepthMeters()
+        val depthConfidence = currentDepthConfidence()
+        val rangeConfidence = if (subjectDistance != null) 0.20 else 0.0
+        val anchorAge = anchor?.let { (nowMs - it.capturedAtMs).coerceAtLeast(0L) }
+        val observedGains = lastObservedColorGains
+        val solution = underwaterWbEstimator.update(
+            UnderwaterWhiteBalanceInput(
+                observation = freshObservation,
+                currentKelvin = current.kelvin,
+                currentTintDuv = current.tintDuv,
+                autoAnchorKelvin = anchor?.kelvin,
+                autoAnchorAgeMillis = anchorAge,
+                depthMeters = depth,
+                depthConfidence = depthConfidence,
+                subjectDistanceMeters = subjectDistance,
+                // Public focus distance is a useful ordering cue, but the housing port has not
+                // yet been metrically calibrated in water, so it remains a deliberately weak prior.
+                subjectDistanceConfidence = rangeConfidence,
+                timestampMillis = nowMs,
+            ),
+        )
+        underwaterWbSolution = solution
+        val commanded = underwaterCommandSolution ?: current
+        val recording = latestState.recording
+        val wallMillis = System.currentTimeMillis()
+        underwaterTraceExecutor.execute {
+            underwaterTrace.record(
+                UnderwaterWhiteBalanceTrace.Sample(
+                    elapsedMillis = nowMs,
+                    wallMillis = wallMillis,
+                    recording = recording,
+                    depthMeters = depth,
+                    depthConfidence = depthConfidence,
+                    rangeMeters = subjectDistance,
+                    rangeConfidence = rangeConfidence,
+                    observation = freshObservation,
+                    anchorKelvin = anchor?.kelvin,
+                    anchorAgeMillis = anchorAge,
+                    estimate = solution,
+                    command = commanded,
+                    appliedRedGain = observedGains?.red?.toDouble(),
+                    appliedBlueGain = observedGains?.blue?.toDouble(),
+                    analysisMicros = analysisMicros,
+                ),
+            )
+        }
+        val commandChanged = abs(solution.kelvin - commanded.kelvin) >= UNDERWATER_COMMAND_KELVIN_EPSILON ||
+            abs(solution.tintDuv - commanded.tintDuv) >= UNDERWATER_COMMAND_DUV_EPSILON
+        if (commandChanged && !underwaterCaptureFrozen) requestUnderwaterWhiteBalanceApply()
+    }
+
+    private fun currentDepthConfidence(): Double {
+        val depth = currentDepthMeters() ?: return 0.0
+        // Below roughly one pressure-sensor quantisation step, the image estimator must lead.
+        val resolvedDepth = (depth / 0.75).coerceIn(0.0, 1.0)
+        val baseline = if (latestSurfaceAmbientKpa != null) 1.0 else 0.45
+        // SafetyState currently carries no packet timestamp. Do not invent staleness from an
+        // unchanged pressure value: a stationary diver legitimately produces the same sample.
+        // Even if an old value survives a disconnect, this remains a weak prior and live image
+        // evidence continues to lead the estimate.
+        return resolvedDepth * baseline
+    }
+
+    private fun requestUnderwaterWhiteBalanceApply() {
+        if (underwaterApplyPosted || underwaterCaptureFrozen) return
+        underwaterApplyPosted = true
+        val now = SystemClock.elapsedRealtime()
+        val delay = (lastUnderwaterCommandAtMs + UNDERWATER_REQUEST_INTERVAL_MS - now).coerceAtLeast(0L)
+        cameraRequestHandler.postDelayed(underwaterApply@{
+            underwaterApplyPosted = false
+            if (!underwaterCaptureFrozen && CameraCatalog.isWhiteBalanceAutoUnderwater(
+                    currentValue(latestState, ".white_balance"),
+                )
+            ) {
+                val estimate = underwaterWbSolution ?: return@underwaterApply
+                val commanded = underwaterCommandSolution
+                val changed = commanded == null ||
+                    abs(estimate.kelvin - commanded.kelvin) >= UNDERWATER_COMMAND_KELVIN_EPSILON ||
+                    abs(estimate.tintDuv - commanded.tintDuv) >= UNDERWATER_COMMAND_DUV_EPSILON
+                if (changed) {
+                    // Publish the command atomically before building its SessionSignature. Any
+                    // unrelated state tick now sees the same stable command instead of bypassing
+                    // this throttle with the newest sub-threshold estimate.
+                    underwaterCommandSolution = estimate
+                    lastUnderwaterCommandAtMs = SystemClock.elapsedRealtime()
+                    applySessionState(latestState)
+                }
+            }
+        }, delay)
+    }
 
     /**
      * Whether a contrast pull is actually reading [latestSharpness] right now.
@@ -1208,6 +1496,8 @@ class CameraRuntimeController(
      * fit can promise but the HAL's own gains at 4500K do by definition.
      */
     @Volatile private var lastAutoColorGains: RggbChannelVector? = null
+    /** Actual gains echoed by the HAL, including in AU; used to diagnose device-side clamping. */
+    @Volatile private var lastObservedColorGains: RggbChannelVector? = null
     @Volatile private var lastAutoWbAnchor: WbAnchor? = null
 
     /**
@@ -1229,6 +1519,7 @@ class CameraRuntimeController(
         val kelvin: Int,
         val gains: RggbChannelVector,
         val transform: android.hardware.camera2.params.ColorSpaceTransform?,
+        val capturedAtMs: Long,
     )
 
     /**
@@ -1634,6 +1925,14 @@ class CameraRuntimeController(
         val previewSurface = previewView ?: return
         val desiredLensFacing = desiredLensFacing(latestState)
         val desiredResolution = desiredResolutionValue(latestState)
+        val desiredFrameRate = currentValue(latestState, ".frame_rate")
+        val desiredFrameRateFps = desiredFrameRate?.removeSuffix("fps")?.toIntOrNull()
+        val highSpeedRecording = desiredFrameRateFps != null && desiredFrameRateFps >= HIGH_SPEED_FPS_MIN
+        val desiredHdrLogMode = resolvedSessionHdrLogMode(latestState)
+        val desiredCaptureFormat = currentValue(latestState, ".save_format")
+        val desiredAspectRatio = currentValue(latestState, ".aspect_ratio")
+        val maximumInformationLog =
+            VideoDynamicRangePolicy.usesMaximumInformationStreamGraph(desiredHdrLogMode)
         activeLensProfile = selectedLensProfile(latestState)
         val focusCapability = selectedFocusCapability(latestState)
         val manualFocusRequest = manualFocusRequestFor(latestState)
@@ -1645,10 +1944,17 @@ class CameraRuntimeController(
 
         if (!force && desiredLensFacing == boundLensFacing &&
             desiredResolution == boundResolution &&
-            selectedLensValue(latestState) == boundLensValue) {
+            desiredFrameRate == boundFrameRate &&
+            selectedLensValue(latestState) == boundLensValue &&
+            desiredHdrLogMode == boundHdrLogMode &&
+            desiredCaptureFormat == boundCaptureFormat &&
+            desiredAspectRatio == boundAspectRatio) {
             applySessionState(latestState)
             return
         }
+
+        boundLogCaptureContractSatisfied = false
+        maximumInformationRequestModes = MaximumInformationRequestModes()
 
         val selectorBuilder = CameraSelector.Builder()
             .requireLensFacing(desiredLensFacing)
@@ -1687,6 +1993,13 @@ class CameraRuntimeController(
         val previewBuilder = Preview.Builder()
         val imageCaptureBuilder = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .setOutputFormat(
+                if (desiredCaptureFormat == "Ultra HDR JPEG") {
+                    ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR
+                } else {
+                    ImageCapture.OUTPUT_FORMAT_JPEG
+                },
+            )
         val analysisBuilder = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             // MediaPipe accepts RGB/RGBA. Keeping this one shared 640x480 stream avoids a second
@@ -1784,7 +2097,9 @@ class CameraRuntimeController(
             }
         }
 
-        val capture = imageCaptureBuilder.build()
+        val capture = imageCaptureBuilder.build().also { imageCapture ->
+            photoCropRatio(desiredAspectRatio)?.let(imageCapture::setCropAspectRatio)
+        }
         val analysis = analysisBuilder.build().also { it ->
             // A do-nothing analyzer, kept for one reason: an ImageAnalysis with no analyzer
             // stays INACTIVE and contributes nothing to the repeating request, so its
@@ -1793,6 +2108,23 @@ class CameraRuntimeController(
             // here. The frame itself is closed immediately; nothing is read or retained.
             it.setAnalyzer(focusAssistExecutor) { image ->
                 val now = SystemClock.elapsedRealtime()
+                if (CameraCatalog.isWhiteBalanceAutoUnderwater(
+                        currentValue(latestState, ".white_balance"),
+                    ) && now - lastUnderwaterAnalysisAtMs >= UNDERWATER_ANALYSIS_INTERVAL_MS
+                ) {
+                    lastUnderwaterAnalysisAtMs = now
+                    val analysisStartedNs = SystemClock.elapsedRealtimeNanos()
+                    val observation = underwaterFrameAnalyzer.analyze(
+                        image,
+                        now,
+                    )
+                    if (observation != null) lastUnderwaterObservation = observation
+                    updateUnderwaterWhiteBalance(
+                        observation,
+                        now,
+                        analysisMicros = (SystemClock.elapsedRealtimeNanos() - analysisStartedNs) / 1_000L,
+                    )
+                }
                 val monitorHeldPlane = afLocked && !afTracking &&
                     now - lastAfHoldMonitorAtMs >= AF_HOLD_MONITOR_INTERVAL_MS
                 if (afPullActive || monitorHeldPlane) {
@@ -1838,6 +2170,7 @@ class CameraRuntimeController(
                 focusPeakingProcessor = it
             }
         processor.peakingEnabled = focusAssistEnabled
+        processor.exposureAssistMode = exposureAssistMode(latestState)
 
         val effect = object : CameraEffect(
             PREVIEW,
@@ -1848,24 +2181,87 @@ class CameraRuntimeController(
 
         // Real video: a Recorder-backed VideoCapture rides in the same group. Highest
         // quality the device offers, falling down the ladder rather than failing the bind.
-        val recorder = Recorder.Builder()
+        val recorderBuilder = Recorder.Builder()
             .setQualitySelector(
-                QualitySelector.from(
-                    Quality.HIGHEST,
-                    FallbackStrategy.lowerQualityOrHigherThan(Quality.SD),
-                ),
+                videoQualitySelector(desiredResolution),
             )
-            .build()
-        val video = VideoCapture.withOutput(recorder)
-        videoCapture = video
+            .setAspectRatio(
+                if (desiredAspectRatio == "4:3") AspectRatio.RATIO_4_3 else AspectRatio.RATIO_16_9,
+            )
+        VideoDynamicRangePolicy.targetVideoBitrate(desiredHdrLogMode)?.let { bitrate ->
+            recorderBuilder.setTargetVideoEncodingBitRate(bitrate)
+        }
+        val recorder = recorderBuilder.build()
+        val supportedDynamicRanges = if (desiredHdrLogMode == "LOG") {
+            val selectedCameraInfo = try {
+                selector.filter(provider.availableCameraInfos).firstOrNull()
+            } catch (error: IllegalArgumentException) {
+                Log.w(TAG, "Could not resolve the selected camera's video capabilities", error)
+                null
+            }
+            selectedCameraInfo
+                ?.let { Recorder.getVideoCapabilities(it) }
+                ?.supportedDynamicRanges
+                .orEmpty()
+        } else {
+            emptySet()
+        }
+        val requestedDynamicRange = VideoDynamicRangePolicy.select(
+            requestedMode = desiredHdrLogMode,
+            supported = supportedDynamicRanges,
+        )
+        val videoBuilder = VideoCapture.Builder(recorder)
+            .setDynamicRange(requestedDynamicRange)
+        // In the maximum-information graph VideoCapture replaces ImageAnalysis as the
+        // repeating telemetry/session tap. Put every session-critical option on the encoded
+        // stream itself so removing the auxiliary surfaces cannot break live manual control.
+        val videoInterop = Camera2Interop.Extender(videoBuilder)
+        physicalCameraId?.let(videoInterop::setPhysicalCameraId)
+        if (isManualFocus) {
+            videoInterop.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                CameraMetadata.CONTROL_AF_MODE_OFF,
+            )
+            if (manualFocusRequest?.vendorLensPosition == null) {
+                manualFocusRequest?.diopters?.let { focusDistance ->
+                    videoInterop.setCaptureRequestOption(
+                        CaptureRequest.LENS_FOCUS_DISTANCE,
+                        focusDistance,
+                    )
+                }
+            }
+            manualFocusRequest?.vendorLensPosition?.let { lensPosition ->
+                vendorFocusLensPositionKey()?.let { key ->
+                    videoInterop.setCaptureRequestOption(key, lensPosition)
+                }
+            }
+        }
+        videoInterop.setSessionCaptureCallback(sessionCaptureCallback)
+        val video = videoBuilder.build()
+        Log.i(TAG, "Video dynamic range=$requestedDynamicRange requestedMode=$desiredHdrLogMode")
+        videoCapture = video.takeUnless { highSpeedRecording }
 
-        val useCaseGroup = UseCaseGroup.Builder()
-            .addUseCase(preview)
-            .addUseCase(capture)
-            .addUseCase(analysis)
-            .addUseCase(video)
-            .addEffect(effect)
-            .build()
+        val useCaseGroup = if (highSpeedRecording) {
+            null
+        } else {
+            UseCaseGroup.Builder()
+                .addUseCase(preview)
+                .addUseCase(video)
+                .addEffect(effect)
+                .also { builder ->
+                    if (!maximumInformationLog) {
+                        builder.addUseCase(capture).addUseCase(analysis)
+                    }
+                }
+                .build()
+        }
+        if (maximumInformationLog) {
+            Log.i(
+                TAG,
+                "Log maximum-information graph: Preview + HLG10 VideoCapture; " +
+                    "still/8-bit analysis surfaces omitted",
+            )
+        }
 
         // Reset native session state before rebinding. A stale nativeFocusActive
         // from a previous lens would trigger cancelFocusAndMetering() on the new
@@ -1876,13 +2272,26 @@ class CameraRuntimeController(
         lastAppliedSessionSignature = null
         provider.unbindAll()
         camera = try {
-            provider.bindToLifecycle(owner, selector, useCaseGroup)
+            if (highSpeedRecording) {
+                // CameraX needs a high-speed CamcorderProfile. Several Samsung devices omit it
+                // despite publishing a valid constrained-high-speed Camera2 map. Keep a genuine
+                // preview here; the shutter swaps briefly to Camera2HighSpeedRecorder, which owns
+                // the encoder surface and the constrained session for the recording itself.
+                Log.i(
+                    TAG,
+                    "Armed direct constrained-high-speed capture: " +
+                        "quality=$desiredResolution fps=$desiredFrameRateFps",
+                )
+                provider.bindToLifecycle(owner, selector, preview)
+            } else {
+                provider.bindToLifecycle(owner, selector, requireNotNull(useCaseGroup))
+            }
         } catch (error: IllegalArgumentException) {
             val triedDirectPhysicalCamera = desiredLensFacing == CameraSelector.LENS_FACING_BACK &&
                 selectedCameraId != null &&
                 selectedCameraId == activeLensProfile?.physicalCameraId &&
                 selectedCameraId != backCameraProfile?.logicalCameraId
-            if (!triedDirectPhysicalCamera) {
+            if (!triedDirectPhysicalCamera && !maximumInformationLog && !highSpeedRecording) {
                 // Preview + ImageCapture + ImageAnalysis + VideoCapture can exceed a device's
                 // stream-combination budget. Shed the analysis leg — the least critical — and
                 // try once more before giving up.
@@ -1899,7 +2308,7 @@ class CameraRuntimeController(
                 } catch (_: IllegalArgumentException) {
                     throw error
                 }
-            } else {
+            } else if (triedDirectPhysicalCamera) {
                 Log.w(
                     TAG,
                     "Direct physical camera binding failed for cameraId=$selectedCameraId, falling back to logical multi-camera binding.",
@@ -1908,14 +2317,38 @@ class CameraRuntimeController(
                 selectedCameraId?.let { failedDirectPhysicalCameraIds += it }
                 bindCamera(force = true)
                 return
+            } else {
+                // The minimal Log graph has no lower-information surface to shed. Propagate the
+                // bind failure instead of quietly adding 8-bit analysis/still streams back in.
+                throw error
             }
         }
-        imageCapture = capture
-        imageAnalysis = analysis
+        // Report this only after a candidate actually binds. The S24 physical camera selector
+        // advertises SDR and then rejects binding; its logical-camera fallback advertises HLG10.
+        // Logging the rejected candidate as a final error produced a false alarm beside a valid
+        // HLG recording.
+        boundLogCaptureContractSatisfied = VideoDynamicRangePolicy.isCaptureContractSatisfied(
+            requestedMode = desiredHdrLogMode,
+            selected = requestedDynamicRange,
+        )
+        if (!boundLogCaptureContractSatisfied) {
+            Log.e(
+                TAG,
+                "The bound camera has no public 10-bit HLG encoder surface; Log recording is blocked.",
+            )
+        }
+        imageCapture = capture.takeUnless { maximumInformationLog }
+            .takeUnless { highSpeedRecording }
+        imageAnalysis = analysis.takeUnless { maximumInformationLog || highSpeedRecording }
         camera?.let { refreshBoundCameraCapabilities(it) }
         boundLensFacing = desiredLensFacing
         boundLensValue = selectedLensValue(latestState)
         boundResolution = desiredResolution
+        boundFrameRate = desiredFrameRate
+        boundHdrLogMode = desiredHdrLogMode
+        boundCaptureFormat = desiredCaptureFormat
+        boundAspectRatio = desiredAspectRatio
+        boundExpectedPhysicalCameraId = activeLensProfile?.physicalCameraId
 
         // Detect device capabilities from the bound camera
 
@@ -1930,10 +2363,23 @@ class CameraRuntimeController(
     // ── Video recording ──────────────────────────────────────────────────────────────
 
     private fun startVideoRecording() {
-        if (activeRecording != null || recordingSegmentFinalizingForReview) return
+        if (activeRecording != null || camera2HighSpeedRecorder.isBusy || recordingSegmentFinalizingForReview) return
+        if (resolvedHdrLogMode(latestState) == "LOG" && !boundLogCaptureContractSatisfied) {
+            Log.e(TAG, "Refusing Log recording because the bound stream is not public HLG10")
+            Toast.makeText(
+                context,
+                "Log recording unavailable: this camera path is not 10-bit HLG",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
         val startedAt = System.currentTimeMillis()
         val sessionDirectory = File(
-            context.cacheDir,
+            // Recording segments are temporary, but they are not disposable: CameraX must
+            // finalise them before preview/publish. Android may evict cacheDir files while a
+            // high-bitrate Log recording is still active, so keep them in the non-backed-up
+            // private files area and delete them explicitly when the session is finished.
+            context.noBackupFilesDir,
             "recording-segments/session-$startedAt-${System.nanoTime()}",
         )
         if (!sessionDirectory.mkdirs() && !sessionDirectory.isDirectory) {
@@ -1942,6 +2388,7 @@ class CameraRuntimeController(
         }
         recordingSessionDirectory = sessionDirectory
         recordingSessionDisplayName = "DiveControl_$startedAt.mp4"
+        recordingMetadataSnapshot = captureMetadataSnapshot()
         recordingSegmentFiles.clear()
         activeRecordingSegmentFile = null
         recordingReviewFile = null
@@ -1962,7 +2409,7 @@ class CameraRuntimeController(
      * for cumulative preview, then Stop publishes one continuous MediaStore video.
      */
     private fun startRecordingSegment() {
-        if (activeRecording != null || recordingSegmentFinalizingForReview) return
+        if (activeRecording != null || camera2HighSpeedRecorder.isBusy || recordingSegmentFinalizingForReview) return
         currentRecordingSegmentDurationMs = 0L
         RecordingClock.reviewUri.value = null
         RecordingClock.reviewFinalizing.value = false
@@ -1980,7 +2427,11 @@ class CameraRuntimeController(
     }
 
     private fun startRecordingSegmentNow() {
-        if (activeRecording != null) return
+        if (activeRecording != null || camera2HighSpeedRecorder.isBusy) return
+        if (isHighSpeedSelection(latestState)) {
+            startCamera2HighSpeedSegment()
+            return
+        }
         val capture = videoCapture ?: run {
             Log.w(TAG, "Record requested but VideoCapture is not bound — rebinding.")
             bindCamera(force = true)
@@ -2002,7 +2453,8 @@ class CameraRuntimeController(
         val hasAudio = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.RECORD_AUDIO,
-        ) == PackageManager.PERMISSION_GRANTED
+        ) == PackageManager.PERMISSION_GRANTED &&
+            currentValue(latestState, ".audio_recording") != "Off"
         val pending = capture.output.prepareRecording(context, options).apply {
             if (hasAudio) withAudioEnabled()
         }
@@ -2060,6 +2512,119 @@ class CameraRuntimeController(
         Log.i(TAG, "Private recording segment started: $segmentFile audio=$hasAudio")
     }
 
+    private fun startCamera2HighSpeedSegment() {
+        val sessionDirectory = recordingSessionDirectory ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+        val fps = currentValue(latestState, ".frame_rate")
+            ?.removeSuffix("fps")
+            ?.toIntOrNull()
+            ?: return
+        val size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: run {
+            Log.e(TAG, "No direct high-speed size for ${desiredResolutionValue(latestState)}")
+            releaseShutterWhiteBalance()
+            return
+        }
+        val boundCamera = camera ?: run {
+            Log.w(TAG, "High-speed record requested without a bound preview; rebinding")
+            bindCamera(force = true)
+            camera
+        } ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+        val cameraId = Camera2CameraInfo.from(boundCamera.cameraInfo).cameraId
+        val segmentFile = File(
+            sessionDirectory,
+            "segment-${(recordingSegmentFiles.size + 1).toString().padStart(4, '0')}.mp4",
+        )
+        activeRecordingSegmentFile = segmentFile
+        val hasAudio = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED &&
+            currentValue(latestState, ".audio_recording") != "Off"
+        val ev = currentValue(latestState, ".exposure_value", ".exposure_compensation")
+            ?.replace("+", "")
+            ?.toDoubleOrNull()
+        val evIndex = ev?.let { evCompensationIndex(boundCamera, it) }
+        val host = previewView ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+
+        cameraProvider?.unbindAll()
+        camera = null
+        videoCapture = null
+        imageCapture = null
+        imageAnalysis = null
+        try {
+            camera2HighSpeedRecorder.start(
+                Camera2HighSpeedRecorder.Request(
+                    previewHost = host,
+                    cameraId = cameraId,
+                    size = size,
+                    fps = fps,
+                    outputFile = segmentFile,
+                    audioEnabled = hasAudio,
+                    exposureCompensationIndex = evIndex,
+                    zoomRatio = latestState.zoomFactor.toFloat().coerceAtLeast(1f),
+                    torchEnabled = currentValue(latestState, ".flash") in setOf("On", "Torch"),
+                ),
+                onStarted = {
+                    currentRecordingSegmentDurationMs = 0L
+                    RecordingClock.paused.value = false
+                    cameraRequestHandler.removeCallbacks(highSpeedClockRunnable)
+                    cameraRequestHandler.post(highSpeedClockRunnable)
+                    Log.i(TAG, "Direct high-speed segment started: $segmentFile audio=$hasAudio")
+                },
+                onFinalized = { result ->
+                    finalizeCamera2HighSpeedSegment(segmentFile, result)
+                },
+            )
+        } catch (error: Throwable) {
+            Log.e(TAG, "Could not start direct high-speed recording", error)
+            activeRecordingSegmentFile = null
+            releaseShutterWhiteBalance()
+            finishRecordingSession(deleteLatest = false)
+            bindCamera(force = true)
+        }
+    }
+
+    private fun finalizeCamera2HighSpeedSegment(segmentFile: File, result: Result<Long>) {
+        cameraRequestHandler.removeCallbacks(highSpeedClockRunnable)
+        val reviewBoundary = recordingSegmentFinalizingForReview
+        if (activeRecordingSegmentFile == segmentFile) activeRecordingSegmentFile = null
+        result.onSuccess { durationMs ->
+            currentRecordingSegmentDurationMs = durationMs
+            completedRecordingDurationMs += durationMs
+            RecordingClock.durationMs.value = completedRecordingDurationMs
+            if (segmentFile.isFile && segmentFile.length() > 0L) recordingSegmentFiles += segmentFile
+            Log.i(TAG, "Direct high-speed segment finalized: $segmentFile durationMs=$durationMs")
+        }.onFailure { error ->
+            Log.e(TAG, "Direct high-speed segment finalize failed", error)
+            segmentFile.delete()
+            RecordingClock.reviewUri.value = null
+            Toast.makeText(context, "High-speed recording failed: ${error.message}", Toast.LENGTH_LONG).show()
+        }
+        currentRecordingSegmentDurationMs = 0L
+        releaseShutterWhiteBalance()
+        bindCamera(force = true)
+        if (reviewBoundary) {
+            if (recordingSegmentFiles.isEmpty()) {
+                recordingSegmentFinalizingForReview = false
+                RecordingClock.reviewFinalizing.value = false
+                runPendingRecordingAction()
+            } else {
+                buildCumulativeRecordingReview()
+            }
+        } else {
+            recordingSegmentFinalizingForReview = false
+            finishRecordingSession(deleteLatest = false)
+        }
+    }
+
     private fun buildCumulativeRecordingReview() {
         val sessionDirectory = recordingSessionDirectory ?: run {
             recordingSegmentFinalizingForReview = false
@@ -2079,7 +2644,12 @@ class CameraRuntimeController(
                 }
                 result
                     .onSuccess { uri ->
-                        recordingReviewFile = reviewFile
+                        // A single finalized CameraX segment is already reviewable and is
+                        // deliberately returned directly to avoid a lossless-but-expensive full
+                        // remux. Multi-segment sessions still return the cumulative review file.
+                        recordingReviewFile = uri.path
+                            ?.let(::File)
+                            ?.takeIf { it.isFile && it.length() > 0L }
                         RecordingClock.reviewUri.value = uri
                         Log.i(TAG, "Cumulative recording preview ready: $uri")
                     }
@@ -2101,6 +2671,11 @@ class CameraRuntimeController(
         RecordingClock.reviewUri.value = null
         RecordingClock.reviewFinalizing.value = true
         pendingRecordingAction = null
+        if (camera2HighSpeedRecorder.isBusy) {
+            recordingSegmentFinalizingForReview = true
+            camera2HighSpeedRecorder.stop()
+            return
+        }
         val recording = activeRecording
         if (recording == null) {
             RecordingClock.reviewFinalizing.value = false
@@ -2140,6 +2715,13 @@ class CameraRuntimeController(
             pendingRecordingAction = CameraCommand.StopVideoRecording
             return
         }
+        if (camera2HighSpeedRecorder.isBusy) {
+            pendingRecordingAction = CameraCommand.StopVideoRecording
+            recordingSegmentFinalizingForReview = true
+            RecordingClock.reviewFinalizing.value = true
+            camera2HighSpeedRecorder.stop()
+            return
+        }
         val recording = activeRecording
         if (recording != null) {
             pendingRecordingAction = CameraCommand.StopVideoRecording
@@ -2156,6 +2738,13 @@ class CameraRuntimeController(
             pendingRecordingAction = CameraCommand.DeleteVideoRecording
             return
         }
+        if (camera2HighSpeedRecorder.isBusy) {
+            pendingRecordingAction = CameraCommand.DeleteVideoRecording
+            recordingSegmentFinalizingForReview = true
+            RecordingClock.reviewFinalizing.value = true
+            camera2HighSpeedRecorder.stop()
+            return
+        }
         finishRecordingSession(deleteLatest = true)
     }
 
@@ -2167,6 +2756,7 @@ class CameraRuntimeController(
         val displayName = recordingSessionDisplayName
             ?: "DiveControl_${System.currentTimeMillis()}.mp4"
         val saveLocation = latestState.recordingSaveLocation
+        val metadataSnapshot = recordingMetadataSnapshot
         recordingSessionActive = false
         pendingRecordingAction = null
         recordingSegmentFinalizingForReview = false
@@ -2175,6 +2765,7 @@ class CameraRuntimeController(
         recordingSegmentFiles.clear()
         activeRecordingSegmentFile = null
         recordingReviewFile = null
+        recordingMetadataSnapshot = null
         completedRecordingDurationMs = 0L
         currentRecordingSegmentDurationMs = 0L
         RecordingClock.durationMs.value = 0L
@@ -2217,6 +2808,9 @@ class CameraRuntimeController(
                 .onSuccess { uri ->
                     sessionDirectory?.deleteRecursively()
                     Log.i(TAG, "Recording session published to ${saveLocation.relativePath}: $uri")
+                    metadataSnapshot?.let {
+                        writeMetadataSidecar(displayName, saveLocation, it)
+                    }
                 }
                 .onFailure { error ->
                     Log.e(
@@ -2249,7 +2843,11 @@ class CameraRuntimeController(
     private fun reportCameraCapabilities() {
         try {
             val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val cameraId = backCameraProfile?.logicalCameraId
+            val selectedCameraInfo = selectedCameraInfoForCapabilities()
+            val cameraId = selectedCameraInfo
+                ?.let { Camera2CameraInfo.from(it).cameraId }
+                ?: selectedCameraIdForBinding(latestState, desiredLensFacing(latestState))
+                ?: backCameraProfile?.logicalCameraId
                 ?: manager.cameraIdList.firstOrNull { id ->
                     manager.getCameraCharacteristics(id)
                         .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
@@ -2291,6 +2889,25 @@ class CameraRuntimeController(
             } else {
                 chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble()
             }
+            val videoCapabilities = selectedCameraInfo?.let(::probeRecorderVideoCapabilities)
+            val videoFrameRates = videoCapabilities
+                ?.frameRatesByResolution
+                ?.values
+                ?.flatten()
+                ?.distinct()
+                ?.sorted()
+                .orEmpty()
+            val videoResolutions = videoCapabilities?.resolutions.orEmpty()
+            val stabilizationModes = chars.get(
+                CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES,
+            )?.toSet().orEmpty()
+            val ultraHdrSupported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    ?.getOutputSizes(android.graphics.ImageFormat.JPEG_R)
+                    ?.isNotEmpty() == true
+            } else {
+                false
+            }
             val caps = CameraCapabilities(
                 isoMin = isoRange?.lower,
                 isoMax = isoRange?.upper,
@@ -2302,6 +2919,12 @@ class CameraRuntimeController(
                 evMax = evIndexUpper?.let { it * evStep },
                 manualFocusSupported = minFocus > 0f,
                 zoomMaxRatio = zoomMax,
+                availableVideoFrameRates = videoFrameRates,
+                availableVideoResolutions = videoResolutions,
+                videoFrameRatesByResolution = videoCapabilities?.frameRatesByResolution.orEmpty(),
+                videoStabilizationSupported =
+                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON in stabilizationModes,
+                ultraHdrJpegSupported = ultraHdrSupported,
             )
             sensorColorCalibration = runCatching { readSensorColorCalibration(chars) }.getOrNull()
             Log.i(
@@ -2314,6 +2937,152 @@ class CameraRuntimeController(
         } catch (e: Exception) {
             Log.w(TAG, "Capability probe failed: ${e.message}")
         }
+    }
+
+    private data class RecorderVideoCapabilities(
+        val resolutions: List<String>,
+        val frameRatesByResolution: Map<String, List<Int>>,
+    )
+
+    /**
+     * The menu is derived from the same Recorder and session types used to capture. Querying
+     * Camera2 sizes alone would advertise streams the encoder cannot consume, while querying
+     * CamcorderProfile alone cannot prove a high-speed camera session for that quality.
+     */
+    private fun probeRecorderVideoCapabilities(cameraInfo: androidx.camera.core.CameraInfo): RecorderVideoCapabilities {
+        val normalCapabilities = Recorder.getVideoCapabilities(cameraInfo)
+        val normalQualities = normalCapabilities.getSupportedQualities(DynamicRange.SDR)
+        val highSpeedCapabilities = Recorder.getHighSpeedVideoCapabilities(cameraInfo)
+        val highSpeedQualities = highSpeedCapabilities
+            ?.getSupportedQualities(DynamicRange.SDR)
+            .orEmpty()
+        val cameraNumericId = Camera2CameraInfo.from(cameraInfo).cameraId.toIntOrNull()
+        val camcorderHighSpeedProfiles = cameraNumericId?.let { id ->
+            listOf(
+                "720p" to CamcorderProfile.QUALITY_HIGH_SPEED_720P,
+                "1080p" to CamcorderProfile.QUALITY_HIGH_SPEED_1080P,
+                "2160p" to CamcorderProfile.QUALITY_HIGH_SPEED_2160P,
+            ).filter { (_, quality) -> CamcorderProfile.hasProfile(id, quality) }
+                .associate { (label, quality) ->
+                    val profile = CamcorderProfile.get(id, quality)
+                    label to "${profile.videoFrameWidth}x${profile.videoFrameHeight}@${profile.videoFrameRate}"
+                }
+        }.orEmpty()
+        Log.i(
+            TAG,
+            "High-speed capability inputs cameraId=${Camera2CameraInfo.from(cameraInfo).cameraId}: " +
+                "cameraXQualities=$highSpeedQualities camcorderProfiles=$camcorderHighSpeedProfiles",
+        )
+        val supportedQualities = recorderQualityLabels.filter { (quality, _) -> quality in normalQualities }
+        val camera2HighSpeedRates = probeCamera2HighSpeedRates(cameraInfo)
+        val ratesByResolution = linkedMapOf<String, List<Int>>()
+
+        supportedQualities.forEach { (quality, label) ->
+            val normalRecorder = Recorder.Builder()
+                .setQualitySelector(QualitySelector.from(quality))
+                .build()
+            val normalVideo = VideoCapture.withOutput(normalRecorder)
+            val normalConfig = SessionConfig.Builder(normalVideo).build()
+            val normalRates = cameraInfo.getSupportedFrameRateRanges(normalConfig)
+                .map { it.upper }
+                .filter { it in recorderFrameRateCandidates && it < HIGH_SPEED_FPS_MIN }
+
+            val highSpeedRates = if (quality in highSpeedQualities) {
+                val highSpeedRecorder = Recorder.Builder()
+                    .setQualitySelector(QualitySelector.from(quality))
+                    .build()
+                val highSpeedVideo = VideoCapture.withOutput(highSpeedRecorder)
+                val highSpeedPreview = Preview.Builder().build()
+                val highSpeedConfig = HighSpeedVideoSessionConfig.Builder(highSpeedVideo)
+                    .setPreview(highSpeedPreview)
+                    .setSlowMotionEnabled(false)
+                    .build()
+                cameraInfo.getSupportedFrameRateRanges(highSpeedConfig)
+                    .map { it.upper }
+                    .filter { it >= HIGH_SPEED_FPS_MIN }
+            } else {
+                emptyList()
+            }
+            ratesByResolution[label] = (
+                normalRates + highSpeedRates + camera2HighSpeedRates[label].orEmpty()
+                ).distinct().sorted()
+        }
+        camera2HighSpeedRates.forEach { (label, rates) ->
+            if (rates.isNotEmpty() && label !in ratesByResolution) {
+                ratesByResolution[label] = rates
+            }
+        }
+        val resolutions = ratesByResolution.keys.toList()
+        Log.i(
+            TAG,
+            "Recorder capabilities cameraId=${Camera2CameraInfo.from(cameraInfo).cameraId}: " +
+                "resolutions=$resolutions fpsByResolution=$ratesByResolution",
+        )
+        return RecorderVideoCapabilities(resolutions, ratesByResolution)
+    }
+
+    /**
+     * Some Samsung devices publish the standard Camera2 constrained-high-speed map but omit the
+     * high-speed CamcorderProfile that CameraX requires. In that case CameraX correctly returns
+     * no high-speed capability even though a hardware encoder and camera stream form a valid
+     * pair. Keep only the intersection; the direct Camera2 fallback records exactly these pairs.
+     */
+    private fun probeCamera2HighSpeedRates(
+        cameraInfo: androidx.camera.core.CameraInfo,
+    ): Map<String, List<Int>> {
+        val streamMap = Camera2CameraInfo.from(cameraInfo).getCameraCharacteristic(
+            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
+        ) ?: return emptyMap()
+        val ratesByLabel = linkedMapOf<String, MutableSet<Int>>()
+        streamMap.highSpeedVideoSizes.orEmpty().forEach { size ->
+            val label = highSpeedResolutionLabel(size) ?: return@forEach
+            val rates = runCatching { streamMap.getHighSpeedVideoFpsRangesFor(size) }
+                .getOrDefault(emptyArray())
+            rates.map { it.upper }
+                .filter { fps ->
+                    fps >= HIGH_SPEED_FPS_MIN && encoderSupportsHighSpeed(size, fps)
+                }
+                .forEach { fps -> ratesByLabel.getOrPut(label) { linkedSetOf() } += fps }
+        }
+        return ratesByLabel.mapValues { (_, rates) -> rates.sorted() }.also { result ->
+            Log.i(TAG, "Camera2 + encoder high-speed intersection: $result")
+        }
+    }
+
+    private fun encoderSupportsHighSpeed(size: Size, fps: Int): Boolean = runCatching {
+        MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.any { codec ->
+            codec.isEncoder && codec.supportedTypes.any { mime ->
+                mime == MediaFormat.MIMETYPE_VIDEO_AVC &&
+                    runCatching {
+                        codec.getCapabilitiesForType(mime)
+                            .videoCapabilities
+                            ?.areSizeAndRateSupported(size.width, size.height, fps.toDouble()) == true
+                    }.getOrDefault(false)
+            }
+        }
+    }.getOrDefault(false)
+
+    private fun highSpeedResolutionLabel(size: Size): String? = when (size.width to size.height) {
+        1280 to 720 -> "HD 720p"
+        1920 to 1080 -> "FHD"
+        1920 to 824 -> "FHD 1920×824"
+        3840 to 2160 -> "UHD 4K"
+        else -> null
+    }
+
+    private fun selectedCameraInfoForCapabilities(): androidx.camera.core.CameraInfo? {
+        camera?.cameraInfo?.let { return it }
+        val provider = cameraProvider ?: return null
+        val lensFacing = desiredLensFacing(latestState)
+        val selectedId = selectedCameraIdForBinding(latestState, lensFacing)
+        val selectorBuilder = CameraSelector.Builder().requireLensFacing(lensFacing)
+        selectedId?.let { id ->
+            selectorBuilder.addCameraFilter { infos ->
+                infos.filter { Camera2CameraInfo.from(it).cameraId == id }
+            }
+        }
+        return runCatching { selectorBuilder.build().filter(provider.availableCameraInfos).firstOrNull() }
+            .getOrNull()
     }
 
     /** A Samsung vendor characteristic by name, or null wherever the tag does not resolve. */
@@ -2509,6 +3278,10 @@ class CameraRuntimeController(
         }
         val boundCamera = camera ?: return
         val filterValue = currentValue(cameraState, ".filters")
+        val underwater = CameraCatalog.isWhiteBalanceAutoUnderwater(
+            currentValue(cameraState, ".white_balance"),
+        )
+        val underwaterSolution = underwaterCommandSolution.takeIf { underwater }
         val signature = SessionSignature(
             flash = currentValue(cameraState, ".flash"),
             exposure = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure"),
@@ -2521,8 +3294,14 @@ class CameraRuntimeController(
             shutter = currentValue(cameraState, ".shutter_speed"),
             resolution = desiredResolutionValue(cameraState),
             frameRate = currentValue(cameraState, ".frame_rate"),
+            metering = currentValue(cameraState, ".metering"),
+            stabilization = currentValue(cameraState, ".video_stabilization"),
             waterPressureKpa = latestWaterPressureKpa?.takeIf { filterValue == "Auto" },
             atmosphericPressureKpa = latestAtmosphericPressureKpa?.takeIf { filterValue == "Auto" },
+            underwaterKelvin = underwaterSolution?.kelvin,
+            underwaterTintTenThousandths = underwaterSolution?.let {
+                (it.tintDuv * 10_000.0).roundToInt()
+            },
         )
         if (!force && signature == lastAppliedSessionSignature) {
             return
@@ -2664,33 +3443,49 @@ class CameraRuntimeController(
         cameraState: CameraState,
         boundCamera: Camera,
     ) {
-        // ── HDR / LOG ──
+        // ── HDR / public 10-bit wide-dynamic-range video ──
         when (resolvedHdrLogMode(cameraState)) {
             "HDR" -> {
                 builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
                 builder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
             }
             "LOG" -> {
+                // Samsung Log is not exposed to third-party Camera2 clients. The LOG control
+                // therefore uses the public 10-bit HLG stream selected at bind time and never
+                // installs a fabricated SDR tonemap curve.
                 builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                builder.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
-                builder.set(CaptureRequest.TONEMAP_CURVE, flatLogCurve())
             }
             else -> builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         }
+        applyMaximumInformationLogControls(builder, cameraState)
+        applyRequestedVideoStabilization(builder, cameraState, boundCamera)
 
         // ── White Balance ──
-        val filterProfile = underwaterFilterProfile(
+        val wbValue = currentValue(cameraState, ".white_balance")
+        val autoUnderwater = CameraCatalog.isWhiteBalanceAutoUnderwater(wbValue)
+        val filterProfile = if (autoUnderwater) null else underwaterFilterProfile(
             value = currentValue(cameraState, ".filters"),
             depthMeters = currentDepthMeters(),
         )
-        if (filterProfile != null) {
+        if (autoUnderwater && underwaterCommandSolution == null) {
+            // Persisted AU starts in this bootstrap state. Let Samsung converge first, then the
+            // estimator seeds from that exact frame and takes over without a white-point jump.
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
+        } else if (autoUnderwater) {
+            val colour = underwaterWhiteBalanceColour(cameraState)
+            builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, colour.first)
+            colour.second?.let { builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
+        } else if (filterProfile != null) {
             builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
             builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
             builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
             builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, filterProfile)
             lastAutoColorTransform?.let { builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
         } else {
-            val wbValue = currentValue(cameraState, ".white_balance")
             val kelvin = wbValue?.removeSuffix("K")?.toIntOrNull()
             if (kelvin != null) {
                 builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
@@ -2740,15 +3535,24 @@ class CameraRuntimeController(
             builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         }
         val aeOff = isoValue != null || shutterNs != null
+        applyRequestedFrameRate(builder, cameraState, boundCamera)
+        if (!aeOff) applyRequestedMetering(builder, cameraState, boundCamera)
 
         // ── Exposure Compensation (pass through when AE is ON) ──
         // With AE off the index means nothing and the native app flips EV to a read-only
         // meter — the reducer refuses the detents, and nothing is written here.
         if (!aeOff) {
-            val ev = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
+            val userEv = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
                 ?.replace("+", "")?.toDoubleOrNull()
-            if (ev != null) {
-                builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evCompensationIndex(boundCamera, ev))
+            if (userEv != null) {
+                val effectiveEv = SamsungLogProfile.effectiveAutoExposureEv(
+                    userEv = userEv,
+                    calibration = samsungLogAcquisitionCalibration(cameraState),
+                )
+                builder.set(
+                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                    evCompensationIndex(boundCamera, effectiveEv),
+                )
             }
         }
 
@@ -2758,6 +3562,159 @@ class CameraRuntimeController(
             builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_TORCH)
         } else {
             builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+        }
+    }
+
+    private fun applyMaximumInformationLogControls(
+        builder: CaptureRequest.Builder,
+        cameraState: CameraState,
+    ) {
+        if (resolvedHdrLogMode(cameraState) != "LOG") return
+        maximumInformationRequestModes.noiseReductionMode?.let { mode ->
+            builder.set(CaptureRequest.NOISE_REDUCTION_MODE, mode)
+        }
+        maximumInformationRequestModes.edgeMode?.let { mode ->
+            builder.set(CaptureRequest.EDGE_MODE, mode)
+        }
+        maximumInformationRequestModes.videoStabilizationMode?.let { mode ->
+            builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, mode)
+        }
+    }
+
+    private fun applyMaximumInformationLogControls(
+        builder: CaptureRequestOptions.Builder,
+        cameraState: CameraState,
+    ) {
+        if (resolvedHdrLogMode(cameraState) != "LOG") return
+        maximumInformationRequestModes.noiseReductionMode?.let { mode ->
+            builder.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, mode)
+        }
+        maximumInformationRequestModes.edgeMode?.let { mode ->
+            builder.setCaptureRequestOption(CaptureRequest.EDGE_MODE, mode)
+        }
+        maximumInformationRequestModes.videoStabilizationMode?.let { mode ->
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, mode)
+        }
+    }
+
+    private fun requestedFpsRange(cameraState: CameraState, boundCamera: Camera): android.util.Range<Int>? {
+        val fps = currentValue(cameraState, ".frame_rate")
+            ?.removeSuffix("fps")
+            ?.toIntOrNull()
+            ?: return null
+        if (fps >= HIGH_SPEED_FPS_MIN) return null
+        val ranges = Camera2CameraInfo.from(boundCamera.cameraInfo).getCameraCharacteristic(
+            CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES,
+        ).orEmpty()
+        return ranges
+            .filter { fps in it.lower..it.upper }
+            .minWithOrNull(
+                compareBy<android.util.Range<Int>>(
+                    { if (it.lower == fps && it.upper == fps) 0 else 1 },
+                    { it.upper - it.lower },
+                    { kotlin.math.abs(it.upper - fps) },
+                ),
+            )
+    }
+
+    private fun applyRequestedFrameRate(
+        builder: CaptureRequest.Builder,
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ) {
+        requestedFpsRange(cameraState, boundCamera)?.let {
+            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
+        }
+    }
+
+    private fun applyRequestedFrameRate(
+        builder: CaptureRequestOptions.Builder,
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ) {
+        requestedFpsRange(cameraState, boundCamera)?.let {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
+        }
+    }
+
+    private fun requestedMeteringRegion(
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ): MeteringRectangle? {
+        val mode = currentValue(cameraState, ".metering")
+        if (mode == null || mode == "Matrix") return null
+        val info = Camera2CameraInfo.from(boundCamera.cameraInfo)
+        val maxRegions = info.getCameraCharacteristic(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+        if (maxRegions <= 0) return null
+        val active = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            ?: return null
+        val fraction = if (mode == "Spot") 0.14f else 0.52f
+        val regionWidth = (active.width() * fraction).roundToInt().coerceAtLeast(1)
+        val regionHeight = (active.height() * fraction).roundToInt().coerceAtLeast(1)
+        val left = active.centerX() - regionWidth / 2
+        val top = active.centerY() - regionHeight / 2
+        val region = Rect(
+            left.coerceAtLeast(active.left),
+            top.coerceAtLeast(active.top),
+            (left + regionWidth).coerceAtMost(active.right),
+            (top + regionHeight).coerceAtMost(active.bottom),
+        )
+        return MeteringRectangle(region, MeteringRectangle.METERING_WEIGHT_MAX)
+    }
+
+    private fun applyRequestedMetering(
+        builder: CaptureRequest.Builder,
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ) {
+        requestedMeteringRegion(cameraState, boundCamera)?.let {
+            builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(it))
+        }
+    }
+
+    private fun applyRequestedMetering(
+        builder: CaptureRequestOptions.Builder,
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ) {
+        requestedMeteringRegion(cameraState, boundCamera)?.let {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(it))
+        }
+    }
+
+    private fun requestedVideoStabilizationMode(
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ): Int? {
+        if (resolvedHdrLogMode(cameraState) == "LOG") return null
+        val supported = Camera2CameraInfo.from(boundCamera.cameraInfo).getCameraCharacteristic(
+            CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES,
+        )?.toSet().orEmpty()
+        val requested = if (currentValue(cameraState, ".video_stabilization") == "Standard") {
+            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+        } else {
+            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+        }
+        return requested.takeIf { it in supported }
+    }
+
+    private fun applyRequestedVideoStabilization(
+        builder: CaptureRequest.Builder,
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ) {
+        requestedVideoStabilizationMode(cameraState, boundCamera)?.let {
+            builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, it)
+        }
+    }
+
+    private fun applyRequestedVideoStabilization(
+        builder: CaptureRequestOptions.Builder,
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ) {
+        requestedVideoStabilizationMode(cameraState, boundCamera)?.let {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, it)
         }
     }
 
@@ -2796,6 +3753,7 @@ class CameraRuntimeController(
                         builder.setCaptureRequestOption(key, 1.toByte())
                     }
                 }
+                applyMaximumInformationLogControls(builder, cameraState)
                 val cam2Control = Camera2CameraControl.from(boundCamera.cameraControl)
                 cam2Control.setCaptureRequestOptions(builder.build())
                 Log.d(
@@ -2877,14 +3835,41 @@ class CameraRuntimeController(
     }
 
     private fun refreshBoundCameraCapabilities(boundCamera: Camera) {
-        selectedFocusCapability(latestState)?.let { capability ->
-            deviceMinFocusDistance = capability.minFocusDistance
-            return
-        }
         val cameraInfo = Camera2CameraInfo.from(boundCamera.cameraInfo)
-        deviceMinFocusDistance = cameraInfo.getCameraCharacteristic(
-            CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
-        ) ?: 0f
+        maximumInformationRequestModes = if (boundHdrLogMode == "LOG" ||
+            resolvedHdrLogMode(latestState) == "LOG"
+        ) {
+            VideoDynamicRangePolicy.maximumInformationRequestModes(
+                availableNoiseReductionModes = cameraInfo.getCameraCharacteristic(
+                    CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES,
+                ),
+                availableEdgeModes = cameraInfo.getCameraCharacteristic(
+                    CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES,
+                ),
+                availableVideoStabilizationModes = cameraInfo.getCameraCharacteristic(
+                    CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES,
+                ),
+            ).also { modes ->
+                Log.i(
+                    TAG,
+                    "Log information-preserving request modes: nr=${modes.noiseReductionMode} " +
+                        "edge=${modes.edgeMode} eis=${modes.videoStabilizationMode}",
+                )
+            }
+        } else {
+            MaximumInformationRequestModes()
+        }
+        val focusCapability = selectedFocusCapability(latestState)
+        if (focusCapability != null) {
+            deviceMinFocusDistance = focusCapability.minFocusDistance
+        } else {
+            deviceMinFocusDistance = cameraInfo.getCameraCharacteristic(
+                CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
+            ) ?: 0f
+        }
+        // Re-probe after every successful lens/session bind. Recorder qualities and high-speed
+        // ranges are camera-specific, so a list captured from the previous lens is invalid.
+        reportCameraCapabilities()
     }
 
     /**
@@ -2980,22 +3965,34 @@ class CameraRuntimeController(
     }
 
     private fun capturePhoto() {
+        underwaterCaptureFrozen = CameraCatalog.isWhiteBalanceAutoUnderwater(
+            currentValue(latestState, ".white_balance"),
+        )
         withShutterWhiteBalance(::capturePhotoNow)
+    }
+
+    private fun releaseUnderwaterCaptureFreeze() {
+        if (!underwaterCaptureFrozen) return
+        underwaterCaptureFrozen = false
+        requestUnderwaterWhiteBalanceApply()
     }
 
     private fun capturePhotoNow() {
         val capture = imageCapture ?: run {
             releaseShutterWhiteBalance()
+            releaseUnderwaterCaptureFreeze()
             return
         }
         val name = "DiveControl_${System.currentTimeMillis()}.jpg"
+        val saveLocation = latestState.recordingSaveLocation
+        val metadataSnapshot = captureMetadataSnapshot()
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 put(
                     MediaStore.MediaColumns.RELATIVE_PATH,
-                    Environment.DIRECTORY_PICTURES + "/Mobile DiveControl",
+                    saveLocation.relativePath,
                 )
             }
         }
@@ -3009,15 +4006,122 @@ class CameraRuntimeController(
             ContextCompat.getMainExecutor(context),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                    metadataSnapshot?.let { snapshot ->
+                        recordingFinalizeExecutor.execute {
+                            writeMetadataSidecar(name, saveLocation, snapshot)
+                        }
+                    }
                     releaseShutterWhiteBalance()
+                    releaseUnderwaterCaptureFreeze()
                 }
 
                 override fun onError(exception: ImageCaptureException) {
                     Log.e(TAG, "Photo capture failed", exception)
                     releaseShutterWhiteBalance()
+                    releaseUnderwaterCaptureFreeze()
                 }
             },
         )
+    }
+
+    /**
+     * Snapshot only the fields the diver enabled. A JSON sidecar is used for both JPEG and MP4
+     * because Android exposes no standard MP4 keys for dive depth, water temperature or heading;
+     * the sidecar keeps the values machine-readable without rewriting or recompressing media.
+     */
+    private fun captureMetadataSnapshot(): CaptureMetadataSnapshot? {
+        fun enabled(suffix: String) = currentValue(latestState, suffix) == "On"
+        val depth = enabled(".metadata_depth")
+        val temperature = enabled(".metadata_temperature")
+        val heading = enabled(".metadata_heading")
+        val pressure = enabled(".metadata_pressure")
+        val exposure = enabled(".metadata_exposure")
+        if (!depth && !temperature && !heading && !pressure && !exposure) return null
+
+        val json = JSONObject()
+            .put("schema", "com.mobiledivecontrol.capture-metadata.v1")
+            .put("captured_at_epoch_ms", System.currentTimeMillis())
+            .put("camera_mode", latestState.activeMode.name)
+        if (depth) currentDepthMeters()?.let { json.put("dive_depth_m", it) }
+        if (temperature) latestWaterTemperatureC?.let { json.put("water_temperature_c", it) }
+        if (heading) latestHeadingDegrees?.let { json.put("heading_degrees_magnetic", it) }
+        if (pressure) {
+            val values = JSONObject()
+            latestWaterPressureKpa?.let { values.put("water_kpa", it) }
+            latestAtmosphericPressureKpa?.let { values.put("housing_kpa", it) }
+            latestSurfaceAmbientKpa?.let { values.put("surface_reference_kpa", it) }
+            if (values.length() > 0) json.put("pressure", values)
+        }
+        if (exposure) {
+            val values = JSONObject()
+            currentValue(latestState, ".iso")?.let { values.put("iso_setting", it) }
+            currentValue(latestState, ".shutter_speed")?.let { values.put("shutter_setting", it) }
+            currentValue(latestState, ".exposure_value", ".exposure_compensation")
+                ?.let { values.put("ev_setting", it) }
+            currentValue(latestState, ".white_balance")?.let { values.put("white_balance_setting", it) }
+            latestState.meteredExposure.iso?.let { values.put("metered_iso", it) }
+            latestState.meteredExposure.shutterNs?.let { values.put("metered_shutter_ns", it) }
+            latestState.meteredExposure.wbKelvin?.let { values.put("metered_wb_kelvin", it) }
+            json.put("exposure", values)
+        }
+        return CaptureMetadataSnapshot(json.toString(2))
+    }
+
+    private fun writeMetadataSidecar(
+        mediaDisplayName: String,
+        location: com.mobiledivecontrol.core.RecordingSaveLocation,
+        snapshot: CaptureMetadataSnapshot,
+    ) {
+        val displayName = mediaDisplayName.substringBeforeLast('.') + ".metadata.json"
+        // Android only permits generic application/json files under Download or Documents;
+        // inserting them into the media file's DCIM path throws on Android 10+. Preserve an
+        // explicit link to the media while publishing sidecars in a legal public collection.
+        val sidecarJson = runCatching {
+            JSONObject(snapshot.json)
+                .put("media_display_name", mediaDisplayName)
+                .put("media_relative_path", location.relativePath)
+                .toString(2)
+        }.getOrElse { snapshot.json }
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, METADATA_SIDECAR_RELATIVE_PATH)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+        }
+        val resolver = context.contentResolver
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        } else {
+            MediaStore.Files.getContentUri("external")
+        }
+        val uri = runCatching { resolver.insert(collection, values) }
+            .onFailure { error ->
+                Log.e(TAG, "Could not create metadata sidecar for $mediaDisplayName", error)
+            }
+            .getOrNull() ?: run {
+            Log.e(TAG, "Could not create metadata sidecar for $mediaDisplayName")
+            return
+        }
+        runCatching {
+            resolver.openOutputStream(uri, "w")?.bufferedWriter(Charsets.UTF_8)?.use {
+                it.write(sidecarJson)
+            } ?: error("MediaStore returned no output stream")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                resolver.update(uri, ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }, null, null)
+            }
+            Log.i(
+                TAG,
+                "Capture metadata written for $mediaDisplayName to " +
+                    "$METADATA_SIDECAR_RELATIVE_PATH: $uri",
+            )
+        }.onFailure { error ->
+            resolver.delete(uri, null, null)
+            Log.e(TAG, "Could not write metadata sidecar for $mediaDisplayName", error)
+        }
     }
 
     private fun applyFlash(cameraState: CameraState) {
@@ -3088,7 +4192,7 @@ class CameraRuntimeController(
         // --- Effect mode ---
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_EFFECT_MODE, CameraMetadata.CONTROL_EFFECT_MODE_OFF)
 
-        // --- HDR / LOG / Off ---
+        // --- HDR / public 10-bit wide-dynamic-range video / Off ---
         if (!boundHdrExtension) {
             when (resolvedHdrLogMode(cameraState)) {
                 "HDR" -> {
@@ -3097,22 +4201,38 @@ class CameraRuntimeController(
                 }
                 "LOG" -> {
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                    builder.setCaptureRequestOption(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
-                    builder.setCaptureRequestOption(CaptureRequest.TONEMAP_CURVE, flatLogCurve())
                 }
                 else -> {
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                 }
             }
         }
+        applyMaximumInformationLogControls(builder, cameraState)
+        applyRequestedVideoStabilization(builder, cameraState, boundCamera)
 
         // --- White Balance ---
-        val filterProfile = underwaterFilterProfile(
+        val wbValue = currentValue(cameraState, ".white_balance")
+        val autoUnderwater = CameraCatalog.isWhiteBalanceAutoUnderwater(wbValue)
+        val filterProfile = if (autoUnderwater) null else underwaterFilterProfile(
             value = currentValue(cameraState, ".filters"),
             depthMeters = currentDepthMeters(),
         )
-        if (filterProfile == null) {
-            val wbValue = currentValue(cameraState, ".white_balance")
+        if (autoUnderwater && underwaterCommandSolution == null) {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, false)
+        } else if (autoUnderwater) {
+            val colour = underwaterWhiteBalanceColour(cameraState)
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, false)
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            builder.setCaptureRequestOption(
+                CaptureRequest.COLOR_CORRECTION_MODE,
+                CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX,
+            )
+            builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_GAINS, colour.first)
+            colour.second?.let {
+                builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it)
+            }
+        } else if (filterProfile == null) {
             val kelvin = wbValue?.removeSuffix("K")?.toIntOrNull()
             if (kelvin != null) {
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, false)
@@ -3168,14 +4288,22 @@ class CameraRuntimeController(
             // rejects the +/-4.0 half of the native Pro window outright, while the interop
             // bundle is unvalidated and wins the request merge — the same channel that carries
             // the vendor focus key. One writer, one bundle, no 3A tug-of-war.
-            val ev = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
+            val userEv = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
                 ?.replace("+", "")?.toDoubleOrNull()
-            if (ev != null) {
+            if (userEv != null) {
+                val effectiveEv = SamsungLogProfile.effectiveAutoExposureEv(
+                    userEv = userEv,
+                    calibration = samsungLogAcquisitionCalibration(cameraState),
+                )
                 builder.setCaptureRequestOption(
                     CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
-                    evCompensationIndex(boundCamera, ev),
+                    evCompensationIndex(boundCamera, effectiveEv),
                 )
             }
+        }
+        applyRequestedFrameRate(builder, cameraState, boundCamera)
+        if (isoValue == null && shutterNs == null) {
+            applyRequestedMetering(builder, cameraState, boundCamera)
         }
 
         try {
@@ -3255,7 +4383,51 @@ class CameraRuntimeController(
     }
 
     private fun desiredResolutionValue(cameraState: CameraState): String? {
-        return currentValue(cameraState, ".megapixels")
+        return currentValue(cameraState, ".resolution", ".megapixels")
+    }
+
+    private fun isHighSpeedSelection(cameraState: CameraState): Boolean =
+        currentValue(cameraState, ".frame_rate")
+            ?.removeSuffix("fps")
+            ?.toIntOrNull()
+            ?.let { it >= HIGH_SPEED_FPS_MIN } == true
+
+    private fun highSpeedResolutionSize(value: String?): Size? = when (value) {
+        "HD 720p" -> Size(1280, 720)
+        "FHD 1920×824" -> Size(1920, 824)
+        "FHD" -> Size(1920, 1080)
+        "UHD 4K" -> Size(3840, 2160)
+        else -> null
+    }
+
+    private fun videoQualitySelector(value: String?): QualitySelector {
+        val requested = when (value) {
+            "SD 480p" -> Quality.SD
+            "HD 720p" -> Quality.HD
+            "FHD" -> Quality.FHD
+            "UHD 4K" -> Quality.UHD
+            else -> Quality.HIGHEST
+        }
+        return QualitySelector.from(
+            requested,
+            FallbackStrategy.lowerQualityOrHigherThan(Quality.SD),
+        )
+    }
+
+    private fun photoCropRatio(value: String?): Rational? = when (value) {
+        "4:3" -> Rational(4, 3)
+        "16:9" -> Rational(16, 9)
+        "1:1" -> Rational(1, 1)
+        else -> null
+    }
+
+    private fun exposureAssistMode(cameraState: CameraState): Int = when (
+        currentValue(cameraState, ".exposure_display")
+    ) {
+        "Zebra ≥70 IRE" -> 1
+        "Zebra ≥95 IRE" -> 2
+        "False colour" -> 3
+        else -> 0
     }
 
     private fun resolvedHdrLogMode(cameraState: CameraState): String {
@@ -3266,6 +4438,19 @@ class CameraRuntimeController(
         val hdr = currentValue(cameraState, ".hdr")
         return if (hdr == "On" || hdr == "HDR") "HDR" else "Off"
     }
+
+    private fun resolvedSessionHdrLogMode(cameraState: CameraState): String {
+        val fps = currentValue(cameraState, ".frame_rate")
+            ?.removeSuffix("fps")
+            ?.toIntOrNull()
+        return if (fps != null && fps >= HIGH_SPEED_FPS_MIN) "Off" else resolvedHdrLogMode(cameraState)
+    }
+
+    private fun samsungLogAcquisitionCalibration(cameraState: CameraState) =
+        SamsungLogProfile.acquisitionCalibration(
+            deviceModel = Build.MODEL.orEmpty(),
+            lensValue = currentValue(cameraState, ".lens"),
+        ).takeIf { resolvedHdrLogMode(cameraState) == "LOG" }
 
     private fun currentValue(cameraState: CameraState, vararg suffixes: String): String? {
         val settings = CameraCatalog.settingsFor(cameraState.activeMode, cameraState.deviceVariant)
@@ -4184,31 +5369,6 @@ class CameraRuntimeController(
         return (water - surface).coerceAtLeast(0.0) / 9.81
     }
 
-    /**
-     * A real log look: strongly concave ABOVE the identity line (y = ln(1+9x)/ln(10)), lifting
-     * shadows and rolling highlights. The previous curve sat BELOW identity everywhere —
-     * mathematically an anti-log — and rendered mids ~2.3 stops dark while AE, which meters
-     * linear sensor light, reported everything as fine. Field report: "way way too dark".
-     */
-    private fun flatLogCurve(): TonemapCurve {
-        val channel = floatArrayOf(
-            0.000f, 0.000f,
-            0.010f, 0.070f,
-            0.025f, 0.130f,
-            0.050f, 0.210f,
-            0.100f, 0.310f,
-            0.180f, 0.420f,
-            0.250f, 0.490f,
-            0.350f, 0.560f,
-            0.500f, 0.660f,
-            0.650f, 0.740f,
-            0.800f, 0.820f,
-            0.900f, 0.890f,
-            1.000f, 1.000f,
-        )
-        return TonemapCurve(channel, channel, channel)
-    }
-
     /** The mode's manual kelvin, or null when white balance sits on Auto (or has no dial). */
     private fun manualWbKelvin(cameraState: CameraState): Int? {
         val wb = currentValue(cameraState, ".white_balance") ?: return null
@@ -4221,7 +5381,29 @@ class CameraRuntimeController(
         val filters = currentValue(cameraState, ".filters")
         if (filters != null && filters != "Off") return false
         val wb = currentValue(cameraState, ".white_balance")
-        return wb == null || CameraCatalog.isWhiteBalanceAuto(wb)
+        if (CameraCatalog.isWhiteBalanceAutoUnderwater(wb)) return underwaterCommandSolution == null
+        return wb == null || CameraCatalog.isWhiteBalanceOemAuto(wb)
+    }
+
+    /**
+     * AU owns one complete physical white point. The calibrated sensor pipeline remains the only
+     * renderer; AU merely supplies its two coordinates (CCT and signed Duv) instead of inventing
+     * independent saturation, exposure or tone controls.
+     */
+    private fun underwaterWhiteBalanceColour(
+        cameraState: CameraState,
+    ): Pair<RggbChannelVector, android.hardware.camera2.params.ColorSpaceTransform?> {
+        val solution = underwaterCommandSolution ?: underwaterWbSolution ?: run {
+            val seed = cameraState.meteredExposure.wbKelvin ?: lastAutoWbAnchor?.kelvin ?: 6_500
+            UnderwaterWhiteBalanceSolution(
+                seed.coerceIn(CameraCatalog.WB_MIN_KELVIN, CameraCatalog.WB_MAX_KELVIN),
+                0.0,
+                0.0,
+                0.0,
+            )
+        }
+        return computedWbColour(solution.kelvin, solution.tintDuv)
+            ?: manualWbColour(solution.kelvin)
     }
 
     /**
@@ -4300,9 +5482,13 @@ class CameraRuntimeController(
      * so that for ANY scene colour, out = XYZtoSRGB x CAT x XYZ — the correct rendering under
      * the declared illuminant, hue axis included.
      */
-    private fun wbPipeline(cal: SensorColorCalibration, kelvin: Int): WbPipeline? {
+    private fun wbPipeline(
+        cal: SensorColorCalibration,
+        kelvin: Int,
+        tintDuv: Double = 0.0,
+    ): WbPipeline? {
         val k = kelvin.coerceIn(2300, 10000).toDouble()
-        val (x, y) = whitePointXy(k)
+        val (x, y) = whitePointXy(k, tintDuv)
         if (y <= 1e-6) return null
         val whiteXyz = doubleArrayOf(x / y, 1.0, (1.0 - x - y) / y)
         val m = interpolatedSensorMatrix(cal, k)
@@ -4310,12 +5496,21 @@ class CameraRuntimeController(
         val g = dot(m[1], whiteXyz)
         val b = dot(m[2], whiteXyz)
         if (r <= 1e-6 || g <= 1e-6 || b <= 1e-6) return null
+        val (baseX, baseY) = whitePointXy(k, 0.0)
+        val baseWhiteXyz = doubleArrayOf(baseX / baseY, 1.0, (1.0 - baseX - baseY) / baseY)
+        val baseR = dot(m[0], baseWhiteXyz)
+        val baseG = dot(m[1], baseWhiteXyz)
+        val baseB = dot(m[2], baseWhiteXyz)
+        if (baseR <= 1e-6 || baseG <= 1e-6 || baseB <= 1e-6) return null
         // The MEASURED native curve wins where it exists; the matrix-derived ratio is the model
-        // for anything nobody has measured yet. These are the TRUE white ratios and may sit
-        // below 1 at warm kelvins.
+        // on the zero-Duv locus. Off-locus, preserve that measured baseline and multiply only
+        // the sensor-model ratio produced by the physical tint displacement. At Duv=0 this is
+        // exactly the old/native-calibrated curve; tint therefore cannot disturb manual Kelvin.
         val measured = measuredWbGains(k)
-        val rTrue = (measured?.first ?: (g / r)).coerceIn(0.1, 10.0)
-        val bTrue = (measured?.second ?: (g / b)).coerceIn(0.1, 10.0)
+        val baseRRatio = measured?.first ?: (baseG / baseR)
+        val baseBRatio = measured?.second ?: (baseG / baseB)
+        val rTrue = (baseRRatio * ((g / r) / (baseG / baseR))).coerceIn(0.1, 10.0)
+        val bTrue = (baseBRatio * ((g / b) / (baseG / baseB))).coerceIn(0.1, 10.0)
         // MIN-NORMALISED, scalar folded into the transform. Real HALs accept only gains >= 1,
         // and matrix hardware clamps CCM entries near +/-4 — so neither half may carry the whole
         // warm-end correction alone. Normalising the gain triple to min = 1 keeps every channel
@@ -4359,20 +5554,16 @@ class CameraRuntimeController(
         // Calibration-fit visibility: whether a channel hit the 16x gain ceiling or the CCM
         // rebalance is active decides whether a LUT tr/tb correction can actually be DELIVERED
         // at this kelvin — saturation here means the fit must move to the rGain/bGain rows.
-        Log.i(
-            TAG,
-            "wbPipeline k=$kelvin rTrue=%.4f bTrue=%.4f minGain=%.4f gainScale=%.4f maxAbs=%.3f gains=[%.3f %.3f %.3f]"
-                .format(rTrue, bTrue, minGain, gainScale, maxAbs, gains.red, gains.greenEven, gains.blue),
-        )
         return WbPipeline(gains, transform)
     }
 
     /** [wbPipeline] with the anchor-continuity correction, quantised for the capture request. */
     private fun computedWbColour(
         kelvin: Int,
+        tintDuv: Double = 0.0,
     ): Pair<RggbChannelVector, android.hardware.camera2.params.ColorSpaceTransform>? {
         val cal = sensorColorCalibration ?: return null
-        val base = wbPipeline(cal, kelvin) ?: return null
+        val base = wbPipeline(cal, kelvin, tintDuv) ?: return null
         var transform = base.transform
         // A measured calibration SUPERSEDES the AWB-continuity correction, by the field's own
         // requirement: our MANUAL curve must equal the native app's manual rendering at every
@@ -4522,25 +5713,9 @@ class CameraRuntimeController(
      * D-series illuminants at the cold end, which is exactly the magenta component the pure
      * black-body model could never produce at 10000K.
      */
-    private fun whitePointXy(kelvin: Double): Pair<Double, Double> {
-        val t = kelvin
-        return if (t < 4000.0) {
-            val x = -0.2661239e9 / (t * t * t) - 0.2343589e6 / (t * t) + 0.8776956e3 / t + 0.179910
-            val y = if (t <= 2222.0) {
-                -1.1063814 * x * x * x - 1.34811020 * x * x + 2.18555832 * x - 0.20219683
-            } else {
-                -0.9549476 * x * x * x - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
-            }
-            x to y
-        } else {
-            val x = if (t <= 7000.0) {
-                -4.6070e9 / (t * t * t) + 2.9678e6 / (t * t) + 0.09911e3 / t + 0.244063
-            } else {
-                -2.0064e9 / (t * t * t) + 1.9018e6 / (t * t) + 0.24748e3 / t + 0.237040
-            }
-            val y = -3.0 * x * x + 2.87 * x - 0.275
-            x to y
-        }
+    private fun whitePointXy(kelvin: Double, tintDuv: Double = 0.0): Pair<Double, Double> {
+        val xy = WhiteBalanceChromaticity.kelvinAndTintToXy(kelvin, tintDuv)
+        return xy.x to xy.y
     }
 
     /** DNG interpolation of the two reference matrices: weights linear in inverse CCT, clamped. */

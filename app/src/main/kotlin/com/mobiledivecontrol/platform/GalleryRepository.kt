@@ -47,9 +47,17 @@ class GalleryRepository(private val context: Context) {
             RecordingSaveLocation(
                 name = album.name.ifBlank { relativePath.trimEnd('/').substringAfterLast('/') },
                 relativePath = relativePath,
+                coverContentUri = album.contentUri,
+                mediaCount = album.mediaCount,
+                coverIsVideo = album.isVideo,
             )
         }
-        return (listOf(RecordingSaveLocation.Default) + albums)
+        // Keep Camera first without discarding its real MediaStore cover/count. Data-class
+        // distinctness is deliberately not used here because cover metadata changes over time.
+        val cameraPath = RecordingSaveLocation.Default.relativePath.normalizedAlbumPath()
+        val camera = albums.firstOrNull { it.relativePath.normalizedAlbumPath() == cameraPath }
+            ?: RecordingSaveLocation.Default
+        return (listOf(camera) + albums)
             .distinctBy { it.relativePath.trimEnd('/').lowercase(Locale.ROOT) }
     }
 

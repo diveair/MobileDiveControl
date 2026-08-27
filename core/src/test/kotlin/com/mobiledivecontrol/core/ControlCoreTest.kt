@@ -184,6 +184,211 @@ class ControlCoreTest {
     }
 
     @Test
+    fun `far left options opens an independent vertical rail`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            focusedZone = CameraUiZone.SettingsPanel,
+            settingsCursor = 0,
+        )
+        val state = AppState(camera = camera)
+        val horizontalBefore = CameraCatalog.settingsBarItems(camera)
+
+        // The same OK/menu action used to enter Focus editing opens the selected far-left tile.
+        val opened = reducer.reduce(state, CameraCommand.Confirm)
+        assertTrue(opened.state.camera.showMoreSettings)
+        assertEquals(camera.settingsCursor, opened.state.camera.settingsCursor)
+        assertEquals(horizontalBefore, CameraCatalog.settingsBarItems(opened.state.camera))
+        assertEquals(listOf(PlatformEffect.LoadRecordingSaveLocations), opened.effects)
+
+        val guidesIndex = CameraCatalog.optionsMenuSettings(opened.state.camera)
+            .indexOfFirst { it.id == "pro_video.guides" }
+        val selected = reducer.reduce(opened.state, CameraCommand.SelectOptionsItem(guidesIndex))
+        val adjusted = reducer.reduce(selected.state, CameraCommand.NavigateRight)
+        assertEquals("4×4 Grid", adjusted.state.camera.settingValues["pro_video.guides"])
+        assertEquals(camera.settingsCursor, adjusted.state.camera.settingsCursor)
+
+        // As in the Focus editor, OK commits the current values and closes the menu.
+        val closed = reducer.reduce(adjusted.state, CameraCommand.Confirm)
+        assertTrue(!closed.state.camera.showMoreSettings)
+        assertEquals(horizontalBefore, CameraCatalog.settingsBarItems(closed.state.camera))
+    }
+
+    @Test
+    fun `options navigation clamps at ends and back closes like focus editor`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            focusedZone = CameraUiZone.SettingsPanel,
+            settingsCursor = 0,
+        )
+        val opened = reducer.reduce(AppState(camera = camera), CameraCommand.Confirm)
+        val settings = CameraCatalog.optionsMenuSettings(opened.state.camera)
+
+        val aboveFirst = reducer.reduce(opened.state, CameraCommand.NavigateUp)
+        assertEquals(0, aboveFirst.state.camera.optionsMenuCursor)
+
+        val atLast = reducer.reduce(
+            aboveFirst.state,
+            CameraCommand.SelectOptionsItem(settings.lastIndex),
+        )
+        val belowLast = reducer.reduce(atLast.state, CameraCommand.NavigateDown)
+        assertEquals(settings.lastIndex, belowLast.state.camera.optionsMenuCursor)
+
+        val closed = reducer.reduce(belowLast.state, CameraCommand.Back)
+        assertTrue(!closed.state.camera.showMoreSettings)
+        assertEquals(CameraUiZone.SettingsPanel, closed.state.camera.focusedZone)
+        assertEquals(0, closed.state.camera.settingsCursor)
+    }
+
+    @Test
+    fun `touch opening options focuses and returns to the far left tile`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            focusedZone = CameraUiZone.SettingsPanel,
+            settingsCursor = 3,
+        )
+
+        val opened = reducer.reduce(AppState(camera = camera), CameraCommand.ToggleOptionsMenu)
+        assertTrue(opened.state.camera.showMoreSettings)
+        assertEquals(0, opened.state.camera.settingsCursor)
+
+        val closed = reducer.reduce(opened.state, CameraCommand.Confirm)
+        assertTrue(!closed.state.camera.showMoreSettings)
+        assertEquals(0, closed.state.camera.settingsCursor)
+    }
+
+    @Test
+    fun `log hdr and stabilization remain mutually exclusive`() {
+        val reducer = ControlReducer()
+        val base = AppState(camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(showMoreSettings = true))
+        val options = CameraCatalog.optionsMenuSettings(base.camera)
+        fun adjust(state: AppState, id: String): AppState {
+            val index = options.indexOfFirst { it.id == id }
+            return reducer.reduce(state, CameraCommand.AdjustOptionsItem(index, +1)).state
+        }
+
+        val logOn = adjust(base, "pro_video.log")
+        assertEquals("On", logOn.camera.settingValues["pro_video.log"])
+        assertEquals("Off", logOn.camera.settingValues["pro_video.hdr"])
+        assertEquals("Off", logOn.camera.settingValues["pro_video.video_stabilization"])
+
+        val stabilized = adjust(logOn, "pro_video.video_stabilization")
+        assertEquals("Standard", stabilized.camera.settingValues["pro_video.video_stabilization"])
+        assertEquals("Off", stabilized.camera.settingValues["pro_video.log"])
+    }
+
+    @Test
+    fun `high speed selection enforces constrained-session controls and manual control exits it`() {
+        val reducer = ControlReducer()
+        val caps = CameraCapabilities(
+            availableVideoFrameRates = listOf(30, 60, 120, 240),
+            availableVideoResolutions = listOf("HD 720p", "FHD"),
+            videoFrameRatesByResolution = mapOf(
+                "HD 720p" to listOf(30, 60, 120, 240),
+                "FHD" to listOf(30, 60, 120),
+            ),
+        )
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            showMoreSettings = true,
+            capabilities = caps,
+            settingValues = CameraCatalog.defaultSettingValues +
+                ("pro_video.resolution" to "HD 720p") +
+                ("pro_video.frame_rate" to "60fps") +
+                ("pro_video.log" to "On") +
+                ("pro_video.iso" to "800") +
+                ("pro_video.shutter_speed" to "1/60") +
+                ("pro_video.manual_focus" to "0.500") +
+                ("pro_video.white_balance" to "5000K") +
+                ("pro_video.focus_peaking" to "On") +
+                ("pro_video.exposure_display" to "False colour"),
+        )
+        val base = AppState(camera = camera)
+        val fpsIndex = CameraCatalog.optionsMenuSettings(camera)
+            .indexOfFirst { it.id == "pro_video.frame_rate" }
+        val highSpeed = reducer.reduce(
+            base,
+            CameraCommand.AdjustOptionsItem(fpsIndex, +1),
+        ).state.camera
+
+        assertEquals("120fps", highSpeed.settingValues["pro_video.frame_rate"])
+        assertEquals("Off", highSpeed.settingValues["pro_video.log"])
+        assertEquals("Auto", highSpeed.settingValues["pro_video.iso"])
+        assertEquals("Auto", highSpeed.settingValues["pro_video.shutter_speed"])
+        assertEquals("AF", highSpeed.settingValues["pro_video.manual_focus"])
+        assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, highSpeed.settingValues["pro_video.white_balance"])
+        assertEquals("Off", highSpeed.settingValues["pro_video.focus_peaking"])
+        assertEquals("Off", highSpeed.settingValues["pro_video.exposure_display"])
+
+        val manualIso = reducer.reduce(
+            AppState(camera = highSpeed),
+            CameraCommand.NudgeSetting("pro_video.iso", +1),
+        ).state.camera
+        assertEquals("60fps", manualIso.settingValues["pro_video.frame_rate"])
+        assertTrue(manualIso.settingValues["pro_video.iso"] != "Auto")
+    }
+
+    @Test
+    fun `enabling log exits high speed at the best supported normal rate`() {
+        val reducer = ControlReducer()
+        val caps = CameraCapabilities(
+            availableVideoFrameRates = listOf(30, 60, 120, 240),
+            availableVideoResolutions = listOf("HD 720p"),
+            videoFrameRatesByResolution = mapOf("HD 720p" to listOf(30, 60, 120, 240)),
+        )
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            showMoreSettings = true,
+            capabilities = caps,
+            settingValues = CameraCatalog.defaultSettingValues +
+                ("pro_video.resolution" to "HD 720p") +
+                ("pro_video.frame_rate" to "120fps") +
+                ("pro_video.log" to "Off"),
+        )
+        val logIndex = CameraCatalog.optionsMenuSettings(camera)
+            .indexOfFirst { it.id == "pro_video.log" }
+        val log = reducer.reduce(
+            AppState(camera = camera),
+            CameraCommand.AdjustOptionsItem(logIndex, +1),
+        ).state.camera
+
+        assertEquals("On", log.settingValues["pro_video.log"])
+        assertEquals("60fps", log.settingValues["pro_video.frame_rate"])
+    }
+
+    @Test
+    fun `selecting a resolution keeps every size reachable and reconciles fps`() {
+        val reducer = ControlReducer()
+        val caps = CameraCapabilities(
+            availableVideoFrameRates = listOf(24, 30, 60, 120, 240),
+            availableVideoResolutions = listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
+            videoFrameRatesByResolution = mapOf(
+                "SD 480p" to listOf(24, 30),
+                "HD 720p" to listOf(24, 30, 60, 120, 240),
+                "FHD" to listOf(24, 30, 60, 120),
+                "UHD 4K" to listOf(24, 30),
+            ),
+        )
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            capabilities = caps,
+            settingValues = CameraCatalog.defaultSettingValues +
+                ("pro_video.resolution" to "HD 720p") +
+                ("pro_video.frame_rate" to "240fps"),
+        )
+
+        val fhd = reducer.reduce(
+            AppState(camera = camera),
+            CameraCommand.NudgeSetting("pro_video.resolution", +1),
+        ).state.camera
+        assertEquals("FHD", fhd.settingValues["pro_video.resolution"])
+        assertEquals("120fps", fhd.settingValues["pro_video.frame_rate"])
+
+        val uhd = reducer.reduce(
+            AppState(camera = fhd),
+            CameraCommand.NudgeSetting("pro_video.resolution", +1),
+        ).state.camera
+        assertEquals("UHD 4K", uhd.settingValues["pro_video.resolution"])
+        assertEquals("30fps", uhd.settingValues["pro_video.frame_rate"])
+    }
+
+    @Test
     fun `slider adjustments respect hold sensitivity rate limiting`() {
         val core = ControlCore()
         core.advanceBle(BleSignal.Ready)
@@ -261,7 +466,6 @@ class ControlCoreTest {
         val reducer = ControlReducer()
         val rates = listOf("pro.iso", "pro.shutter_speed", "pro.white_balance", "pro.exposure_value")
             .map { settingId ->
-                val settings = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
                 val cursor = CameraCatalog.settingsBarItems(
                     CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra, false,
                 ).indexOfFirst { it is BottomBarItem.Setting && it.spec.id == settingId }
@@ -326,20 +530,26 @@ class ControlCoreTest {
             payload = byteArrayOf(0x10),
             receivedAt = Instant.parse("2026-05-27T12:00:00Z"),
         )
-        assertEquals(CameraCatalog.WB_AUTO_SHUTTER, firstPress.state.camera.settingValues["pro.white_balance"])
+        assertEquals(CameraCatalog.WB_AUTO_UNDERWATER, firstPress.state.camera.settingValues["pro.white_balance"])
 
         val secondPress = core.handleButtonPayload(
             payload = byteArrayOf(0x10),
             receivedAt = Instant.parse("2026-05-27T12:00:00.250Z"),
         )
-        // ONE RUNG PER TAP: Auto Continuous -> Auto Shutter -> first Kelvin rung.
+        // ONE RUNG PER TAP: Auto Continuous -> Auto Underwater -> Auto Shutter.
         // what this pins is that a deliberate, isolated press moves exactly one step and
         // never a geared stride.
         assertEquals(
-            "2300K",
+            CameraCatalog.WB_AUTO_SHUTTER,
             secondPress.state.camera.settingValues["pro.white_balance"],
-            "second press must land on the ring's first kelvin rung",
+            "second press must land on Auto Shutter",
         )
+
+        val thirdPress = core.handleButtonPayload(
+            payload = byteArrayOf(0x10),
+            receivedAt = Instant.parse("2026-05-27T12:00:00.500Z"),
+        )
+        assertEquals("2300K", thirdPress.state.camera.settingValues["pro.white_balance"])
     }
 
     /** Live telemetry changes the readout, never the explicitly circular wheel topology. */
@@ -359,7 +569,7 @@ class ControlCoreTest {
         val shutterSeeded = core.dispatch(CameraCommand.NudgeSetting("pro.shutter_speed", +1))
         assertEquals("1/24000", shutterSeeded.state.camera.settingValues["pro.shutter_speed"])
         val wbSeeded = core.dispatch(CameraCommand.NudgeSetting("pro.white_balance", +1))
-        assertEquals(CameraCatalog.WB_AUTO_SHUTTER, wbSeeded.state.camera.settingValues["pro.white_balance"])
+        assertEquals(CameraCatalog.WB_AUTO_UNDERWATER, wbSeeded.state.camera.settingValues["pro.white_balance"])
 
         // With no telemetry, the fallback is ordinary stepping: Auto -> the first rung.
         val blind = ControlCore()

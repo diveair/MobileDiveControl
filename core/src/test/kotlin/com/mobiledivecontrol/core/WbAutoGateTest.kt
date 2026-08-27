@@ -3,7 +3,7 @@ package com.mobiledivecontrol.core
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-/** The white-balance housing control is one continuous ring with two explicit auto modes. */
+/** The white-balance housing control is one continuous ring with three explicit auto modes. */
 class WbAutoGateTest {
 
     private val settingId = "pro.white_balance"
@@ -55,6 +55,7 @@ class WbAutoGateTest {
     fun `cold end crosses continuous then shutter then warm end`() {
         val rig = Rig("10000K")
         assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, rig.press(CameraCommand.NavigateRight))
+        assertEquals(CameraCatalog.WB_AUTO_UNDERWATER, rig.press(CameraCommand.NavigateRight))
         assertEquals(CameraCatalog.WB_AUTO_SHUTTER, rig.press(CameraCommand.NavigateRight))
         assertEquals("2300K", rig.press(CameraCommand.NavigateRight))
     }
@@ -63,6 +64,7 @@ class WbAutoGateTest {
     fun `warm end crosses shutter then continuous then cold end`() {
         val rig = Rig("2300K")
         assertEquals(CameraCatalog.WB_AUTO_SHUTTER, rig.press(CameraCommand.NavigateLeft))
+        assertEquals(CameraCatalog.WB_AUTO_UNDERWATER, rig.press(CameraCommand.NavigateLeft))
         assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, rig.press(CameraCommand.NavigateLeft))
         assertEquals("10000K", rig.press(CameraCommand.NavigateLeft))
     }
@@ -71,6 +73,7 @@ class WbAutoGateTest {
     fun `ramp nudges use the identical circular topology`() {
         val rig = Rig("10000K")
         assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, rig.nudge(+1))
+        assertEquals(CameraCatalog.WB_AUTO_UNDERWATER, rig.nudge(+1))
         assertEquals(CameraCatalog.WB_AUTO_SHUTTER, rig.nudge(+1))
         assertEquals("2300K", rig.nudge(+1))
         assertEquals(CameraCatalog.WB_AUTO_SHUTTER, rig.nudge(-1))

@@ -3,13 +3,16 @@ package com.mobiledivecontrol.ui.camera
 import android.content.ContentUris
 import android.content.Context
 import android.graphics.Bitmap
+import android.net.Uri
 import android.provider.MediaStore
+import android.os.Build
 import android.util.Size
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
 import androidx.compose.ui.layout.ContentScale
@@ -28,14 +31,11 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
-import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -46,6 +46,7 @@ import androidx.compose.material.icons.rounded.Exposure
 import androidx.compose.material.icons.rounded.Filter
 import androidx.compose.material.icons.rounded.FiberManualRecord
 import androidx.compose.material.icons.rounded.FlashOn
+import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.HdrAuto
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.PhotoLibrary
@@ -65,7 +66,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -87,13 +90,17 @@ import com.mobiledivecontrol.core.FocusCurveMode
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.RecordingPausedAction
 import com.mobiledivecontrol.core.RecordingSaveConfirmationAction
+import com.mobiledivecontrol.core.RecordingSaveLocation
 import com.mobiledivecontrol.core.SafetyState
+import com.mobiledivecontrol.core.SamsungLogProfile
 import com.mobiledivecontrol.core.SliderEditTarget
 import com.mobiledivecontrol.core.SliderSensitivity
 import com.mobiledivecontrol.core.selectedSetting
 import com.mobiledivecontrol.core.BottomBarItem
 import com.mobiledivecontrol.theme.DiveColors
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import androidx.compose.material3.Icon
 import java.util.Locale
 
@@ -110,6 +117,7 @@ fun CameraShellScreen(
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     onPointingGesture: ((PointingGesture) -> Unit)? = null,
     onCameraCommand: (CameraCommand) -> Unit = {},
+    headingDegrees: Double? = null,
     /** True while the housing-link banner occupies the top strip, so the mode pill yields to it. */
     housingLinkAlert: Boolean = false,
     modifier: Modifier = Modifier,
@@ -131,10 +139,16 @@ fun CameraShellScreen(
                 onCapabilities = onCapabilities,
                 onMeteredExposure = onMeteredExposure,
                 onPointingGesture = onPointingGesture,
+                headingDegrees = headingDegrees,
             )
         } else {
             CameraPreviewPlaceholder()
         }
+
+        CaptureGuideOverlay(
+            cameraState = cameraState,
+            modifier = Modifier.fillMaxSize(),
+        )
 
         // The runtime only publishes this URI after every paused segment has a complete MP4 index
         // and the cumulative, gap-free review container has been assembled.
@@ -214,6 +228,26 @@ fun CameraShellScreen(
         ) {
             BottomSettingsTray(
                 cameraState = cameraState,
+                onCommand = onCameraCommand,
+            )
+        }
+
+        AnimatedVisibility(
+            visible = cameraState.showMoreSettings &&
+                cameraState.focusedZone == CameraUiZone.SettingsPanel &&
+                !cameraState.settingsEditing &&
+                !cameraState.recordingPaused,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                // The persistent rail is 48dp tall. Dock Options directly to its top so its
+                // upper edge matches the Focus editor instead of floating a row too high.
+                .padding(start = 12.dp, bottom = 48.dp),
+        ) {
+            ProOptionsPanel(
+                cameraState = cameraState,
+                onCommand = onCameraCommand,
             )
         }
 
@@ -282,6 +316,333 @@ private fun ParameterBadge(label: String, value: String) {
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.Bold,
         )
+    }
+}
+
+/** Preview-only composition guides. They never alter or burn into captured media. */
+@Composable
+private fun CaptureGuideOverlay(
+    cameraState: CameraState,
+    modifier: Modifier = Modifier,
+) {
+    val guideSpec = CameraCatalog.settingsFor(cameraState)
+        .firstOrNull { it.id.endsWith(".guides") || it.id.endsWith(".grid") }
+        ?: return
+    val guide = CameraCatalog.currentValue(cameraState, guideSpec)
+    if (guide == "Off") return
+    val guideColor = Color.White.copy(alpha = 0.52f)
+
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = 1.2.dp.toPx()
+        fun vertical(fraction: Float) = drawLine(
+            guideColor, Offset(w * fraction, 0f), Offset(w * fraction, h), stroke,
+        )
+        fun horizontal(fraction: Float) = drawLine(
+            guideColor, Offset(0f, h * fraction), Offset(w, h * fraction), stroke,
+        )
+
+        when (guide) {
+            "3x3", "3×3 Grid" -> {
+                vertical(1f / 3f); vertical(2f / 3f)
+                horizontal(1f / 3f); horizontal(2f / 3f)
+            }
+            "4×4 Grid" -> {
+                vertical(0.25f); vertical(0.5f); vertical(0.75f)
+                horizontal(0.25f); horizontal(0.5f); horizontal(0.75f)
+            }
+            "Square" -> {
+                val side = minOf(w, h) * 0.72f
+                drawRect(
+                    color = guideColor,
+                    topLeft = Offset((w - side) / 2f, (h - side) / 2f),
+                    size = androidx.compose.ui.geometry.Size(side, side),
+                    style = Stroke(stroke),
+                )
+            }
+            "Diagonal" -> {
+                drawLine(guideColor, Offset.Zero, Offset(w, h), stroke)
+                drawLine(guideColor, Offset(w, 0f), Offset(0f, h), stroke)
+            }
+            "Golden Ratio" -> {
+                vertical(0.382f); vertical(0.618f)
+                horizontal(0.382f); horizontal(0.618f)
+            }
+            "Fibonacci Left", "Fibonacci Right" -> {
+                val geometry = fibonacciGuideGeometry(eyeOnLeft = guide.endsWith("Left"))
+                geometry.lines.forEach { line ->
+                    drawLine(
+                        color = guideColor,
+                        start = Offset(w * line.startX, h * line.startY),
+                        end = Offset(w * line.endX, h * line.endY),
+                        strokeWidth = stroke,
+                    )
+                }
+                geometry.arcs.forEach { arc ->
+                    drawArc(
+                        color = guideColor,
+                        startAngle = arc.startAngle,
+                        sweepAngle = arc.sweepAngle,
+                        useCenter = false,
+                        topLeft = Offset(
+                            w * (arc.centerX - arc.radiusX),
+                            h * (arc.centerY - arc.radiusY),
+                        ),
+                        size = androidx.compose.ui.geometry.Size(
+                            w * arc.radiusX * 2f,
+                            h * arc.radiusY * 2f,
+                        ),
+                        style = Stroke(stroke * 1.5f),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProOptionsPanel(
+    cameraState: CameraState,
+    onCommand: (CameraCommand) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val settings = CameraCatalog.optionsMenuSettings(cameraState)
+    if (settings.isEmpty()) return
+    val listState = rememberLazyListState()
+    LaunchedEffect(cameraState.optionsMenuCursor, settings.size) {
+        listState.animateScrollToItem(cameraState.optionsMenuCursor.coerceIn(0, settings.lastIndex))
+    }
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = modifier
+            .fillMaxWidth(0.72f)
+            .widthIn(min = 280.dp, max = 390.dp)
+            // Together with the 48dp rail below, this reproduces the Focus editor's vertical
+            // footprint while keeping the horizontal controls visible as originally required.
+            .fillMaxHeight(0.60f)
+            .background(DiveColors.DeepBlack.copy(alpha = 0.84f), RoundedCornerShape(22.dp))
+            .border(1.5.dp, DiveColors.SurfaceBorder.copy(alpha = 0.78f), RoundedCornerShape(22.dp))
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+    ) {
+        Text(
+            text = "${cameraState.activeMode.label.uppercase()} OPTIONS",
+            color = DiveColors.DiveCyan,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+        )
+        Spacer(Modifier.height(4.dp))
+        LazyColumn(
+            state = listState,
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+        ) {
+            itemsIndexed(settings, key = { _, spec -> spec.id }) { index, spec ->
+                val selected = index == cameraState.optionsMenuCursor
+                val rawValue = CameraCatalog.currentValue(cameraState, spec)
+                BottomEditCard(
+                    title = spec.label,
+                    value = displaySettingValue(cameraState, spec, rawValue),
+                    selected = selected,
+                    onClick = { onCommand(CameraCommand.SelectOptionsItem(index)) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    when {
+                        spec.id.endsWith(".save_location") -> SaveLocationAlbumRail(
+                            locations = cameraState.recordingSaveLocations,
+                            highlightedIndex = cameraState.recordingSaveLocationIndex,
+                            activeRelativePath = cameraState.recordingSaveLocation.relativePath,
+                            onLocationClick = { locationIndex ->
+                                onCommand(CameraCommand.SelectRecordingSaveLocation(locationIndex))
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(96.dp),
+                        )
+                        spec.options.isEmpty() -> Text(
+                            text = "Unavailable",
+                            color = DiveColors.TextMuted,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                        spec.options.size <= 4 -> ToggleOptionDisplay(
+                            currentValue = rawValue,
+                            options = spec.options,
+                            displayTransform = { option ->
+                                displaySettingValue(cameraState, spec, option)
+                            },
+                        )
+                        else -> SliderMeterAdjuster(spec = spec, value = rawValue)
+                    }
+                    if (spec.status == CameraFeatureStatus.NeedsVerification) {
+                        Text(
+                            text = "DEVICE CHECK · ${spec.note.orEmpty()}",
+                            color = DiveColors.Warning,
+                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.padding(top = 3.dp),
+                        )
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = "UP/DOWN Select  LEFT/RIGHT Adjust",
+            color = DiveColors.TextMuted,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier
+                .align(Alignment.Start)
+                .padding(start = 8.dp),
+        )
+    }
+}
+
+@Composable
+private fun SaveLocationAlbumRail(
+    locations: List<RecordingSaveLocation>,
+    highlightedIndex: Int,
+    activeRelativePath: String,
+    onLocationClick: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val listState = rememberLazyListState()
+    LaunchedEffect(highlightedIndex, locations.size) {
+        if (highlightedIndex in locations.indices) {
+            listState.animateScrollToItem(highlightedIndex)
+        }
+    }
+
+    if (locations.isEmpty()) {
+        Text(
+            text = "No writable media albums",
+            color = DiveColors.TextMuted,
+            style = MaterialTheme.typography.labelSmall,
+        )
+        return
+    }
+
+    LazyRow(
+        state = listState,
+        contentPadding = PaddingValues(horizontal = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = modifier,
+    ) {
+        itemsIndexed(
+            items = locations,
+            key = { _, location -> location.relativePath.lowercase(Locale.ROOT) },
+        ) { index, location ->
+            val highlighted = index == highlightedIndex
+            val active = location.relativePath.trimEnd('/').equals(
+                activeRelativePath.trimEnd('/'),
+                ignoreCase = true,
+            )
+            Column(
+                modifier = Modifier
+                    .width(104.dp)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(
+                        if (highlighted) DiveColors.DiveCyan.copy(alpha = 0.18f)
+                        else DiveColors.SurfaceElevated,
+                    )
+                    .border(
+                        width = if (highlighted) 1.5.dp else 1.dp,
+                        color = when {
+                            highlighted -> DiveColors.DiveCyan
+                            active -> DiveColors.Success.copy(alpha = 0.85f)
+                            else -> DiveColors.SurfaceBorder.copy(alpha = 0.65f)
+                        },
+                        shape = RoundedCornerShape(9.dp),
+                    )
+                    .clickable { onLocationClick(index) }
+                    .padding(4.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(51.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(DiveColors.DeepBlack),
+                ) {
+                    SaveLocationAlbumCover(location = location, modifier = Modifier.fillMaxSize())
+                    Icon(
+                        imageVector = Icons.Rounded.Folder,
+                        contentDescription = null,
+                        tint = if (highlighted) DiveColors.DiveCyan else DiveColors.TextPrimary,
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(3.dp)
+                            .size(17.dp),
+                    )
+                    if (active) {
+                        Text(
+                            text = "CURRENT",
+                            color = DiveColors.DeepBlack,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .background(DiveColors.Success, RoundedCornerShape(bottomEnd = 5.dp))
+                                .padding(horizontal = 4.dp, vertical = 1.dp),
+                        )
+                    }
+                }
+                Text(
+                    text = location.name,
+                    color = if (highlighted) DiveColors.DiveCyan else DiveColors.TextPrimary,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = if (location.mediaCount == 0) "Empty" else
+                        "${location.mediaCount} ${if (location.mediaCount == 1) "item" else "items"}",
+                    color = DiveColors.TextMuted,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SaveLocationAlbumCover(
+    location: RecordingSaveLocation,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    var bitmap by remember(location.coverContentUri) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    LaunchedEffect(context, location.coverContentUri) {
+        bitmap = if (location.coverContentUri.isBlank()) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.loadThumbnail(
+                        Uri.parse(location.coverContentUri),
+                        Size(256, 160),
+                        null,
+                    ).asImageBitmap()
+                }.getOrNull()
+            }
+        }
+    }
+
+    val cover = bitmap
+    if (cover != null) {
+        Image(
+            bitmap = cover,
+            contentDescription = "${location.name} album cover",
+            contentScale = ContentScale.Crop,
+            modifier = modifier,
+        )
+    } else {
+        Box(modifier = modifier.background(DiveColors.SurfaceCard))
     }
 }
 
@@ -360,6 +721,7 @@ private fun RightModeRail(
 }
 
 @Composable
+@Suppress("UNUSED_PARAMETER")
 private fun BottomSettingsTrayLegacy(
     cameraState: CameraState,
     settings: List<CameraSettingSpec>,
@@ -568,6 +930,7 @@ private fun BottomSettingsTrayLegacy(
 @Composable
 private fun BottomSettingsTray(
     cameraState: CameraState,
+    onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -743,6 +1106,7 @@ private fun BottomSettingsTray(
             CenteredModesBar(
                 items = items,
                 cameraState = cameraState,
+                onCommand = onCommand,
                 modifier = Modifier.fillMaxWidth(),
             )
         }
@@ -753,6 +1117,7 @@ private fun BottomSettingsTray(
 private fun CenteredModesBar(
     items: List<BottomBarItem>,
     cameraState: CameraState,
+    onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val modesIndex = items.indexOfFirst { it is BottomBarItem.ModesButton }.coerceAtLeast(0)
@@ -769,6 +1134,7 @@ private fun CenteredModesBar(
             cameraState = cameraState,
             startIndex = 0,
             alignToEnd = true,
+            onCommand = onCommand,
             modifier = Modifier.weight(1f),
         )
         Spacer(modifier = Modifier.width(4.dp))
@@ -777,6 +1143,7 @@ private fun CenteredModesBar(
             cameraState = cameraState,
             selected = cameraState.settingsCursor == modesIndex,
             compact = false,
+            onClick = null,
         )
         Spacer(modifier = Modifier.width(4.dp))
         ModesBarSide(
@@ -784,6 +1151,7 @@ private fun CenteredModesBar(
             cameraState = cameraState,
             startIndex = modesIndex + 1,
             alignToEnd = false,
+            onCommand = onCommand,
             modifier = Modifier.weight(1f),
         )
     }
@@ -795,6 +1163,7 @@ private fun ModesBarSide(
     cameraState: CameraState,
     startIndex: Int,
     alignToEnd: Boolean,
+    onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(
@@ -811,6 +1180,11 @@ private fun ModesBarSide(
                     cameraState = cameraState,
                     selected = cameraState.settingsCursor == startIndex + index,
                     compact = true,
+                    onClick = if (item is BottomBarItem.MoreSettings) {
+                        { onCommand(CameraCommand.ToggleOptionsMenu) }
+                    } else {
+                        null
+                    },
                 )
             }
         }
@@ -823,6 +1197,7 @@ private fun BottomEditCard(
     value: String,
     selected: Boolean,
     modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     Column(
@@ -836,6 +1211,7 @@ private fun BottomEditCard(
                 color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.55f),
                 shape = RoundedCornerShape(10.dp),
             )
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(horizontal = 8.dp, vertical = if (selected) 5.dp else 3.dp),
     ) {
         Row(
@@ -871,6 +1247,7 @@ private fun BottomBarChip(
     cameraState: CameraState,
     selected: Boolean,
     compact: Boolean = false,
+    onClick: (() -> Unit)? = null,
 ) {
     val icon = bottomBarIcon(item)
     val label = bottomBarLabel(item)
@@ -902,6 +1279,7 @@ private fun BottomBarChip(
                     color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.46f),
                     shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
                 )
+                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
                 .padding(horizontal = horizontalPadding, vertical = verticalPadding),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -948,6 +1326,7 @@ private fun BottomBarChip(
                     color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.46f),
                     shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
                 )
+                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
                 .padding(horizontal = horizontalPadding, vertical = verticalPadding),
         ) {
             if (item is BottomBarItem.GalleryShortcut) {
@@ -1024,11 +1403,22 @@ private fun bottomBarValue(item: BottomBarItem, cameraState: CameraState): Strin
     is BottomBarItem.ModesButton -> cameraState.activeMode.label
     is BottomBarItem.GalleryShortcut -> null
     is BottomBarItem.LensShortcut -> formatLensValue(item.value)
-    is BottomBarItem.MoreSettings -> if (cameraState.showMoreSettings) "Less" else null
+    is BottomBarItem.MoreSettings -> null
     is BottomBarItem.Setting -> displaySettingValue(cameraState, item.spec, CameraCatalog.currentValue(cameraState, item.spec))
 }
 
 private fun displaySettingValue(cameraState: CameraState?, spec: CameraSettingSpec, value: String): String {
+    val logCalibration = cameraState?.takeIf {
+        it.activeMode == CameraModeId.ProVideo &&
+        cameraState.settingValues["pro_video.log"] == "On" &&
+        spec.id == "pro_video.exposure_value"
+    }?.let {
+        SamsungLogProfile.acquisitionCalibration(
+            deviceModel = Build.MODEL.orEmpty(),
+            lensValue = it.settingValues["pro_video.lens"],
+        )
+    }
+    val protectedLogExposure = logCalibration != null
     return when {
         spec.id.endsWith(".lens") -> formatLensValue(value)
         spec.id.endsWith(".manual_focus") -> formatFocusValue(cameraState, spec, value)
@@ -1046,15 +1436,36 @@ private fun displaySettingValue(cameraState: CameraState?, spec: CameraSettingSp
                 ?.let { "A $it" } ?: value
         CameraCatalog.isWhiteBalanceAuto(value) && spec.id.endsWith(".white_balance") -> {
             val shutterMode = CameraCatalog.isWhiteBalanceAutoShutter(value)
-            val shortMode = if (shutterMode) "AS" else "AC"
+            val underwaterMode = CameraCatalog.isWhiteBalanceAutoUnderwater(value)
+            val shortMode = when {
+                shutterMode -> "AS"
+                underwaterMode -> "AU"
+                else -> "AC"
+            }
             cameraState?.meteredExposure?.wbKelvin
                 ?.let { CameraCatalog.nearestWhiteBalanceOption(it, spec.options) }
-                ?.let { "$shortMode $it" }
-                ?: if (shutterMode) "Auto S" else "Auto C"
+                ?.let { kelvin ->
+                    if (!underwaterMode) "$shortMode $kelvin" else {
+                        val tint = cameraState.meteredExposure.wbTintDuv
+                        if (tint == null) "$shortMode $kelvin" else {
+                            "$shortMode $kelvin ${java.lang.String.format(java.util.Locale.US, "%+.3f", tint)}"
+                        }
+                    }
+                }
+                ?: when {
+                    shutterMode -> "Auto S"
+                    underwaterMode -> "Auto U"
+                    else -> "Auto C"
+                }
         }
         // The native EV meter: with both ISO and shutter manual the compensation index has no
         // authority, so the field turns into a read-only meter of the measured deviation —
         // or an em dash when the vendor meter tag is absent, never a dial that pretends to work.
+        cameraState != null && protectedLogExposure && CameraCatalog.evMeterLocked(cameraState, spec) ->
+            cameraState.meteredExposure.evTenths
+                ?.let { SamsungLogProfile.protectedManualMeterTenths(it, logCalibration) }
+                ?.let { "L ${CameraCatalog.evLabel(it.coerceIn(-20, 20))}" } ?: "L —"
+        cameraState != null && protectedLogExposure -> "L $value"
         cameraState != null && CameraCatalog.evMeterLocked(cameraState, spec) ->
             cameraState.meteredExposure.evTenths
                 ?.let { "M ${CameraCatalog.evLabel(it.coerceIn(-20, 20))}" } ?: "—"
@@ -1501,24 +1912,6 @@ private fun RecordingPausedChooser(
                 return@Box
             }
 
-            val locationGridState = rememberLazyGridState()
-            LaunchedEffect(
-                cameraState.recordingSaveLocationIndex,
-                cameraState.recordingSaveLocations.size,
-            ) {
-                val index = cameraState.recordingSaveLocationIndex
-                if (index !in cameraState.recordingSaveLocations.indices) return@LaunchedEffect
-                val visibleItem = locationGridState.layoutInfo.visibleItemsInfo
-                    .firstOrNull { it.index == index }
-                val viewportStart = locationGridState.layoutInfo.viewportStartOffset
-                val viewportEnd = locationGridState.layoutInfo.viewportEndOffset
-                val fullyVisible = visibleItem != null &&
-                    visibleItem.offset.y >= viewportStart &&
-                    visibleItem.offset.y + visibleItem.size.height <= viewportEnd
-                if (!fullyVisible) {
-                    locationGridState.animateScrollToItem(index)
-                }
-            }
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
@@ -1533,56 +1926,17 @@ private fun RecordingPausedChooser(
                     fontWeight = FontWeight.Bold,
                 )
                 Spacer(modifier = Modifier.height(8.dp))
-                LazyVerticalGrid(
-                    columns = GridCells.Fixed(3),
-                    state = locationGridState,
+                SaveLocationAlbumRail(
+                    locations = cameraState.recordingSaveLocations,
+                    highlightedIndex = cameraState.recordingSaveLocationIndex,
+                    activeRelativePath = cameraState.recordingSaveLocation.relativePath,
+                    onLocationClick = { index ->
+                        onCommand(CameraCommand.OpenRecordingSaveLocationConfirmation(index))
+                    },
                     modifier = Modifier
                         .width(720.dp)
-                        // Two complete rows fit the S24's 360 dp landscape viewport; further
-                        // albums remain reachable through the grid's native vertical scroll.
-                        .heightIn(max = 130.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    gridItemsIndexed(cameraState.recordingSaveLocations) { index, location ->
-                        val selected = index == cameraState.recordingSaveLocationIndex
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 62.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(
-                                    if (selected) DiveColors.DiveCyan.copy(alpha = 0.2f)
-                                    else DiveColors.SurfaceElevated,
-                                )
-                                .border(
-                                    width = if (selected) 1.5.dp else 0.dp,
-                                    color = if (selected) DiveColors.DiveCyan else Color.Transparent,
-                                    shape = RoundedCornerShape(8.dp),
-                                )
-                                .clickable {
-                                    onCommand(CameraCommand.OpenRecordingSaveLocationConfirmation(index))
-                                }
-                                .padding(horizontal = 10.dp, vertical = 7.dp),
-                        ) {
-                            Text(
-                                text = location.name,
-                                color = if (selected) DiveColors.DiveCyan else DiveColors.TextPrimary,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                text = location.relativePath,
-                                color = DiveColors.TextSecondary,
-                                style = MaterialTheme.typography.labelSmall,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                    }
-                }
+                        .height(96.dp),
+                )
             }
             return@Box
         }

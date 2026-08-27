@@ -32,33 +32,49 @@ internal object RecordingSessionMuxer {
         segmentFiles: List<File>,
         displayName: String,
         location: RecordingSaveLocation,
-    ): Result<Uri> = runCatching {
-        require(segmentFiles.isNotEmpty()) { "A recording session has no segments" }
-        segmentFiles.forEach { file ->
-            require(file.isFile && file.length() > 0L) { "Missing recording segment: $file" }
+    ): Result<Uri> {
+        // A single CameraX segment is already a finalized MP4. Remuxing it cannot add any
+        // information, but it does rewrite every 100 Mb/s sample and temporarily needs space for
+        // a second multi-gigabyte file. Publish the original bytes directly; reserve MediaMuxer
+        // exclusively for the timestamp repair that a genuinely multi-segment session needs.
+        if (segmentFiles.size == 1) {
+            return publishPreparedFile(context, segmentFiles.single(), displayName, location)
         }
+        return runCatching {
+            require(segmentFiles.isNotEmpty()) { "A recording session has no segments" }
+            segmentFiles.forEach { file ->
+                require(file.isFile && file.length() > 0L) { "Missing recording segment: $file" }
+            }
 
-        val resolver = context.contentResolver
-        val values = outputValues(displayName, location)
-        val outputUri = checkNotNull(
-            resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values),
-        ) { "MediaStore did not create an output row" }
+            val resolver = context.contentResolver
+            val values = outputValues(displayName, location)
+            val outputUri = checkNotNull(
+                resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values),
+            ) { "MediaStore did not create an output row" }
 
-        try {
-            resolver.openFileDescriptor(outputUri, "rw")?.use { descriptor ->
-                muxSegments(segmentFiles, descriptor.fileDescriptor)
-            } ?: error("MediaStore did not open the output file")
+            try {
+                resolver.openFileDescriptor(outputUri, "rw")?.use { descriptor ->
+                    muxSegments(segmentFiles, descriptor.fileDescriptor)
+                } ?: error("MediaStore did not open the output file")
 
-            publishPendingRow(resolver, outputUri)
-            outputUri
-        } catch (error: Throwable) {
-            runCatching { resolver.delete(outputUri, null, null) }
-            throw error
+                publishPendingRow(resolver, outputUri)
+                outputUri
+            } catch (error: Throwable) {
+                runCatching { resolver.delete(outputUri, null, null) }
+                throw error
+            }
         }
     }
 
     fun buildReview(segmentFiles: List<File>, outputFile: File): Result<Uri> = runCatching {
         require(segmentFiles.isNotEmpty()) { "A recording session has no segments" }
+        if (segmentFiles.size == 1) {
+            val segment = segmentFiles.single()
+            require(segment.isFile && segment.length() > 0L) {
+                "Missing recording segment: $segment"
+            }
+            return@runCatching Uri.fromFile(segment)
+        }
         outputFile.parentFile?.mkdirs()
         RandomAccessFile(outputFile, "rw").use { destination ->
             destination.setLength(0L)
@@ -87,7 +103,9 @@ internal object RecordingSessionMuxer {
         ) { "MediaStore did not create an output row" }
         try {
             resolver.openOutputStream(outputUri, "w")?.use { output ->
-                preparedFile.inputStream().buffered().use { input -> input.copyTo(output) }
+                preparedFile.inputStream().buffered(COPY_BUFFER_BYTES).use { input ->
+                    input.copyTo(output, COPY_BUFFER_BYTES)
+                }
             } ?: error("MediaStore did not open the output stream")
             publishPendingRow(resolver, outputUri)
             outputUri

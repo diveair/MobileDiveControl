@@ -1,0 +1,73 @@
+// DiveControl S24 1x 10-bit BT.2020 HLG -> chart-matched Samsung Log input transform.
+//
+// Capture contract:
+//   * DiveControl Pro Video "10-bit HLG / Log grade" enabled
+//   * Original HLG master retained and interpreted by the editor as BT.2020 HLG
+//   * Log acquisition baseline enabled (automatic in AE; L meter target in manual exposure)
+//
+// Apply this DCTL to normalized HLG RGB before any Samsung Log creative LUT. It includes the
+// constrained S24 1x scene-linear colour matrix measured from the equal-exposure 18-patch pair.
+// Use the TransferOnly DCTL for another phone/lens. Do not override the source file's HLG transfer
+// metadata and do not bake this transform back into the camera master.
+
+__DEVICE__ float dc_log10(float x)
+{
+    return _logf(x) * 0.4342944819032518f;
+}
+
+__DEVICE__ float dc_hlg_inverse(float signal)
+{
+    const float a = 0.17883277f;
+    const float b = 0.28466892f;
+    const float c = 0.55991073f;
+    float e = _fmaxf(0.0f, _fminf(1.0f, signal));
+    return e <= 0.5f
+        ? e * e / 3.0f
+        : (_expf((e - c) / a) + b) / 12.0f;
+}
+
+__DEVICE__ float dc_samsung_log(float scene)
+{
+    const float x0 = -0.05f;
+    const float xt = 0.01f;
+    if (scene >= xt) {
+        return 0.258984868f * dc_log10(scene + 0.0003645f) + 0.720504856f;
+    }
+    if (scene >= x0) {
+        return -0.20942f * dc_log10(-scene + 0.016904f) - 0.24597f;
+    }
+    return 0.0f;
+}
+
+__DEVICE__ float3 dc_s24_1x_colour(float3 scene)
+{
+    // Column sums are 0.9813 / 0.9931 / 0.9910, preserving the neutral axis. Six held-column
+    // chart folds and a later recording both improved, so this is retained as a small calibrated
+    // input correction rather than an unconstrained 18-point 3D-LUT fit.
+    return make_float3(
+        0.816255188f * scene.x + 0.045897303f * scene.y + 0.119142174f * scene.z,
+        0.052168667f * scene.x + 0.886385493f * scene.y + 0.054573116f * scene.z,
+        0.083766334f * scene.x - 0.004657279f * scene.y + 0.911936771f * scene.z
+    );
+}
+
+__DEVICE__ float3 transform(
+    int p_Width,
+    int p_Height,
+    int p_X,
+    int p_Y,
+    float p_R,
+    float p_G,
+    float p_B)
+{
+    float3 scene = dc_s24_1x_colour(make_float3(
+        12.0f * dc_hlg_inverse(p_R),
+        12.0f * dc_hlg_inverse(p_G),
+        12.0f * dc_hlg_inverse(p_B)
+    ));
+    return make_float3(
+        dc_samsung_log(scene.x),
+        dc_samsung_log(scene.y),
+        dc_samsung_log(scene.z)
+    );
+}

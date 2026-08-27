@@ -56,11 +56,13 @@ class CameraCatalogTest {
         val settings = CameraCatalog.settingsFor(CameraModeId.ProVideo, GalaxyDeviceVariant.S26Ultra).map { it.id }.toSet()
         assertContains(settings, "pro_video.iso")
         assertContains(settings, "pro_video.shutter_speed")
-        assertContains(settings, "pro_video.microphone_source")
-        assertContains(settings, "pro_video.microphone_gain")
+        assertContains(settings, "pro_video.resolution")
+        assertContains(settings, "pro_video.frame_rate")
+        assertContains(settings, "pro_video.audio_recording")
         assertContains(settings, "pro_video.focus_peaking")
-        assertContains(settings, "pro_video.exposure_monitor")
-        assertContains(settings, "pro_video.grid")
+        assertContains(settings, "pro_video.exposure_display")
+        assertContains(settings, "pro_video.guides")
+        assertContains(settings, "pro_video.video_stabilization")
         assertContains(settings, "pro_video.log")
     }
 
@@ -68,8 +70,8 @@ class CameraCatalogTest {
     fun `slider defaults include manual controls`() {
         assertTrue("pro.iso" in CameraCatalog.defaultSliderSensitivities)
         assertTrue("expert.white_balance" in CameraCatalog.defaultSliderSensitivities)
-        assertTrue("pro_video.microphone_gain" in CameraCatalog.defaultSliderSensitivities)
-        assertTrue("pro_video.frame_rate" in CameraCatalog.defaultSliderSensitivities)
+        assertTrue("pro_video.iso" in CameraCatalog.defaultSliderSensitivities)
+        assertTrue("pro_video.frame_rate" !in CameraCatalog.defaultSliderSensitivities)
     }
 
     @Test
@@ -141,24 +143,134 @@ class CameraCatalogTest {
         )
         assertEquals(3, CameraCatalog.defaultSettingsCursor(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra))
 
-        // Video: no per-lens shortcut chips anywhere any more — one synthesized Lens tile
-        // instead — and the mode extras live behind More at the far left.
+        // Opening Options never mutates the horizontal rail. Extras belong only to the
+        // independent vertical collection.
+        val videoClosed = CameraCatalog.settingsBarItems(CameraModeId.Video, GalaxyDeviceVariant.S26Ultra, showMore = false)
         val videoItems = CameraCatalog.settingsBarItems(CameraModeId.Video, GalaxyDeviceVariant.S26Ultra, showMore = true)
         val videoIds = ids(videoItems)
+        assertEquals(ids(videoClosed), videoIds)
         assertTrue(videoItems.none { it is BottomBarItem.LensShortcut })
         assertTrue(videoIds.contains("video.lens"))
-        assertTrue(videoIds.contains("video.flash"))
-        assertTrue(videoIds.contains("video.super_steady"))
-        assertTrue(videoIds.contains("video.resolution"))
-        assertTrue(videoIds.contains("video.frame_rate"))
+        assertTrue("video.flash" !in videoIds)
+        assertTrue("video.resolution" !in videoIds)
         assertEquals("gallery", videoIds.last())
         assertEquals("video.slider_assignment", videoIds[videoIds.size - 2])
         assertEquals("more", videoIds.first())
+
+        val videoOptions = CameraCatalog.optionsMenuSettings(
+            CameraCatalog.launchCameraState(CameraModeId.Video),
+        ).map { it.id }
+        assertContains(videoOptions, "video.flash")
+        assertContains(videoOptions, "video.super_steady")
+        assertContains(videoOptions, "video.resolution")
+        assertContains(videoOptions, "video.frame_rate")
 
         // The wheel's default assignment is Focus wherever focus exists.
         val slider = proItems.filterIsInstance<BottomBarItem.Setting>()
             .first { it.spec.id.endsWith(CameraCatalog.SLIDER_ASSIGNMENT_SUFFIX) }
         assertEquals("Focus", slider.spec.defaultValue)
+    }
+
+    @Test
+    fun `pro options contain only controls absent from the horizontal spine`() {
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo)
+        val horizontalIds = CameraCatalog.settingsBarItems(camera)
+            .filterIsInstance<BottomBarItem.Setting>()
+            .map { it.spec.id }
+            .toSet()
+        val options = CameraCatalog.optionsMenuSettings(camera)
+        val optionIds = options.map { it.id }.toSet()
+
+        assertTrue(horizontalIds.intersect(optionIds).isEmpty())
+        listOf(
+            "pro_video.resolution",
+            "pro_video.frame_rate",
+            "pro_video.save_location",
+            "pro_video.metering",
+            "pro_video.guides",
+            "pro_video.exposure_display",
+            "pro_video.hdr",
+            "pro_video.log",
+            "pro_video.video_stabilization",
+            "pro_video.audio_recording",
+            "pro_video.metadata_depth",
+            "pro_video.metadata_temperature",
+            "pro_video.metadata_heading",
+        ).forEach { assertContains(optionIds, it) }
+        assertTrue("pro_video.focus_peaking" !in optionIds)
+        assertTrue("pro_video.focus_curve" !in optionIds)
+    }
+
+    @Test
+    fun `device capability probe removes options the capture pipeline cannot execute`() {
+        val caps = CameraCapabilities(
+            availableVideoFrameRates = listOf(30, 60),
+            availableVideoResolutions = listOf("FHD", "UHD 4K"),
+            videoStabilizationSupported = false,
+            ultraHdrJpegSupported = false,
+        )
+        val proVideo = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(capabilities = caps)
+        val videoSettings = CameraCatalog.settingsFor(proVideo)
+        assertEquals(
+            listOf("30fps", "60fps"),
+            videoSettings.first { it.id == "pro_video.frame_rate" }.options,
+        )
+        assertEquals(
+            listOf("FHD", "UHD 4K"),
+            videoSettings.first { it.id == "pro_video.resolution" }.options,
+        )
+        assertTrue(videoSettings.none { it.id == "pro_video.video_stabilization" })
+
+        val pro = CameraCatalog.launchCameraState(CameraModeId.Pro).copy(capabilities = caps)
+        assertEquals(
+            listOf("JPEG"),
+            CameraCatalog.settingsFor(pro).first { it.id == "pro.save_format" }.options,
+        )
+    }
+
+    @Test
+    fun `resolution menu shows every real size while fps follows the selected resolution`() {
+        val caps = CameraCapabilities(
+            availableVideoFrameRates = listOf(24, 30, 60, 120, 240),
+            availableVideoResolutions = listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
+            videoFrameRatesByResolution = mapOf(
+                "SD 480p" to listOf(30),
+                "HD 720p" to listOf(30, 60, 120, 240),
+                "FHD" to listOf(30, 60, 120),
+                "UHD 4K" to listOf(24, 30, 60),
+            ),
+        )
+        val highSpeed = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            capabilities = caps,
+            settingValues = CameraCatalog.defaultSettingValues +
+                ("pro_video.resolution" to "HD 720p") +
+                ("pro_video.frame_rate" to "240fps"),
+        )
+        val highSpeedSettings = CameraCatalog.settingsFor(highSpeed)
+        assertEquals(
+            listOf("30fps", "60fps", "120fps", "240fps"),
+            highSpeedSettings.first { it.id == "pro_video.frame_rate" }.options,
+        )
+        assertEquals(
+            listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
+            highSpeedSettings.first { it.id == "pro_video.resolution" }.options,
+        )
+
+        val sixtyFps = highSpeed.copy(
+            settingValues = highSpeed.settingValues + ("pro_video.frame_rate" to "60fps"),
+        )
+        assertEquals(
+            listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
+            CameraCatalog.settingsFor(sixtyFps)
+                .first { it.id == "pro_video.resolution" }
+                .options,
+        )
+        assertTrue(
+            CameraCatalog.settingsFor(CameraModeId.ProVideo, GalaxyDeviceVariant.S26Ultra)
+                .first { it.id == "pro_video.resolution" }
+                .options
+                .none { it == "8K" },
+        )
     }
 
     /**
@@ -350,17 +462,18 @@ class CameraCatalogTest {
         }
     }
 
-    /** Samsung's native manual table plus the two housing-specific automatic modes. */
+    /** Samsung's native manual table plus the three housing-specific automatic modes. */
     @Test
     fun `white balance ladder is the native 100K table followed by both auto modes`() {
         val wb = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "pro.white_balance" }
             .options
 
-        assertEquals(CameraCatalog.WB_LADDER_RUNGS + 2, wb.size)
+        assertEquals(CameraCatalog.WB_LADDER_RUNGS + 3, wb.size)
         assertEquals("2300K", wb.first())
         assertEquals("10000K", wb[CameraCatalog.WB_LADDER_RUNGS - 1])
         assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, wb[CameraCatalog.WB_LADDER_RUNGS])
+        assertEquals(CameraCatalog.WB_AUTO_UNDERWATER, wb[CameraCatalog.WB_LADDER_RUNGS + 1])
         assertEquals(CameraCatalog.WB_AUTO_SHUTTER, wb.last())
         val kelvin = wb.take(CameraCatalog.WB_LADDER_RUNGS).map { it.removeSuffix("K").toInt() }
         assertTrue(kelvin.zipWithNext().all { (a, b) -> b - a == 100 })
@@ -511,7 +624,8 @@ class CameraCatalogTest {
         assertEquals("Auto", clipped.first { it.id == "pro.shutter_speed" }.options.first())
         val clippedWb = clipped.first { it.id == "pro.white_balance" }.options
         assertEquals("2300K", clippedWb.first())
-        assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, clippedWb[clippedWb.lastIndex - 1])
+        assertEquals(CameraCatalog.WB_AUTO_CONTINUOUS, clippedWb[clippedWb.lastIndex - 2])
+        assertEquals(CameraCatalog.WB_AUTO_UNDERWATER, clippedWb[clippedWb.lastIndex - 1])
         assertEquals(CameraCatalog.WB_AUTO_SHUTTER, clippedWb.last())
         // The native fast floor (the vendor characteristic's 1/12000) trims the two rungs the
         // stock dial never shows either.

@@ -121,6 +121,8 @@ fun CameraHudOverlay(
             )
         }
 
+        val bottomControlMenuOpen = state.mode in setOf(AppMode.CameraLive, AppMode.CameraAdjust) &&
+            (state.camera.settingsEditing || state.camera.showMoreSettings)
         val bottomPadding = cameraReadoutBottomPadding(state.mode, state.camera)
 
         // Produce the projected arrow and its lock state once. Both the arrow and numeric heading
@@ -151,10 +153,11 @@ fun CameraHudOverlay(
                     mesh = targetArrowMesh,
                     targetHeading = targetHeading,
                     onHeading = headingTargetSynchronized,
+                    compact = bottomControlMenuOpen,
                 )
-                Spacer(modifier = Modifier.height(3.dp))
+                Spacer(modifier = Modifier.height(if (bottomControlMenuOpen) 1.dp else 3.dp))
             }
-            OverlayPill {
+            OverlayPill(compact = bottomControlMenuOpen) {
                 DepthGauge(
                     waterPressureKpa = state.safety.waterPressureKpa,
                     surfaceAmbientKpa = state.safety.surfaceAmbientKpa,
@@ -231,6 +234,7 @@ private fun TargetHeadingArrow(
     mesh: NavigationArrowMesh,
     targetHeading: Double,
     onHeading: Boolean,
+    compact: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val turn = mesh.yawErrorDegrees
@@ -244,7 +248,7 @@ private fun TargetHeadingArrow(
 
     Canvas(
         modifier = modifier
-            .size(30.dp)
+            .size(if (compact) 16.dp else 30.dp)
             .semantics {
                 contentDescription =
                     "Target ${targetHeading.roundToInt().mod(360)} degrees, $direction"
@@ -316,19 +320,23 @@ private val SEAL_CLUSTER_GAP = 6.dp
 /** Leaves only the final 15% of the former gap above the collapsed camera navigation tray. */
 private val CAMERA_READOUT_LIVE_PADDING = 54.dp
 
-/** Safe position above the expanded full-width bottom settings editor. */
-private val CAMERA_READOUT_MENU_PADDING = 86.dp
+/** Clears the shared top edge of Focus, ISO, shutter, Options and all other bottom editors. */
+private val CAMERA_READOUT_MENU_PADDING = 235.dp
 
 /** Existing lock tolerance, shared by arrow and numeric-heading colour. */
 private const val TARGET_HEADING_SYNC_TOLERANCE_DEGREES = 3.0
 
 /**
- * Lift the readout only for the full-width bottom editor that can intersect it. The mode rail is
- * confined to the right edge, so opening Track Heading must leave the centred readout stationary.
+ * Lift the complete dive readout for every editor opened from a bottom control. The centre mode
+ * button opens the side rail instead, so it deliberately keeps the live-view position.
  */
 internal fun cameraReadoutBottomPadding(mode: AppMode, camera: CameraState) = when (mode) {
     AppMode.CameraLive, AppMode.CameraAdjust ->
-        if (camera.settingsEditing) CAMERA_READOUT_MENU_PADDING else CAMERA_READOUT_LIVE_PADDING
+        if (camera.settingsEditing || camera.showMoreSettings) {
+            CAMERA_READOUT_MENU_PADDING
+        } else {
+            CAMERA_READOUT_LIVE_PADDING
+        }
     // Gallery's preview actions and bottom-centre Back share one dock below the gauge.
     AppMode.Gallery -> 150.dp
     else -> 28.dp
@@ -340,6 +348,7 @@ private val SEAL_STACKED_TOP = 140.dp
 @Composable
 private fun OverlayPill(
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     Box(
@@ -348,7 +357,7 @@ private fun OverlayPill(
                 color = DiveColors.DeepBlack.copy(alpha = 0.62f),
                 shape = RoundedCornerShape(18.dp),
             )
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = 12.dp, vertical = if (compact) 4.dp else 8.dp),
     ) {
         content()
     }

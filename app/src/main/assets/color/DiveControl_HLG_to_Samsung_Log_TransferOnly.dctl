@@ -1,0 +1,47 @@
+// DiveControl standards-only 10-bit BT.2020 HLG -> Samsung Log input transform.
+// Use this variant for any phone/lens without a measured DiveControl colour matrix.
+
+__DEVICE__ float dc_log10(float x)
+{
+    return _logf(x) * 0.4342944819032518f;
+}
+
+__DEVICE__ float dc_hlg_inverse(float signal)
+{
+    const float a = 0.17883277f;
+    const float b = 0.28466892f;
+    const float c = 0.55991073f;
+    float e = _fmaxf(0.0f, _fminf(1.0f, signal));
+    return e <= 0.5f
+        ? e * e / 3.0f
+        : (_expf((e - c) / a) + b) / 12.0f;
+}
+
+__DEVICE__ float dc_samsung_log(float scene)
+{
+    const float x0 = -0.05f;
+    const float xt = 0.01f;
+    if (scene >= xt) {
+        return 0.258984868f * dc_log10(scene + 0.0003645f) + 0.720504856f;
+    }
+    if (scene >= x0) {
+        return -0.20942f * dc_log10(-scene + 0.016904f) - 0.24597f;
+    }
+    return 0.0f;
+}
+
+__DEVICE__ float3 transform(
+    int p_Width,
+    int p_Height,
+    int p_X,
+    int p_Y,
+    float p_R,
+    float p_G,
+    float p_B)
+{
+    return make_float3(
+        dc_samsung_log(12.0f * dc_hlg_inverse(p_R)),
+        dc_samsung_log(12.0f * dc_hlg_inverse(p_G)),
+        dc_samsung_log(12.0f * dc_hlg_inverse(p_B))
+    );
+}
