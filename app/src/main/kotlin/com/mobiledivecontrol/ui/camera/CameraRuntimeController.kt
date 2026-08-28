@@ -13,6 +13,7 @@ import android.hardware.SensorManager
 import android.media.CamcorderProfile
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.media.MediaRecorder
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -123,6 +124,33 @@ internal fun playbackTimestampScale(playbackFrameRate: Double): Double =
 
 internal fun captureToPlaybackTimestampScale(captureFrameRate: Int, playbackFrameRate: Double): Double =
     captureFrameRate.toDouble() / playbackFrameRate
+
+/**
+ * Direct Camera2 recording owns exceptional stream sizes only while the shutter is active.
+ * Keeping CameraX's idle graph at a widely-supported FHD size avoids asking Samsung's HAL to
+ * configure an ordinary preview/video session for constrained-only sizes such as 1920x824 or
+ * silently map its public "highest" quality to UHD while the UI says 8K.
+ */
+internal fun previewBindingResolution(
+    selectedResolution: String?,
+    directCamera2Armed: Boolean,
+): String? = if (directCamera2Armed) "FHD" else selectedResolution
+
+/** Direct capture swaps sessions at record time; its idle CameraX preview remains a stable 30 fps. */
+internal fun previewFrameRateRequestFps(
+    selectedCaptureFps: Int?,
+    directCamera2Armed: Boolean,
+): Int? = if (directCamera2Armed) 30 else selectedCaptureFps
+
+/** Playback speed changes only timestamps and must never tear down a healthy camera session. */
+internal fun previewFrameRateSessionKey(
+    frameRateValue: String?,
+    directCamera2Armed: Boolean,
+): String? = if (directCamera2Armed) {
+    "stable-direct-camera2-preview"
+} else {
+    CameraCatalog.captureFrameRateFps(frameRateValue)?.let { "${it}fps" }
+}
 
 @OptIn(ExperimentalSessionConfig::class, ExperimentalHighSpeedVideo::class)
 class CameraRuntimeController(
@@ -340,6 +368,11 @@ class CameraRuntimeController(
     private var imageAnalysis: ImageAnalysis? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
+    @Volatile private var eightKCameraId: String? = null
+    private var cachedEightKProbePublicCameraId: String? = null
+    private var cachedEightKRecorderCameraId: String? = null
+    private var cachedEightKRates: List<Int>? = null
+    private val camera2EightKRecorder = Camera2EightKRecorder(context)
     private val camera2HighSpeedRecorder = Camera2HighSpeedRecorder(context)
     private val camera2TimeLapseRecorder = Camera2TimeLapseRecorder(context)
     private val highSpeedVideoTranscoder = HighSpeedVideoTranscoder(context)
@@ -347,6 +380,7 @@ class CameraRuntimeController(
         override fun run() {
             if (!directCamera2RecorderBusy()) return
             currentRecordingSegmentDurationMs = when {
+                camera2EightKRecorder.isBusy -> camera2EightKRecorder.elapsedDurationMs
                 camera2HighSpeedRecorder.isBusy -> camera2HighSpeedRecorder.elapsedDurationMs
                 else -> camera2TimeLapseRecorder.elapsedDurationMs
             }
@@ -357,10 +391,11 @@ class CameraRuntimeController(
     }
 
     private fun directCamera2RecorderBusy(): Boolean =
-        camera2HighSpeedRecorder.isBusy || camera2TimeLapseRecorder.isBusy
+        camera2EightKRecorder.isBusy || camera2HighSpeedRecorder.isBusy || camera2TimeLapseRecorder.isBusy
 
     private fun stopDirectCamera2Recorder() {
         when {
+            camera2EightKRecorder.isBusy -> camera2EightKRecorder.stop()
             camera2HighSpeedRecorder.isBusy -> camera2HighSpeedRecorder.stop()
             camera2TimeLapseRecorder.isBusy -> camera2TimeLapseRecorder.stop()
         }
@@ -794,6 +829,7 @@ class CameraRuntimeController(
         resumeObserver?.let { observer -> lifecycleOwner?.lifecycle?.removeObserver(observer) }
         resumeObserver = null
         cameraProvider?.unbindAll()
+        camera2EightKRecorder.release()
         camera2HighSpeedRecorder.release()
         camera2TimeLapseRecorder.release()
         highSpeedVideoTranscoder.cancel()
@@ -905,7 +941,11 @@ class CameraRuntimeController(
         }
 
         val desiredLensFacing = desiredLensFacing(cameraState)
-        val desiredResolution = desiredResolutionValue(cameraState)
+        val directCamera2Armed = isDirectCamera2Selection(cameraState)
+        val desiredResolution = previewBindingResolution(
+            desiredResolutionValue(cameraState),
+            directCamera2Armed,
+        )
         val desiredLens = selectedLensValue(cameraState)
         val desiredFrameRate = frameRateSessionKey(cameraState)
         val desiredHdrLogMode = resolvedSessionHdrLogMode(cameraState)
@@ -1969,10 +2009,14 @@ class CameraRuntimeController(
         val owner = lifecycleOwner ?: return
         val previewSurface = previewView ?: return
         val desiredLensFacing = desiredLensFacing(latestState)
-        val desiredResolution = desiredResolutionValue(latestState)
+        val selectedCaptureResolution = desiredResolutionValue(latestState)
         val selectedFrameRate = currentValue(latestState, ".frame_rate")
         val desiredFrameRate = frameRateSessionKey(latestState)
-        val highSpeedRecording = isHighSpeedSelection(latestState)
+        val directCamera2Recording = isDirectCamera2Selection(latestState)
+        val desiredResolution = previewBindingResolution(
+            selectedCaptureResolution,
+            directCamera2Recording,
+        )
         val desiredHdrLogMode = resolvedSessionHdrLogMode(latestState)
         val desiredCaptureFormat = currentValue(latestState, ".save_format")
         val desiredAspectRatio = currentValue(latestState, ".aspect_ratio")
@@ -2289,22 +2333,18 @@ class CameraRuntimeController(
         videoInterop.setSessionCaptureCallback(sessionCaptureCallback)
         val video = videoBuilder.build()
         Log.i(TAG, "Video dynamic range=$requestedDynamicRange requestedMode=$desiredHdrLogMode")
-        videoCapture = video.takeUnless { highSpeedRecording }
+        videoCapture = video
 
-        val useCaseGroup = if (highSpeedRecording) {
-            null
-        } else {
-            UseCaseGroup.Builder()
-                .addUseCase(preview)
-                .addUseCase(video)
-                .addEffect(effect)
-                .also { builder ->
-                    if (!maximumInformationLog) {
-                        builder.addUseCase(capture).addUseCase(analysis)
-                    }
+        val useCaseGroup = UseCaseGroup.Builder()
+            .addUseCase(preview)
+            .addUseCase(video)
+            .addEffect(effect)
+            .also { builder ->
+                if (!maximumInformationLog) {
+                    builder.addUseCase(capture).addUseCase(analysis)
                 }
-                .build()
-        }
+            }
+            .build()
         if (maximumInformationLog) {
             Log.i(
                 TAG,
@@ -2322,26 +2362,24 @@ class CameraRuntimeController(
         lastAppliedSessionSignature = null
         provider.unbindAll()
         camera = try {
-            if (highSpeedRecording) {
-                // CameraX needs a high-speed CamcorderProfile. Several Samsung devices omit it
-                // despite publishing a valid constrained-high-speed Camera2 map. Keep a genuine
-                // preview here; the shutter swaps briefly to Camera2HighSpeedRecorder, which owns
-                // the encoder surface and the constrained session for the recording itself.
+            if (directCamera2Recording) {
+                // CameraX remains an ordinary, fully-observable FHD/30 preview. The shutter swaps
+                // briefly to the matching direct recorder, which alone owns the constrained or
+                // vendor-advertised capture stream.
                 Log.i(
                     TAG,
-                    "Armed direct constrained-high-speed capture: " +
-                        "quality=$desiredResolution fps=$selectedFrameRate",
+                    "Armed direct Camera2 capture: " +
+                        "captureQuality=$selectedCaptureResolution captureFps=$selectedFrameRate " +
+                        "stablePreviewQuality=$desiredResolution",
                 )
-                provider.bindToLifecycle(owner, selector, preview)
-            } else {
-                provider.bindToLifecycle(owner, selector, requireNotNull(useCaseGroup))
             }
+            provider.bindToLifecycle(owner, selector, useCaseGroup)
         } catch (error: IllegalArgumentException) {
             val triedDirectPhysicalCamera = desiredLensFacing == CameraSelector.LENS_FACING_BACK &&
                 selectedCameraId != null &&
                 selectedCameraId == activeLensProfile?.physicalCameraId &&
                 selectedCameraId != backCameraProfile?.logicalCameraId
-            if (!triedDirectPhysicalCamera && !maximumInformationLog && !highSpeedRecording) {
+            if (!triedDirectPhysicalCamera && !maximumInformationLog) {
                 // Preview + ImageCapture + ImageAnalysis + VideoCapture can exceed a device's
                 // stream-combination budget. Shed the analysis leg — the least critical — and
                 // try once more before giving up.
@@ -2388,8 +2426,7 @@ class CameraRuntimeController(
             )
         }
         imageCapture = capture.takeUnless { maximumInformationLog }
-            .takeUnless { highSpeedRecording }
-        imageAnalysis = analysis.takeUnless { maximumInformationLog || highSpeedRecording }
+        imageAnalysis = analysis.takeUnless { maximumInformationLog }
         camera?.let { refreshBoundCameraCapabilities(it) }
         boundLensFacing = desiredLensFacing
         boundLensValue = selectedLensValue(latestState)
@@ -2495,6 +2532,10 @@ class CameraRuntimeController(
         if (activeRecording != null || directCamera2RecorderBusy()) return
         if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse) {
             startCamera2TimeLapseSegment()
+            return
+        }
+        if (isEightKSelection(latestState)) {
+            startCamera2EightKSegment()
             return
         }
         if (isHighSpeedSelection(latestState)) {
@@ -2669,6 +2710,160 @@ class CameraRuntimeController(
             // URI/clock behind would imply that Resume can still append.
             recordingSegmentFinalizingForReview = false
             finishRecordingSession(deleteLatest = false)
+        }
+    }
+
+    private fun startCamera2EightKSegment() {
+        val sessionDirectory = recordingSessionDirectory ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+        val fps = CameraCatalog.captureFrameRateFps(currentValue(latestState, ".frame_rate"))
+            ?.takeIf { it == 24 || it == 30 }
+            ?: run {
+                Log.e(TAG, "8K record requested without a supported 24/30 fps selection")
+                releaseShutterWhiteBalance()
+                finishRecordingSession(deleteLatest = false)
+                return
+            }
+        val boundCamera = camera ?: run {
+            Log.w(TAG, "8K record requested without a bound preview; rebinding")
+            bindCamera(force = true)
+            camera
+        } ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+        val cameraId = eightKCameraId ?: Camera2CameraInfo.from(boundCamera.cameraInfo).cameraId
+        val segmentFile = File(
+            sessionDirectory,
+            "segment-${(recordingSegmentFiles.size + 1).toString().padStart(4, '0')}.mp4",
+        )
+        activeRecordingSegmentFile = segmentFile
+        val ev = currentValue(latestState, ".exposure_value", ".exposure_compensation", ".exposure")
+            ?.replace("+", "")
+            ?.toDoubleOrNull()
+        val evIndex = ev?.let { evCompensationIndex(boundCamera, it) }
+        val host = previewView ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+        val playbackFrameRate = proVideoPlaybackFrameRate(
+            currentValue(latestState, ".frame_rate"),
+        )
+        val playbackScale = captureToPlaybackTimestampScale(fps, playbackFrameRate)
+        val variablePlayback = kotlin.math.abs(playbackScale - 1.0) > 0.000_001
+        val hasAudio = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED &&
+            currentValue(latestState, ".audio_recording") == "On" &&
+            // Fractional playback is an encoded-sample timestamp remux. Keeping an unchanged
+            // AAC clock would make it drift from the retimed video track.
+            !variablePlayback
+        val hdrLogMode = resolvedHdrLogMode(latestState)
+
+        cameraProvider?.unbindAll()
+        camera = null
+        videoCapture = null
+        imageCapture = null
+        imageAnalysis = null
+        cam2Session = null
+        cam2Surfaces = emptyList()
+        try {
+            camera2EightKRecorder.start(
+                Camera2EightKRecorder.Request(
+                    previewHost = host,
+                    cameraId = cameraId,
+                    fps = fps,
+                    outputFile = segmentFile,
+                    audioEnabled = hasAudio,
+                    exposureCompensationIndex = evIndex,
+                    zoomRatio = latestState.zoomFactor.toFloat().coerceAtLeast(1f),
+                    torchEnabled = currentValue(latestState, ".flash") in setOf("On", "Torch"),
+                    focusDiopters = manualFocusRequestFor(latestState)?.diopters,
+                    hdrLogMode = hdrLogMode,
+                ),
+                onStarted = {
+                    currentRecordingSegmentDurationMs = 0L
+                    RecordingClock.paused.value = false
+                    cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
+                    cameraRequestHandler.post(directRecordingClockRunnable)
+                    Log.i(
+                        TAG,
+                        "Direct 8K segment started: $segmentFile capture=${fps}fps " +
+                            "playback=${playbackFrameRate}fps dynamicRange=$hdrLogMode " +
+                            "audio=$hasAudio",
+                    )
+                },
+                onFinalized = { result ->
+                    finalizeCamera2EightKSegment(
+                        segmentFile = segmentFile,
+                        result = result,
+                        captureFrameRate = fps,
+                        playbackFrameRate = playbackFrameRate,
+                    )
+                },
+            )
+        } catch (error: Throwable) {
+            Log.e(TAG, "Could not start direct 8K recording", error)
+            activeRecordingSegmentFile = null
+            releaseShutterWhiteBalance()
+            finishRecordingSession(deleteLatest = false)
+            bindCamera(force = true)
+        }
+    }
+
+    private fun finalizeCamera2EightKSegment(
+        segmentFile: File,
+        result: Result<Long>,
+        captureFrameRate: Int,
+        playbackFrameRate: Double,
+    ) {
+        cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
+        if (activeRecordingSegmentFile == segmentFile) activeRecordingSegmentFile = null
+        val timestampScale = captureToPlaybackTimestampScale(
+            captureFrameRate,
+            playbackFrameRate,
+        )
+        val label = "8K ${captureFrameRate}fps/${playbackFrameRate}fps playback"
+        if (result.isFailure || kotlin.math.abs(timestampScale - 1.0) <= 0.000_001) {
+            finalizeCamera2VariableRateSegment(segmentFile, result, label)
+            return
+        }
+
+        val retimedFile = File(
+            segmentFile.parentFile,
+            segmentFile.nameWithoutExtension + "-retimed.mp4",
+        )
+        recordingFinalizeExecutor.execute {
+            val retimed = RecordingSessionMuxer.retime(
+                inputFile = segmentFile,
+                outputFile = retimedFile,
+                timestampScale = timestampScale,
+                playbackFrameRate = playbackFrameRate,
+            )
+            ContextCompat.getMainExecutor(context).execute {
+                retimed.onSuccess {
+                    segmentFile.delete()
+                    Log.i(
+                        TAG,
+                        "Retimed 8K segment from ${captureFrameRate}fps to exact " +
+                            "${playbackFrameRate}fps: $it",
+                    )
+                }
+                val durationResult = result.map { durationMs ->
+                    (durationMs * timestampScale).toLong().coerceAtLeast(1L)
+                }
+                finalizeCamera2VariableRateSegment(
+                    segmentFile = retimed.getOrDefault(segmentFile),
+                    result = if (retimed.isSuccess) durationResult else Result.failure(
+                        retimed.exceptionOrNull()
+                            ?: IllegalStateException("8K playback retime failed"),
+                    ),
+                    modeLabel = label,
+                )
+            }
         }
     }
 
@@ -3371,6 +3566,7 @@ class CameraRuntimeController(
         )
         val supportedQualities = recorderQualityLabels.filter { (quality, _) -> quality in normalQualities }
         val camera2HighSpeedRates = probeCamera2HighSpeedRates(cameraInfo)
+        val camera2EightKRates = probeCamera2EightKRates(cameraInfo)
         val ratesByResolution = linkedMapOf<String, List<Int>>()
 
         supportedQualities.forEach { (quality, label) ->
@@ -3408,6 +3604,9 @@ class CameraRuntimeController(
                 ratesByResolution[label] = rates
             }
         }
+        if (camera2EightKRates.isNotEmpty()) {
+            ratesByResolution["8K"] = camera2EightKRates
+        }
         val resolutions = ratesByResolution.keys.toList()
         Log.i(
             TAG,
@@ -3416,6 +3615,109 @@ class CameraRuntimeController(
         )
         return RecorderVideoCapabilities(resolutions, ratesByResolution)
     }
+
+    /**
+     * The S24's public StreamConfigurationMap stops at UHD, while Samsung's native recording
+     * table advertises 7680x4320 at 24/30. Check both sources, then intersect them with a public
+     * HEVC encoder that accepts the same size/rate. This is the capability-gated equivalent of
+     * checking getOutputSizes(MediaRecorder.class), extended for Samsung's real metadata layout.
+     */
+    private fun probeCamera2EightKRates(
+        cameraInfo: androidx.camera.core.CameraInfo,
+    ): List<Int> {
+        val publicCameraId = Camera2CameraInfo.from(cameraInfo).cameraId
+        if (cachedEightKProbePublicCameraId == publicCameraId) {
+            eightKCameraId = cachedEightKRecorderCameraId
+            return cachedEightKRates.orEmpty()
+        }
+        fun cache(rates: List<Int>, recorderCameraId: String?): List<Int> {
+            cachedEightKProbePublicCameraId = publicCameraId
+            cachedEightKRecorderCameraId = recorderCameraId
+            cachedEightKRates = rates
+            eightKCameraId = recorderCameraId
+            return rates
+        }
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val candidateIds = buildList {
+            add(publicCameraId)
+            // Samsung Camera's S24 Pro Video/8K logical device. It is omitted from
+            // CameraManager.cameraIdList for ordinary clients, but some firmware revisions still
+            // allow explicit characteristics/open access by ID; probe instead of assuming.
+            if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) add("56")
+        }.distinct()
+        val encoderRates = listOf(24, 30).filter(::encoderSupportsEightK)
+        Log.i(TAG, "8K HEVC encoder rates for ${Build.MODEL}: $encoderRates")
+        candidateIds.forEach { cameraId ->
+            val chars = runCatching { manager.getCameraCharacteristics(cameraId) }
+                .onFailure { error ->
+                    Log.d(
+                        TAG,
+                        "8K cameraId=$cameraId characteristics inaccessible: ${error.message}",
+                    )
+                }
+                .getOrNull() ?: return@forEach
+            val streamMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val publicEightK = streamMap
+                ?.getOutputSizes(MediaRecorder::class.java)
+                .orEmpty()
+                .any { it.width == EIGHT_K_SIZE.width && it.height == EIGHT_K_SIZE.height }
+            val vendorConfigurations = vendorCharacteristic(
+                chars,
+                "samsung.android.scaler.availableVideoConfigurations",
+                IntArray::class.java,
+            )
+            val vendorRates = samsungVendorEightKFrameRates(vendorConfigurations)
+            val publicRates = if (publicEightK) {
+                chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                    .orEmpty()
+                    .flatMap { range -> listOf(24, 30).filter { it in range.lower..range.upper } }
+                    .distinct()
+            } else {
+                emptyList()
+            }
+            val advertisedRates = (vendorRates + publicRates).distinct().sorted()
+            val supportedRates = advertisedRates.filter { fps -> encoderSupportsEightK(fps) }
+            Log.i(
+                TAG,
+                "8K capability cameraId=$cameraId listed=${cameraId in manager.cameraIdList} " +
+                    "publicMediaRecorder=$publicEightK vendorRates=$vendorRates " +
+                    "encoderIntersection=$supportedRates",
+            )
+            if (supportedRates.isNotEmpty()) {
+                return cache(supportedRates, cameraId)
+            }
+        }
+        if (Build.MODEL.uppercase().startsWith("SM-S921") && encoderRates.isNotEmpty()) {
+            // This exact device family has a native 8K table on hidden logical camera 56. Android
+            // filters that ID from non-system clients before CameraManager can return its
+            // characteristics. Keep the public camera-0 attempt enabled: Samsung's session
+            // parameters are applied before configure, where the HAL can promote the stream.
+            // Camera2EightKRecorder still rejects and deletes anything not actually 7680x4320.
+            Log.w(
+                TAG,
+                "Using SM-S921 vendor-session 8K attempt through public cameraId=$publicCameraId; " +
+                    "hidden camera 56 is filtered by CameraManager",
+            )
+            return cache(encoderRates, publicCameraId)
+        }
+        return cache(emptyList(), null)
+    }
+
+    private fun encoderSupportsEightK(fps: Int): Boolean = runCatching {
+        MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.any { codec ->
+            codec.isEncoder && codec.supportedTypes.any { mime ->
+                mime == MediaFormat.MIMETYPE_VIDEO_HEVC && runCatching {
+                    codec.getCapabilitiesForType(mime)
+                        .videoCapabilities
+                        ?.areSizeAndRateSupported(
+                            EIGHT_K_SIZE.width,
+                            EIGHT_K_SIZE.height,
+                            fps.toDouble(),
+                        ) == true
+                }.getOrDefault(false)
+            }
+        }
+    }.getOrDefault(false)
 
     /**
      * Some Samsung devices publish the standard Camera2 constrained-high-speed map but omit the
@@ -3995,9 +4297,14 @@ class CameraRuntimeController(
     }
 
     private fun requestedFpsRange(cameraState: CameraState, boundCamera: Camera): android.util.Range<Int>? {
-        val fps = CameraCatalog.captureFrameRateFps(currentValue(cameraState, ".frame_rate"))
+        val selectedCaptureFps = CameraCatalog.captureFrameRateFps(
+            currentValue(cameraState, ".frame_rate"),
+        )
+        val fps = previewFrameRateRequestFps(
+            selectedCaptureFps,
+            isDirectCamera2Selection(cameraState),
+        )
             ?: return null
-        if (isHighSpeedSelection(cameraState)) return null
         val ranges = Camera2CameraInfo.from(boundCamera.cameraInfo).getCameraCharacteristic(
             CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES,
         ).orEmpty()
@@ -4808,13 +5115,18 @@ class CameraRuntimeController(
             (cameraState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion && fps >= 48)
     }
 
+    private fun isEightKSelection(cameraState: CameraState): Boolean =
+        desiredResolutionValue(cameraState) == "8K"
+
+    private fun isDirectCamera2Selection(cameraState: CameraState): Boolean =
+        isEightKSelection(cameraState) || isHighSpeedSelection(cameraState)
+
     /** The live preview graph only cares whether direct constrained capture is armed. */
     private fun frameRateSessionKey(cameraState: CameraState): String? =
-        if (isHighSpeedSelection(cameraState)) {
-            "direct-constrained-high-speed"
-        } else {
-            currentValue(cameraState, ".frame_rate")
-        }
+        previewFrameRateSessionKey(
+            currentValue(cameraState, ".frame_rate"),
+            isDirectCamera2Selection(cameraState),
+        )
 
     private fun highSpeedResolutionSize(value: String?): Size? = when (value) {
         "HD 720p" -> Size(1280, 720)

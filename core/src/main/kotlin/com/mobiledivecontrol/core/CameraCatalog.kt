@@ -1435,7 +1435,7 @@ object CameraCatalog {
                     resolutions,
                     "UHD 4K",
                     CameraFeatureStatus.NeedsVerification,
-                    "8K and Super Steady QHD depend on Samsung encoder profiles not exposed by CameraX.",
+                    "8K uses a capability-gated Samsung Camera2 + HEVC path; Super Steady QHD remains vendor-only.",
                 ),
                 choice("video.frame_rate", "Frame rate", "Core", frameRates, "30fps"),
                 choice("video.aspect_ratio", "Aspect ratio", "Core", videoAspectRatios(), "16:9"),
@@ -1695,7 +1695,7 @@ object CameraCatalog {
         if (fps % 1.0 == 0.0) fps.toInt().toString() else fps.toString()
 
     private val videoResolutionOptions =
-        listOf("SD 480p", "HD 720p", "FHD 1920×824", "FHD", "UHD 4K")
+        listOf("SD 480p", "HD 720p", "FHD 1920×824", "FHD", "UHD 4K", "8K")
 
     private fun microphoneSources(): List<String> = listOf("Auto", "Front", "Rear", "USB", "Mixed")
 

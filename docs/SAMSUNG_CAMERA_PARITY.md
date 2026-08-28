@@ -98,12 +98,33 @@ menu and housing controls: lens, flash/torch, EV, timer, aspect ratio, photo res
 resolution/FPS, focus, ISO, shutter, white balance, filters, HDR/Log, audio recording, grid, and
 standard stabilization.
 
+### Verified rear-video resolution map (Galaxy S24 SM-S921W)
+
+| Samsung label | Encoded dimensions | DiveControl public-camera status |
+|---|---:|---|
+| 8K | 7680×4320 | Verified HEVC through the Samsung vendor session on public camera ID 0 at 24/30 fps |
+| UHD | 3840×2160 | Supported as `UHD 4K` at 24/30 fps |
+| FHD | 1920×1080 | Supported as `FHD` at 24/30/60/120/240 fps |
+| HD / 720p | 1280×720 | One resolution, supported as `HD 720p` at 24/30/60/120/240 fps |
+| SD / 480p | 720×480 | Supported as `SD 480p` at 24/30 fps |
+| Constrained FHD | 1920×824 | Samsung high-speed-only stream, supported at 120 fps |
+
+The public Camera2 stream map stops at 3840×2160 and Samsung Camera uses hidden logical camera ID
+56 for its own 8K path. On SM-S921 firmware, however, Samsung's vendor session parameters promote
+an exact 7680×4320 MediaRecorder surface through public camera ID 0. DiveControl keeps an ordinary
+FHD/30 CameraX graph while idle, gives the direct Camera2 recorder sole ownership of the 8K surface
+while the shutter is active, and rejects the segment unless its muxed track verifies as 7680×4320
+HEVC. Device testing verified native 24 and 30 fps capture. Pro Video pairs those with exact
+23.976/24 and 29.97/30 playback clocks through encoded-sample timestamp remuxing; it neither
+duplicates nor interpolates frames. The custom 1920×824 stream is likewise kept out of the idle
+graph and is bound only by the constrained high-speed recorder while the shutter is active.
+
 Samsung computational features do not have public third-party APIs. Portrait/background effects,
 Beauty, Food radial blur, Samsung multi-frame Night capture, panorama stitching, Hyperlapse/Night
 Hyperlapse processing, Motion Photo packaging, HEIF/RAW vendor output, Super Steady's wide crop,
-and Samsung-only 8K/QHD encoder profiles remain visible but carry an explicit **DEVICE CHECK**
-warning. The warning is intentional: selecting one is persisted and housing-navigable, but the
-app does not claim that CameraX reproduces Samsung's private image-processing pipeline.
+and Samsung-only QHD encoder profiles are retained in the parity inventory but are clipped from the
+live selector when the capture path cannot prove support. The app does not claim that CameraX
+reproduces Samsung's private image-processing pipeline.
 
 Photo's manual focus, focus assist, focus curve, and underwater filter choices are retained as
 explicit DiveControl housing enhancements. They are additional to—not replacements for—the

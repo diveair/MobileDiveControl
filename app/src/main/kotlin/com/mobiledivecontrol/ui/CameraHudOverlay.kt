@@ -38,6 +38,7 @@ import com.mobiledivecontrol.core.AppMode
 import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.BleConnectionState
 import com.mobiledivecontrol.core.CameraState
+import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.NavigationArrowMesh
 import com.mobiledivecontrol.core.ProjectedArrowPoint
 import com.mobiledivecontrol.core.SealState
@@ -101,6 +102,7 @@ fun CameraHudOverlay(
         // The wrapper Box is measured even when the chip inside renders nothing, so the seal
         // chip's anchor below collapses back to the default the moment the cluster disappears.
         var clusterHeightPx by remember { mutableIntStateOf(0) }
+        val currentResolutionStatus = currentCameraResolutionStatusLabel(state.camera)
         Box(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -118,12 +120,22 @@ fun CameraHudOverlay(
                 .align(Alignment.TopEnd)
                 .padding(end = 16.dp, top = 16.dp),
         ) {
-            Text(
-                text = rememberClockText(),
-                color = DiveColors.TextPrimary,
-                style = MaterialTheme.typography.labelLarge,
-                fontFamily = FontFamily.Monospace,
-            )
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    text = rememberClockText(),
+                    color = DiveColors.TextPrimary,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontFamily = FontFamily.Monospace,
+                )
+                if (currentResolutionStatus != null) {
+                    Text(
+                        text = currentResolutionStatus,
+                        color = DiveColors.TextPrimary,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
         }
 
         val bottomControlMenuOpen = state.mode in setOf(AppMode.CameraLive, AppMode.CameraAdjust) &&
@@ -147,30 +159,32 @@ fun CameraHudOverlay(
             abs(turn) < TARGET_HEADING_SYNC_TOLERANCE_DEGREES
         } == true
 
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = bottomPadding),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            if (targetArrowMesh != null && targetHeading != null) {
-                TargetHeadingArrow(
-                    mesh = targetArrowMesh,
-                    targetHeading = targetHeading,
-                    onHeading = headingTargetSynchronized,
-                    compact = bottomControlMenuOpen,
-                )
-                Spacer(modifier = Modifier.height(if (bottomControlMenuOpen) 1.dp else 3.dp))
-            }
-            OverlayPill(compact = bottomControlMenuOpen) {
-                DepthGauge(
-                    waterPressureKpa = state.safety.waterPressureKpa,
-                    surfaceAmbientKpa = state.safety.surfaceAmbientKpa,
-                    useMetric = useMetric,
-                    temperatureCelsius = state.safety.waterTemperatureC,
-                    headingDegrees = compassReading.headingDegrees,
-                    headingTargetSynchronized = headingTargetSynchronized,
-                )
+        if (cameraDiveReadoutVisible(state.mode)) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = bottomPadding),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                if (targetArrowMesh != null && targetHeading != null) {
+                    TargetHeadingArrow(
+                        mesh = targetArrowMesh,
+                        targetHeading = targetHeading,
+                        onHeading = headingTargetSynchronized,
+                        compact = bottomControlMenuOpen,
+                    )
+                    Spacer(modifier = Modifier.height(if (bottomControlMenuOpen) 1.dp else 3.dp))
+                }
+                OverlayPill(compact = bottomControlMenuOpen) {
+                    DepthGauge(
+                        waterPressureKpa = state.safety.waterPressureKpa,
+                        surfaceAmbientKpa = state.safety.surfaceAmbientKpa,
+                        useMetric = useMetric,
+                        temperatureCelsius = state.safety.waterTemperatureC,
+                        headingDegrees = compassReading.headingDegrees,
+                        headingTargetSynchronized = headingTargetSynchronized,
+                    )
+                }
             }
         }
 
@@ -345,6 +359,50 @@ internal fun cameraReadoutBottomPadding(mode: AppMode, camera: CameraState) = wh
     // Gallery's preview actions and bottom-centre Back share one dock below the gauge.
     AppMode.Gallery -> 150.dp
     else -> 28.dp
+}
+
+internal fun cameraDiveReadoutVisible(mode: AppMode): Boolean = mode != AppMode.Gallery
+
+/** The selected file resolution, or the photo pixel count when that mode has no size selector. */
+internal fun currentCameraResolutionLabel(camera: CameraState): String? {
+    val settings = CameraCatalog.settingsFor(camera)
+    val resolution = settings.firstOrNull { it.id.endsWith(".resolution") }
+        ?: settings.firstOrNull { it.id.endsWith(".megapixels") }
+        ?: return null
+    return detailedResolutionLabel(CameraCatalog.currentValue(camera, resolution))
+}
+
+/** One compact HUD line: active dynamic range first, followed by the encoded resolution. */
+internal fun currentCameraResolutionStatusLabel(camera: CameraState): String? {
+    val resolution = currentCameraResolutionLabel(camera) ?: return null
+    val dynamicRange = currentCameraHdrLogLabel(camera)
+    return listOfNotNull(dynamicRange, resolution).joinToString(" ")
+}
+
+/** The active video dynamic-range choice, without repeating the camera mode name. */
+internal fun currentCameraHdrLogLabel(camera: CameraState): String? {
+    val settings = CameraCatalog.settingsFor(camera)
+    val log = settings.firstOrNull { it.id.endsWith(".log") }
+    val hdr = settings.firstOrNull { it.id.endsWith(".hdr") || it.id.endsWith(".hdr_log") }
+    val active = mutableListOf<String>()
+    if (hdr != null) {
+        val value = CameraCatalog.currentValue(camera, hdr)
+        if (value == "On" || value == "HDR") active += "HDR"
+        if (value == "LOG") active += "LOG"
+    }
+    if (log != null && CameraCatalog.currentValue(camera, log) == "On") active += "LOG"
+    return active.distinct().joinToString(" · ").takeIf { it.isNotEmpty() }
+}
+
+/** Expand video-quality shorthand into the exact encoded frame dimensions shown in the HUD. */
+internal fun detailedResolutionLabel(value: String): String = when (value) {
+    "8K" -> "8K · 7680×4320"
+    "UHD 4K" -> "UHD 4K · 3840×2160"
+    "FHD" -> "FHD · 1920×1080"
+    "FHD 1920×824" -> "FHD · 1920×824"
+    "HD 720p" -> "HD · 1280×720"
+    "SD 480p" -> "SD · 720×480"
+    else -> value
 }
 
 /** Clears a two-line link banner so a seal failure and a link warning can coexist. */

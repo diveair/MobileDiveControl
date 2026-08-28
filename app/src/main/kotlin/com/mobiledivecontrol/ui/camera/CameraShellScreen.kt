@@ -119,11 +119,8 @@ fun CameraShellScreen(
     onPointingGesture: ((PointingGesture) -> Unit)? = null,
     onCameraCommand: (CameraCommand) -> Unit = {},
     headingDegrees: Double? = null,
-    /** True while the housing-link banner occupies the top strip, so the mode pill yields to it. */
-    housingLinkAlert: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    val profile = CameraCatalog.profile(cameraState.activeMode, cameraState.deviceVariant)
     val settings = CameraCatalog.settingsFor(cameraState.activeMode, cameraState.deviceVariant)
     val settingsVisible = settings.isNotEmpty()
 
@@ -176,39 +173,6 @@ fun CameraShellScreen(
             zoomFactor = cameraState.zoomFactor,
             modifier = Modifier.align(Alignment.Center),
         )
-
-        // Top-right: active camera mode indicator (when ModeRail is closed). Hidden while the
-        // housing-link banner is up — the mode is already legible in the bottom bar, and a
-        // disconnected housing is the more urgent thing to read.
-        AnimatedVisibility(
-            visible = cameraState.focusedZone != CameraUiZone.ModeRail && !housingLinkAlert,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(end = 16.dp, top = 72.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .background(
-                        color = DiveColors.DeepBlack.copy(alpha = 0.62f),
-                        shape = RoundedCornerShape(14.dp),
-                    )
-                    .border(
-                        width = 1.dp,
-                        color = DiveColors.DiveCyan.copy(alpha = 0.3f),
-                        shape = RoundedCornerShape(14.dp),
-                    )
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-            ) {
-                Text(
-                    text = "MODE: ${profile.modeName.uppercase()}",
-                    color = DiveColors.DiveCyan,
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
-        }
 
         // Right side: mode rail (only visible when in ModeRail zone)
         AnimatedVisibility(

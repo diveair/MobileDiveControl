@@ -162,7 +162,6 @@ private fun DiveControlContent(
                     onPointingGesture = onPointingGesture,
                     onCameraCommand = onCameraCommand,
                     headingDegrees = compassReading.headingDegrees,
-                    housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.CameraAdjust -> CameraShellScreen(
                     cameraState = state.camera,
@@ -177,7 +176,6 @@ private fun DiveControlContent(
                     onPointingGesture = onPointingGesture,
                     onCameraCommand = onCameraCommand,
                     headingDegrees = compassReading.headingDegrees,
-                    housingLinkAlert = state.bleConnectionState != BleConnectionState.Ready,
                 )
                 AppMode.Safety -> SafetyScreen(safety = state.safety)
                 AppMode.Diagnostics -> DiagnosticsScreen(

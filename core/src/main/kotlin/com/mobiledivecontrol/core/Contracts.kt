@@ -868,7 +868,7 @@ data class CameraCapabilities(
     val zoomMaxRatio: Double? = null,
     /** Empty until probed; otherwise only FPS values the active recording pipeline can schedule. */
     val availableVideoFrameRates: List<Int> = emptyList(),
-    /** Empty until probed; exact CameraX Recorder quality labels for the active lens. */
+    /** Empty until probed; exact capture-pipeline quality labels for the active lens. */
     val availableVideoResolutions: List<String> = emptyList(),
     /**
      * Recorder-compatible FPS values per quality label. This is deliberately a pair map rather

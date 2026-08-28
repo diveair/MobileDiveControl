@@ -497,11 +497,11 @@ class CameraCatalogTest {
                 .first { it.id == "pro_video.resolution" }
                 .options,
         )
-        assertTrue(
+        assertContains(
             CameraCatalog.settingsFor(CameraModeId.ProVideo, GalaxyDeviceVariant.S26Ultra)
                 .first { it.id == "pro_video.resolution" }
-                .options
-                .none { it == "8K" },
+                .options,
+            "8K",
         )
 
         val uhd = highSpeed.copy(
@@ -541,6 +541,29 @@ class CameraCatalogTest {
             CameraCatalog.proVideoFrameRateOption(60),
             CameraCatalog.currentValue(legacy, legacySpec),
         )
+    }
+
+    @Test
+    fun `eight k exposes genuine capture cadences and exact fractional playback pairs`() {
+        val caps = CameraCapabilities(
+            availableVideoFrameRates = listOf(24, 30),
+            availableVideoResolutions = listOf("8K"),
+            videoFrameRatesByResolution = mapOf("8K" to listOf(24, 30)),
+        )
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            capabilities = caps,
+            settingValues = CameraCatalog.defaultSettingValues +
+                ("pro_video.resolution" to "8K"),
+        )
+        val fps = CameraCatalog.settingsFor(camera)
+            .first { it.id == "pro_video.frame_rate" }
+            .options
+
+        assertEquals(listOf(24, 30), fps.mapNotNull(CameraCatalog::captureFrameRateFps).distinct())
+        assertContains(fps, CameraCatalog.proVideoFrameRateOption(24, 23.976))
+        assertContains(fps, CameraCatalog.proVideoFrameRateOption(24, 24.0))
+        assertContains(fps, CameraCatalog.proVideoFrameRateOption(30, 29.97))
+        assertContains(fps, CameraCatalog.proVideoFrameRateOption(30, 30.0))
     }
 
     @Test
