@@ -25,7 +25,7 @@ class InputRouterTest {
     }
 
     @Test
-    fun `hyperlapse shutter starts then stops without ordinary video pause chooser`() {
+    fun `hyperlapse shutter starts then pauses into the shared video chooser`() {
         val idle = readyState(
             mode = AppMode.CameraLive,
             camera = CameraState(activeMode = CameraModeId.Hyperlapse),
@@ -37,59 +37,63 @@ class InputRouterTest {
 
         val recording = idle.copy(camera = idle.camera.copy(recording = true))
         assertEquals(
-            listOf(CameraCommand.StopVideoRecording),
+            listOf(CameraCommand.PauseVideoRecording),
             router.route(recording, HousingButtonEvent.Shutter).commands,
         )
     }
 
     @Test
-    fun `paused video shutter confirms each selected review action`() {
+    fun `paused video and hyperlapse shutter confirm each selected review action`() {
         val expected = mapOf(
             RecordingPausedAction.Resume to CameraCommand.ResumeVideoRecording,
             RecordingPausedAction.Preview to CameraCommand.PreviewVideoRecording,
             RecordingPausedAction.Stop to CameraCommand.StopVideoRecording,
             RecordingPausedAction.Delete to CameraCommand.DeleteVideoRecording,
         )
-        expected.forEach { (action, command) ->
-            val state = readyState(
-                mode = AppMode.CameraLive,
-                camera = CameraState(
-                    activeMode = CameraModeId.Video,
-                    recording = true,
-                    recordingPaused = true,
-                    recordingPausedAction = action,
-                ),
-            )
-            assertEquals(
-                listOf(command),
-                router.route(state, HousingButtonEvent.Shutter).commands,
-                "Shutter must confirm $action",
-            )
+        for (mode in listOf(CameraModeId.Video, CameraModeId.Hyperlapse)) {
+            expected.forEach { (action, command) ->
+                val state = readyState(
+                    mode = AppMode.CameraLive,
+                    camera = CameraState(
+                        activeMode = mode,
+                        recording = true,
+                        recordingPaused = true,
+                        recordingPausedAction = action,
+                    ),
+                )
+                assertEquals(
+                    listOf(command),
+                    router.route(state, HousingButtonEvent.Shutter).commands,
+                    "$mode shutter must confirm $action",
+                )
+            }
         }
     }
 
     @Test
-    fun `paused video shutter confirms save location controls`() {
-        for (camera in listOf(
-            CameraState(
-                activeMode = CameraModeId.Video,
-                recording = true,
-                recordingPaused = true,
-                recordingLocationFocused = true,
-            ),
-            CameraState(
-                activeMode = CameraModeId.Video,
-                recording = true,
-                recordingPaused = true,
-                recordingLocationFocused = true,
-                recordingLocationChooserVisible = true,
-            ),
-        )) {
-            val state = readyState(mode = AppMode.CameraLive, camera = camera)
-            assertEquals(
-                listOf(CameraCommand.Confirm),
-                router.route(state, HousingButtonEvent.Shutter).commands,
-            )
+    fun `paused video and hyperlapse shutter confirm save location controls`() {
+        for (mode in listOf(CameraModeId.Video, CameraModeId.Hyperlapse)) {
+            for (camera in listOf(
+                CameraState(
+                    activeMode = mode,
+                    recording = true,
+                    recordingPaused = true,
+                    recordingLocationFocused = true,
+                ),
+                CameraState(
+                    activeMode = mode,
+                    recording = true,
+                    recordingPaused = true,
+                    recordingLocationFocused = true,
+                    recordingLocationChooserVisible = true,
+                ),
+            )) {
+                val state = readyState(mode = AppMode.CameraLive, camera = camera)
+                assertEquals(
+                    listOf(CameraCommand.Confirm),
+                    router.route(state, HousingButtonEvent.Shutter).commands,
+                )
+            }
         }
     }
 
