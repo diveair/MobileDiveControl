@@ -72,6 +72,7 @@ class CameraCatalogTest {
     @Test
     fun `every camera guide menu exposes the complete composition guide set`() {
         val requiredGuides = listOf(
+            "Rule of Thirds + Center",
             "Rule of Thirds",
             "Phi Grid",
             "Symmetry",
@@ -94,6 +95,7 @@ class CameraCatalogTest {
         assertTrue(guideSpecs.isNotEmpty())
         guideSpecs.forEach { spec ->
             requiredGuides.forEach { guide -> assertContains(spec.options, guide) }
+            assertEquals("Rule of Thirds + Center", spec.options.first())
             assertEquals("Rule of Thirds", spec.defaultValue)
         }
     }
@@ -429,8 +431,9 @@ class CameraCatalogTest {
         val proVideo = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(capabilities = caps)
         val videoSettings = CameraCatalog.settingsFor(proVideo)
         assertEquals(
-            listOf("30fps", "60fps"),
-            videoSettings.first { it.id == "pro_video.frame_rate" }.options,
+            listOf(30, 60),
+            videoSettings.first { it.id == "pro_video.frame_rate" }
+                .options.mapNotNull(CameraCatalog::captureFrameRateFps).distinct(),
         )
         assertEquals(
             listOf("FHD", "UHD 4K"),
@@ -446,7 +449,7 @@ class CameraCatalogTest {
     }
 
     @Test
-    fun `resolution menu shows every real size while fps follows the selected resolution`() {
+    fun `pro video shows all real frame rates independent of selected resolution`() {
         val caps = CameraCapabilities(
             availableVideoFrameRates = listOf(24, 30, 60, 120, 240),
             availableVideoResolutions = listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
@@ -464,19 +467,22 @@ class CameraCatalogTest {
                 ("pro_video.frame_rate" to "240fps"),
         )
         val highSpeedSettings = CameraCatalog.settingsFor(highSpeed)
+        val allProRates = highSpeedSettings.first { it.id == "pro_video.frame_rate" }.options
         assertEquals(
-            listOf(
-                "30fps",
-                "60fps",
-                "120fps",
-                "240fps/23.976fps playback",
-                "240fps/24fps playback",
-                "240fps/29.97fps playback",
-                "240fps/30fps playback",
-                "240fps/48fps playback",
-            ),
-            highSpeedSettings.first { it.id == "pro_video.frame_rate" }.options,
+            listOf(24, 30, 60, 120, 240),
+            allProRates.mapNotNull(CameraCatalog::captureFrameRateFps).distinct(),
         )
+        listOf(24, 30, 60, 120, 240).forEach { captureFps ->
+            assertContains(allProRates, CameraCatalog.proVideoFrameRateOption(captureFps))
+        }
+        listOf(60, 120, 240).forEach { captureFps ->
+            listOf(23.976, 24.0, 29.97, 30.0, 48.0).forEach { playbackFps ->
+                assertContains(
+                    allProRates,
+                    CameraCatalog.proVideoFrameRateOption(captureFps, playbackFps),
+                )
+            }
+        }
         assertEquals(
             listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
             highSpeedSettings.first { it.id == "pro_video.resolution" }.options,
@@ -497,6 +503,16 @@ class CameraCatalogTest {
                 .options
                 .none { it == "8K" },
         )
+
+        val uhd = highSpeed.copy(
+            settingValues = highSpeed.settingValues +
+                ("pro_video.resolution" to "UHD 4K") +
+                ("pro_video.frame_rate" to "30fps"),
+        )
+        assertEquals(
+            allProRates,
+            CameraCatalog.settingsFor(uhd).first { it.id == "pro_video.frame_rate" }.options,
+        )
     }
 
     @Test
@@ -505,12 +521,26 @@ class CameraCatalogTest {
         assertEquals(23.976, CameraCatalog.playbackFrameRateFps("240fps/23.976fps playback"))
         assertEquals(60, CameraCatalog.captureFrameRateFps("60fps"))
         assertEquals(60.0, CameraCatalog.playbackFrameRateFps("60fps"))
+        assertEquals(60, CameraCatalog.captureFrameRateFps("60fps/24fps playback"))
+        assertEquals(24.0, CameraCatalog.playbackFrameRateFps("60fps/24fps playback"))
 
         val settings = CameraCatalog.settingsFor(CameraModeId.ProVideo, GalaxyDeviceVariant.S26Ultra)
         val ids = settings.map { it.id }
         val fps = settings.first { it.id == "pro_video.frame_rate" }
         assertTrue(ids.none { it.contains("playback_frame_rate") })
+        assertContains(fps.options, "60fps/48fps playback")
+        assertContains(fps.options, "120fps/24fps playback")
         assertContains(fps.options, "240fps/48fps playback")
+        assertTrue(fps.options.all { '/' in it })
+
+        val legacy = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            settingValues = CameraCatalog.defaultSettingValues + ("pro_video.frame_rate" to "60fps"),
+        )
+        val legacySpec = CameraCatalog.settingsFor(legacy).first { it.id == "pro_video.frame_rate" }
+        assertEquals(
+            CameraCatalog.proVideoFrameRateOption(60),
+            CameraCatalog.currentValue(legacy, legacySpec),
+        )
     }
 
     @Test
@@ -863,9 +893,10 @@ class CameraCatalogTest {
         )
 
         listOf("pro.iso", "pro.shutter_speed", "pro.white_balance").forEach { id ->
-            val spec = clipped.firstOrNull { it.id == id }
-            assertTrue(spec != null, "$id was clipped out of existence")
-            assertTrue(spec!!.options.isNotEmpty(), "$id lost every option")
+            val spec = requireNotNull(clipped.firstOrNull { it.id == id }) {
+                "$id was clipped out of existence"
+            }
+            assertTrue(spec.options.isNotEmpty(), "$id lost every option")
         }
         assertEquals("Auto", clipped.first { it.id == "pro.iso" }.options.first())
         assertEquals("Auto", clipped.first { it.id == "pro.shutter_speed" }.options.first())

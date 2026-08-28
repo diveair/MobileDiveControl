@@ -115,11 +115,14 @@ internal fun hyperlapseRecordingLimitMillis(value: String?): Long? = value
 
 internal fun proVideoPlaybackFrameRate(value: String?): Double =
     CameraCatalog.playbackFrameRateFps(value)
-        ?.takeIf { it in setOf(23.976, 24.0, 29.97, 30.0, 48.0) }
+        ?.takeIf { it.isFinite() && it > 0.0 }
         ?: 30.0
 
 internal fun playbackTimestampScale(playbackFrameRate: Double): Double =
     playbackFrameRate.roundToInt().toDouble() / playbackFrameRate
+
+internal fun captureToPlaybackTimestampScale(captureFrameRate: Int, playbackFrameRate: Double): Double =
+    captureFrameRate.toDouble() / playbackFrameRate
 
 @OptIn(ExperimentalSessionConfig::class, ExperimentalHighSpeedVideo::class)
 class CameraRuntimeController(
@@ -2516,11 +2519,31 @@ class CameraRuntimeController(
         )
         activeRecordingSegmentFile = segmentFile
         val options = FileOutputOptions.Builder(segmentFile).build()
+        val proCaptureFps = if (
+            latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.ProVideo
+        ) {
+            CameraCatalog.captureFrameRateFps(currentValue(latestState, ".frame_rate"))
+        } else {
+            null
+        }
+        val proPlaybackFps = proCaptureFps?.let {
+            proVideoPlaybackFrameRate(currentValue(latestState, ".frame_rate"))
+        }
+        val proPlaybackScale = if (proCaptureFps != null && proPlaybackFps != null) {
+            captureToPlaybackTimestampScale(proCaptureFps, proPlaybackFps)
+        } else {
+            1.0
+        }
+        val variablePlayback = kotlin.math.abs(proPlaybackScale - 1.0) > 0.000_001
         val hasAudio = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.RECORD_AUDIO,
         ) == PackageManager.PERMISSION_GRANTED &&
-            currentValue(latestState, ".audio_recording") == "On"
+            currentValue(latestState, ".audio_recording") == "On" &&
+            // Slow/fast playback changes the media clock after capture. A live AAC track cannot
+            // be losslessly conformed by the MP4 timestamp-only retimer, so paired rates record
+            // video-only just like the constrained high-speed path.
+            !variablePlayback
         val pending = capture.output.prepareRecording(context, options).apply {
             if (hasAudio) withAudioEnabled()
         }
@@ -2539,43 +2562,114 @@ class CameraRuntimeController(
                         activeRecordingSegmentFile = null
                     }
                     if (event.hasError()) {
-                        Log.e(TAG, "Recording finalize error ${event.error}", event.cause)
-                        runCatching { segmentFile.delete() }
-                        RecordingClock.reviewUri.value = null
+                        completeCameraXSegment(
+                            segmentFile = segmentFile,
+                            result = Result.failure(
+                                event.cause ?: IllegalStateException(
+                                    "Recording finalize error ${event.error}",
+                                ),
+                            ),
+                            durationMs = 0L,
+                            reviewBoundary = reviewBoundary,
+                        )
                     } else {
                         val finalizedDurationMs = maxOf(
                             currentRecordingSegmentDurationMs,
                             event.recordingStats.recordedDurationNanos / 1_000_000L,
                         )
-                        completedRecordingDurationMs += finalizedDurationMs
-                        RecordingClock.durationMs.value = completedRecordingDurationMs
-                        if (segmentFile.isFile && segmentFile.length() > 0L) {
-                            recordingSegmentFiles += segmentFile
-                        }
-                        Log.i(TAG, "Recording review segment finalized: $segmentFile")
-                    }
-                    currentRecordingSegmentDurationMs = 0L
-                    releaseShutterWhiteBalance()
-                    if (reviewBoundary) {
-                        if (recordingSegmentFiles.isEmpty()) {
-                            recordingSegmentFinalizingForReview = false
-                            RecordingClock.reviewFinalizing.value = false
-                            runPendingRecordingAction()
+                        if (variablePlayback && proPlaybackFps != null) {
+                            finalizeCameraXProPlaybackSegment(
+                                segmentFile = segmentFile,
+                                recordedDurationMs = finalizedDurationMs,
+                                timestampScale = proPlaybackScale,
+                                playbackFrameRate = proPlaybackFps,
+                                reviewBoundary = reviewBoundary,
+                            )
                         } else {
-                            buildCumulativeRecordingReview()
+                            completeCameraXSegment(
+                                segmentFile = segmentFile,
+                                result = Result.success(segmentFile),
+                                durationMs = finalizedDurationMs,
+                                reviewBoundary = reviewBoundary,
+                            )
                         }
-                    } else {
-                        // An unsolicited finalisation ends the logical session too; leaving a
-                        // stale URI/clock behind would imply that Resume can still append.
-                        recordingSegmentFinalizingForReview = false
-                        finishRecordingSession(deleteLatest = false)
                     }
                 }
                 else -> Unit
             }
         }
         RecordingClock.paused.value = false
-        Log.i(TAG, "Private recording segment started: $segmentFile audio=$hasAudio")
+        Log.i(
+            TAG,
+            "Private recording segment started: $segmentFile audio=$hasAudio " +
+                "capture=${proCaptureFps ?: "native"} playback=${proPlaybackFps ?: "native"}",
+        )
+    }
+
+    private fun finalizeCameraXProPlaybackSegment(
+        segmentFile: File,
+        recordedDurationMs: Long,
+        timestampScale: Double,
+        playbackFrameRate: Double,
+        reviewBoundary: Boolean,
+    ) {
+        val retimedFile = File(
+            segmentFile.parentFile,
+            segmentFile.nameWithoutExtension + "-retimed.mp4",
+        )
+        recordingFinalizeExecutor.execute {
+            val retimed = RecordingSessionMuxer.retime(
+                inputFile = segmentFile,
+                outputFile = retimedFile,
+                timestampScale = timestampScale,
+                playbackFrameRate = playbackFrameRate,
+            )
+            ContextCompat.getMainExecutor(context).execute {
+                retimed.onSuccess { segmentFile.delete() }
+                completeCameraXSegment(
+                    segmentFile = retimed.getOrDefault(segmentFile),
+                    result = retimed,
+                    durationMs = (recordedDurationMs * timestampScale).toLong().coerceAtLeast(1L),
+                    reviewBoundary = reviewBoundary,
+                )
+            }
+        }
+    }
+
+    private fun completeCameraXSegment(
+        segmentFile: File,
+        result: Result<File>,
+        durationMs: Long,
+        reviewBoundary: Boolean,
+    ) {
+        result.onSuccess { completedFile ->
+            completedRecordingDurationMs += durationMs
+            RecordingClock.durationMs.value = completedRecordingDurationMs
+            if (completedFile.isFile && completedFile.length() > 0L) {
+                recordingSegmentFiles += completedFile
+            }
+            Log.i(TAG, "Recording review segment finalized: $completedFile durationMs=$durationMs")
+        }.onFailure { error ->
+            Log.e(TAG, "Recording finalize failed", error)
+            segmentFile.delete()
+            RecordingClock.reviewUri.value = null
+        }
+        currentRecordingSegmentDurationMs = 0L
+        releaseShutterWhiteBalance()
+        if (reviewBoundary) {
+            if (recordingSegmentFiles.isEmpty()) {
+                recordingSegmentFinalizingForReview = false
+                RecordingClock.reviewFinalizing.value = false
+                runPendingRecordingAction()
+            } else {
+                buildCumulativeRecordingReview()
+            }
+        } else {
+            // An unsolicited finalisation ends the logical session too; leaving a stale
+            // URI/clock behind would imply that Resume can still append.
+            recordingSegmentFinalizingForReview = false
+            finishRecordingSession(deleteLatest = false)
+        }
     }
 
     private fun startCamera2TimeLapseSegment() {

@@ -381,6 +381,16 @@ private fun CaptureGuideOverlay(
         }
 
         when (guide) {
+            "Rule of Thirds + Center" -> {
+                vertical(1f / 3f); vertical(2f / 3f)
+                horizontal(1f / 3f); horizontal(2f / 3f)
+                drawCircle(
+                    color = guideColor,
+                    radius = minOf(w, h) * 0.07f,
+                    center = Offset(w / 2f, h / 2f),
+                    style = Stroke(stroke),
+                )
+            }
             "Rule of Thirds", "3x3", "3×3 Grid" -> {
                 vertical(1f / 3f); vertical(2f / 3f)
                 horizontal(1f / 3f); horizontal(2f / 3f)

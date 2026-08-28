@@ -2025,6 +2025,28 @@ class ControlReducer(
         var selectedFps = CameraCatalog.captureFrameRateFps(
             updatedValues["$prefix.frame_rate"],
         )
+        if (settingId == "pro_video.frame_rate" && selectedFps != null) {
+            val ratesByResolution = camera.capabilities?.videoFrameRatesByResolution.orEmpty()
+            val currentResolution = updatedValues["$prefix.resolution"]
+            if (
+                ratesByResolution.isNotEmpty() &&
+                selectedFps !in ratesByResolution[currentResolution].orEmpty()
+            ) {
+                // Keep every device-supported Pro rate reachable from one FPS menu. When the
+                // current resolution cannot carry it, land on the highest-quality compatible
+                // resolution in the catalog's own order (on the S24: FHD for 60/120/240 fps).
+                val compatibleResolution = CameraCatalog.settingsFor(
+                    camera.copy(settingValues = updatedValues),
+                ).firstOrNull { it.id == "$prefix.resolution" }
+                    ?.options
+                    ?.lastOrNull { resolution ->
+                        selectedFps in ratesByResolution[resolution].orEmpty()
+                    }
+                if (compatibleResolution != null) {
+                    updatedValues = updatedValues + ("$prefix.resolution" to compatibleResolution)
+                }
+            }
+        }
         if (settingId.endsWith(".resolution")) {
             val compatibleRates = camera.capabilities?.videoFrameRatesByResolution
                 ?.get(value)
@@ -2036,7 +2058,12 @@ class ControlReducer(
                 val compatibleFps = compatibleRates.lastOrNull { it <= selectedFps!! }
                     ?: compatibleRates.first()
                 selectedFps = compatibleFps
-                updatedValues = updatedValues + ("$prefix.frame_rate" to "${compatibleFps}fps")
+                val compatibleValue = if (prefix == "pro_video") {
+                    CameraCatalog.proVideoFrameRateOption(compatibleFps)
+                } else {
+                    "${compatibleFps}fps"
+                }
+                updatedValues = updatedValues + ("$prefix.frame_rate" to compatibleValue)
             }
         }
         val highSpeedSelected = selectedFps != null && selectedFps >= HIGH_SPEED_FPS_MIN
@@ -2109,7 +2136,11 @@ class ControlReducer(
             ?.takeIf { it.isNotEmpty() }
             ?: capabilities?.availableVideoFrameRates.orEmpty()
         val normal = rates.filter { it in 1 until HIGH_SPEED_FPS_MIN }.maxOrNull() ?: 30
-        return "${normal}fps"
+        return if (prefix == "pro_video") {
+            CameraCatalog.proVideoFrameRateOption(normal)
+        } else {
+            "${normal}fps"
+        }
     }
 
     /**

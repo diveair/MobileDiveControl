@@ -53,35 +53,39 @@ internal fun fibonacciGuideGeometry(
         when (orientation) {
             0 -> {
                 side = bottom - top
-                centerX = left
-                centerY = top
-                startAngle = 0f
-                divider = NormalizedGuideLine(left + side, top, left + side, bottom)
-                left += side
+                val squareRight = left + side
+                centerX = squareRight
+                centerY = bottom
+                startAngle = 180f
+                divider = NormalizedGuideLine(squareRight, top, squareRight, bottom)
+                left = squareRight
             }
             1 -> {
                 side = right - left
-                centerX = right
-                centerY = top
-                startAngle = 90f
-                divider = NormalizedGuideLine(left, top + side, right, top + side)
-                top += side
+                val squareBottom = top + side
+                centerX = left
+                centerY = squareBottom
+                startAngle = 270f
+                divider = NormalizedGuideLine(left, squareBottom, right, squareBottom)
+                top = squareBottom
             }
             2 -> {
                 side = bottom - top
-                centerX = right
-                centerY = bottom
-                startAngle = 180f
-                divider = NormalizedGuideLine(right - side, top, right - side, bottom)
-                right -= side
+                val squareLeft = right - side
+                centerX = squareLeft
+                centerY = top
+                startAngle = 0f
+                divider = NormalizedGuideLine(squareLeft, top, squareLeft, bottom)
+                right = squareLeft
             }
             else -> {
                 side = right - left
-                centerX = left
-                centerY = bottom
-                startAngle = 270f
-                divider = NormalizedGuideLine(left, bottom - side, right, bottom - side)
-                bottom -= side
+                val squareTop = bottom - side
+                centerX = right
+                centerY = squareTop
+                startAngle = 90f
+                divider = NormalizedGuideLine(left, squareTop, right, squareTop)
+                bottom = squareTop
             }
         }
 

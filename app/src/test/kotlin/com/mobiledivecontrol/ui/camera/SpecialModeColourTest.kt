@@ -31,6 +31,9 @@ class SpecialModeColourTest {
     @Test
     fun `pro video combined rate keeps capture and fractional playback distinct`() {
         assertEquals(23.976, proVideoPlaybackFrameRate("240fps/23.976fps playback"), 1e-9)
+        assertEquals(48.0, proVideoPlaybackFrameRate("60fps/48fps playback"), 1e-9)
+        assertEquals(2.5, captureToPlaybackTimestampScale(60, 24.0), 1e-9)
+        assertEquals(30.0 / 29.97, captureToPlaybackTimestampScale(30, 29.97), 1e-9)
         assertEquals(24.0 / 23.976, playbackTimestampScale(23.976), 1e-9)
         assertEquals(1.0, playbackTimestampScale(24.0), 1e-9)
         assertEquals(30.0 / 29.97, playbackTimestampScale(29.97), 1e-9)

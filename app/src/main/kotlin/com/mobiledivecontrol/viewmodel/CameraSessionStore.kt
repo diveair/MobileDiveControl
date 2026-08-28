@@ -250,6 +250,13 @@ class CameraSessionStore(context: Context) {
      */
     internal fun normalizeRestoredSettingValues(values: Map<String, String>): Map<String, String> {
         val result = values.toMutableMap()
+        // Pro Video now spells both columns in one option. Preserve the capture cadence chosen
+        // by older builds and make its playback cadence identical until the user changes it.
+        result["pro_video.frame_rate"]?.takeIf { '/' !in it }?.let { legacy ->
+            CameraCatalog.captureFrameRateFps(legacy)?.let { captureFps ->
+                result["pro_video.frame_rate"] = CameraCatalog.proVideoFrameRateOption(captureFps)
+            }
+        }
         // Validate focus curve values
         listOf(
             "photo.focus_curve", "expert.focus_curve", "pro.focus_curve", "pro_video.focus_curve",

@@ -423,7 +423,8 @@ class ControlCoreTest {
             CameraCommand.AdjustOptionsItem(fpsIndex, +1),
         ).state.camera
 
-        assertEquals("120fps", highSpeed.settingValues["pro_video.frame_rate"])
+        assertEquals(120, CameraCatalog.captureFrameRateFps(highSpeed.settingValues["pro_video.frame_rate"]))
+        assertEquals(23.976, CameraCatalog.playbackFrameRateFps(highSpeed.settingValues["pro_video.frame_rate"]))
         assertEquals("Off", highSpeed.settingValues["pro_video.log"])
         assertEquals("Auto", highSpeed.settingValues["pro_video.iso"])
         assertEquals("Auto", highSpeed.settingValues["pro_video.shutter_speed"])
@@ -436,7 +437,10 @@ class ControlCoreTest {
             AppState(camera = highSpeed),
             CameraCommand.NudgeSetting("pro_video.iso", +1),
         ).state.camera
-        assertEquals("60fps", manualIso.settingValues["pro_video.frame_rate"])
+        assertEquals(
+            CameraCatalog.proVideoFrameRateOption(60),
+            manualIso.settingValues["pro_video.frame_rate"],
+        )
         assertTrue(manualIso.settingValues["pro_video.iso"] != "Auto")
     }
 
@@ -464,7 +468,10 @@ class ControlCoreTest {
         ).state.camera
 
         assertEquals("On", log.settingValues["pro_video.log"])
-        assertEquals("60fps", log.settingValues["pro_video.frame_rate"])
+        assertEquals(
+            CameraCatalog.proVideoFrameRateOption(60),
+            log.settingValues["pro_video.frame_rate"],
+        )
     }
 
     @Test
@@ -492,14 +499,53 @@ class ControlCoreTest {
             CameraCommand.NudgeSetting("pro_video.resolution", +1),
         ).state.camera
         assertEquals("FHD", fhd.settingValues["pro_video.resolution"])
-        assertEquals("120fps", fhd.settingValues["pro_video.frame_rate"])
+        assertEquals(
+            CameraCatalog.proVideoFrameRateOption(120),
+            fhd.settingValues["pro_video.frame_rate"],
+        )
 
         val uhd = reducer.reduce(
             AppState(camera = fhd),
             CameraCommand.NudgeSetting("pro_video.resolution", +1),
         ).state.camera
         assertEquals("UHD 4K", uhd.settingValues["pro_video.resolution"])
-        assertEquals("30fps", uhd.settingValues["pro_video.frame_rate"])
+        assertEquals(
+            CameraCatalog.proVideoFrameRateOption(30),
+            uhd.settingValues["pro_video.frame_rate"],
+        )
+    }
+
+    @Test
+    fun `selecting a pro frame rate moves to the best compatible resolution`() {
+        val reducer = ControlReducer()
+        val caps = CameraCapabilities(
+            availableVideoFrameRates = listOf(24, 30, 60, 120, 240),
+            availableVideoResolutions = listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
+            videoFrameRatesByResolution = mapOf(
+                "SD 480p" to listOf(24, 30),
+                "HD 720p" to listOf(24, 30, 60, 120, 240),
+                "FHD" to listOf(24, 30, 60, 120, 240),
+                "UHD 4K" to listOf(24, 30),
+            ),
+        )
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            showMoreSettings = true,
+            capabilities = caps,
+            settingValues = CameraCatalog.defaultSettingValues +
+                ("pro_video.resolution" to "UHD 4K") +
+                ("pro_video.frame_rate" to "30fps"),
+        )
+        val fpsIndex = CameraCatalog.optionsMenuSettings(camera)
+            .indexOfFirst { it.id == "pro_video.frame_rate" }
+
+        val sixty = reducer.reduce(
+            AppState(camera = camera),
+            CameraCommand.AdjustOptionsItem(fpsIndex, +1),
+        ).state.camera
+
+        assertEquals(60, CameraCatalog.captureFrameRateFps(sixty.settingValues["pro_video.frame_rate"]))
+        assertEquals(23.976, CameraCatalog.playbackFrameRateFps(sixty.settingValues["pro_video.frame_rate"]))
+        assertEquals("FHD", sixty.settingValues["pro_video.resolution"])
     }
 
     @Test

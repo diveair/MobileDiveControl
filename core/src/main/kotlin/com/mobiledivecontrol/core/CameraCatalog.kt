@@ -263,7 +263,7 @@ object CameraCatalog {
         return Math.round(1_000_000_000.0 / fps)
     }
 
-    /** Capture column from either `30fps` or `240fps/23.976fps playback`. */
+    /** Capture column from either a legacy `30fps` value or a paired Pro Video label. */
     fun captureFrameRateFps(value: String?): Int? = value
         ?.substringBefore('/')
         ?.trim()
@@ -271,7 +271,7 @@ object CameraCatalog {
         ?.trim()
         ?.toIntOrNull()
 
-    /** Playback column; ordinary entries play at their capture rate. */
+    /** Playback column; legacy unpaired entries play at their capture rate. */
     fun playbackFrameRateFps(value: String?): Double? {
         if (value == null) return null
         val playback = value.substringAfter('/', missingDelimiterValue = value)
@@ -280,6 +280,10 @@ object CameraCatalog {
             .toDoubleOrNull()
         return playback ?: captureFrameRateFps(value)?.toDouble()
     }
+
+    /** Canonical paired Pro Video value used for defaults, migration, and reducer fallbacks. */
+    fun proVideoFrameRateOption(captureFps: Int, playbackFps: Double = captureFps.toDouble()): String =
+        "${captureFps}fps/${frameRateLabel(playbackFps)}fps playback"
 
     /** [settingsFor] with every clamp the CameraState itself implies — the one call the reducer and UI share. */
     fun settingsFor(camera: CameraState): List<CameraSettingSpec> {
@@ -333,10 +337,18 @@ object CameraCatalog {
                     ev == null || ev in caps.evMin..caps.evMax
                 }
             spec.id.endsWith(".frame_rate") && !caps?.availableVideoFrameRates.isNullOrEmpty() -> {
-                val rates = caps?.videoFrameRatesByResolution
-                    ?.get(selectedResolution)
-                    ?.takeIf { it.isNotEmpty() }
-                    ?: caps!!.availableVideoFrameRates
+                // Pro Video keeps every real rate reported anywhere on the selected camera
+                // visible. Choosing a rate that the current resolution cannot carry moves Pro
+                // Video to the best compatible resolution in ControlReducer. Hiding those rates
+                // behind the resolution selector made UHD's 24/30 row look like the whole camera.
+                val rates = if (spec.id == "pro_video.frame_rate") {
+                    caps!!.availableVideoFrameRates
+                } else {
+                    caps?.videoFrameRatesByResolution
+                        ?.get(selectedResolution)
+                        ?.takeIf { it.isNotEmpty() }
+                        ?: caps!!.availableVideoFrameRates
+                }
                 clip { option ->
                     val fps = captureFrameRateFps(option)
                     fps in rates ||
@@ -678,6 +690,11 @@ object CameraCatalog {
         val value = camera.settingValues[spec.id] ?: spec.defaultValue
         return if (spec.id.endsWith(".grid") || spec.id.endsWith(".guides")) {
             canonicalGuideValue(value)
+        } else if (spec.id == "pro_video.frame_rate" && '/' !in value) {
+            captureFrameRateFps(value)
+                ?.let { captureFps -> proVideoFrameRateOption(captureFps) }
+                ?.takeIf { it in spec.options }
+                ?: spec.defaultValue
         } else {
             value
         }
@@ -782,8 +799,14 @@ object CameraCatalog {
                 }
             clippedSettings
                 .filter { spec -> spec.kind != CameraSettingKind.Slider }
-                .forEach { spec ->
-                    val stored = values[spec.id] ?: return@forEach
+                .forEach choiceLoop@{ spec ->
+                    var stored = values[spec.id] ?: return@choiceLoop
+                    if (spec.id == "pro_video.frame_rate" && '/' !in stored) {
+                        stored = captureFrameRateFps(stored)
+                            ?.let { captureFps -> proVideoFrameRateOption(captureFps) }
+                            ?: stored
+                        values = values + (spec.id to stored)
+                    }
                     if (stored !in spec.options) {
                         values = values + (spec.id to spec.defaultValue)
                     }
@@ -1441,13 +1464,14 @@ object CameraCatalog {
 
     private fun proVideoProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
-        val frameRates = videoFrameRates(variant).filterNot { it == "240fps" } + listOf(
-            "240fps/23.976fps playback",
-            "240fps/24fps playback",
-            "240fps/29.97fps playback",
-            "240fps/30fps playback",
-            "240fps/48fps playback",
-        )
+        val frameRates = videoFrameRates(variant).flatMap { captureLabel ->
+            val captureFps = captureFrameRateFps(captureLabel) ?: return@flatMap emptyList()
+            (proVideoPlaybackFrameRates + captureFps.toDouble())
+                .distinct()
+                .sorted()
+                .filter { playbackFps -> playbackFps <= captureFps }
+                .map { playbackFps -> proVideoFrameRateOption(captureFps, playbackFps) }
+        }
         return CameraModeProfile(
             mode = CameraModeId.ProVideo,
             modeName = CameraModeId.ProVideo.label,
@@ -1471,7 +1495,13 @@ object CameraCatalog {
                 slider("pro_video.shutter_speed", "Shutter", "Manual", shutterOptions, "Auto"),
                 slider("pro_video.exposure_value", "Exposure Value", "Manual", evProOptions, "0.0"),
                 choice("pro_video.resolution", "Resolution", "File", videoResolutionOptions, "UHD 4K"),
-                choice("pro_video.frame_rate", "FPS", "File", frameRates, "30fps"),
+                choice(
+                    "pro_video.frame_rate",
+                    "FPS / Playback",
+                    "File",
+                    frameRates,
+                    proVideoFrameRateOption(30),
+                ),
                 choice(
                     "pro_video.aspect_ratio",
                     "Aspect ratio",
@@ -1659,6 +1689,11 @@ object CameraCatalog {
     private fun videoFrameRates(_variant: GalaxyDeviceVariant): List<String> =
         listOf(24, 25, 30, 48, 50, 60, 90, 100, 120, 240).map { "${it}fps" }
 
+    private val proVideoPlaybackFrameRates = listOf(23.976, 24.0, 29.97, 30.0, 48.0)
+
+    private fun frameRateLabel(fps: Double): String =
+        if (fps % 1.0 == 0.0) fps.toInt().toString() else fps.toString()
+
     private val videoResolutionOptions =
         listOf("SD 480p", "HD 720p", "FHD 1920×824", "FHD", "UHD 4K")
 
@@ -1669,6 +1704,7 @@ object CameraCatalog {
     private fun gridOptions(): List<String> = guideOptions()
 
     private fun guideOptions(): List<String> = listOf(
+        "Rule of Thirds + Center",
         "Off",
         "Rule of Thirds",
         "Phi Grid",

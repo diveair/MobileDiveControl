@@ -16,12 +16,17 @@ class CaptureGuideGeometryTest {
         assertEquals(7, guide.lines.size)
         assertEquals(0.61803395f, guide.lines[0].startX, 0.000001f)
         assertEquals(0.61803395f, guide.lines[1].startY, 0.000001f)
+        assertEquals(0.61803395f, guide.arcs[0].centerX, 0.000001f)
+        assertEquals(1f, guide.arcs[0].centerY, 0.000001f)
+        assertEquals(180f, guide.arcs[0].startAngle, 0.000001f)
         assertTrue(guide.arcs.zipWithNext().all { (outer, inner) -> inner.radiusY < outer.radiusY })
         assertTrue(guide.arcs.zipWithNext().all { (outer, inner) ->
             assertEquals(1.6180339f, outer.radiusY / inner.radiusY, 0.0001f)
-            arcEndpoints(outer).any { outerPoint ->
-                arcEndpoints(inner).any { innerPoint -> outerPoint.distanceTo(innerPoint) < 0.00001f }
-            }
+            val outerEnd = arcPoint(outer, outer.startAngle + outer.sweepAngle)
+            val innerStart = arcPoint(inner, inner.startAngle)
+            val outerTangent = arcTangent(outer, outer.startAngle + outer.sweepAngle)
+            val innerTangent = arcTangent(inner, inner.startAngle)
+            outerEnd.distanceTo(innerStart) < 0.00001f && outerTangent.dot(innerTangent) > 0.9999f
         })
     }
 
@@ -82,16 +87,61 @@ class CaptureGuideGeometryTest {
         }
     }
 
-    private fun arcEndpoints(arc: NormalizedGuideArc): List<GuidePoint> =
-        listOf(arc.startAngle, arc.startAngle + arc.sweepAngle).map { angle ->
-            val radians = Math.toRadians(angle.toDouble())
-            GuidePoint(
-                x = arc.centerX + arc.radiusX * cos(radians).toFloat(),
-                y = arc.centerY + arc.radiusY * sin(radians).toFloat(),
-            )
+    @Test
+    fun `every mirrored spiral keeps tangent joins`() {
+        listOf(false, true).forEach { eyeOnLeft ->
+            listOf(false, true).forEach { eyeOnTop ->
+                val arcs = fibonacciGuideGeometry(eyeOnLeft = eyeOnLeft, eyeOnTop = eyeOnTop).arcs
+                arcs.zipWithNext().forEach { (outer, inner) ->
+                    val outerEndpoints = listOf(
+                        outer.startAngle to arcPoint(outer, outer.startAngle),
+                        (outer.startAngle + outer.sweepAngle) to
+                            arcPoint(outer, outer.startAngle + outer.sweepAngle),
+                    )
+                    val innerEndpoints = listOf(
+                        inner.startAngle to arcPoint(inner, inner.startAngle),
+                        (inner.startAngle + inner.sweepAngle) to
+                            arcPoint(inner, inner.startAngle + inner.sweepAngle),
+                    )
+                    val join = outerEndpoints.flatMap { outerEndpoint ->
+                        innerEndpoints.map { innerEndpoint -> outerEndpoint to innerEndpoint }
+                    }.minBy { (outerEndpoint, innerEndpoint) ->
+                        outerEndpoint.second.distanceTo(innerEndpoint.second)
+                    }
+                    assertTrue(join.first.second.distanceTo(join.second.second) < 0.00001f)
+                    assertTrue(
+                        kotlin.math.abs(
+                            arcTangent(outer, join.first.first)
+                                .dot(arcTangent(inner, join.second.first)),
+                        ) > 0.9999f,
+                    )
+                }
+            }
         }
+    }
+
+    private fun arcPoint(arc: NormalizedGuideArc, angle: Float): GuidePoint {
+        val radians = Math.toRadians(angle.toDouble())
+        return GuidePoint(
+            x = arc.centerX + arc.radiusX * cos(radians).toFloat(),
+            y = arc.centerY + arc.radiusY * sin(radians).toFloat(),
+        )
+    }
+
+    private fun arcTangent(arc: NormalizedGuideArc, angle: Float): GuidePoint {
+        val radians = Math.toRadians(angle.toDouble())
+        return GuidePoint(
+            x = -arc.radiusX * sin(radians).toFloat(),
+            y = arc.radiusY * cos(radians).toFloat(),
+        ).normalized()
+    }
 
     private data class GuidePoint(val x: Float, val y: Float) {
         fun distanceTo(other: GuidePoint): Float = hypot(x - other.x, y - other.y)
+        fun dot(other: GuidePoint): Float = x * other.x + y * other.y
+        fun normalized(): GuidePoint {
+            val length = hypot(x, y)
+            return GuidePoint(x / length, y / length)
+        }
     }
 }
