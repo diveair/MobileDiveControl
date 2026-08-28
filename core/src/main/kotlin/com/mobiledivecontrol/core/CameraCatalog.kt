@@ -653,6 +653,33 @@ object CameraCatalog {
             defaultValue = camera.recordingSaveLocation.name,
             note = "MediaStore album; available albums are loaded when Options opens.",
         )
+        if (camera.activeMode == CameraModeId.ProVideo) {
+            // This is also the housing's Up/Down traversal order: the reducer and Compose panel
+            // both consume this exact list. Keep the capture-defining choices first, followed by
+            // the complete metadata block. Unlisted legacy controls remain reachable afterward.
+            val settingsById = (extras + saveLocation).associateBy { it.id }
+            val priorityIds = listOf(
+                "pro_video.hdr",
+                "pro_video.log",
+                "pro_video.resolution",
+                "pro_video.frame_rate",
+                "pro_video.guides",
+                "pro_video.aspect_ratio",
+                "pro_video.metering",
+                "pro_video.video_stabilization",
+                "pro_video.exposure_display",
+                "pro_video.audio_recording",
+                "pro_video.save_location",
+                "pro_video.metadata_depth",
+                "pro_video.metadata_temperature",
+                "pro_video.metadata_heading",
+                "pro_video.metadata_pressure",
+                "pro_video.metadata_exposure",
+            )
+            val prioritized = priorityIds.mapNotNull(settingsById::get)
+            return prioritized + (extras + saveLocation).filterNot { it.id in priorityIds }
+        }
+
         val fileInsert = extras.indexOfFirst {
             it.id.endsWith(".save_format") || it.id.endsWith(".aspect_ratio")
         }.let { if (it < 0) 0 else it + 1 }

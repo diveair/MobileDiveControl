@@ -1504,9 +1504,15 @@ class ControlReducer(
     private fun moveOptionsCursor(state: AppState, delta: Int): Reduction {
         val settings = CameraCatalog.optionsMenuSettings(state.camera)
         if (settings.size <= 1) return Reduction(state = state)
-        // Match the Focus editor: the highlighted card stops at either end instead of
-        // unexpectedly wrapping a diver from the first setting to the last.
-        val next = (state.camera.optionsMenuCursor + delta).coerceIn(0, settings.lastIndex)
+        val current = state.camera.optionsMenuCursor.coerceIn(0, settings.lastIndex)
+        val next = if (state.camera.activeMode == CameraModeId.ProVideo) {
+            // The housing has no touch shortcut underwater. A circular Pro Video rail makes the
+            // first and last controls one detent apart and the Compose list follows the wrapped
+            // cursor so the opposite end becomes visible immediately.
+            ((current + delta) % settings.size + settings.size) % settings.size
+        } else {
+            (current + delta).coerceIn(0, settings.lastIndex)
+        }
         return Reduction(
             state = state.copy(camera = state.camera.copy(optionsMenuCursor = next)),
         )

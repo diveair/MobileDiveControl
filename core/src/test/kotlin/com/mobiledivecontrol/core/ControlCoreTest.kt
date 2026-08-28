@@ -328,7 +328,7 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `options navigation clamps at ends and back closes like focus editor`() {
+    fun `pro video options navigation wraps at both ends and back closes`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
             focusedZone = CameraUiZone.SettingsPanel,
@@ -337,17 +337,13 @@ class ControlCoreTest {
         val opened = reducer.reduce(AppState(camera = camera), CameraCommand.Confirm)
         val settings = CameraCatalog.optionsMenuSettings(opened.state.camera)
 
-        val aboveFirst = reducer.reduce(opened.state, CameraCommand.NavigateUp)
-        assertEquals(0, aboveFirst.state.camera.optionsMenuCursor)
+        val wrappedToLast = reducer.reduce(opened.state, CameraCommand.NavigateUp)
+        assertEquals(settings.lastIndex, wrappedToLast.state.camera.optionsMenuCursor)
 
-        val atLast = reducer.reduce(
-            aboveFirst.state,
-            CameraCommand.SelectOptionsItem(settings.lastIndex),
-        )
-        val belowLast = reducer.reduce(atLast.state, CameraCommand.NavigateDown)
-        assertEquals(settings.lastIndex, belowLast.state.camera.optionsMenuCursor)
+        val wrappedToFirst = reducer.reduce(wrappedToLast.state, CameraCommand.NavigateDown)
+        assertEquals(0, wrappedToFirst.state.camera.optionsMenuCursor)
 
-        val closed = reducer.reduce(belowLast.state, CameraCommand.Back)
+        val closed = reducer.reduce(wrappedToFirst.state, CameraCommand.Back)
         assertTrue(!closed.state.camera.showMoreSettings)
         assertEquals(CameraUiZone.SettingsPanel, closed.state.camera.focusedZone)
         assertEquals(0, closed.state.camera.settingsCursor)

@@ -401,6 +401,28 @@ class CameraCatalogTest {
         val optionIds = options.map { it.id }.toSet()
 
         assertTrue(horizontalIds.intersect(optionIds).isEmpty())
+        assertEquals(
+            listOf(
+                "pro_video.hdr",
+                "pro_video.log",
+                "pro_video.resolution",
+                "pro_video.frame_rate",
+                "pro_video.guides",
+                "pro_video.aspect_ratio",
+                "pro_video.metering",
+                "pro_video.video_stabilization",
+                "pro_video.exposure_display",
+                "pro_video.audio_recording",
+                "pro_video.save_location",
+                "pro_video.metadata_depth",
+                "pro_video.metadata_temperature",
+                "pro_video.metadata_heading",
+                "pro_video.metadata_pressure",
+                "pro_video.metadata_exposure",
+                "pro_video.flash",
+            ),
+            options.map { it.id },
+        )
         listOf(
             "pro_video.resolution",
             "pro_video.frame_rate",
