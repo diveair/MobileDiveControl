@@ -585,7 +585,7 @@ class CameraRuntimeController(
                 .coerceIn(0f, PANORAMA_TARGET_RADIANS)
             PanoramaCaptureState.progress.value = panoramaProgressFraction(panoramaSweepRadians)
             PanoramaCaptureState.movingTooFast.value =
-                sweepRate > PANORAMA_TOO_FAST_RADIANS_PER_SECOND
+                kotlin.math.abs(sweepRate) > PANORAMA_TOO_FAST_RADIANS_PER_SECOND
             PanoramaCaptureState.message.value = if (PanoramaCaptureState.movingTooFast.value) {
                 "MOVE SLOWLY"
             } else {
@@ -4940,6 +4940,7 @@ class CameraRuntimeController(
         panoramaGeneration++
         panoramaFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
         panoramaFrames.clear()
+        PanoramaCaptureState.reset()
         panoramaCaptureActive = true
         panoramaCaptureInFlight = false
         panoramaFinishPending = false
@@ -5008,6 +5009,20 @@ class CameraRuntimeController(
                     panoramaFrames += CapturedPanoramaFrame(normalized, requestedRadians)
                     panoramaLastCapturedRadians = requestedRadians
                     PanoramaCaptureState.frameCount.value = panoramaFrames.size
+                    if (panoramaFrames.size == 1) {
+                        val referenceWidth = 360.coerceAtMost(normalized.width)
+                        val referenceHeight = (
+                            normalized.height * referenceWidth.toFloat() / normalized.width
+                            ).roundToInt().coerceAtLeast(1)
+                        PanoramaCaptureState.replaceReferenceFrame(
+                            Bitmap.createScaledBitmap(
+                                normalized,
+                                referenceWidth,
+                                referenceHeight,
+                                true,
+                            ),
+                        )
+                    }
                     Log.d(
                         TAG,
                         "Panorama frame ${panoramaFrames.size}: " +
@@ -5108,6 +5123,7 @@ class CameraRuntimeController(
                 PanoramaCaptureState.frameCount.value = 0
                 PanoramaCaptureState.progress.value = 0f
                 PanoramaCaptureState.movingTooFast.value = false
+                PanoramaCaptureState.replaceReferenceFrame(null)
                 setPanorama3ALock(false)
                 cameraRequestHandler.postDelayed({
                     if (!PanoramaCaptureState.active.value && !PanoramaCaptureState.finalizing.value) {

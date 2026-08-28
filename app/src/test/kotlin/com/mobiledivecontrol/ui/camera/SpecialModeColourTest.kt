@@ -1,6 +1,7 @@
 package com.mobiledivecontrol.ui.camera
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class SpecialModeColourTest {
@@ -54,6 +55,51 @@ class SpecialModeColourTest {
         assertEquals("Up", panoramaDirectionFromGyro(1, 0.1f, 0.8f))
         assertEquals(1f, panoramaProgressFraction(PANORAMA_TARGET_RADIANS), 1e-6f)
         assertEquals(0f, panoramaProgressFraction(-1f), 1e-6f)
+    }
+
+    @Test
+    fun `panorama registration corrects gyro spacing and cross axis drift`() {
+        val width = 96
+        val height = 64
+        fun texture(x: Int, y: Int): Int {
+            var value = x * 0x45d9f3b xor y * 0x119de1f3
+            value = value xor (value ushr 16)
+            value *= 0x45d9f3b
+            value = value xor (value ushr 16)
+            return value and 0xff
+        }
+        val previous = IntArray(width * height) { index ->
+            texture(index % width, index / width)
+        }
+        fun shifted(offsetX: Int, offsetY: Int) = IntArray(width * height) { index ->
+            val x = index % width
+            val y = index / width
+            texture(x + offsetX, y + offsetY)
+        }
+
+        val right = panoramaFrameOffset(previous, shifted(18, 4), width, height, "Right", 16)
+        assertEquals(18, right.x)
+        assertEquals(4, right.y)
+        assertTrue(right.correlation > 0.99)
+
+        val left = panoramaFrameOffset(previous, shifted(-14, -2), width, height, "Left", 16)
+        assertEquals(-14, left.x)
+        assertEquals(-2, left.y)
+        assertTrue(left.correlation > 0.99)
+
+        val down = panoramaFrameOffset(previous, shifted(2, 16), width, height, "Down", 15)
+        assertEquals(2, down.x)
+        assertEquals(16, down.y)
+        assertTrue(down.correlation > 0.99)
+    }
+
+    @Test
+    fun `panorama registration falls back to gyro for textureless frames`() {
+        val blank = IntArray(80 * 60) { 127 }
+        val offset = panoramaFrameOffset(blank, blank, 80, 60, "Right", 14)
+
+        assertEquals(14, offset.x)
+        assertEquals(0, offset.y)
     }
 
     @Test

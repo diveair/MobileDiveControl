@@ -534,10 +534,10 @@ private fun ModeGuideOverlay(
             val active by PanoramaCaptureState.active
             val finalizing by PanoramaCaptureState.finalizing
             val progress by PanoramaCaptureState.progress
-            val frameCount by PanoramaCaptureState.frameCount
             val movingTooFast by PanoramaCaptureState.movingTooFast
             val detectedDirection by PanoramaCaptureState.direction
             val message by PanoramaCaptureState.message
+            val referenceFrame by PanoramaCaptureState.referenceFrame
             if (CameraCatalog.currentValue(cameraState, guide) != "On" && !active && !finalizing) return
             val direction = settings.firstOrNull { it.id == "panorama.direction" }
                 ?.let { CameraCatalog.currentValue(cameraState, it) }
@@ -547,9 +547,9 @@ private fun ModeGuideOverlay(
                 active = active,
                 finalizing = finalizing,
                 progress = progress,
-                frameCount = frameCount,
                 movingTooFast = movingTooFast,
                 message = message,
+                referenceFrame = referenceFrame,
                 modifier = modifier,
             )
         }
@@ -572,16 +572,41 @@ private fun PanoramaGuideOverlay(
     active: Boolean,
     finalizing: Boolean,
     progress: Float,
-    frameCount: Int,
     movingTooFast: Boolean,
     message: String,
+    referenceFrame: Bitmap?,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier) {
+        val horizontal = direction == "Auto" || direction == "Left" || direction == "Right"
+        if (active && referenceFrame != null) {
+            Image(
+                bitmap = referenceFrame.asImageBitmap(),
+                contentDescription = "Panorama starting frame",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .then(
+                        if (horizontal) {
+                            Modifier.width(136.dp).height(82.dp)
+                        } else {
+                            Modifier.width(82.dp).height(136.dp)
+                        },
+                    )
+                    .clip(RoundedCornerShape(4.dp)),
+            )
+        }
         Canvas(modifier = Modifier.fillMaxSize()) {
-            val horizontal = direction == "Auto" || direction == "Left" || direction == "Right"
-            val guideWidth = if (horizontal) size.width * 0.36f else size.width * 0.18f
-            val guideHeight = if (horizontal) size.height * 0.28f else size.height * 0.50f
+            val guideWidth = if (horizontal) {
+                minOf(260.dp.toPx(), size.width * 0.58f)
+            } else {
+                minOf(96.dp.toPx(), size.width * 0.30f)
+            }
+            val guideHeight = if (horizontal) {
+                minOf(96.dp.toPx(), size.height * 0.42f)
+            } else {
+                minOf(260.dp.toPx(), size.height * 0.68f)
+            }
             val left = (size.width - guideWidth) / 2f
             val top = (size.height - guideHeight) / 2f
             val side = if (horizontal) guideWidth * 0.23f else guideWidth
@@ -655,14 +680,14 @@ private fun PanoramaGuideOverlay(
 
             if (active) {
                 val trackStart = if (horizontal) {
-                    Offset(size.width * 0.18f, center.y)
+                    Offset(left + side, center.y)
                 } else {
-                    Offset(center.x, size.height * 0.18f)
+                    Offset(center.x, top + end)
                 }
                 val trackEnd = if (horizontal) {
-                    Offset(size.width * 0.82f, center.y)
+                    Offset(left + guideWidth - side, center.y)
                 } else {
-                    Offset(center.x, size.height * 0.82f)
+                    Offset(center.x, top + guideHeight - end)
                 }
                 val directedProgress = if (direction == "Left" || direction == "Up") 1f - progress else progress
                 val marker = Offset(
@@ -680,7 +705,7 @@ private fun PanoramaGuideOverlay(
         }
         if (active || finalizing) {
             Text(
-                text = if (finalizing) message else "$message  ·  $frameCount FRAMES",
+                text = message,
                 color = if (movingTooFast) DiveColors.Warning else DiveColors.TextPrimary,
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.Bold,
