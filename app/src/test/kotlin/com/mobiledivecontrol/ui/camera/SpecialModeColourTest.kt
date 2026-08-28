@@ -29,6 +29,29 @@ class SpecialModeColourTest {
     }
 
     @Test
+    fun `hyperlapse cadence produces real frame intervals and shorter output clocks`() {
+        assertEquals(5, hyperlapseSpeedFactor("5x", "Day"))
+        assertEquals(45, hyperlapseSpeedFactor("Night 45x", "Night"))
+        assertEquals(0.5, hyperlapseCaptureRateFps(60), 1e-9)
+        assertEquals(2.0, hyperlapseFrameIntervalSeconds(60), 1e-9)
+        assertEquals(2_000L, hyperlapsePlaybackDurationMs(10_000L, 5))
+        assertEquals(0L, hyperlapsePlaybackDurationMs(-1L, 10))
+    }
+
+    @Test
+    fun `panorama motion follows the on screen sweep axis in landscape`() {
+        // Android display rotations 1 and 3 are the two landscape orientations.
+        assertEquals(0.8f, panoramaSweepAxisRate("Right", 1, 0.8f, 0.2f), 1e-6f)
+        assertEquals(0.8f, panoramaSweepAxisRate("Left", 1, -0.8f, 0.2f), 1e-6f)
+        assertEquals(0.2f, panoramaSweepAxisRate("Up", 1, 0.8f, 0.2f), 1e-6f)
+        assertEquals(-0.2f, panoramaSweepAxisRate("Down", 1, 0.8f, 0.2f), 1e-6f)
+        assertEquals("Right", panoramaDirectionFromGyro(1, 0.8f, 0.1f))
+        assertEquals("Up", panoramaDirectionFromGyro(1, 0.1f, 0.8f))
+        assertEquals(1f, panoramaProgressFraction(PANORAMA_TARGET_RADIANS), 1e-6f)
+        assertEquals(0f, panoramaProgressFraction(-1f), 1e-6f)
+    }
+
+    @Test
     fun `pro video combined rate keeps capture and fractional playback distinct`() {
         assertEquals(23.976, proVideoPlaybackFrameRate("240fps/23.976fps playback"), 1e-9)
         assertEquals(48.0, proVideoPlaybackFrameRate("60fps/48fps playback"), 1e-9)

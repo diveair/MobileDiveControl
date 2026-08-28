@@ -173,9 +173,11 @@ class CameraSessionStore(context: Context) {
             ?.let { stored -> runCatching { CameraModeId.valueOf(stored) }.getOrNull() }
             ?: CameraModeId.Photo
 
-        val settingValues = migrateLegacyAssistDefaults(
-            normalizeRestoredSettingValues(
-                CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES),
+        val settingValues = migrateLegacyPanoramaDirection(
+            migrateLegacyAssistDefaults(
+                normalizeRestoredSettingValues(
+                    CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES),
+                ),
             ),
         )
         val sliderSensitivities = CameraCatalog.defaultSliderSensitivities + restoreSensitivityMap()
@@ -287,6 +289,17 @@ class CameraSessionStore(context: Context) {
         return result
     }
 
+    /**
+     * Builds before automatic panorama steering always persisted "Right", including when the
+     * user had never selected a direction. Replace that legacy value once so an updated install
+     * gets the native-camera behaviour; choices made after this migration remain untouched.
+     */
+    private fun migrateLegacyPanoramaDirection(values: Map<String, String>): Map<String, String> {
+        if (preferences.getBoolean(KEY_PANORAMA_DIRECTION_MIGRATED, false)) return values
+        preferences.edit().putBoolean(KEY_PANORAMA_DIRECTION_MIGRATED, true).apply()
+        return values + ("panorama.direction" to "Auto")
+    }
+
     private companion object {
         const val PREFERENCES_NAME = "camera_session"
         const val KEY_ACTIVE_MODE = "active_mode"
@@ -295,5 +308,6 @@ class CameraSessionStore(context: Context) {
         const val KEY_FOCUS_CURVE_MODES = "focus_curve_modes"
         const val KEY_DETECTED_LENSES = "detected_lenses"
         const val KEY_ASSIST_DEFAULTS_MIGRATED = "assist_defaults_migrated_v2"
+        const val KEY_PANORAMA_DIRECTION_MIGRATED = "panorama_direction_migrated_v1"
     }
 }

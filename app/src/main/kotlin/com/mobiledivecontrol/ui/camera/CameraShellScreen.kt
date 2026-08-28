@@ -137,6 +137,7 @@ fun CameraShellScreen(
                 onCapabilities = onCapabilities,
                 onMeteredExposure = onMeteredExposure,
                 onPointingGesture = onPointingGesture,
+                onCameraCommand = onCameraCommand,
                 headingDegrees = headingDegrees,
             )
         } else {
@@ -159,14 +160,24 @@ fun CameraShellScreen(
             RecordingSegmentPreview(modifier = Modifier.fillMaxSize())
         }
 
-        // Top-left: recording badge with the live elapsed clock
-        RecordingBadge(
-            visible = cameraState.recording && !cameraState.recordingPaused,
-            paused = false,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(start = 18.dp, top = 72.dp),
-        )
+        // Top-left: ordinary recordings use one elapsed clock; Hyperlapse mirrors Samsung's
+        // output-duration (left) / real elapsed-time (right) presentation.
+        if (cameraState.activeMode == CameraModeId.Hyperlapse) {
+            HyperlapseRecordingBadge(
+                visible = cameraState.recording && !cameraState.recordingPaused,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 18.dp, top = 72.dp),
+            )
+        } else {
+            RecordingBadge(
+                visible = cameraState.recording && !cameraState.recordingPaused,
+                paused = false,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 18.dp, top = 72.dp),
+            )
+        }
 
         // Center: zoom overlay (fades after 1.4s)
         ZoomOverlay(
@@ -191,7 +202,9 @@ fun CameraShellScreen(
 
         // Bottom center: persistent mode-specific control bar
         AnimatedVisibility(
-            visible = settingsVisible,
+            visible = settingsVisible &&
+                !PanoramaCaptureState.active.value &&
+                !PanoramaCaptureState.finalizing.value,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier.align(Alignment.BottomCenter),
@@ -517,11 +530,27 @@ private fun ModeGuideOverlay(
     when (cameraState.activeMode) {
         CameraModeId.Panorama -> {
             val guide = settings.firstOrNull { it.id == "panorama.guide" } ?: return
-            if (CameraCatalog.currentValue(cameraState, guide) != "On") return
+            val active by PanoramaCaptureState.active
+            val finalizing by PanoramaCaptureState.finalizing
+            val progress by PanoramaCaptureState.progress
+            val frameCount by PanoramaCaptureState.frameCount
+            val movingTooFast by PanoramaCaptureState.movingTooFast
+            val detectedDirection by PanoramaCaptureState.direction
+            val message by PanoramaCaptureState.message
+            if (CameraCatalog.currentValue(cameraState, guide) != "On" && !active && !finalizing) return
             val direction = settings.firstOrNull { it.id == "panorama.direction" }
                 ?.let { CameraCatalog.currentValue(cameraState, it) }
-                ?: "Right"
-            PanoramaGuideOverlay(direction = direction, modifier = modifier)
+                ?: "Auto"
+            PanoramaGuideOverlay(
+                direction = if (active || finalizing) detectedDirection else direction,
+                active = active,
+                finalizing = finalizing,
+                progress = progress,
+                frameCount = frameCount,
+                movingTooFast = movingTooFast,
+                message = message,
+                modifier = modifier,
+            )
         }
         CameraModeId.Food -> {
             val blur = settings.firstOrNull { it.id == "food.radial_blur" } ?: return
@@ -533,80 +562,133 @@ private fun ModeGuideOverlay(
 }
 
 /**
- * Start-frame window and sweep chevrons modelled on Samsung Camera 16.5's Panorama guide.
- * The live panorama stitcher is vendor-only, but this guide gives a housing user the same
- * alignment target and an unambiguous direction cue before capture begins.
+ * Start-frame window, live sweep progress and speed warning modelled on Samsung Camera's
+ * Panorama guide. The first shutter starts frame collection; the second completes the stitch.
  */
 @Composable
 private fun PanoramaGuideOverlay(
     direction: String,
+    active: Boolean,
+    finalizing: Boolean,
+    progress: Float,
+    frameCount: Int,
+    movingTooFast: Boolean,
+    message: String,
     modifier: Modifier = Modifier,
 ) {
-    Canvas(modifier = modifier) {
-        val horizontal = direction == "Left" || direction == "Right"
-        val guideWidth = if (horizontal) size.width * 0.36f else size.width * 0.18f
-        val guideHeight = if (horizontal) size.height * 0.28f else size.height * 0.50f
-        val left = (size.width - guideWidth) / 2f
-        val top = (size.height - guideHeight) / 2f
-        val side = if (horizontal) guideWidth * 0.23f else guideWidth
-        val end = if (horizontal) guideHeight else guideHeight * 0.19f
-        val stroke = 2.dp.toPx()
-        val border = Color.White.copy(alpha = 0.90f)
-        val shade = DiveColors.DeepBlack.copy(alpha = 0.48f)
+    Box(modifier = modifier) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val horizontal = direction == "Auto" || direction == "Left" || direction == "Right"
+            val guideWidth = if (horizontal) size.width * 0.36f else size.width * 0.18f
+            val guideHeight = if (horizontal) size.height * 0.28f else size.height * 0.50f
+            val left = (size.width - guideWidth) / 2f
+            val top = (size.height - guideHeight) / 2f
+            val side = if (horizontal) guideWidth * 0.23f else guideWidth
+            val end = if (horizontal) guideHeight else guideHeight * 0.19f
+            val stroke = 2.dp.toPx()
+            val border = Color.White.copy(alpha = 0.90f)
+            val shade = DiveColors.DeepBlack.copy(alpha = 0.48f)
 
-        drawRoundRect(
-            color = border,
-            topLeft = Offset(left, top),
-            size = androidx.compose.ui.geometry.Size(guideWidth, guideHeight),
-            cornerRadius = androidx.compose.ui.geometry.CornerRadius(7.dp.toPx()),
-            style = Stroke(stroke),
-        )
-        if (horizontal) {
-            drawRect(shade, Offset(left, top), androidx.compose.ui.geometry.Size(side, guideHeight))
-            drawRect(
-                shade,
-                Offset(left + guideWidth - side, top),
-                androidx.compose.ui.geometry.Size(side, guideHeight),
+            drawRoundRect(
+                color = border,
+                topLeft = Offset(left, top),
+                size = androidx.compose.ui.geometry.Size(guideWidth, guideHeight),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(7.dp.toPx()),
+                style = Stroke(stroke),
             )
-            drawLine(border, Offset(left + side, top), Offset(left + side, top + guideHeight), stroke)
-            drawLine(
-                border,
-                Offset(left + guideWidth - side, top),
-                Offset(left + guideWidth - side, top + guideHeight),
-                stroke,
-            )
-            fun chevron(cx: Float, pointsRight: Boolean, emphasized: Boolean) {
-                val dx = 14.dp.toPx() * if (pointsRight) 1f else -1f
-                val dy = 18.dp.toPx()
-                val colour = if (emphasized) DiveColors.DiveCyan else border
-                drawLine(colour, Offset(cx - dx, center.y - dy), Offset(cx, center.y), stroke * 2f)
-                drawLine(colour, Offset(cx, center.y), Offset(cx - dx, center.y + dy), stroke * 2f)
+            if (horizontal) {
+                drawRect(shade, Offset(left, top), androidx.compose.ui.geometry.Size(side, guideHeight))
+                drawRect(
+                    shade,
+                    Offset(left + guideWidth - side, top),
+                    androidx.compose.ui.geometry.Size(side, guideHeight),
+                )
+                drawLine(border, Offset(left + side, top), Offset(left + side, top + guideHeight), stroke)
+                drawLine(
+                    border,
+                    Offset(left + guideWidth - side, top),
+                    Offset(left + guideWidth - side, top + guideHeight),
+                    stroke,
+                )
+                fun chevron(cx: Float, pointsRight: Boolean, emphasized: Boolean) {
+                    val dx = 14.dp.toPx() * if (pointsRight) 1f else -1f
+                    val dy = 18.dp.toPx()
+                    val colour = if (emphasized) DiveColors.DiveCyan else border
+                    drawLine(colour, Offset(cx - dx, center.y - dy), Offset(cx, center.y), stroke * 2f)
+                    drawLine(colour, Offset(cx, center.y), Offset(cx - dx, center.y + dy), stroke * 2f)
+                }
+                chevron(
+                    left + side * 0.52f,
+                    pointsRight = false,
+                    emphasized = direction == "Auto" || direction == "Left",
+                )
+                chevron(
+                    left + guideWidth - side * 0.52f,
+                    pointsRight = true,
+                    emphasized = direction == "Auto" || direction == "Right",
+                )
+            } else {
+                drawRect(shade, Offset(left, top), androidx.compose.ui.geometry.Size(guideWidth, end))
+                drawRect(
+                    shade,
+                    Offset(left, top + guideHeight - end),
+                    androidx.compose.ui.geometry.Size(guideWidth, end),
+                )
+                drawLine(border, Offset(left, top + end), Offset(left + guideWidth, top + end), stroke)
+                drawLine(
+                    border,
+                    Offset(left, top + guideHeight - end),
+                    Offset(left + guideWidth, top + guideHeight - end),
+                    stroke,
+                )
+                fun chevron(cy: Float, pointsDown: Boolean, emphasized: Boolean) {
+                    val dx = 18.dp.toPx()
+                    val dy = 14.dp.toPx() * if (pointsDown) 1f else -1f
+                    val colour = if (emphasized) DiveColors.DiveCyan else border
+                    drawLine(colour, Offset(center.x - dx, cy - dy), Offset(center.x, cy), stroke * 2f)
+                    drawLine(colour, Offset(center.x, cy), Offset(center.x + dx, cy - dy), stroke * 2f)
+                }
+                chevron(top + end * 0.52f, pointsDown = false, emphasized = direction == "Up")
+                chevron(top + guideHeight - end * 0.52f, pointsDown = true, emphasized = direction == "Down")
             }
-            chevron(left + side * 0.52f, pointsRight = false, emphasized = direction == "Left")
-            chevron(left + guideWidth - side * 0.52f, pointsRight = true, emphasized = direction == "Right")
-        } else {
-            drawRect(shade, Offset(left, top), androidx.compose.ui.geometry.Size(guideWidth, end))
-            drawRect(
-                shade,
-                Offset(left, top + guideHeight - end),
-                androidx.compose.ui.geometry.Size(guideWidth, end),
-            )
-            drawLine(border, Offset(left, top + end), Offset(left + guideWidth, top + end), stroke)
-            drawLine(
-                border,
-                Offset(left, top + guideHeight - end),
-                Offset(left + guideWidth, top + guideHeight - end),
-                stroke,
-            )
-            fun chevron(cy: Float, pointsDown: Boolean, emphasized: Boolean) {
-                val dx = 18.dp.toPx()
-                val dy = 14.dp.toPx() * if (pointsDown) 1f else -1f
-                val colour = if (emphasized) DiveColors.DiveCyan else border
-                drawLine(colour, Offset(center.x - dx, cy - dy), Offset(center.x, cy), stroke * 2f)
-                drawLine(colour, Offset(center.x, cy), Offset(center.x + dx, cy - dy), stroke * 2f)
+
+            if (active) {
+                val trackStart = if (horizontal) {
+                    Offset(size.width * 0.18f, center.y)
+                } else {
+                    Offset(center.x, size.height * 0.18f)
+                }
+                val trackEnd = if (horizontal) {
+                    Offset(size.width * 0.82f, center.y)
+                } else {
+                    Offset(center.x, size.height * 0.82f)
+                }
+                val directedProgress = if (direction == "Left" || direction == "Up") 1f - progress else progress
+                val marker = Offset(
+                    trackStart.x + (trackEnd.x - trackStart.x) * directedProgress,
+                    trackStart.y + (trackEnd.y - trackStart.y) * directedProgress,
+                )
+                drawLine(border.copy(alpha = 0.45f), trackStart, trackEnd, stroke * 2f)
+                drawLine(DiveColors.DiveCyan, if (direction == "Left" || direction == "Up") trackEnd else trackStart, marker, stroke * 3f)
+                drawCircle(
+                    color = if (movingTooFast) DiveColors.Warning else DiveColors.DiveCyan,
+                    radius = 8.dp.toPx(),
+                    center = marker,
+                )
             }
-            chevron(top + end * 0.52f, pointsDown = false, emphasized = direction == "Up")
-            chevron(top + guideHeight - end * 0.52f, pointsDown = true, emphasized = direction == "Down")
+        }
+        if (active || finalizing) {
+            Text(
+                text = if (finalizing) message else "$message  ·  $frameCount FRAMES",
+                color = if (movingTooFast) DiveColors.Warning else DiveColors.TextPrimary,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 72.dp)
+                    .background(DiveColors.DeepBlack.copy(alpha = 0.78f), RoundedCornerShape(14.dp))
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+            )
         }
     }
 }
@@ -2082,6 +2164,71 @@ private fun RecordingBadge(
                 fontWeight = FontWeight.Bold,
             )
         }
+    }
+}
+
+@Composable
+private fun HyperlapseRecordingBadge(
+    visible: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    AnimatedVisibility(visible = visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
+        val elapsedMs by RecordingClock.durationMs
+        val outputMs by RecordingClock.playbackDurationMs
+        val speedFactor by RecordingClock.timeLapseSpeedFactor
+        val interval = hyperlapseFrameIntervalSeconds(speedFactor)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier
+                .background(DiveColors.DeepBlack.copy(alpha = 0.82f), RoundedCornerShape(16.dp))
+                .border(1.dp, DiveColors.Critical.copy(alpha = 0.75f), RoundedCornerShape(16.dp))
+                .padding(horizontal = 13.dp, vertical = 8.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.FiberManualRecord,
+                contentDescription = null,
+                tint = DiveColors.Critical,
+                modifier = Modifier.size(12.dp),
+            )
+            HyperlapseClockColumn(label = "OUTPUT", durationMs = outputMs)
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .height(30.dp)
+                    .background(DiveColors.SurfaceBorder.copy(alpha = 0.75f)),
+            )
+            HyperlapseClockColumn(label = "ELAPSED", durationMs = elapsedMs)
+            Text(
+                text = String.format(
+                    Locale.US,
+                    "%d× · %.2fs/frame",
+                    speedFactor,
+                    interval,
+                ),
+                color = DiveColors.DiveCyan,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+    }
+}
+
+@Composable
+private fun HyperlapseClockColumn(label: String, durationMs: Long) {
+    val seconds = durationMs.coerceAtLeast(0L) / 1_000L
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            text = label,
+            color = DiveColors.TextMuted,
+            style = MaterialTheme.typography.labelSmall,
+        )
+        Text(
+            text = "%d:%02d".format(seconds / 60, seconds % 60),
+            color = DiveColors.TextPrimary,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+        )
     }
 }
 

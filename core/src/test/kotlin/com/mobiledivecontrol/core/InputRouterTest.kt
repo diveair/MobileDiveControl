@@ -25,6 +25,24 @@ class InputRouterTest {
     }
 
     @Test
+    fun `hyperlapse shutter starts then stops without ordinary video pause chooser`() {
+        val idle = readyState(
+            mode = AppMode.CameraLive,
+            camera = CameraState(activeMode = CameraModeId.Hyperlapse),
+        )
+        assertEquals(
+            listOf(CameraCommand.ToggleVideoRecording),
+            router.route(idle, HousingButtonEvent.Shutter).commands,
+        )
+
+        val recording = idle.copy(camera = idle.camera.copy(recording = true))
+        assertEquals(
+            listOf(CameraCommand.StopVideoRecording),
+            router.route(recording, HousingButtonEvent.Shutter).commands,
+        )
+    }
+
+    @Test
     fun `paused video shutter confirms each selected review action`() {
         val expected = mapOf(
             RecordingPausedAction.Resume to CameraCommand.ResumeVideoRecording,

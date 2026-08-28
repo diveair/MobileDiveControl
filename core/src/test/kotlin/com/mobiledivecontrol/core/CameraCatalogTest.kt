@@ -252,6 +252,12 @@ class CameraCatalogTest {
             "panorama.guide",
             "panorama.exposure",
         ).forEach { assertContains(ids(CameraModeId.Panorama), it) }
+        assertEquals(
+            "Auto",
+            CameraCatalog.settingsFor(CameraModeId.Panorama, GalaxyDeviceVariant.S26Ultra)
+                .first { it.id == "panorama.direction" }
+                .defaultValue,
+        )
 
         listOf(
             "hyperlapse.flash",
@@ -361,6 +367,11 @@ class CameraCatalogTest {
             hyperlapse.getValue("hyperlapse.speed").options,
         )
         assertEquals("∞", hyperlapse.getValue("hyperlapse.recording_time").options.first())
+        assertEquals("Frame interval", hyperlapse.getValue("hyperlapse.speed").label)
+        val hyperlapseQuickBar = CameraCatalog.settingsBarItems(
+            CameraCatalog.launchCameraState(CameraModeId.Hyperlapse),
+        ).filterIsInstance<BottomBarItem.Setting>().map { it.spec.id }
+        assertContains(hyperlapseQuickBar, "hyperlapse.speed")
 
         val portraitVideo = CameraCatalog.settingsFor(CameraModeId.PortraitVideo, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "portrait_video.background_effect" }

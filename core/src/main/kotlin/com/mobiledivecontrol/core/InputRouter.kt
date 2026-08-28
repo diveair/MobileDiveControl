@@ -187,6 +187,17 @@ class InputRouter {
         if (cameraState.activeMode.captureType != CameraCaptureType.Video) {
             return CameraCommand.CapturePhoto
         }
+        // Samsung Hyperlapse is a single continuous interval-capture session: shutter starts it,
+        // and the next shutter stops and saves it. The generic pause/review segment chooser makes
+        // it look and behave like ordinary video, and can also concatenate clips with unrelated
+        // time bases, so this mode intentionally bypasses that lifecycle.
+        if (cameraState.activeMode == CameraModeId.Hyperlapse) {
+            return if (cameraState.recording) {
+                CameraCommand.StopVideoRecording
+            } else {
+                CameraCommand.ToggleVideoRecording
+            }
+        }
         // The whole recording lifecycle lives on the shutter. The second press closes a valid
         // segment, then the same button confirms the action LEFT/RIGHT selected. Finalising at
         // that boundary is what makes Preview and Delete reliable on every CameraX device.

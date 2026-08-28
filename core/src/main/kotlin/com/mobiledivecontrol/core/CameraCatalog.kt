@@ -590,10 +590,14 @@ object CameraCatalog {
         val iso = find(".iso")
         val focus = find(".manual_focus")
         val wb = find(".white_balance")
-        // Slow Motion's native Video size sheet buries 120/240 FPS behind another tap. In a
-        // housing that is needlessly expensive, so FPS is promoted to the persistent bar and is
-        // adjusted by the same Up/Down path as every other quick control.
-        val priorityFrameRate = find(".frame_rate").takeIf { mode == CameraModeId.SlowMotion }
+        // Slow Motion FPS and Hyperlapse frame interval are the cadence controls a diver must be
+        // able to reach without opening the long Options list. Both use the same housing Up/Down
+        // editor path as every other quick control.
+        val priorityFrameRate = when (mode) {
+            CameraModeId.SlowMotion -> find(".frame_rate")
+            CameraModeId.Hyperlapse -> find(".speed")
+            else -> null
+        }
 
         val spine = listOfNotNull(lens, ev, shutter, iso, priorityFrameRate, focus, wb)
         val extras = allSettings.filter { it !in spine }
@@ -1314,10 +1318,10 @@ object CameraCatalog {
                 "panorama.direction",
                 "Sweep direction",
                 "Core",
-                listOf("Left", "Right", "Up", "Down"),
-                "Right",
-                CameraFeatureStatus.NeedsVerification,
-                "Panorama stitching is supplied by Samsung's vendor pipeline.",
+                listOf("Auto", "Left", "Right", "Up", "Down"),
+                "Auto",
+                CameraFeatureStatus.Confirmed,
+                "Auto detects the first horizontal or vertical sweep, matching Samsung Panorama.",
             ),
             toggle("panorama.guide", "Panorama guide", "Assist", "On"),
             slider("panorama.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
@@ -1416,12 +1420,12 @@ object CameraCatalog {
                 ),
                 choice(
                     "hyperlapse.speed",
-                    "Speed",
+                    "Frame interval",
                     "Core",
                     listOf("Night 45x", "Night 15x", "Auto", "5x", "10x", "15x", "30x", "60x"),
                     "Auto",
-                    CameraFeatureStatus.NeedsVerification,
-                    "The dial order matches Samsung Camera 16.5.02.36; accelerated encoding remains device-dependent.",
+                    CameraFeatureStatus.Confirmed,
+                    "Samsung dial order; each multiplier maps to a real 30/speed capture rate and 30 fps playback.",
                 ),
                 choice(
                     "hyperlapse.day_night",

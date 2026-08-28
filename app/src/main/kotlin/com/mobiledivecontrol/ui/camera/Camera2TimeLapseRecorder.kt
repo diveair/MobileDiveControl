@@ -44,6 +44,12 @@ internal fun hyperlapseSpeedFactor(value: String?, dayNight: String?): Int = whe
 internal fun hyperlapseCaptureRateFps(speedFactor: Int): Double =
     TIME_LAPSE_PLAYBACK_FPS.toDouble() / speedFactor.coerceIn(1, 60)
 
+internal fun hyperlapseFrameIntervalSeconds(speedFactor: Int): Double =
+    1.0 / hyperlapseCaptureRateFps(speedFactor)
+
+internal fun hyperlapsePlaybackDurationMs(elapsedDurationMs: Long, speedFactor: Int): Long =
+    elapsedDurationMs.coerceAtLeast(0L) / speedFactor.coerceAtLeast(1)
+
 /**
  * Direct Camera2 + MediaRecorder time-lapse session.
  *

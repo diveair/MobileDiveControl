@@ -5,6 +5,9 @@ import android.content.Intent
 import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.Rect
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -152,7 +155,11 @@ internal fun previewFrameRateSessionKey(
     CameraCatalog.captureFrameRateFps(frameRateValue)?.let { "${it}fps" }
 }
 
-@OptIn(ExperimentalSessionConfig::class, ExperimentalHighSpeedVideo::class)
+@ExperimentalCamera2Interop
+@OptIn(
+    ExperimentalSessionConfig::class,
+    ExperimentalHighSpeedVideo::class,
+)
 class CameraRuntimeController(
     private val context: Context,
 ) {
@@ -170,6 +177,9 @@ class CameraRuntimeController(
         )
         private const val RESUME_STREAM_CHECK_DELAY_MS = 2_500L
         private const val DEFAULT_HORIZONTAL_FOV_DEGREES = 70.0
+        private const val PANORAMA_MAX_FRAMES = 12
+        private const val PANORAMA_TOO_FAST_RADIANS_PER_SECOND = 1.25f
+        private val PANORAMA_CAPTURE_SIZE = Size(1920, 1440)
 
         /** The native app's vendor "manual kelvin" AWB mode (AeAfController branch B). */
         /** XYZ (D65) to linear sRGB. */
@@ -386,6 +396,14 @@ class CameraRuntimeController(
             }
             RecordingClock.durationMs.value =
                 completedRecordingDurationMs + currentRecordingSegmentDurationMs
+            RecordingClock.playbackDurationMs.value = if (camera2TimeLapseRecorder.isBusy) {
+                hyperlapsePlaybackDurationMs(
+                    RecordingClock.durationMs.value,
+                    RecordingClock.timeLapseSpeedFactor.value,
+                )
+            } else {
+                RecordingClock.durationMs.value
+            }
             cameraRequestHandler.postDelayed(this, 100L)
         }
     }
@@ -417,6 +435,7 @@ class CameraRuntimeController(
     private var pendingRecordingAction: CameraCommand? = null
     private var onCapabilities: ((CameraCapabilities) -> Unit)? = null
     private var onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null
+    private var onCameraCommand: ((CameraCommand) -> Unit)? = null
 
     /**
      * The EV index window writes are clamped to: the vendor aeCompensationRange where it
@@ -443,6 +462,7 @@ class CameraRuntimeController(
     private var boundHdrLogMode: String? = null
     private var boundCaptureFormat: String? = null
     private var boundAspectRatio: String? = null
+    private var boundMode: com.mobiledivecontrol.core.CameraModeId? = null
     private var boundExpectedPhysicalCameraId: String? = null
     private var boundHdrExtension: Boolean = false
     @Volatile private var boundLogCaptureContractSatisfied: Boolean = false
@@ -510,6 +530,76 @@ class CameraRuntimeController(
     private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     private var focusMotionMonitorRegistered = false
     @Volatile private var lastSignificantFocusMotionAtMs = 0L
+
+    private val panoramaExecutor = Executors.newSingleThreadExecutor()
+    private val panoramaFrames = mutableListOf<CapturedPanoramaFrame>()
+    private var panoramaCaptureActive = false
+    private var panoramaCaptureInFlight = false
+    private var panoramaFinishPending = false
+    private var panoramaSensorRegistered = false
+    private var panoramaGeneration = 0
+    private var panoramaLastSensorTimestampNs = 0L
+    private var panoramaSweepRadians = 0f
+    private var panoramaLastCapturedRadians = 0f
+    private var panoramaDirection = "Right"
+    private var panoramaDirectionPending = false
+    private var panoramaMetadataSnapshot: CaptureMetadataSnapshot? = null
+
+    private val panoramaMotionListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            if (!panoramaCaptureActive || event.sensor.type != Sensor.TYPE_GYROSCOPE || event.values.size < 2) return
+            val previousTimestamp = panoramaLastSensorTimestampNs
+            panoramaLastSensorTimestampNs = event.timestamp
+            if (previousTimestamp == 0L) return
+            val elapsedSeconds = ((event.timestamp - previousTimestamp) / 1_000_000_000f)
+                .coerceIn(0f, 0.08f)
+            val displayRotation = previewView?.display?.rotation ?: 1
+            if (panoramaDirectionPending &&
+                maxOf(kotlin.math.abs(event.values[0]), kotlin.math.abs(event.values[1])) >= 0.08f
+            ) {
+                panoramaDirection = panoramaDirectionFromGyro(
+                    displayRotation = displayRotation,
+                    gyroX = event.values[0],
+                    gyroY = event.values[1],
+                )
+                panoramaDirectionPending = false
+                PanoramaCaptureState.direction.value = panoramaDirection
+                Log.i(TAG, "Panorama auto direction: $panoramaDirection")
+            }
+            val sweepRate = panoramaSweepAxisRate(
+                direction = panoramaDirection,
+                displayRotation = displayRotation,
+                gyroX = event.values[0],
+                gyroY = event.values[1],
+            )
+            if (kotlin.math.abs(sweepRate) < 0.035f) {
+                PanoramaCaptureState.movingTooFast.value = false
+                return
+            }
+            panoramaSweepRadians = (panoramaSweepRadians + sweepRate * elapsedSeconds)
+                .coerceIn(0f, PANORAMA_TARGET_RADIANS)
+            PanoramaCaptureState.progress.value = panoramaProgressFraction(panoramaSweepRadians)
+            PanoramaCaptureState.movingTooFast.value =
+                sweepRate > PANORAMA_TOO_FAST_RADIANS_PER_SECOND
+            PanoramaCaptureState.message.value = if (PanoramaCaptureState.movingTooFast.value) {
+                "MOVE SLOWLY"
+            } else {
+                "PAN ${panoramaDirection.uppercase()}"
+            }
+            if (!panoramaCaptureInFlight &&
+                panoramaSweepRadians - panoramaLastCapturedRadians >= PANORAMA_FRAME_STEP_RADIANS
+            ) {
+                takePanoramaFrame()
+            }
+            if (panoramaSweepRadians >= PANORAMA_TARGET_RADIANS &&
+                !panoramaCaptureInFlight && panoramaFrames.size >= 2
+            ) {
+                finishPanoramaCapture()
+            }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
 
     private val focusMotionListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
@@ -719,6 +809,7 @@ class CameraRuntimeController(
         onCapabilities: ((CameraCapabilities) -> Unit)? = null,
         onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
         onPointingGesture: ((PointingGesture) -> Unit)? = null,
+        onCameraCommand: ((CameraCommand) -> Unit)? = null,
     ) {
         this.previewView = previewView
         this.lifecycleOwner = lifecycleOwner
@@ -727,6 +818,7 @@ class CameraRuntimeController(
         this.onCapabilities = onCapabilities
         this.onMeteredExposure = onMeteredExposure
         this.onPointingGesture = onPointingGesture
+        this.onCameraCommand = onCameraCommand
         startFocusMotionMonitor()
         wbCalibration = runCatching { loadWbCalibration() }.getOrNull()
         loadAwbCurve()
@@ -825,6 +917,7 @@ class CameraRuntimeController(
 
     fun detach() {
         photoTimerGeneration++
+        cancelPanoramaCapture("Camera closed")
         stopFocusMotionMonitor()
         resumeObserver?.let { observer -> lifecycleOwner?.lifecycle?.removeObserver(observer) }
         resumeObserver = null
@@ -846,6 +939,7 @@ class CameraRuntimeController(
         boundHdrLogMode = null
         boundCaptureFormat = null
         boundAspectRatio = null
+        boundMode = null
         boundExpectedPhysicalCameraId = null
         boundHdrExtension = false
         boundLogCaptureContractSatisfied = false
@@ -880,6 +974,7 @@ class CameraRuntimeController(
         // MediaPipe's GPU delegate is thread-affine. Stop new analyzer work first, then enqueue
         // close behind any inference already running on the same executor that created it.
         onPointingGesture = null
+        onCameraCommand = null
         val recognizerToClose = pointingRecognizer
         pointingRecognizer = null
         recognizerToClose?.let { recognizer ->
@@ -902,11 +997,18 @@ class CameraRuntimeController(
         waterTemperatureC: Double? = null,
         headingDegrees: Double? = null,
     ) {
+        val previousMode = latestState.activeMode
         val previousUnderwater = underwaterModeEnabled(latestState)
         val underwater = underwaterModeEnabled(cameraState)
         val now = SystemClock.elapsedRealtime()
         val pressureChanged = waterPressureKpa != latestWaterPressureKpa
         latestState = cameraState
+        if (previousMode == com.mobiledivecontrol.core.CameraModeId.Panorama &&
+            cameraState.activeMode != com.mobiledivecontrol.core.CameraModeId.Panorama &&
+            panoramaCaptureActive
+        ) {
+            cancelPanoramaCapture("Panorama cancelled")
+        }
         if ((shutterAwbLockActive || shutterAwbLockInFlight) &&
             !CameraCatalog.isWhiteBalanceAutoShutter(currentValue(cameraState, ".white_balance"))
         ) {
@@ -959,7 +1061,8 @@ class CameraRuntimeController(
                 desiredLens != boundLensValue ||
                 desiredHdrLogMode != boundHdrLogMode ||
                 desiredCaptureFormat != boundCaptureFormat ||
-                desiredAspectRatio != boundAspectRatio
+                desiredAspectRatio != boundAspectRatio ||
+                cameraState.activeMode != boundMode
         if (needsRebind) {
             Log.d(TAG, "applyState: rebinding camera")
             focusSlewGen++
@@ -2037,7 +2140,8 @@ class CameraRuntimeController(
             selectedLensValue(latestState) == boundLensValue &&
             desiredHdrLogMode == boundHdrLogMode &&
             desiredCaptureFormat == boundCaptureFormat &&
-            desiredAspectRatio == boundAspectRatio) {
+            desiredAspectRatio == boundAspectRatio &&
+            latestState.activeMode == boundMode) {
             applySessionState(latestState)
             return
         }
@@ -2172,7 +2276,13 @@ class CameraRuntimeController(
             .build()
             .also { it.setSurfaceProvider(previewSurface.surfaceProvider) }
         // Use ResolutionSelector for better resolution support including high-res modes
-        val targetSize = resolutionFor(desiredResolution)
+        val targetSize = if (
+            latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Panorama
+        ) {
+            PANORAMA_CAPTURE_SIZE
+        } else {
+            resolutionFor(desiredResolution)
+        }
         if (targetSize != null) {
             try {
                 val resolutionSelector = ResolutionSelector.Builder()
@@ -2435,6 +2545,7 @@ class CameraRuntimeController(
         boundHdrLogMode = desiredHdrLogMode
         boundCaptureFormat = desiredCaptureFormat
         boundAspectRatio = desiredAspectRatio
+        boundMode = latestState.activeMode
         boundExpectedPhysicalCameraId = activeLensProfile?.physicalCameraId
 
         // Detect device capabilities from the bound camera
@@ -2484,6 +2595,17 @@ class CameraRuntimeController(
         currentRecordingSegmentDurationMs = 0L
         pendingRecordingAction = null
         RecordingClock.durationMs.value = 0L
+        RecordingClock.playbackDurationMs.value = 0L
+        RecordingClock.timeLapseSpeedFactor.value = if (
+            latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse
+        ) {
+            hyperlapseSpeedFactor(
+                currentValue(latestState, ".speed"),
+                currentValue(latestState, ".day_night"),
+            )
+        } else {
+            1
+        }
         RecordingClock.paused.value = false
         RecordingClock.reviewUri.value = null
         RecordingClock.reviewFinalizing.value = false
@@ -2500,7 +2622,10 @@ class CameraRuntimeController(
         cameraRequestHandler.postDelayed({
             if (generation == recordingLimitGeneration && recordingSessionActive) {
                 Log.i(TAG, "Hyperlapse recording limit reached: ${limitMs / 1_000L}s")
-                stopVideoRecording()
+                // The reducer owns `camera.recording`; stopping only the platform recorder left
+                // the HUD and shutter in a phantom recording state. Route the automatic stop
+                // through the same command path as the housing shutter.
+                onCameraCommand?.invoke(CameraCommand.StopVideoRecording) ?: stopVideoRecording()
             }
         }, limitMs)
     }
@@ -2595,6 +2720,7 @@ class CameraRuntimeController(
                         event.recordingStats.recordedDurationNanos / 1_000_000L
                     RecordingClock.durationMs.value =
                         completedRecordingDurationMs + currentRecordingSegmentDurationMs
+                    RecordingClock.playbackDurationMs.value = RecordingClock.durationMs.value
                 }
                 is VideoRecordEvent.Finalize -> {
                     val reviewBoundary = recordingSegmentFinalizingForReview
@@ -2871,6 +2997,7 @@ class CameraRuntimeController(
         val speedValue = currentValue(latestState, ".speed")
         val dayNightValue = currentValue(latestState, ".day_night")
         val speedFactor = hyperlapseSpeedFactor(speedValue, dayNightValue)
+        RecordingClock.timeLapseSpeedFactor.value = speedFactor
         startCamera2VariableRateSegment(
             captureRateFps = hyperlapseCaptureRateFps(speedFactor),
             playbackFps = TIME_LAPSE_PLAYBACK_FPS,
@@ -3153,6 +3280,7 @@ class CameraRuntimeController(
             currentRecordingSegmentDurationMs = durationMs
             completedRecordingDurationMs += durationMs
             RecordingClock.durationMs.value = completedRecordingDurationMs
+            RecordingClock.playbackDurationMs.value = completedRecordingDurationMs
             if (segmentFile.isFile && segmentFile.length() > 0L) recordingSegmentFiles += segmentFile
             Log.i(TAG, "Direct high-speed segment finalized: $segmentFile durationMs=$durationMs")
         }.onFailure { error ->
@@ -3190,6 +3318,14 @@ class CameraRuntimeController(
             currentRecordingSegmentDurationMs = durationMs
             completedRecordingDurationMs += durationMs
             RecordingClock.durationMs.value = completedRecordingDurationMs
+            RecordingClock.playbackDurationMs.value = if (modeLabel == "Hyperlapse") {
+                hyperlapsePlaybackDurationMs(
+                    completedRecordingDurationMs,
+                    RecordingClock.timeLapseSpeedFactor.value,
+                )
+            } else {
+                completedRecordingDurationMs
+            }
             if (segmentFile.isFile && segmentFile.length() > 0L) recordingSegmentFiles += segmentFile
             Log.i(TAG, "Direct $modeLabel segment finalized: $segmentFile durationMs=$durationMs")
         }.onFailure { error ->
@@ -3360,6 +3496,8 @@ class CameraRuntimeController(
         completedRecordingDurationMs = 0L
         currentRecordingSegmentDurationMs = 0L
         RecordingClock.durationMs.value = 0L
+        RecordingClock.playbackDurationMs.value = 0L
+        RecordingClock.timeLapseSpeedFactor.value = 1
         RecordingClock.paused.value = false
         RecordingClock.reviewUri.value = null
         RecordingClock.reviewFinalizing.value = false
@@ -4670,6 +4808,10 @@ class CameraRuntimeController(
     }
 
     private fun capturePhoto() {
+        if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Panorama) {
+            if (panoramaCaptureActive) finishPanoramaCapture() else startPanoramaCapture()
+            return
+        }
         val requestedMode = latestState.activeMode
         val delayMs = currentValue(latestState, ".timer")
             ?.removeSuffix("s")
@@ -4685,6 +4827,338 @@ class CameraRuntimeController(
             }, delayMs)
         } else {
             beginPhotoCapture()
+        }
+    }
+
+    private fun startPanoramaCapture() {
+        if (PanoramaCaptureState.finalizing.value) {
+            Toast.makeText(context, "Panorama is still saving", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (imageCapture == null) {
+            Log.w(TAG, "Panorama requested without ImageCapture; rebinding")
+            bindCamera(force = true)
+        }
+        if (imageCapture == null) {
+            Toast.makeText(context, "Panorama camera is not ready", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        panoramaGeneration++
+        panoramaFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+        panoramaFrames.clear()
+        panoramaCaptureActive = true
+        panoramaCaptureInFlight = false
+        panoramaFinishPending = false
+        panoramaLastSensorTimestampNs = 0L
+        panoramaSweepRadians = 0f
+        panoramaLastCapturedRadians = 0f
+        val requestedDirection = currentValue(latestState, ".direction") ?: "Auto"
+        panoramaDirectionPending = requestedDirection == "Auto"
+        panoramaDirection = requestedDirection.takeUnless { it == "Auto" } ?: "Right"
+        panoramaMetadataSnapshot = captureMetadataSnapshot()
+        PanoramaCaptureState.active.value = true
+        PanoramaCaptureState.finalizing.value = false
+        PanoramaCaptureState.progress.value = 0f
+        PanoramaCaptureState.frameCount.value = 0
+        PanoramaCaptureState.movingTooFast.value = false
+        PanoramaCaptureState.direction.value = panoramaDirection
+        PanoramaCaptureState.message.value = if (panoramaDirectionPending) {
+            "PAN SLOWLY IN ANY DIRECTION"
+        } else {
+            "PAN ${panoramaDirection.uppercase()}"
+        }
+        setPanorama3ALock(true)
+        val sensor = gyroscope
+        panoramaSensorRegistered = sensor != null && sensorManager.registerListener(
+            panoramaMotionListener,
+            sensor,
+            SensorManager.SENSOR_DELAY_GAME,
+        )
+        Log.i(TAG, "Panorama started: direction=$panoramaDirection gyro=$panoramaSensorRegistered")
+        takePanoramaFrame()
+    }
+
+    private fun takePanoramaFrame() {
+        if (!panoramaCaptureActive || panoramaCaptureInFlight) return
+        val capture = imageCapture ?: run {
+            cancelPanoramaCapture("Panorama camera stopped")
+            return
+        }
+        if (panoramaFrames.size >= PANORAMA_MAX_FRAMES) {
+            finishPanoramaCapture()
+            return
+        }
+        val generation = panoramaGeneration
+        val requestedRadians = panoramaSweepRadians
+        panoramaCaptureInFlight = true
+        capture.takePicture(
+            ContextCompat.getMainExecutor(context),
+            object : ImageCapture.OnImageCapturedCallback() {
+                override fun onCaptureSuccess(image: androidx.camera.core.ImageProxy) {
+                    val bitmap = try {
+                        decodePanoramaFrame(image)
+                    } finally {
+                        image.close()
+                    }
+                    if (generation != panoramaGeneration) {
+                        bitmap?.recycle()
+                        return
+                    }
+                    panoramaCaptureInFlight = false
+                    if (bitmap == null) {
+                        handlePanoramaFrameFailure("Could not decode panorama frame")
+                        return
+                    }
+                    val normalized = normalizePanoramaFrame(bitmap)
+                    if (normalized !== bitmap) bitmap.recycle()
+                    panoramaFrames += CapturedPanoramaFrame(normalized, requestedRadians)
+                    panoramaLastCapturedRadians = requestedRadians
+                    PanoramaCaptureState.frameCount.value = panoramaFrames.size
+                    Log.d(
+                        TAG,
+                        "Panorama frame ${panoramaFrames.size}: " +
+                            "${normalized.width}x${normalized.height} sweep=$requestedRadians",
+                    )
+                    when {
+                        panoramaFinishPending -> finalizePanoramaFrames()
+                        panoramaSweepRadians >= PANORAMA_TARGET_RADIANS -> finishPanoramaCapture()
+                        panoramaSweepRadians - panoramaLastCapturedRadians >= PANORAMA_FRAME_STEP_RADIANS ->
+                            takePanoramaFrame()
+                    }
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    if (generation != panoramaGeneration) return
+                    panoramaCaptureInFlight = false
+                    Log.e(TAG, "Panorama frame capture failed", exception)
+                    handlePanoramaFrameFailure(exception.message ?: "Panorama capture failed")
+                }
+            },
+        )
+    }
+
+    private fun handlePanoramaFrameFailure(message: String) {
+        if (panoramaFrames.isEmpty()) {
+            cancelPanoramaCapture(message)
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        } else if (panoramaFinishPending) {
+            finalizePanoramaFrames()
+        } else {
+            PanoramaCaptureState.message.value = "HOLD STEADY"
+        }
+    }
+
+    private fun finishPanoramaCapture() {
+        if (!panoramaCaptureActive) return
+        panoramaCaptureActive = false
+        PanoramaCaptureState.active.value = false
+        PanoramaCaptureState.finalizing.value = true
+        PanoramaCaptureState.message.value = "STITCHING PANORAMA"
+        unregisterPanoramaSensor()
+        if (panoramaCaptureInFlight) {
+            panoramaFinishPending = true
+        } else {
+            finalizePanoramaFrames()
+        }
+    }
+
+    private fun finalizePanoramaFrames() {
+        panoramaFinishPending = false
+        panoramaDirectionPending = false
+        panoramaCaptureInFlight = false
+        val frames = panoramaFrames.toList()
+        panoramaFrames.clear()
+        if (frames.isEmpty()) {
+            PanoramaCaptureState.reset()
+            setPanorama3ALock(false)
+            Toast.makeText(context, "No panorama frames were captured", Toast.LENGTH_LONG).show()
+            return
+        }
+        val generation = panoramaGeneration
+        val direction = panoramaDirection
+        val snapshot = panoramaMetadataSnapshot
+        panoramaMetadataSnapshot = null
+        val saveLocation = latestState.recordingSaveLocation
+        val displayName = "DiveControl_Panorama_${System.currentTimeMillis()}.jpg"
+        panoramaExecutor.execute {
+            val result = runCatching {
+                val stitched = PanoramaBitmapStitcher.stitch(frames, direction)
+                try {
+                    publishPanorama(stitched, displayName, saveLocation)
+                } finally {
+                    stitched.recycle()
+                }
+            }
+            frames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+            ContextCompat.getMainExecutor(context).execute mainThread@{
+                if (generation != panoramaGeneration) return@mainThread
+                result.onSuccess { uri ->
+                    snapshot?.let { metadata ->
+                        panoramaExecutor.execute {
+                            writeMetadataSidecar(displayName, saveLocation, metadata)
+                        }
+                    }
+                    Log.i(TAG, "Panorama saved: frames=${frames.size} uri=$uri")
+                    PanoramaCaptureState.message.value = "PANORAMA SAVED"
+                    Toast.makeText(context, "Panorama saved", Toast.LENGTH_SHORT).show()
+                }.onFailure { error ->
+                    Log.e(TAG, "Panorama stitch/save failed", error)
+                    PanoramaCaptureState.message.value = "PANORAMA FAILED"
+                    Toast.makeText(
+                        context,
+                        "Panorama failed: ${error.message}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                PanoramaCaptureState.finalizing.value = false
+                PanoramaCaptureState.frameCount.value = 0
+                PanoramaCaptureState.progress.value = 0f
+                PanoramaCaptureState.movingTooFast.value = false
+                setPanorama3ALock(false)
+                cameraRequestHandler.postDelayed({
+                    if (!PanoramaCaptureState.active.value && !PanoramaCaptureState.finalizing.value) {
+                        PanoramaCaptureState.message.value = ""
+                    }
+                }, 1_200L)
+            }
+        }
+    }
+
+    private fun cancelPanoramaCapture(message: String) {
+        panoramaGeneration++
+        panoramaCaptureActive = false
+        panoramaCaptureInFlight = false
+        panoramaFinishPending = false
+        panoramaDirectionPending = false
+        unregisterPanoramaSensor()
+        panoramaFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+        panoramaFrames.clear()
+        panoramaMetadataSnapshot = null
+        PanoramaCaptureState.reset()
+        if (message.isNotBlank()) PanoramaCaptureState.message.value = message
+        setPanorama3ALock(false)
+    }
+
+    private fun unregisterPanoramaSensor() {
+        if (!panoramaSensorRegistered) return
+        sensorManager.unregisterListener(panoramaMotionListener)
+        panoramaSensorRegistered = false
+        panoramaLastSensorTimestampNs = 0L
+    }
+
+    private fun setPanorama3ALock(locked: Boolean) {
+        val boundCamera = camera ?: return
+        runCatching {
+            val options = CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, locked)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, locked)
+                .build()
+            Camera2CameraControl.from(boundCamera.cameraControl).addCaptureRequestOptions(options)
+        }.onFailure { error ->
+            Log.w(TAG, "Could not ${if (locked) "lock" else "unlock"} panorama 3A", error)
+        }
+        if (!locked) {
+            lastAppliedSessionSignature = null
+            applySessionState(latestState, force = true)
+        }
+    }
+
+    private fun decodePanoramaFrame(image: androidx.camera.core.ImageProxy): Bitmap? {
+        val plane = image.planes.firstOrNull() ?: return null
+        val buffer = plane.buffer.duplicate().apply { rewind() }
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
+        var decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val rotation = image.imageInfo.rotationDegrees
+        if (rotation != 0) {
+            val rotated = Bitmap.createBitmap(
+                decoded,
+                0,
+                0,
+                decoded.width,
+                decoded.height,
+                Matrix().apply { postRotate(rotation.toFloat()) },
+                true,
+            )
+            if (rotated !== decoded) decoded.recycle()
+            decoded = rotated
+        }
+        // The app is landscape-locked; normalize camera sensors which still report portrait JPEG
+        // orientation so every frame's sweep axes agree with the on-screen guide.
+        if (decoded.height > decoded.width) {
+            val landscape = Bitmap.createBitmap(
+                decoded,
+                0,
+                0,
+                decoded.width,
+                decoded.height,
+                Matrix().apply { postRotate(90f) },
+                true,
+            )
+            if (landscape !== decoded) decoded.recycle()
+            decoded = landscape
+        }
+        return decoded
+    }
+
+    private fun normalizePanoramaFrame(bitmap: Bitmap): Bitmap {
+        val reference = panoramaFrames.firstOrNull()?.bitmap
+        val targetWidth: Int
+        val targetHeight: Int
+        if (reference != null) {
+            targetWidth = reference.width
+            targetHeight = reference.height
+        } else {
+            val scale = minOf(
+                1f,
+                PANORAMA_CAPTURE_SIZE.width.toFloat() / bitmap.width,
+                PANORAMA_CAPTURE_SIZE.height.toFloat() / bitmap.height,
+            )
+            targetWidth = (bitmap.width * scale).roundToInt().coerceAtLeast(1)
+            targetHeight = (bitmap.height * scale).roundToInt().coerceAtLeast(1)
+        }
+        return if (bitmap.width == targetWidth && bitmap.height == targetHeight) {
+            bitmap
+        } else {
+            Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+        }
+    }
+
+    private fun publishPanorama(
+        bitmap: Bitmap,
+        displayName: String,
+        saveLocation: com.mobiledivecontrol.core.RecordingSaveLocation,
+    ): android.net.Uri {
+        val resolver = context.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, saveLocation.relativePath)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+        }
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: error("MediaStore could not create the panorama")
+        try {
+            resolver.openOutputStream(uri, "w")?.use { stream ->
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
+                    "JPEG encoder rejected the panorama"
+                }
+            } ?: error("MediaStore returned no panorama output stream")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                resolver.update(
+                    uri,
+                    ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
+                    null,
+                    null,
+                )
+            }
+            return uri
+        } catch (error: Throwable) {
+            resolver.delete(uri, null, null)
+            throw error
         }
     }
 

@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.LifecycleOwner
 import com.mobiledivecontrol.core.CameraState
+import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.theme.DiveColors
@@ -45,6 +46,7 @@ fun StateDrivenCameraPreview(
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     onPointingGesture: ((PointingGesture) -> Unit)? = null,
+    onCameraCommand: ((CameraCommand) -> Unit)? = null,
     headingDegrees: Double? = null,
     modifier: Modifier = Modifier,
 ) {
@@ -75,6 +77,7 @@ fun StateDrivenCameraPreview(
             onCapabilities = onCapabilities,
             onMeteredExposure = onMeteredExposure,
             onPointingGesture = onPointingGesture,
+            onCameraCommand = onCameraCommand,
         )
 
         onDispose {
