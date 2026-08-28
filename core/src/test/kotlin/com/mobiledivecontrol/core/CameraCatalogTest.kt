@@ -366,8 +366,11 @@ class CameraCatalogTest {
             listOf("Night 45x", "Night 15x", "Auto", "5x", "10x", "15x", "30x", "60x"),
             hyperlapse.getValue("hyperlapse.speed").options,
         )
-        assertEquals("∞", hyperlapse.getValue("hyperlapse.recording_time").options.first())
-        assertEquals("Frame interval", hyperlapse.getValue("hyperlapse.speed").label)
+        assertEquals(
+            listOf("∞", "10m", "30m", "60m", "120m", "180m", "300m"),
+            hyperlapse.getValue("hyperlapse.recording_time").options,
+        )
+        assertEquals("Speed", hyperlapse.getValue("hyperlapse.speed").label)
         val hyperlapseQuickBar = CameraCatalog.settingsBarItems(
             CameraCatalog.launchCameraState(CameraModeId.Hyperlapse),
         ).filterIsInstance<BottomBarItem.Setting>().map { it.spec.id }

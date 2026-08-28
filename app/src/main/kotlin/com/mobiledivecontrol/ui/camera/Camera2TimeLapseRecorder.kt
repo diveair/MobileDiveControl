@@ -29,8 +29,12 @@ import kotlin.math.max
 
 internal const val TIME_LAPSE_PLAYBACK_FPS = 30
 
-/** The initial Samsung Auto choice; explicit speed rungs remain exact. */
-internal fun hyperlapseSpeedFactor(value: String?, dayNight: String?): Int = when (value) {
+/** Explicit rungs stay exact; Auto follows Samsung's low-light suggestion with a safe fallback. */
+internal fun hyperlapseSpeedFactor(
+    value: String?,
+    dayNight: String?,
+    samsungSuggestedMotionSpeedMode: Int? = null,
+): Int = when (value) {
     "Night 45x" -> 45
     "Night 15x" -> 15
     "5x" -> 5
@@ -38,7 +42,9 @@ internal fun hyperlapseSpeedFactor(value: String?, dayNight: String?): Int = whe
     "15x" -> 15
     "30x" -> 30
     "60x" -> 60
-    else -> if (dayNight == "Night") 15 else 10
+    else -> if (
+        dayNight == "Night" || hyperlapseAutoUsesNightCadence(samsungSuggestedMotionSpeedMode)
+    ) 15 else 10
 }
 
 internal fun hyperlapseCaptureRateFps(speedFactor: Int): Double =
@@ -92,6 +98,7 @@ internal class Camera2TimeLapseRecorder(
     private var startedAtElapsedMs = 0L
     private var finalizeDelivered = false
     private var stopRequested = false
+    private var terminating = false
 
     val isBusy: Boolean
         get() = request != null
@@ -111,6 +118,7 @@ internal class Camera2TimeLapseRecorder(
         this.onFinalized = onFinalized
         finalizeDelivered = false
         stopRequested = false
+        terminating = false
         startedAtElapsedMs = 0L
         request.outputFile.parentFile?.mkdirs()
 
@@ -134,8 +142,16 @@ internal class Camera2TimeLapseRecorder(
             ) = Unit
 
             override fun surfaceDestroyed(holder: SurfaceHolder) {
-                if (this@Camera2TimeLapseRecorder.request === request && !finalizeDelivered) {
-                    fail(IllegalStateException("Time-lapse preview surface was destroyed"))
+                if (this@Camera2TimeLapseRecorder.request === request && !terminating) {
+                    // Android destroys this overlay when the activity loses the foreground.
+                    // A started recording is still a valid clip, so close its MP4 index instead
+                    // of deleting it as a failure. The identity/terminal guards also prevent the
+                    // surface and CameraDevice callbacks from finalising the same segment twice.
+                    if (startedAtElapsedMs > 0L) {
+                        stop()
+                    } else {
+                        fail(IllegalStateException("Time-lapse preview surface was destroyed before start"))
+                    }
                 }
             }
         })
@@ -194,12 +210,16 @@ internal class Camera2TimeLapseRecorder(
 
                     override fun onDisconnected(device: CameraDevice) {
                         device.close()
-                        fail(IllegalStateException("Time-lapse camera disconnected"))
+                        if (this@Camera2TimeLapseRecorder.request === request && !terminating) {
+                            fail(IllegalStateException("Time-lapse camera disconnected"))
+                        }
                     }
 
                     override fun onError(device: CameraDevice, error: Int) {
                         device.close()
-                        fail(IllegalStateException("Time-lapse camera open error $error"))
+                        if (this@Camera2TimeLapseRecorder.request === request && !terminating) {
+                            fail(IllegalStateException("Time-lapse camera open error $error"))
+                        }
                     }
                 },
                 handler,
@@ -290,7 +310,9 @@ internal class Camera2TimeLapseRecorder(
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        fail(IllegalStateException("Could not configure time-lapse session"))
+                        if (this@Camera2TimeLapseRecorder.request === request && !terminating) {
+                            fail(IllegalStateException("Could not configure time-lapse session"))
+                        }
                     }
                 },
                 handler,
@@ -309,11 +331,12 @@ internal class Camera2TimeLapseRecorder(
     }
 
     fun stop() {
-        if (!isBusy) return
+        if (!isBusy || terminating) return
         if (startedAtElapsedMs == 0L) {
             stopRequested = true
             return
         }
+        terminating = true
         val duration = elapsedDurationMs
         try {
             session?.stopRepeating()
@@ -323,9 +346,11 @@ internal class Camera2TimeLapseRecorder(
                 throw IllegalStateException("Time-lapse recorder produced no video")
             }
             inspectEncodedStream(file, duration)
-            finish(Result.success(duration))
+            deliverFinalResult(Result.success(duration))
         } catch (error: Throwable) {
-            fail(error)
+            Log.e(TAG, "Time-lapse recording failed while stopping", error)
+            request?.outputFile?.delete()
+            deliverFinalResult(Result.failure(error))
         }
     }
 
@@ -363,17 +388,21 @@ internal class Camera2TimeLapseRecorder(
 
     fun release() {
         if (!isBusy) return
+        terminating = true
+        finalizeDelivered = true
         request?.outputFile?.delete()
         cleanup()
     }
 
     private fun fail(error: Throwable) {
+        if (!isBusy || terminating || finalizeDelivered) return
+        terminating = true
         Log.e(TAG, "Time-lapse recording failed", error)
         request?.outputFile?.delete()
-        finish(Result.failure(error))
+        deliverFinalResult(Result.failure(error))
     }
 
-    private fun finish(result: Result<Long>) {
+    private fun deliverFinalResult(result: Result<Long>) {
         if (finalizeDelivered) return
         finalizeDelivered = true
         val callback = onFinalized

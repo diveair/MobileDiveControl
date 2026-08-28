@@ -259,6 +259,11 @@ class CameraSessionStore(context: Context) {
                 result["pro_video.frame_rate"] = CameraCatalog.proVideoFrameRateOption(captureFps)
             }
         }
+        // Samsung's duration choices are minutes. Builds that labelled the same numeric choices
+        // as seconds persisted values such as "30s"; retain the user's rung while correcting it.
+        result["hyperlapse.recording_time"]?.takeIf { it.endsWith("s") }?.let { legacy ->
+            result["hyperlapse.recording_time"] = legacy.removeSuffix("s") + "m"
+        }
         // Validate focus curve values
         listOf(
             "photo.focus_curve", "expert.focus_curve", "pro.focus_curve", "pro_video.focus_curve",

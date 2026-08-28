@@ -160,14 +160,15 @@ fun CameraShellScreen(
             RecordingSegmentPreview(modifier = Modifier.fillMaxSize())
         }
 
-        // Top-left: ordinary recordings use one elapsed clock; Hyperlapse mirrors Samsung's
-        // output-duration (left) / real elapsed-time (right) presentation.
+        // Samsung Hyperlapse centres one combined output / elapsed clock at the top.
         if (cameraState.activeMode == CameraModeId.Hyperlapse) {
             HyperlapseRecordingBadge(
                 visible = cameraState.recording && !cameraState.recordingPaused,
                 modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(start = 18.dp, top = 72.dp),
+                    .align(Alignment.TopCenter)
+                    // The native clock is top-centred; DiveControl's vacuum HUD occupies the
+                    // first row, so place it immediately below that row instead of over it.
+                    .padding(top = 56.dp),
             )
         } else {
             RecordingBadge(
@@ -2175,61 +2176,29 @@ private fun HyperlapseRecordingBadge(
     AnimatedVisibility(visible = visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
         val elapsedMs by RecordingClock.durationMs
         val outputMs by RecordingClock.playbackDurationMs
-        val speedFactor by RecordingClock.timeLapseSpeedFactor
-        val interval = hyperlapseFrameIntervalSeconds(speedFactor)
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier
-                .background(DiveColors.DeepBlack.copy(alpha = 0.82f), RoundedCornerShape(16.dp))
-                .border(1.dp, DiveColors.Critical.copy(alpha = 0.75f), RoundedCornerShape(16.dp))
-                .padding(horizontal = 13.dp, vertical = 8.dp),
+                .background(DiveColors.Critical.copy(alpha = 0.9f), RoundedCornerShape(16.dp))
+                .padding(horizontal = 14.dp, vertical = 7.dp),
         ) {
-            Icon(
-                imageVector = Icons.Rounded.FiberManualRecord,
-                contentDescription = null,
-                tint = DiveColors.Critical,
-                modifier = Modifier.size(12.dp),
-            )
-            HyperlapseClockColumn(label = "OUTPUT", durationMs = outputMs)
-            Box(
-                modifier = Modifier
-                    .width(1.dp)
-                    .height(30.dp)
-                    .background(DiveColors.SurfaceBorder.copy(alpha = 0.75f)),
-            )
-            HyperlapseClockColumn(label = "ELAPSED", durationMs = elapsedMs)
             Text(
-                text = String.format(
-                    Locale.US,
-                    "%d× · %.2fs/frame",
-                    speedFactor,
-                    interval,
-                ),
-                color = DiveColors.DiveCyan,
-                style = MaterialTheme.typography.labelSmall,
+                text = "${hyperlapseClockText(outputMs)} (${hyperlapseClockText(elapsedMs)})",
+                color = DiveColors.TextPrimary,
+                style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.Bold,
             )
         }
     }
 }
 
-@Composable
-private fun HyperlapseClockColumn(label: String, durationMs: Long) {
+internal fun hyperlapseClockText(durationMs: Long): String {
     val seconds = durationMs.coerceAtLeast(0L) / 1_000L
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(
-            text = label,
-            color = DiveColors.TextMuted,
-            style = MaterialTheme.typography.labelSmall,
-        )
-        Text(
-            text = "%d:%02d".format(seconds / 60, seconds % 60),
-            color = DiveColors.TextPrimary,
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Bold,
-        )
-    }
+    return "%02d:%02d:%02d".format(
+        seconds / 3_600L,
+        (seconds / 60L) % 60L,
+        seconds % 60L,
+    )
 }
 
 /** Paused-session actions and save destination, with housing and touch sharing core selection. */

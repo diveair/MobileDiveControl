@@ -112,10 +112,15 @@ internal fun aquaToneDuv(value: String?): Double = value
     ?: 0.0
 
 internal fun hyperlapseRecordingLimitMillis(value: String?): Long? = value
-    ?.removeSuffix("s")
+    ?.removeSuffix("m")
+    ?.removeSuffix("s") // legacy builds persisted the same numeric choices with the wrong unit
     ?.toLongOrNull()
     ?.takeIf { it in 1..300 }
-    ?.times(1_000L)
+    ?.times(60_000L)
+
+/** Samsung reports 0x62 when Auto should enter its low-light/night Hyperlapse cadence. */
+internal fun hyperlapseAutoUsesNightCadence(suggestedMotionSpeedMode: Int?): Boolean =
+    suggestedMotionSpeedMode == 0x62
 
 internal fun proVideoPlaybackFrameRate(value: String?): Double =
     CameraCatalog.playbackFrameRateFps(value)
@@ -631,6 +636,9 @@ class CameraRuntimeController(
     @Volatile private var cam2Session: CameraCaptureSession? = null
     @Volatile private var cam2Surfaces: List<android.view.Surface> = emptyList()
     @Volatile private var nativeFocusActive: Boolean = false
+    @Volatile private var suggestedHyperlapseMotionSpeedMode: Int? = null
+    private var suggestedHyperlapseResultKey: CaptureResult.Key<Int>? = null
+    private var suggestedHyperlapseResultKeyProbed = false
 
     private val sessionCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
@@ -696,6 +704,29 @@ class CameraRuntimeController(
             result.get(CaptureResult.CONTROL_AE_ANTIBANDING_MODE)?.let { lastAntibandingMode = it }
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastAeExposureNs = it }
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastAeSensitivity = it }
+
+            // Samsung's native Auto speed asks the HAL whether the scene should switch to the
+            // special low-light cadence (0x62). The request is armed on the idle Hyperlapse
+            // preview below; capture the suggestion before shutter so MediaRecorder can be
+            // configured with the resulting fixed capture rate.
+            if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse &&
+                currentValue(latestState, ".speed") == "Auto"
+            ) {
+                if (!suggestedHyperlapseResultKeyProbed) {
+                    suggestedHyperlapseResultKeyProbed = true
+                    suggestedHyperlapseResultKey = makeVendorResultKey(
+                        "samsung.android.control.recordingSuggestedMotionSpeedMode",
+                    )
+                }
+                readVendorResult(result, suggestedHyperlapseResultKey) {
+                    suggestedHyperlapseResultKey = null
+                }?.let { suggestion ->
+                    if (suggestion != suggestedHyperlapseMotionSpeedMode) {
+                        suggestedHyperlapseMotionSpeedMode = suggestion
+                        Log.i(TAG, "Samsung Hyperlapse Auto suggestion=$suggestion")
+                    }
+                }
+            }
 
             val captureNow = SystemClock.elapsedRealtime()
             observeAutofocusState(result, captureNow)
@@ -786,6 +817,20 @@ class CameraRuntimeController(
         null
     }
 
+    @Suppress("UNCHECKED_CAST")
+    private fun samsungHyperlapseMotionSpeedKey(cameraId: String?): CaptureRequest.Key<Int>? {
+        val resolvedCameraId = cameraId ?: backCameraProfile?.logicalCameraId ?: return null
+        return runCatching {
+            val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            manager.getCameraCharacteristics(resolvedCameraId)
+                .availableCaptureRequestKeys
+                .firstOrNull { it.name == "samsung.android.control.recordingMotionSpeedMode" }
+                as? CaptureRequest.Key<Int>
+        }.onFailure { error ->
+            Log.d(TAG, "Samsung Hyperlapse vendor request is unavailable", error)
+        }.getOrNull()
+    }
+
     private fun readVendorResult(
         result: CaptureResult,
         key: CaptureResult.Key<Int>?,
@@ -872,7 +917,12 @@ class CameraRuntimeController(
     private fun installResumeWatchdog(owner: LifecycleOwner) {
         resumeObserver?.let { observer -> lifecycleOwner?.lifecycle?.removeObserver(observer) }
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
+            if (event == Lifecycle.Event.ON_PAUSE && directCamera2RecorderBusy()) {
+                // Match Samsung Camera: leaving the foreground closes and saves the current
+                // segment. This prevents SurfaceView destruction and camera eviction racing to
+                // fail the same recorder, which previously crashed CameraX during its rebind.
+                onCameraCommand?.invoke(CameraCommand.StopVideoRecording) ?: stopVideoRecording()
+            } else if (event == Lifecycle.Event.ON_RESUME) {
                 cameraRequestHandler.postDelayed({
                     val pv = previewView ?: return@postDelayed
                     // The GL heartbeat is the authoritative health signal: PreviewView's
@@ -881,8 +931,13 @@ class CameraRuntimeController(
                     val healthy = focusPeakingProcessor?.let { processor ->
                         SystemClock.elapsedRealtime() - processor.lastDrawSuccessAtMs < 2_000L
                     } ?: (pv.previewStreamState.value == PreviewView.StreamState.STREAMING)
-                    if (!healthy && camera != null && activeRecording == null) {
-                        Log.w(TAG, "Preview pipeline dead after resume — forcing camera rebind")
+                    if ((!healthy || camera == null) &&
+                        activeRecording == null && !directCamera2RecorderBusy()
+                    ) {
+                        Log.w(
+                            TAG,
+                            "Preview pipeline absent or dead after resume — forcing camera rebind",
+                        )
                         bindCamera(force = true)
                     }
                 }, RESUME_STREAM_CHECK_DELAY_MS)
@@ -2214,6 +2269,18 @@ class CameraRuntimeController(
                     )
                     .build(),
             )
+        if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse &&
+            currentValue(latestState, ".speed") == "Auto"
+        ) {
+            samsungHyperlapseMotionSpeedKey(selectedCameraId)?.let { key ->
+                // 10 is Samsung's Auto value (the native app tests this exact value before
+                // consuming recordingSuggestedMotionSpeedMode). Put it on every repeating-use
+                // case so CameraX stream sharing cannot silently discard the vendor request.
+                Camera2Interop.Extender(previewBuilder).setCaptureRequestOption(key, 10)
+                Camera2Interop.Extender(imageCaptureBuilder).setCaptureRequestOption(key, 10)
+                Camera2Interop.Extender(analysisBuilder).setCaptureRequestOption(key, 10)
+            }
+        }
         if (physicalCameraId != null) {
             Camera2Interop.Extender(previewBuilder).setPhysicalCameraId(physicalCameraId)
             Camera2Interop.Extender(imageCaptureBuilder).setPhysicalCameraId(physicalCameraId)
@@ -2421,6 +2488,13 @@ class CameraRuntimeController(
         // stream itself so removing the auxiliary surfaces cannot break live manual control.
         val videoInterop = Camera2Interop.Extender(videoBuilder)
         physicalCameraId?.let(videoInterop::setPhysicalCameraId)
+        if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse &&
+            currentValue(latestState, ".speed") == "Auto"
+        ) {
+            samsungHyperlapseMotionSpeedKey(selectedCameraId)?.let { key ->
+                videoInterop.setCaptureRequestOption(key, 10)
+            }
+        }
         if (isManualFocus) {
             videoInterop.setCaptureRequestOption(
                 CaptureRequest.CONTROL_AF_MODE,
@@ -2602,6 +2676,7 @@ class CameraRuntimeController(
             hyperlapseSpeedFactor(
                 currentValue(latestState, ".speed"),
                 currentValue(latestState, ".day_night"),
+                suggestedHyperlapseMotionSpeedMode,
             )
         } else {
             1
@@ -2621,7 +2696,7 @@ class CameraRuntimeController(
             ?: return
         cameraRequestHandler.postDelayed({
             if (generation == recordingLimitGeneration && recordingSessionActive) {
-                Log.i(TAG, "Hyperlapse recording limit reached: ${limitMs / 1_000L}s")
+                Log.i(TAG, "Hyperlapse recording limit reached: ${limitMs / 60_000L}m")
                 // The reducer owns `camera.recording`; stopping only the platform recorder left
                 // the HUD and shutter in a phantom recording state. Route the automatic stop
                 // through the same command path as the housing shutter.
@@ -2996,7 +3071,11 @@ class CameraRuntimeController(
     private fun startCamera2TimeLapseSegment() {
         val speedValue = currentValue(latestState, ".speed")
         val dayNightValue = currentValue(latestState, ".day_night")
-        val speedFactor = hyperlapseSpeedFactor(speedValue, dayNightValue)
+        val speedFactor = hyperlapseSpeedFactor(
+            speedValue,
+            dayNightValue,
+            suggestedHyperlapseMotionSpeedMode,
+        )
         RecordingClock.timeLapseSpeedFactor.value = speedFactor
         startCamera2VariableRateSegment(
             captureRateFps = hyperlapseCaptureRateFps(speedFactor),
@@ -3291,7 +3370,7 @@ class CameraRuntimeController(
         }
         currentRecordingSegmentDurationMs = 0L
         releaseShutterWhiteBalance()
-        bindCamera(force = true)
+        rebindAfterDirectRecording()
         if (reviewBoundary) {
             if (recordingSegmentFiles.isEmpty()) {
                 recordingSegmentFinalizingForReview = false
@@ -3304,6 +3383,20 @@ class CameraRuntimeController(
             recordingSegmentFinalizingForReview = false
             finishRecordingSession(deleteLatest = false)
         }
+    }
+
+    /** A direct recorder can finish after ON_PAUSE; never rebind CameraX into a dead surface. */
+    private fun rebindAfterDirectRecording() {
+        val owner = lifecycleOwner
+        val host = previewView
+        if (owner == null || host == null ||
+            !owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) ||
+            !host.isAttachedToWindow
+        ) {
+            Log.i(TAG, "Skipping direct-recorder rebind while camera surface is inactive")
+            return
+        }
+        bindCamera(force = true)
     }
 
     private fun finalizeCamera2VariableRateSegment(
@@ -3336,7 +3429,7 @@ class CameraRuntimeController(
         }
         currentRecordingSegmentDurationMs = 0L
         releaseShutterWhiteBalance()
-        bindCamera(force = true)
+        rebindAfterDirectRecording()
         if (reviewBoundary) {
             if (recordingSegmentFiles.isEmpty()) {
                 recordingSegmentFinalizingForReview = false

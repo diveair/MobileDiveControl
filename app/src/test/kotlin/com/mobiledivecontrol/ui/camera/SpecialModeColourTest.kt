@@ -21,11 +21,12 @@ class SpecialModeColourTest {
     }
 
     @Test
-    fun `hyperlapse recording limit accepts infinity through 300 seconds`() {
+    fun `hyperlapse recording limit accepts Samsung minute choices through 300`() {
         assertEquals(null, hyperlapseRecordingLimitMillis("∞"))
-        assertEquals(10_000L, hyperlapseRecordingLimitMillis("10s"))
-        assertEquals(300_000L, hyperlapseRecordingLimitMillis("300s"))
-        assertEquals(null, hyperlapseRecordingLimitMillis("301s"))
+        assertEquals(600_000L, hyperlapseRecordingLimitMillis("10m"))
+        assertEquals(600_000L, hyperlapseRecordingLimitMillis("10s"))
+        assertEquals(18_000_000L, hyperlapseRecordingLimitMillis("300m"))
+        assertEquals(null, hyperlapseRecordingLimitMillis("301m"))
     }
 
     @Test
@@ -36,6 +37,10 @@ class SpecialModeColourTest {
         assertEquals(2.0, hyperlapseFrameIntervalSeconds(60), 1e-9)
         assertEquals(2_000L, hyperlapsePlaybackDurationMs(10_000L, 5))
         assertEquals(0L, hyperlapsePlaybackDurationMs(-1L, 10))
+        assertEquals(10, hyperlapseSpeedFactor("Auto", "Day", 10))
+        assertEquals(15, hyperlapseSpeedFactor("Auto", "Day", 0x62))
+        assertEquals("00:00:00", hyperlapseClockText(-1L))
+        assertEquals("01:01:01", hyperlapseClockText(3_661_999L))
     }
 
     @Test
