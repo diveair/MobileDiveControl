@@ -318,7 +318,7 @@ class ControlCoreTest {
             .indexOfFirst { it.id == "pro_video.guides" }
         val selected = reducer.reduce(opened.state, CameraCommand.SelectOptionsItem(guidesIndex))
         val adjusted = reducer.reduce(selected.state, CameraCommand.NavigateRight)
-        assertEquals("4×4 Grid", adjusted.state.camera.settingValues["pro_video.guides"])
+        assertEquals("Phi Grid", adjusted.state.camera.settingValues["pro_video.guides"])
         assertEquals(camera.settingsCursor, adjusted.state.camera.settingsCursor)
 
         // As in the Focus editor, OK commits the current values and closes the menu.

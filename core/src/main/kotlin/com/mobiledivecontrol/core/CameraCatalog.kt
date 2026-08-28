@@ -675,7 +675,22 @@ object CameraCatalog {
 
     fun currentValue(camera: CameraState, spec: CameraSettingSpec): String {
         if (spec.id.endsWith(".save_location")) return camera.recordingSaveLocation.name
-        return camera.settingValues[spec.id] ?: spec.defaultValue
+        val value = camera.settingValues[spec.id] ?: spec.defaultValue
+        return if (spec.id.endsWith(".grid") || spec.id.endsWith(".guides")) {
+            canonicalGuideValue(value)
+        } else {
+            value
+        }
+    }
+
+    /** Keeps guide selections made by older builds valid after the guide names were clarified. */
+    fun canonicalGuideValue(value: String): String = when (value) {
+        "3x3", "3×3 Grid" -> "Rule of Thirds"
+        "Golden Ratio" -> "Phi Grid"
+        "Fibonacci Left" -> "Fibonacci Spiral Left"
+        "Fibonacci Right" -> "Fibonacci Spiral Right"
+        "Lines & Patterns" -> "Lines and Patterns"
+        else -> value
     }
 
     fun isWhiteBalanceAuto(value: String?): Boolean =
@@ -942,7 +957,7 @@ object CameraCatalog {
                 choice("photo.focus_curve", "Focus Curve", "DiveControl", focusCurveOptions(), "SquareRoot"),
                 slider("photo.exposure_compensation", "EV", "Core", evQuickOptions, "0.0"),
                 choice("photo.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
-                choice("photo.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+                choice("photo.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
             ),
         )
     }
@@ -999,7 +1014,7 @@ object CameraCatalog {
                 "The native eight-step lighting control is catalogued; rendering is vendor-only.",
                 supportsSensitivity = false,
             ),
-            choice("portrait.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+            choice("portrait.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
         ),
     )
 
@@ -1033,7 +1048,7 @@ object CameraCatalog {
             ),
             slider("food.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
             choice("food.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3"),
-            choice("food.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+            choice("food.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
         ),
     )
 
@@ -1066,7 +1081,7 @@ object CameraCatalog {
                 slider("expert.exposure_value", "Exposure Value", "Manual", evProOptions, "0.0"),
                 toggle("expert.exposure_monitor", "Exposure monitor", "Assist"),
                 choice("expert.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
-                choice("expert.grid", "Grid", "Assist", gridOptions(), "3x3"),
+                choice("expert.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
                 choice("expert.hdr", "HDR", "Assist", listOf("Off", "On"), "On"),
                 slider(
                     "expert.virtual_aperture",
@@ -1218,7 +1233,7 @@ object CameraCatalog {
                 choice("pro.metering", "Metering", "Exposure", meteringOptions(), "Matrix"),
                 toggle("pro.histogram", "Histogram", "Assist", "On"),
                 choice("pro.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
-                choice("pro.guides", "Guides", "Assist", guideOptions(), "3×3 Grid"),
+                choice("pro.guides", "Guides", "Assist", guideOptions(), "Rule of Thirds"),
                 choice("pro.exposure_display", "Exposure display", "Assist", exposureDisplayOptions(), "Off"),
                 choice("pro.hdr", "HDR photo", "Dynamic range", listOf("Off", "On"), "On"),
                 slider(
@@ -1256,7 +1271,7 @@ object CameraCatalog {
             ),
             toggle("panorama.guide", "Panorama guide", "Assist", "On"),
             slider("panorama.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
-            choice("panorama.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+            choice("panorama.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
         ),
     )
 
@@ -1284,7 +1299,7 @@ object CameraCatalog {
                     CameraFeatureStatus.NeedsVerification,
                     "Samsung's multi-frame Night exposure is vendor-only.",
                 ),
-                choice("night.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+                choice("night.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
             ),
         )
     }
@@ -1370,7 +1385,7 @@ object CameraCatalog {
                 slider("hyperlapse.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("hyperlapse.focus_peaking", "Focus Assist", "Assist"),
                 choice("hyperlapse.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
-                choice("hyperlapse.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+                choice("hyperlapse.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
             ),
         )
     }
@@ -1419,7 +1434,7 @@ object CameraCatalog {
                 choice("video.log", "Log", "Dynamic range", listOf("Off", "On"), "Off"),
                 toggle("video.audio_recording", "Audio recording", "Audio", "On"),
                 choice("video.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
-                choice("video.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+                choice("video.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
             ),
         )
     }
@@ -1467,7 +1482,7 @@ object CameraCatalog {
                 choice("pro_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
                 choice("pro_video.lens", "Lens", "Core", lenses, "Auto"),
                 choice("pro_video.metering", "Metering", "Exposure", meteringOptions(), "Matrix"),
-                choice("pro_video.guides", "Guides", "Assist", guideOptions(), "3×3 Grid"),
+                choice("pro_video.guides", "Guides", "Assist", guideOptions(), "Rule of Thirds"),
                 choice("pro_video.exposure_display", "Exposure display", "Assist", exposureDisplayOptions(), "Off"),
                 // Both default OFF: wide-dynamic-range capture is a deliberate grading workflow.
                 choice("pro_video.hdr", "HDR video", "Dynamic range", listOf("Off", "On"), "Off"),
@@ -1519,7 +1534,7 @@ object CameraCatalog {
             choice("portrait_video.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
             choice("portrait_video.hdr", "HDR", "Dynamic range", listOf("Off", "On"), "Off"),
             toggle("portrait_video.audio_recording", "Audio recording", "Audio", "On"),
-            choice("portrait_video.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+            choice("portrait_video.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
         ),
     )
 
@@ -1562,7 +1577,7 @@ object CameraCatalog {
                 CameraFeatureStatus.NeedsVerification,
                 "Public Android high-speed sessions record SDR; On is available only if a device vendor path accepts high-speed HDR.",
             ),
-            choice("slow_motion.grid", "Grid lines and level", "Assist", gridOptions(), "3x3"),
+            choice("slow_motion.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
         ),
     )
 
@@ -1605,7 +1620,7 @@ object CameraCatalog {
                 choice("night_video.microphone", "Microphone", "Audio", microphoneSources(), "Auto"),
                 toggle("night_video.exposure_monitor", "Exposure monitor", "Assist"),
                 choice("night_video.guidelines", "Guidelines", "Assist", listOf("Off", "On"), "On"),
-                choice("night_video.grid", "Grid", "Assist", gridOptions(), "3x3"),
+                choice("night_video.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
                 choice("night_video.hdr", "HDR", "Assist", listOf("Off", "On"), "On"),
                 choice("night_video.log", "10-bit HLG", "Assist", listOf("Off", "On"), "Off"),
             ),
@@ -1651,17 +1666,26 @@ object CameraCatalog {
 
     private fun microphoneGainOptions(): List<String> = listOf("-12dB", "-6dB", "0dB", "+6dB", "+12dB")
 
-    private fun gridOptions(): List<String> = listOf("Off", "3x3", "Square")
+    private fun gridOptions(): List<String> = guideOptions()
 
     private fun guideOptions(): List<String> = listOf(
         "Off",
-        "3×3 Grid",
+        "Rule of Thirds",
+        "Phi Grid",
+        "Symmetry",
+        "Fibonacci Spiral Left",
+        "Fibonacci Spiral Right",
+        "Fibonacci Spiral Top Left",
+        "Fibonacci Spiral Top Right",
+        "Golden Triangles",
+        "Vanishing Point",
+        "Framing Depth",
+        "Landscape Depth",
+        "Leading Lines",
+        "Lines and Patterns",
         "4×4 Grid",
         "Square",
         "Diagonal",
-        "Golden Ratio",
-        "Fibonacci Left",
-        "Fibonacci Right",
     )
 
     private fun exposureDisplayOptions(): List<String> = listOf(

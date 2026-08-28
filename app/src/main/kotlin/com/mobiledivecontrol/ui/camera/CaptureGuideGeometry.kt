@@ -9,7 +9,7 @@ internal data class NormalizedGuideLine(
     val endY: Float,
 )
 
-/** An ellipse arc in normalized capture coordinates; radii may extend outside the viewport. */
+/** A quarter-ellipse arc in normalized capture coordinates. */
 internal data class NormalizedGuideArc(
     val centerX: Float,
     val centerY: Float,
@@ -26,10 +26,11 @@ internal data class FibonacciGuideGeometry(
 
 /**
  * Builds the standard Fibonacci guide: successive squares removed from a golden rectangle with
- * a tangent quarter-circle in each square. Left and right are exact horizontal mirrors.
+ * one tangent quarter-circle in each square. The eye can be reflected into any frame corner.
  */
 internal fun fibonacciGuideGeometry(
     eyeOnLeft: Boolean,
+    eyeOnTop: Boolean = false,
     iterations: Int = 8,
 ): FibonacciGuideGeometry {
     require(iterations > 0)
@@ -84,29 +85,55 @@ internal fun fibonacciGuideGeometry(
             }
         }
 
-        if (iteration < iterations - 1) lines += divider.normalizedAndMirrored(eyeOnLeft)
+        if (iteration < iterations - 1) {
+            lines += divider.normalizedAndMirrored(eyeOnLeft, eyeOnTop)
+        }
         arcs += NormalizedGuideArc(
             centerX = centerX / PHI,
             centerY = centerY,
             radiusX = side / PHI,
             radiusY = side,
             startAngle = startAngle,
-        ).mirroredIfNeeded(eyeOnLeft)
+        ).mirroredIfNeeded(eyeOnLeft, eyeOnTop)
     }
 
     return FibonacciGuideGeometry(lines = lines, arcs = arcs)
 }
 
-private fun NormalizedGuideLine.normalizedAndMirrored(eyeOnLeft: Boolean): NormalizedGuideLine {
-    val normalized = copy(startX = startX / PHI, endX = endX / PHI)
-    return if (!eyeOnLeft) normalized else normalized.copy(
-        startX = 1f - normalized.startX,
-        endX = 1f - normalized.endX,
-    )
+private fun NormalizedGuideLine.normalizedAndMirrored(
+    eyeOnLeft: Boolean,
+    eyeOnTop: Boolean,
+): NormalizedGuideLine {
+    var transformed = copy(startX = startX / PHI, endX = endX / PHI)
+    if (eyeOnLeft) {
+        transformed = transformed.copy(
+            startX = 1f - transformed.startX,
+            endX = 1f - transformed.endX,
+        )
+    }
+    if (eyeOnTop) {
+        transformed = transformed.copy(
+            startY = 1f - transformed.startY,
+            endY = 1f - transformed.endY,
+        )
+    }
+    return transformed
 }
 
-private fun NormalizedGuideArc.mirroredIfNeeded(eyeOnLeft: Boolean): NormalizedGuideArc {
-    if (!eyeOnLeft) return this
-    val mirroredStart = ((180f - startAngle - sweepAngle) % 360f + 360f) % 360f
-    return copy(centerX = 1f - centerX, startAngle = mirroredStart)
+private fun NormalizedGuideArc.mirroredIfNeeded(
+    eyeOnLeft: Boolean,
+    eyeOnTop: Boolean,
+): NormalizedGuideArc {
+    var transformed = this
+    if (eyeOnLeft) {
+        val mirroredStart = normalizeAngle(180f - transformed.startAngle - transformed.sweepAngle)
+        transformed = transformed.copy(centerX = 1f - transformed.centerX, startAngle = mirroredStart)
+    }
+    if (eyeOnTop) {
+        val mirroredStart = normalizeAngle(360f - transformed.startAngle - transformed.sweepAngle)
+        transformed = transformed.copy(centerY = 1f - transformed.centerY, startAngle = mirroredStart)
+    }
+    return transformed
 }
+
+private fun normalizeAngle(angle: Float): Float = ((angle % 360f) + 360f) % 360f

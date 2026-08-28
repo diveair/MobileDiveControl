@@ -65,6 +65,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -335,21 +336,52 @@ private fun CaptureGuideOverlay(
         ?: return
     val guide = CameraCatalog.currentValue(cameraState, guideSpec)
     if (guide == "Off") return
-    val guideColor = Color.White.copy(alpha = 0.52f)
+    val guideColor = Color.White.copy(alpha = 0.64f)
+    val constructionColor = Color.White.copy(alpha = 0.46f)
 
     Canvas(modifier = modifier) {
         val w = size.width
         val h = size.height
-        val stroke = 1.2.dp.toPx()
+        val stroke = 0.85.dp.toPx()
+        val guideDash = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 3.dp.toPx()))
+        val spiralDash = PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 4.dp.toPx()))
+        fun guideLine(
+            start: Offset,
+            end: Offset,
+            color: Color = guideColor,
+            width: Float = stroke,
+            pathEffect: PathEffect? = null,
+        ) = drawLine(
+            color = color,
+            start = start,
+            end = end,
+            strokeWidth = width,
+            pathEffect = pathEffect,
+        )
         fun vertical(fraction: Float) = drawLine(
             guideColor, Offset(w * fraction, 0f), Offset(w * fraction, h), stroke,
         )
         fun horizontal(fraction: Float) = drawLine(
             guideColor, Offset(0f, h * fraction), Offset(w, h * fraction), stroke,
         )
+        fun arrow(start: Offset, end: Offset) {
+            guideLine(start, end, pathEffect = guideDash)
+            val angle = kotlin.math.atan2((end.y - start.y).toDouble(), (end.x - start.x).toDouble())
+            val headLength = 15.dp.toPx()
+            val spread = Math.PI / 7.0
+            listOf(angle - spread, angle + spread).forEach { headAngle ->
+                guideLine(
+                    start = end,
+                    end = Offset(
+                        x = end.x - headLength * kotlin.math.cos(headAngle).toFloat(),
+                        y = end.y - headLength * kotlin.math.sin(headAngle).toFloat(),
+                    ),
+                )
+            }
+        }
 
         when (guide) {
-            "3x3", "3×3 Grid" -> {
+            "Rule of Thirds", "3x3", "3×3 Grid" -> {
                 vertical(1f / 3f); vertical(2f / 3f)
                 horizontal(1f / 3f); horizontal(2f / 3f)
             }
@@ -370,18 +402,35 @@ private fun CaptureGuideOverlay(
                 drawLine(guideColor, Offset.Zero, Offset(w, h), stroke)
                 drawLine(guideColor, Offset(w, 0f), Offset(0f, h), stroke)
             }
-            "Golden Ratio" -> {
-                vertical(0.382f); vertical(0.618f)
-                horizontal(0.382f); horizontal(0.618f)
+            "Phi Grid", "Golden Ratio" -> {
+                val major = 1f / 1.618033988749895f
+                val minor = 1f - major
+                vertical(minor); vertical(major)
+                horizontal(minor); horizontal(major)
             }
+            "Symmetry" -> {
+                vertical(0.5f)
+                horizontal(0.5f)
+                drawCircle(
+                    color = guideColor,
+                    radius = 4.dp.toPx(),
+                    center = Offset(w / 2f, h / 2f),
+                    style = Stroke(stroke),
+                )
+            }
+            "Fibonacci Spiral Left", "Fibonacci Spiral Right",
+            "Fibonacci Spiral Top Left", "Fibonacci Spiral Top Right",
             "Fibonacci Left", "Fibonacci Right" -> {
-                val geometry = fibonacciGuideGeometry(eyeOnLeft = guide.endsWith("Left"))
+                val geometry = fibonacciGuideGeometry(
+                    eyeOnLeft = guide.endsWith("Left"),
+                    eyeOnTop = guide.contains("Top"),
+                )
                 geometry.lines.forEach { line ->
-                    drawLine(
-                        color = guideColor,
+                    guideLine(
                         start = Offset(w * line.startX, h * line.startY),
                         end = Offset(w * line.endX, h * line.endY),
-                        strokeWidth = stroke,
+                        color = constructionColor,
+                        pathEffect = guideDash,
                     )
                 }
                 geometry.arcs.forEach { arc ->
@@ -398,8 +447,86 @@ private fun CaptureGuideOverlay(
                             w * arc.radiusX * 2f,
                             h * arc.radiusY * 2f,
                         ),
-                        style = Stroke(stroke * 1.5f),
+                        style = Stroke(stroke * 1.45f, pathEffect = spiralDash),
                     )
+                }
+            }
+            "Golden Triangles" -> {
+                val denominator = w * w + h * h
+                val topRightProjection = w * w / denominator
+                val bottomLeftProjection = h * h / denominator
+                guideLine(Offset.Zero, Offset(w, h))
+                guideLine(
+                    Offset(w, 0f),
+                    Offset(w * topRightProjection, h * topRightProjection),
+                )
+                guideLine(
+                    Offset(0f, h),
+                    Offset(w * bottomLeftProjection, h * bottomLeftProjection),
+                )
+            }
+            "Vanishing Point" -> {
+                val vanishingPoint = Offset(w * 0.5f, h * 0.42f)
+                val edgePoints = listOf(
+                    Offset.Zero,
+                    Offset(w * 0.25f, 0f),
+                    Offset(w * 0.5f, 0f),
+                    Offset(w * 0.75f, 0f),
+                    Offset(w, 0f),
+                    Offset(w, h * 0.5f),
+                    Offset(w, h),
+                    Offset(w * 0.75f, h),
+                    Offset(w * 0.5f, h),
+                    Offset(w * 0.25f, h),
+                    Offset(0f, h),
+                    Offset(0f, h * 0.5f),
+                )
+                edgePoints.forEach { guideLine(vanishingPoint, it) }
+                drawCircle(guideColor, 4.dp.toPx(), vanishingPoint)
+            }
+            "Framing Depth" -> {
+                val center = Offset(w / 2f, h / 2f)
+                val radius = minOf(w, h) * 0.24f
+                drawCircle(
+                    color = guideColor,
+                    radius = radius,
+                    center = center,
+                    style = Stroke(stroke),
+                )
+                repeat(8) { index ->
+                    val angle = index * Math.PI / 4.0
+                    val dx = kotlin.math.cos(angle).toFloat()
+                    val dy = kotlin.math.sin(angle).toFloat()
+                    guideLine(
+                        start = Offset(center.x + dx * radius, center.y + dy * radius),
+                        end = Offset(center.x + dx * radius * 1.48f, center.y + dy * radius * 1.48f),
+                    )
+                }
+            }
+            "Landscape Depth" -> {
+                val horizonY = h * 0.42f
+                val vanishingPoint = Offset(w / 2f, horizonY)
+                horizontal(0.42f)
+                listOf(0f, 0.2f, 0.4f, 0.6f, 0.8f, 1f).forEach { fraction ->
+                    guideLine(vanishingPoint, Offset(w * fraction, h))
+                }
+                listOf(0.56f, 0.70f, 0.84f).forEach { yFraction ->
+                    val progress = (yFraction - 0.42f) / (1f - 0.42f)
+                    guideLine(
+                        Offset(vanishingPoint.x * (1f - progress), h * yFraction),
+                        Offset(vanishingPoint.x + (w - vanishingPoint.x) * progress, h * yFraction),
+                    )
+                }
+            }
+            "Leading Lines" -> {
+                val target = Offset(w * 0.62f, h * 0.28f)
+                arrow(Offset(w * 0.06f, h * 0.82f), target)
+                arrow(Offset(w * 0.32f, h), target)
+                arrow(Offset(w * 0.78f, h), target)
+            }
+            "Lines and Patterns" -> {
+                repeat(7) { index ->
+                    vertical(0.2f + index * 0.1f)
                 }
             }
         }

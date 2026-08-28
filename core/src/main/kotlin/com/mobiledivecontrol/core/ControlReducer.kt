@@ -522,7 +522,7 @@ class ControlReducer(
                 // the compensation index does nothing, so the detent is refused, not absorbed.
                 Reduction(state = state)
             } else {
-                val currentValue = state.camera.settingValues[spec.id] ?: spec.defaultValue
+                val currentValue = CameraCatalog.currentValue(state.camera, spec)
                 val nextValue = if (CameraCatalog.isCircularSlider(spec)) {
                     advanceOption(currentValue, spec.options, command.step, wrap = true)
                 } else {
@@ -2000,7 +2000,7 @@ class ControlReducer(
             } else {
                 val shouldWrap = spec.kind != CameraSettingKind.Slider
                 val nextValue = advanceOption(
-                    currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue,
+                    currentValue = CameraCatalog.currentValue(preparedCamera, spec),
                     options = spec.options,
                     step = step,
                     wrap = shouldWrap,

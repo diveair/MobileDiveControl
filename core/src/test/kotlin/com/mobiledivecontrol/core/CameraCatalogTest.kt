@@ -70,6 +70,46 @@ class CameraCatalogTest {
     }
 
     @Test
+    fun `every camera guide menu exposes the complete composition guide set`() {
+        val requiredGuides = listOf(
+            "Rule of Thirds",
+            "Phi Grid",
+            "Symmetry",
+            "Fibonacci Spiral Left",
+            "Fibonacci Spiral Right",
+            "Fibonacci Spiral Top Left",
+            "Fibonacci Spiral Top Right",
+            "Golden Triangles",
+            "Vanishing Point",
+            "Framing Depth",
+            "Landscape Depth",
+            "Leading Lines",
+            "Lines and Patterns",
+        )
+        val guideSpecs = CameraCatalog.primaryRailEntries
+            .mapNotNull { it.mode }
+            .flatMap { CameraCatalog.settingsFor(it, GalaxyDeviceVariant.S26Ultra) }
+            .filter { it.id.endsWith(".grid") || it.id.endsWith(".guides") }
+
+        assertTrue(guideSpecs.isNotEmpty())
+        guideSpecs.forEach { spec ->
+            requiredGuides.forEach { guide -> assertContains(spec.options, guide) }
+            assertEquals("Rule of Thirds", spec.defaultValue)
+        }
+    }
+
+    @Test
+    fun `legacy golden guide selections migrate to their clarified names`() {
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
+            settingValues = mapOf("pro_video.guides" to "Golden Ratio"),
+        )
+        val spec = CameraCatalog.settingsFor(camera)
+            .first { it.id == "pro_video.guides" }
+
+        assertEquals("Phi Grid", CameraCatalog.currentValue(camera, spec))
+    }
+
+    @Test
     fun `slider defaults include manual controls`() {
         assertTrue("pro.iso" in CameraCatalog.defaultSliderSensitivities)
         assertTrue("expert.white_balance" in CameraCatalog.defaultSliderSensitivities)
