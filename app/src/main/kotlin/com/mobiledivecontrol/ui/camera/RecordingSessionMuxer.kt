@@ -174,7 +174,7 @@ internal object RecordingSessionMuxer {
                             scaledPtsUs,
                             (lastPtsByTrack[outputTrack] ?: -1L) + 1L,
                         )
-                        info.set(0, size, outputPtsUs, extractor.sampleFlags)
+                        info.set(0, size, outputPtsUs, muxerSampleFlags(extractor.sampleFlags))
                         muxer.writeSampleData(outputTrack, buffer, info)
                         lastPtsByTrack[outputTrack] = outputPtsUs
                         if (!extractor.advance()) break
@@ -319,7 +319,7 @@ internal object RecordingSessionMuxer {
                 greatestLocalPtsUs = max(greatestLocalPtsUs, localPtsUs)
                 val requestedPtsUs = sessionOffsetUs + localPtsUs
                 val outputPtsUs = max(requestedPtsUs, (lastOutputPtsUs[outputTrack] ?: -1L) + 1L)
-                bufferInfo.set(0, size, outputPtsUs, extractor.sampleFlags)
+                bufferInfo.set(0, size, outputPtsUs, muxerSampleFlags(extractor.sampleFlags))
                 muxer.writeSampleData(outputTrack, buffer, bufferInfo)
                 lastOutputPtsUs[outputTrack] = outputPtsUs
                 if (!extractor.advance()) break
@@ -333,6 +333,14 @@ internal object RecordingSessionMuxer {
             extractor.release()
         }
     }
+
+    /** MediaExtractor and MediaCodec reuse bit values for different flags; muxing needs keyframe only. */
+    private fun muxerSampleFlags(extractorFlags: Int): Int =
+        if (extractorFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) {
+            MediaCodec.BUFFER_FLAG_KEY_FRAME
+        } else {
+            0
+        }
 
     private fun validateCompatibleTrack(kind: String, format: MediaFormat) {
         val mime = format.getString(MediaFormat.KEY_MIME)
