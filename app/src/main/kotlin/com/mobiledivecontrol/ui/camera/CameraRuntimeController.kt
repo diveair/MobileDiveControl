@@ -6,7 +6,6 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.hardware.Sensor
@@ -182,9 +181,11 @@ class CameraRuntimeController(
         )
         private const val RESUME_STREAM_CHECK_DELAY_MS = 2_500L
         private const val DEFAULT_HORIZONTAL_FOV_DEGREES = 70.0
-        private const val PANORAMA_MAX_FRAMES = 12
+        private const val PANORAMA_MAX_FRAMES = 40
         private const val PANORAMA_TOO_FAST_RADIANS_PER_SECOND = 1.25f
-        private val PANORAMA_CAPTURE_SIZE = Size(1920, 1440)
+        private const val PANORAMA_THUMBNAIL_INTERVAL_MS = 100L
+        private val PANORAMA_CAPTURE_SIZE = Size(1280, 960)
+        private val PANORAMA_STORED_FRAME_SIZE = Size(960, 720)
 
         /** The native app's vendor "manual kelvin" AWB mode (AeAfController branch B). */
         /** XYZ (D65) to linear sRGB. */
@@ -539,16 +540,21 @@ class CameraRuntimeController(
     private val panoramaExecutor = Executors.newSingleThreadExecutor()
     private val panoramaFrames = mutableListOf<CapturedPanoramaFrame>()
     private var panoramaCaptureActive = false
-    private var panoramaCaptureInFlight = false
+    @Volatile private var panoramaCaptureInFlight = false
+    @Volatile private var panoramaFrameRequestClaimed = false
+    private val panoramaFrameRequestLock = Any()
+    private var panoramaRequestedRadians = 0f
     private var panoramaFinishPending = false
     private var panoramaSensorRegistered = false
     private var panoramaGeneration = 0
     private var panoramaLastSensorTimestampNs = 0L
     private var panoramaSweepRadians = 0f
+    private var panoramaCrossAxisRadians = 0f
     private var panoramaLastCapturedRadians = 0f
     private var panoramaDirection = "Right"
     private var panoramaDirectionPending = false
     private var panoramaMetadataSnapshot: CaptureMetadataSnapshot? = null
+    private var lastPanoramaThumbnailAtMs = 0L
 
     private val panoramaMotionListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
@@ -569,6 +575,7 @@ class CameraRuntimeController(
                 )
                 panoramaDirectionPending = false
                 PanoramaCaptureState.direction.value = panoramaDirection
+                PanoramaCaptureState.directionLocked.value = true
                 Log.i(TAG, "Panorama auto direction: $panoramaDirection")
             }
             val sweepRate = panoramaSweepAxisRate(
@@ -577,26 +584,46 @@ class CameraRuntimeController(
                 gyroX = event.values[0],
                 gyroY = event.values[1],
             )
+            val crossAxisRate = panoramaCrossAxisRate(
+                direction = panoramaDirection,
+                displayRotation = displayRotation,
+                gyroX = event.values[0],
+                gyroY = event.values[1],
+            )
+            panoramaCrossAxisRadians = (
+                panoramaCrossAxisRadians + crossAxisRate * elapsedSeconds
+                ).coerceIn(-0.34906584f, 0.34906584f)
+            PanoramaCaptureState.crossAxisRadians.value = panoramaCrossAxisRadians
+            val warningLevel = panoramaWarningLevel(panoramaCrossAxisRadians)
+            PanoramaCaptureState.warningLevel.value = warningLevel
+            PanoramaCaptureState.correction.value = panoramaCorrection(
+                direction = panoramaDirection,
+                crossAxisRadians = panoramaCrossAxisRadians,
+            )
             if (kotlin.math.abs(sweepRate) < 0.035f) {
                 PanoramaCaptureState.movingTooFast.value = false
+                PanoramaCaptureState.message.value = ""
                 return
             }
+            val wideAngle = boundLensValue == "0.6x"
+            val targetRadians = panoramaTargetRadians(panoramaDirection, wideAngle)
             panoramaSweepRadians = (panoramaSweepRadians + sweepRate * elapsedSeconds)
-                .coerceIn(0f, PANORAMA_TARGET_RADIANS)
-            PanoramaCaptureState.progress.value = panoramaProgressFraction(panoramaSweepRadians)
+                .coerceIn(0f, targetRadians)
+            PanoramaCaptureState.progress.value = panoramaProgressFraction(
+                sweepRadians = panoramaSweepRadians,
+                direction = panoramaDirection,
+                wideAngle = wideAngle,
+            )
             PanoramaCaptureState.movingTooFast.value =
                 kotlin.math.abs(sweepRate) > PANORAMA_TOO_FAST_RADIANS_PER_SECOND
-            PanoramaCaptureState.message.value = if (PanoramaCaptureState.movingTooFast.value) {
-                "MOVE SLOWLY"
-            } else {
-                "PAN ${panoramaDirection.uppercase()}"
-            }
+            PanoramaCaptureState.message.value =
+                if (PanoramaCaptureState.movingTooFast.value) "Move slowly" else ""
             if (!panoramaCaptureInFlight &&
                 panoramaSweepRadians - panoramaLastCapturedRadians >= PANORAMA_FRAME_STEP_RADIANS
             ) {
                 takePanoramaFrame()
             }
-            if (panoramaSweepRadians >= PANORAMA_TARGET_RADIANS &&
+            if (panoramaSweepRadians >= targetRadians &&
                 !panoramaCaptureInFlight && panoramaFrames.size >= 2
             ) {
                 finishPanoramaCapture()
@@ -2254,6 +2281,9 @@ class CameraRuntimeController(
                     ImageCapture.OUTPUT_FORMAT_JPEG
                 },
             )
+        val panoramaMode = latestState.activeMode ==
+            com.mobiledivecontrol.core.CameraModeId.Panorama
+        val analysisTargetSize = if (panoramaMode) PANORAMA_CAPTURE_SIZE else Size(640, 480)
         val analysisBuilder = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             // MediaPipe accepts RGB/RGBA. Keeping this one shared 640x480 stream avoids a second
@@ -2263,7 +2293,7 @@ class CameraRuntimeController(
                 ResolutionSelector.Builder()
                     .setResolutionStrategy(
                         ResolutionStrategy(
-                            Size(640, 480),
+                            analysisTargetSize,
                             ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
                         ),
                     )
@@ -2380,6 +2410,29 @@ class CameraRuntimeController(
             // here. The frame itself is closed immediately; nothing is read or retained.
             it.setAnalyzer(focusAssistExecutor) { image ->
                 val now = SystemClock.elapsedRealtime()
+                claimPanoramaAnalysisFrame()?.let { request ->
+                    val bitmap = runCatching { decodePanoramaAnalysisFrame(image) }
+                        .onFailure { error -> Log.e(TAG, "Could not copy panorama analysis frame", error) }
+                        .getOrNull()
+                    cameraRequestHandler.post {
+                        completePanoramaAnalysisFrame(
+                            bitmap = bitmap,
+                            generation = request.first,
+                            requestedRadians = request.second,
+                        )
+                    }
+                }
+                if (panoramaMode &&
+                    !panoramaCaptureActive &&
+                    !PanoramaCaptureState.finalizing.value &&
+                    now - lastPanoramaThumbnailAtMs >= PANORAMA_THUMBNAIL_INTERVAL_MS
+                ) {
+                    lastPanoramaThumbnailAtMs = now
+                    runCatching { decodePanoramaThumbnail(image) }
+                        .onFailure { error -> Log.w(TAG, "Could not update panorama thumbnail", error) }
+                        .getOrNull()
+                        ?.let(::publishPanoramaThumbnail)
+                }
                 if (underwaterModeEnabled(latestState) &&
                     now - lastUnderwaterAnalysisAtMs >= UNDERWATER_ANALYSIS_INTERVAL_MS
                 ) {
@@ -2407,7 +2460,7 @@ class CameraRuntimeController(
                     }
                 }
                 val callback = onPointingGesture
-                if (!latestState.recording && callback != null) {
+                if (!latestState.recording && !panoramaMode && callback != null) {
                     val recognizer = pointingRecognizer ?: PointingGestureRecognizer(context) { x, confidence ->
                         // An inference submitted just before Record may complete just after it;
                         // the second gate makes "not recording only" an invariant, not a race.
@@ -2517,15 +2570,19 @@ class CameraRuntimeController(
         videoInterop.setSessionCaptureCallback(sessionCaptureCallback)
         val video = videoBuilder.build()
         Log.i(TAG, "Video dynamic range=$requestedDynamicRange requestedMode=$desiredHdrLogMode")
-        videoCapture = video
+        videoCapture = video.takeUnless { panoramaMode }
 
         val useCaseGroup = UseCaseGroup.Builder()
             .addUseCase(preview)
-            .addUseCase(video)
             .addEffect(effect)
             .also { builder ->
-                if (!maximumInformationLog) {
-                    builder.addUseCase(capture).addUseCase(analysis)
+                when {
+                    panoramaMode -> builder.addUseCase(analysis)
+                    !maximumInformationLog -> builder
+                        .addUseCase(video)
+                        .addUseCase(capture)
+                        .addUseCase(analysis)
+                    else -> builder.addUseCase(video)
                 }
             }
             .build()
@@ -2563,7 +2620,7 @@ class CameraRuntimeController(
                 selectedCameraId != null &&
                 selectedCameraId == activeLensProfile?.physicalCameraId &&
                 selectedCameraId != backCameraProfile?.logicalCameraId
-            if (!triedDirectPhysicalCamera && !maximumInformationLog) {
+            if (!triedDirectPhysicalCamera && !maximumInformationLog && !panoramaMode) {
                 // Preview + ImageCapture + ImageAnalysis + VideoCapture can exceed a device's
                 // stream-combination budget. Shed the analysis leg — the least critical — and
                 // try once more before giving up.
@@ -2609,7 +2666,7 @@ class CameraRuntimeController(
                 "The bound camera has no public 10-bit HLG encoder surface; Log recording is blocked.",
             )
         }
-        imageCapture = capture.takeUnless { maximumInformationLog }
+        imageCapture = capture.takeUnless { maximumInformationLog || panoramaMode }
         imageAnalysis = analysis.takeUnless { maximumInformationLog }
         camera?.let { refreshBoundCameraCapabilities(it) }
         boundLensFacing = desiredLensFacing
@@ -4902,7 +4959,15 @@ class CameraRuntimeController(
 
     private fun capturePhoto() {
         if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Panorama) {
-            if (panoramaCaptureActive) finishPanoramaCapture() else startPanoramaCapture()
+            if (panoramaCaptureActive) {
+                if (panoramaFrames.size >= 2) {
+                    finishPanoramaCapture()
+                } else {
+                    PanoramaCaptureState.message.value = "Pan slowly in any direction."
+                }
+            } else {
+                startPanoramaCapture()
+            }
             return
         }
         val requestedMode = latestState.activeMode
@@ -4928,11 +4993,11 @@ class CameraRuntimeController(
             Toast.makeText(context, "Panorama is still saving", Toast.LENGTH_SHORT).show()
             return
         }
-        if (imageCapture == null) {
-            Log.w(TAG, "Panorama requested without ImageCapture; rebinding")
+        if (imageAnalysis == null) {
+            Log.w(TAG, "Panorama requested without ImageAnalysis; rebinding")
             bindCamera(force = true)
         }
-        if (imageCapture == null) {
+        if (imageAnalysis == null) {
             Toast.makeText(context, "Panorama camera is not ready", Toast.LENGTH_SHORT).show()
             return
         }
@@ -4940,12 +5005,18 @@ class CameraRuntimeController(
         panoramaGeneration++
         panoramaFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
         panoramaFrames.clear()
+        val oldReferenceFrame = PanoramaCaptureState.referenceFrame.value
         PanoramaCaptureState.reset()
+        oldReferenceFrame?.let { frame ->
+            cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 500L)
+        }
         panoramaCaptureActive = true
         panoramaCaptureInFlight = false
+        panoramaFrameRequestClaimed = false
         panoramaFinishPending = false
         panoramaLastSensorTimestampNs = 0L
         panoramaSweepRadians = 0f
+        panoramaCrossAxisRadians = 0f
         panoramaLastCapturedRadians = 0f
         val requestedDirection = currentValue(latestState, ".direction") ?: "Auto"
         panoramaDirectionPending = requestedDirection == "Auto"
@@ -4956,11 +5027,13 @@ class CameraRuntimeController(
         PanoramaCaptureState.progress.value = 0f
         PanoramaCaptureState.frameCount.value = 0
         PanoramaCaptureState.movingTooFast.value = false
+        PanoramaCaptureState.crossAxisRadians.value = 0f
         PanoramaCaptureState.direction.value = panoramaDirection
+        PanoramaCaptureState.directionLocked.value = !panoramaDirectionPending
         PanoramaCaptureState.message.value = if (panoramaDirectionPending) {
-            "PAN SLOWLY IN ANY DIRECTION"
+            "Pan slowly in any direction."
         } else {
-            "PAN ${panoramaDirection.uppercase()}"
+            "Pan ${panoramaDirection.lowercase()}"
         }
         setPanorama3ALock(true)
         val sensor = gyroscope
@@ -4975,7 +5048,7 @@ class CameraRuntimeController(
 
     private fun takePanoramaFrame() {
         if (!panoramaCaptureActive || panoramaCaptureInFlight) return
-        val capture = imageCapture ?: run {
+        if (imageAnalysis == null) {
             cancelPanoramaCapture("Panorama camera stopped")
             return
         }
@@ -4983,67 +5056,61 @@ class CameraRuntimeController(
             finishPanoramaCapture()
             return
         }
-        val generation = panoramaGeneration
-        val requestedRadians = panoramaSweepRadians
-        panoramaCaptureInFlight = true
-        capture.takePicture(
-            ContextCompat.getMainExecutor(context),
-            object : ImageCapture.OnImageCapturedCallback() {
-                override fun onCaptureSuccess(image: androidx.camera.core.ImageProxy) {
-                    val bitmap = try {
-                        decodePanoramaFrame(image)
-                    } finally {
-                        image.close()
-                    }
-                    if (generation != panoramaGeneration) {
-                        bitmap?.recycle()
-                        return
-                    }
-                    panoramaCaptureInFlight = false
-                    if (bitmap == null) {
-                        handlePanoramaFrameFailure("Could not decode panorama frame")
-                        return
-                    }
-                    val normalized = normalizePanoramaFrame(bitmap)
-                    if (normalized !== bitmap) bitmap.recycle()
-                    panoramaFrames += CapturedPanoramaFrame(normalized, requestedRadians)
-                    panoramaLastCapturedRadians = requestedRadians
-                    PanoramaCaptureState.frameCount.value = panoramaFrames.size
-                    if (panoramaFrames.size == 1) {
-                        val referenceWidth = 360.coerceAtMost(normalized.width)
-                        val referenceHeight = (
-                            normalized.height * referenceWidth.toFloat() / normalized.width
-                            ).roundToInt().coerceAtLeast(1)
-                        PanoramaCaptureState.replaceReferenceFrame(
-                            Bitmap.createScaledBitmap(
-                                normalized,
-                                referenceWidth,
-                                referenceHeight,
-                                true,
-                            ),
-                        )
-                    }
-                    Log.d(
-                        TAG,
-                        "Panorama frame ${panoramaFrames.size}: " +
-                            "${normalized.width}x${normalized.height} sweep=$requestedRadians",
-                    )
-                    when {
-                        panoramaFinishPending -> finalizePanoramaFrames()
-                        panoramaSweepRadians >= PANORAMA_TARGET_RADIANS -> finishPanoramaCapture()
-                        panoramaSweepRadians - panoramaLastCapturedRadians >= PANORAMA_FRAME_STEP_RADIANS ->
-                            takePanoramaFrame()
-                    }
-                }
+        synchronized(panoramaFrameRequestLock) {
+            panoramaRequestedRadians = panoramaSweepRadians
+            panoramaFrameRequestClaimed = false
+            panoramaCaptureInFlight = true
+        }
+    }
 
-                override fun onError(exception: ImageCaptureException) {
-                    if (generation != panoramaGeneration) return
-                    panoramaCaptureInFlight = false
-                    Log.e(TAG, "Panorama frame capture failed", exception)
-                    handlePanoramaFrameFailure(exception.message ?: "Panorama capture failed")
-                }
-            },
+    /** Claims one frame from CameraX's repeating RGBA stream without interrupting Preview. */
+    private fun claimPanoramaAnalysisFrame(): Pair<Int, Float>? =
+        synchronized(panoramaFrameRequestLock) {
+            if (!panoramaCaptureActive || !panoramaCaptureInFlight || panoramaFrameRequestClaimed) {
+                null
+            } else {
+                panoramaFrameRequestClaimed = true
+                panoramaGeneration to panoramaRequestedRadians
+            }
+        }
+
+    private fun completePanoramaAnalysisFrame(
+        bitmap: Bitmap?,
+        generation: Int,
+        requestedRadians: Float,
+    ) {
+        synchronized(panoramaFrameRequestLock) {
+            panoramaCaptureInFlight = false
+            panoramaFrameRequestClaimed = false
+        }
+        if (generation != panoramaGeneration) {
+            bitmap?.recycle()
+            return
+        }
+        if (bitmap == null) {
+            handlePanoramaFrameFailure("Could not copy panorama frame")
+            return
+        }
+        val normalized = normalizePanoramaFrame(bitmap)
+        if (normalized !== bitmap) bitmap.recycle()
+        panoramaFrames += CapturedPanoramaFrame(normalized, requestedRadians)
+        panoramaLastCapturedRadians = requestedRadians
+        PanoramaCaptureState.frameCount.value = panoramaFrames.size
+        PanoramaCaptureState.canStop.value = panoramaFrames.size >= 2
+        Log.d(
+            TAG,
+            "Panorama stream frame ${panoramaFrames.size}: " +
+                "${normalized.width}x${normalized.height} sweep=$requestedRadians",
         )
+        when {
+            panoramaFinishPending -> finalizePanoramaFrames()
+            panoramaSweepRadians >= panoramaTargetRadians(
+                direction = panoramaDirection,
+                wideAngle = boundLensValue == "0.6x",
+            ) -> finishPanoramaCapture()
+            panoramaSweepRadians - panoramaLastCapturedRadians >= PANORAMA_FRAME_STEP_RADIANS ->
+                takePanoramaFrame()
+        }
     }
 
     private fun handlePanoramaFrameFailure(message: String) {
@@ -5053,7 +5120,7 @@ class CameraRuntimeController(
         } else if (panoramaFinishPending) {
             finalizePanoramaFrames()
         } else {
-            PanoramaCaptureState.message.value = "HOLD STEADY"
+            PanoramaCaptureState.message.value = "Move slowly"
         }
     }
 
@@ -5062,9 +5129,18 @@ class CameraRuntimeController(
         panoramaCaptureActive = false
         PanoramaCaptureState.active.value = false
         PanoramaCaptureState.finalizing.value = true
-        PanoramaCaptureState.message.value = "STITCHING PANORAMA"
+        PanoramaCaptureState.message.value = "Saving panorama…"
         unregisterPanoramaSensor()
-        if (panoramaCaptureInFlight) {
+        val waitForClaimedFrame = synchronized(panoramaFrameRequestLock) {
+            if (panoramaCaptureInFlight && panoramaFrameRequestClaimed) {
+                true
+            } else {
+                panoramaCaptureInFlight = false
+                panoramaFrameRequestClaimed = false
+                false
+            }
+        }
+        if (waitForClaimedFrame) {
             panoramaFinishPending = true
         } else {
             finalizePanoramaFrames()
@@ -5075,6 +5151,7 @@ class CameraRuntimeController(
         panoramaFinishPending = false
         panoramaDirectionPending = false
         panoramaCaptureInFlight = false
+        panoramaFrameRequestClaimed = false
         val frames = panoramaFrames.toList()
         panoramaFrames.clear()
         if (frames.isEmpty()) {
@@ -5089,9 +5166,14 @@ class CameraRuntimeController(
         panoramaMetadataSnapshot = null
         val saveLocation = latestState.recordingSaveLocation
         val displayName = "DiveControl_Panorama_${System.currentTimeMillis()}.jpg"
+        val horizontalFovRadians = Math.toRadians(horizontalFovDegrees()).toFloat()
         panoramaExecutor.execute {
             val result = runCatching {
-                val stitched = PanoramaBitmapStitcher.stitch(frames, direction)
+                val stitched = PanoramaBitmapStitcher.stitch(
+                    frames = frames,
+                    direction = direction,
+                    horizontalFovRadians = horizontalFovRadians,
+                )
                 try {
                     publishPanorama(stitched, displayName, saveLocation)
                 } finally {
@@ -5108,11 +5190,11 @@ class CameraRuntimeController(
                         }
                     }
                     Log.i(TAG, "Panorama saved: frames=${frames.size} uri=$uri")
-                    PanoramaCaptureState.message.value = "PANORAMA SAVED"
+                    PanoramaCaptureState.message.value = "Panorama saved"
                     Toast.makeText(context, "Panorama saved", Toast.LENGTH_SHORT).show()
                 }.onFailure { error ->
                     Log.e(TAG, "Panorama stitch/save failed", error)
-                    PanoramaCaptureState.message.value = "PANORAMA FAILED"
+                    PanoramaCaptureState.message.value = "Can't create panorama. Not enough detail in scene."
                     Toast.makeText(
                         context,
                         "Panorama failed: ${error.message}",
@@ -5123,7 +5205,7 @@ class CameraRuntimeController(
                 PanoramaCaptureState.frameCount.value = 0
                 PanoramaCaptureState.progress.value = 0f
                 PanoramaCaptureState.movingTooFast.value = false
-                PanoramaCaptureState.replaceReferenceFrame(null)
+                PanoramaCaptureState.crossAxisRadians.value = 0f
                 setPanorama3ALock(false)
                 cameraRequestHandler.postDelayed({
                     if (!PanoramaCaptureState.active.value && !PanoramaCaptureState.finalizing.value) {
@@ -5138,13 +5220,19 @@ class CameraRuntimeController(
         panoramaGeneration++
         panoramaCaptureActive = false
         panoramaCaptureInFlight = false
+        panoramaFrameRequestClaimed = false
         panoramaFinishPending = false
         panoramaDirectionPending = false
         unregisterPanoramaSensor()
         panoramaFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
         panoramaFrames.clear()
         panoramaMetadataSnapshot = null
+        panoramaCrossAxisRadians = 0f
+        val oldReferenceFrame = PanoramaCaptureState.referenceFrame.value
         PanoramaCaptureState.reset()
+        oldReferenceFrame?.let { frame ->
+            cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 500L)
+        }
         if (message.isNotBlank()) PanoramaCaptureState.message.value = message
         setPanorama3ALock(false)
     }
@@ -5173,13 +5261,96 @@ class CameraRuntimeController(
         }
     }
 
-    private fun decodePanoramaFrame(image: androidx.camera.core.ImageProxy): Bitmap? {
+    /** Copies a selected RGBA analysis frame; unlike ImageCapture this never changes the request. */
+    private fun decodePanoramaAnalysisFrame(image: androidx.camera.core.ImageProxy): Bitmap? {
         val plane = image.planes.firstOrNull() ?: return null
+        val buffer = plane.buffer
+        var decoded = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+        val packedRowBytes = image.width * 4
+        if (plane.pixelStride == 4 && plane.rowStride == packedRowBytes) {
+            decoded.copyPixelsFromBuffer(buffer.duplicate().apply { rewind() })
+        } else {
+            val pixels = IntArray(image.width * image.height)
+            for (y in 0 until image.height) {
+                val rowOffset = y * plane.rowStride
+                for (x in 0 until image.width) {
+                    val offset = rowOffset + x * plane.pixelStride
+                    val red = buffer.get(offset).toInt() and 0xff
+                    val green = buffer.get(offset + 1).toInt() and 0xff
+                    val blue = buffer.get(offset + 2).toInt() and 0xff
+                    val alpha = buffer.get(offset + 3).toInt() and 0xff
+                    pixels[y * image.width + x] =
+                        (alpha shl 24) or (red shl 16) or (green shl 8) or blue
+                }
+            }
+            decoded.setPixels(pixels, 0, image.width, 0, 0, image.width, image.height)
+        }
+        return orientPanoramaBitmap(decoded, image.imageInfo.rotationDegrees)
+    }
+
+    /**
+     * Builds the native guide's live miniature directly from the RGBA analysis plane. Sampling
+     * only 264 pixels across keeps this below one percent of the work of copying a full frame and
+     * avoids the PreviewView bitmap reads which previously stalled the visible camera surface.
+     */
+    private fun decodePanoramaThumbnail(image: androidx.camera.core.ImageProxy): Bitmap? {
+        val plane = image.planes.firstOrNull() ?: return null
+        if (plane.pixelStride < 4) return null
         val buffer = plane.buffer.duplicate().apply { rewind() }
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-        var decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
-        val rotation = image.imageInfo.rotationDegrees
+        val sampleWidth = 264
+        val sampleHeight = (sampleWidth * image.height.toFloat() / image.width)
+            .roundToInt()
+            .coerceAtLeast(1)
+        val pixels = IntArray(sampleWidth * sampleHeight)
+        for (y in 0 until sampleHeight) {
+            val sourceY = (y * image.height / sampleHeight).coerceAtMost(image.height - 1)
+            val rowOffset = sourceY * plane.rowStride
+            for (x in 0 until sampleWidth) {
+                val sourceX = (x * image.width / sampleWidth).coerceAtMost(image.width - 1)
+                val offset = rowOffset + sourceX * plane.pixelStride
+                if (offset + 3 >= buffer.limit()) return null
+                val red = buffer.get(offset).toInt() and 0xff
+                val green = buffer.get(offset + 1).toInt() and 0xff
+                val blue = buffer.get(offset + 2).toInt() and 0xff
+                val alpha = buffer.get(offset + 3).toInt() and 0xff
+                pixels[y * sampleWidth + x] =
+                    (alpha shl 24) or (red shl 16) or (green shl 8) or blue
+            }
+        }
+        val sampled = Bitmap.createBitmap(
+            pixels,
+            sampleWidth,
+            sampleHeight,
+            Bitmap.Config.ARGB_8888,
+        )
+        val oriented = orientPanoramaBitmap(sampled, image.imageInfo.rotationDegrees)
+        val targetRatio = 1.5f
+        val currentRatio = oriented.width.toFloat() / oriented.height
+        val cropWidth = if (currentRatio > targetRatio) {
+            (oriented.height * targetRatio).roundToInt()
+        } else {
+            oriented.width
+        }
+        val cropHeight = if (currentRatio > targetRatio) {
+            oriented.height
+        } else {
+            (oriented.width / targetRatio).roundToInt()
+        }
+        val cropped = Bitmap.createBitmap(
+            oriented,
+            (oriented.width - cropWidth) / 2,
+            (oriented.height - cropHeight) / 2,
+            cropWidth,
+            cropHeight,
+        )
+        if (cropped !== oriented) oriented.recycle()
+        val thumbnail = Bitmap.createScaledBitmap(cropped, 132, 88, true)
+        if (thumbnail !== cropped) cropped.recycle()
+        return thumbnail
+    }
+
+    private fun orientPanoramaBitmap(source: Bitmap, rotation: Int): Bitmap {
+        var decoded = source
         if (rotation != 0) {
             val rotated = Bitmap.createBitmap(
                 decoded,
@@ -5211,6 +5382,23 @@ class CameraRuntimeController(
         return decoded
     }
 
+    private fun publishPanoramaThumbnail(thumbnail: Bitmap) {
+        cameraRequestHandler.post {
+            if (latestState.activeMode != com.mobiledivecontrol.core.CameraModeId.Panorama ||
+                panoramaCaptureActive ||
+                PanoramaCaptureState.finalizing.value
+            ) {
+                thumbnail.recycle()
+                return@post
+            }
+            val previous = PanoramaCaptureState.referenceFrame.value
+            PanoramaCaptureState.referenceFrame.value = thumbnail
+            previous?.let { frame ->
+                cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 500L)
+            }
+        }
+    }
+
     private fun normalizePanoramaFrame(bitmap: Bitmap): Bitmap {
         val reference = panoramaFrames.firstOrNull()?.bitmap
         val targetWidth: Int
@@ -5221,8 +5409,8 @@ class CameraRuntimeController(
         } else {
             val scale = minOf(
                 1f,
-                PANORAMA_CAPTURE_SIZE.width.toFloat() / bitmap.width,
-                PANORAMA_CAPTURE_SIZE.height.toFloat() / bitmap.height,
+                PANORAMA_STORED_FRAME_SIZE.width.toFloat() / bitmap.width,
+                PANORAMA_STORED_FRAME_SIZE.height.toFloat() / bitmap.height,
             )
             targetWidth = (bitmap.width * scale).roundToInt().coerceAtLeast(1)
             targetHeight = (bitmap.height * scale).roundToInt().coerceAtLeast(1)

@@ -10,6 +10,12 @@ import android.util.Size
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.Canvas
@@ -66,6 +72,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -150,6 +157,7 @@ fun CameraShellScreen(
         )
         ModeGuideOverlay(
             cameraState = cameraState,
+            onCommand = onCameraCommand,
             modifier = Modifier.fillMaxSize(),
         )
 
@@ -525,6 +533,7 @@ private fun CaptureGuideOverlay(
 @Composable
 private fun ModeGuideOverlay(
     cameraState: CameraState,
+    onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val settings = CameraCatalog.settingsFor(cameraState)
@@ -536,7 +545,12 @@ private fun ModeGuideOverlay(
             val progress by PanoramaCaptureState.progress
             val movingTooFast by PanoramaCaptureState.movingTooFast
             val detectedDirection by PanoramaCaptureState.direction
+            val directionLocked by PanoramaCaptureState.directionLocked
             val message by PanoramaCaptureState.message
+            val crossAxisRadians by PanoramaCaptureState.crossAxisRadians
+            val warningLevel by PanoramaCaptureState.warningLevel
+            val correction by PanoramaCaptureState.correction
+            val canStop by PanoramaCaptureState.canStop
             val referenceFrame by PanoramaCaptureState.referenceFrame
             if (CameraCatalog.currentValue(cameraState, guide) != "On" && !active && !finalizing) return
             val direction = settings.firstOrNull { it.id == "panorama.direction" }
@@ -549,7 +563,13 @@ private fun ModeGuideOverlay(
                 progress = progress,
                 movingTooFast = movingTooFast,
                 message = message,
+                directionLocked = directionLocked,
+                crossAxisRadians = crossAxisRadians,
+                warningLevel = warningLevel,
+                correction = correction,
+                canStop = canStop,
                 referenceFrame = referenceFrame,
+                onShutter = { onCommand(CameraCommand.CapturePhoto) },
                 modifier = modifier,
             )
         }
@@ -562,10 +582,7 @@ private fun ModeGuideOverlay(
     }
 }
 
-/**
- * Start-frame window, live sweep progress and speed warning modelled on Samsung Camera's
- * Panorama guide. The first shutter starts frame collection; the second completes the stitch.
- */
+/** Samsung Panorama's observed idle, direction-lock, correction, stop and saving states. */
 @Composable
 private fun PanoramaGuideOverlay(
     direction: String,
@@ -574,148 +591,263 @@ private fun PanoramaGuideOverlay(
     progress: Float,
     movingTooFast: Boolean,
     message: String,
+    directionLocked: Boolean,
+    crossAxisRadians: Float,
+    warningLevel: PanoramaWarningLevel,
+    correction: PanoramaCorrection,
+    canStop: Boolean,
     referenceFrame: Bitmap?,
+    onShutter: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier) {
         val horizontal = direction == "Auto" || direction == "Left" || direction == "Right"
-        if (active && referenceFrame != null) {
-            Image(
-                bitmap = referenceFrame.asImageBitmap(),
-                contentDescription = "Panorama starting frame",
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .then(
-                        if (horizontal) {
-                            Modifier.width(136.dp).height(82.dp)
-                        } else {
-                            Modifier.width(82.dp).height(136.dp)
-                        },
+        val arrowTransition = rememberInfiniteTransition(label = "panorama-arrow")
+        val arrowSwing by arrowTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 4.5f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 500, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "panorama-arrow-swing",
+        )
+
+        if (!active && !finalizing) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val frameWidth = if (horizontal) 132.dp.toPx() else 88.dp.toPx()
+                val frameHeight = if (horizontal) 88.dp.toPx() else 132.dp.toPx()
+                val groupWidth = if (horizontal) 248.dp.toPx() else frameWidth
+                val groupHeight = if (horizontal) frameHeight else 248.dp.toPx()
+                val left = center.x - groupWidth / 2f
+                val top = center.y - groupHeight / 2f
+                drawRect(
+                    color = Color(0x3D222222),
+                    topLeft = Offset(left, top),
+                    size = androidx.compose.ui.geometry.Size(groupWidth, groupHeight),
+                )
+            }
+            referenceFrame?.takeUnless(Bitmap::isRecycled)?.let { frame ->
+                Image(
+                    bitmap = frame.asImageBitmap(),
+                    contentDescription = "Preview thumbnail guide",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(
+                            width = if (horizontal) 132.dp else 88.dp,
+                            height = if (horizontal) 88.dp else 132.dp,
+                        ),
+                )
+            }
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val frameWidth = if (horizontal) 132.dp.toPx() else 88.dp.toPx()
+                val frameHeight = if (horizontal) 88.dp.toPx() else 132.dp.toPx()
+                val groupWidth = if (horizontal) 248.dp.toPx() else frameWidth
+                val groupHeight = if (horizontal) frameHeight else 248.dp.toPx()
+                val left = center.x - groupWidth / 2f
+                val top = center.y - groupHeight / 2f
+                val border = Color.White
+                val borderWidth = 0.5.dp.toPx()
+                val sideZone = if (horizontal) (groupWidth - frameWidth) / 2f else
+                    (groupHeight - frameHeight) / 2f
+                drawRect(
+                    color = border,
+                    topLeft = Offset(left, top),
+                    size = androidx.compose.ui.geometry.Size(groupWidth, groupHeight),
+                    style = Stroke(borderWidth),
+                )
+                if (horizontal) {
+                    drawLine(border, Offset(left + sideZone, top), Offset(left + sideZone, top + groupHeight), borderWidth)
+                    drawLine(border, Offset(left + groupWidth - sideZone, top), Offset(left + groupWidth - sideZone, top + groupHeight), borderWidth)
+                    drawPanoramaChevron(
+                        center = Offset(left + sideZone / 2f - arrowSwing.dp.toPx(), center.y),
+                        direction = PanoramaCorrection.Left,
+                        color = border,
                     )
-                    .clip(RoundedCornerShape(4.dp)),
-            )
-        }
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val guideWidth = if (horizontal) {
-                minOf(260.dp.toPx(), size.width * 0.58f)
-            } else {
-                minOf(96.dp.toPx(), size.width * 0.30f)
-            }
-            val guideHeight = if (horizontal) {
-                minOf(96.dp.toPx(), size.height * 0.42f)
-            } else {
-                minOf(260.dp.toPx(), size.height * 0.68f)
-            }
-            val left = (size.width - guideWidth) / 2f
-            val top = (size.height - guideHeight) / 2f
-            val side = if (horizontal) guideWidth * 0.23f else guideWidth
-            val end = if (horizontal) guideHeight else guideHeight * 0.19f
-            val stroke = 2.dp.toPx()
-            val border = Color.White.copy(alpha = 0.90f)
-            val shade = DiveColors.DeepBlack.copy(alpha = 0.48f)
-
-            drawRoundRect(
-                color = border,
-                topLeft = Offset(left, top),
-                size = androidx.compose.ui.geometry.Size(guideWidth, guideHeight),
-                cornerRadius = androidx.compose.ui.geometry.CornerRadius(7.dp.toPx()),
-                style = Stroke(stroke),
-            )
-            if (horizontal) {
-                drawRect(shade, Offset(left, top), androidx.compose.ui.geometry.Size(side, guideHeight))
-                drawRect(
-                    shade,
-                    Offset(left + guideWidth - side, top),
-                    androidx.compose.ui.geometry.Size(side, guideHeight),
-                )
-                drawLine(border, Offset(left + side, top), Offset(left + side, top + guideHeight), stroke)
-                drawLine(
-                    border,
-                    Offset(left + guideWidth - side, top),
-                    Offset(left + guideWidth - side, top + guideHeight),
-                    stroke,
-                )
-                fun chevron(cx: Float, pointsRight: Boolean, emphasized: Boolean) {
-                    val dx = 14.dp.toPx() * if (pointsRight) 1f else -1f
-                    val dy = 18.dp.toPx()
-                    val colour = if (emphasized) DiveColors.DiveCyan else border
-                    drawLine(colour, Offset(cx - dx, center.y - dy), Offset(cx, center.y), stroke * 2f)
-                    drawLine(colour, Offset(cx, center.y), Offset(cx - dx, center.y + dy), stroke * 2f)
-                }
-                chevron(
-                    left + side * 0.52f,
-                    pointsRight = false,
-                    emphasized = direction == "Auto" || direction == "Left",
-                )
-                chevron(
-                    left + guideWidth - side * 0.52f,
-                    pointsRight = true,
-                    emphasized = direction == "Auto" || direction == "Right",
-                )
-            } else {
-                drawRect(shade, Offset(left, top), androidx.compose.ui.geometry.Size(guideWidth, end))
-                drawRect(
-                    shade,
-                    Offset(left, top + guideHeight - end),
-                    androidx.compose.ui.geometry.Size(guideWidth, end),
-                )
-                drawLine(border, Offset(left, top + end), Offset(left + guideWidth, top + end), stroke)
-                drawLine(
-                    border,
-                    Offset(left, top + guideHeight - end),
-                    Offset(left + guideWidth, top + guideHeight - end),
-                    stroke,
-                )
-                fun chevron(cy: Float, pointsDown: Boolean, emphasized: Boolean) {
-                    val dx = 18.dp.toPx()
-                    val dy = 14.dp.toPx() * if (pointsDown) 1f else -1f
-                    val colour = if (emphasized) DiveColors.DiveCyan else border
-                    drawLine(colour, Offset(center.x - dx, cy - dy), Offset(center.x, cy), stroke * 2f)
-                    drawLine(colour, Offset(center.x, cy), Offset(center.x + dx, cy - dy), stroke * 2f)
-                }
-                chevron(top + end * 0.52f, pointsDown = false, emphasized = direction == "Up")
-                chevron(top + guideHeight - end * 0.52f, pointsDown = true, emphasized = direction == "Down")
-            }
-
-            if (active) {
-                val trackStart = if (horizontal) {
-                    Offset(left + side, center.y)
+                    drawPanoramaChevron(
+                        center = Offset(left + groupWidth - sideZone / 2f + arrowSwing.dp.toPx(), center.y),
+                        direction = PanoramaCorrection.Right,
+                        color = border,
+                    )
                 } else {
-                    Offset(center.x, top + end)
+                    drawLine(border, Offset(left, top + sideZone), Offset(left + groupWidth, top + sideZone), borderWidth)
+                    drawLine(border, Offset(left, top + groupHeight - sideZone), Offset(left + groupWidth, top + groupHeight - sideZone), borderWidth)
+                    drawPanoramaChevron(
+                        center = Offset(center.x, top + sideZone / 2f - arrowSwing.dp.toPx()),
+                        direction = PanoramaCorrection.Up,
+                        color = border,
+                    )
+                    drawPanoramaChevron(
+                        center = Offset(center.x, top + groupHeight - sideZone / 2f + arrowSwing.dp.toPx()),
+                        direction = PanoramaCorrection.Down,
+                        color = border,
+                    )
                 }
-                val trackEnd = if (horizontal) {
-                    Offset(left + guideWidth - side, center.y)
+            }
+        } else if (active) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val frameWidth = if (horizontal) 132.dp.toPx() else 88.dp.toPx()
+                val frameHeight = if (horizontal) 88.dp.toPx() else 132.dp.toPx()
+                val travel = if (horizontal) {
+                    minOf(330.dp.toPx(), size.width * 0.32f)
                 } else {
-                    Offset(center.x, top + guideHeight - end)
+                    minOf(210.dp.toPx(), size.height * 0.34f)
                 }
-                val directedProgress = if (direction == "Left" || direction == "Up") 1f - progress else progress
-                val marker = Offset(
-                    trackStart.x + (trackEnd.x - trackStart.x) * directedProgress,
-                    trackStart.y + (trackEnd.y - trackStart.y) * directedProgress,
+                val mainSign = if (direction == "Left" || direction == "Up") -1f else 1f
+                val crossFraction = panoramaGuideCrossFraction(crossAxisRadians)
+                val crossTravel = if (horizontal) 52.dp.toPx() else 58.dp.toPx()
+                val currentCenter = if (!directionLocked) {
+                    center
+                } else if (horizontal) {
+                    Offset(
+                        center.x + mainSign * progress.coerceIn(0f, 1f) * travel,
+                        center.y - crossFraction * crossTravel,
+                    )
+                } else {
+                    Offset(
+                        center.x + crossFraction * crossTravel,
+                        center.y + mainSign * progress.coerceIn(0f, 1f) * travel,
+                    )
+                }
+                val corridorLeft = minOf(center.x, currentCenter.x) - frameWidth / 2f
+                val corridorTop = minOf(center.y, currentCenter.y) - frameHeight / 2f
+                val corridorRight = maxOf(center.x, currentCenter.x) + frameWidth / 2f
+                val corridorBottom = maxOf(center.y, currentCenter.y) + frameHeight / 2f
+                drawRect(
+                    color = Color(0x3D222222),
+                    topLeft = Offset(corridorLeft, corridorTop),
+                    size = androidx.compose.ui.geometry.Size(
+                        corridorRight - corridorLeft,
+                        corridorBottom - corridorTop,
+                    ),
                 )
-                drawLine(border.copy(alpha = 0.45f), trackStart, trackEnd, stroke * 2f)
-                drawLine(DiveColors.DiveCyan, if (direction == "Left" || direction == "Up") trackEnd else trackStart, marker, stroke * 3f)
-                drawCircle(
-                    color = if (movingTooFast) DiveColors.Warning else DiveColors.DiveCyan,
-                    radius = 8.dp.toPx(),
-                    center = marker,
+                drawRect(
+                    color = Color.White.copy(alpha = 0.45f),
+                    topLeft = Offset(corridorLeft, corridorTop),
+                    size = androidx.compose.ui.geometry.Size(
+                        corridorRight - corridorLeft,
+                        corridorBottom - corridorTop,
+                    ),
+                    style = Stroke(0.5.dp.toPx()),
                 )
+                val warningColor = Color(0xFFFFD90D)
+                val guideColor = if (warningLevel == PanoramaWarningLevel.None) {
+                    Color.White
+                } else {
+                    warningColor.copy(alpha = if (warningLevel == PanoramaWarningLevel.High) 1f else 0.82f)
+                }
+                drawRect(
+                    color = guideColor,
+                    topLeft = Offset(
+                        currentCenter.x - frameWidth / 2f,
+                        currentCenter.y - frameHeight / 2f,
+                    ),
+                    size = androidx.compose.ui.geometry.Size(frameWidth, frameHeight),
+                    style = Stroke(4.dp.toPx()),
+                )
+                when {
+                    correction != PanoramaCorrection.None -> {
+                        val arrowCenter = when (correction) {
+                            PanoramaCorrection.Up -> Offset(currentCenter.x, currentCenter.y - frameHeight / 2f - 14.dp.toPx())
+                            PanoramaCorrection.Down -> Offset(currentCenter.x, currentCenter.y + frameHeight / 2f + 14.dp.toPx())
+                            PanoramaCorrection.Left -> Offset(currentCenter.x - frameWidth / 2f - 14.dp.toPx(), currentCenter.y)
+                            PanoramaCorrection.Right -> Offset(currentCenter.x + frameWidth / 2f + 14.dp.toPx(), currentCenter.y)
+                            PanoramaCorrection.None -> currentCenter
+                        }
+                        drawPanoramaChevron(arrowCenter, correction, warningColor)
+                    }
+                    !directionLocked -> {
+                        drawPanoramaChevron(Offset(center.x - frameWidth / 2f - 14.dp.toPx(), center.y), PanoramaCorrection.Left, Color.White)
+                        drawPanoramaChevron(Offset(center.x + frameWidth / 2f + 14.dp.toPx(), center.y), PanoramaCorrection.Right, Color.White)
+                        drawPanoramaChevron(Offset(center.x, center.y - frameHeight / 2f - 14.dp.toPx()), PanoramaCorrection.Up, Color.White)
+                        drawPanoramaChevron(Offset(center.x, center.y + frameHeight / 2f + 14.dp.toPx()), PanoramaCorrection.Down, Color.White)
+                    }
+                    horizontal -> drawPanoramaChevron(
+                        center = Offset(center.x - mainSign * (frameWidth / 2f + 18.dp.toPx()), center.y),
+                        direction = if (mainSign > 0f) PanoramaCorrection.Left else PanoramaCorrection.Right,
+                        color = Color.White.copy(alpha = 0.82f),
+                    )
+                    else -> drawPanoramaChevron(
+                        center = Offset(center.x, center.y - mainSign * (frameHeight / 2f + 18.dp.toPx())),
+                        direction = if (mainSign > 0f) PanoramaCorrection.Up else PanoramaCorrection.Down,
+                        color = Color.White.copy(alpha = 0.82f),
+                    )
+                }
             }
         }
-        if (active || finalizing) {
+        val guidanceText = when {
+            finalizing -> message.ifBlank { "Saving panorama…" }
+            !active -> "Tap the Camera button, then pan slowly in one direction."
+            movingTooFast -> "Move slowly"
+            !directionLocked -> "Pan slowly in any direction."
+            else -> ""
+        }
+        if (guidanceText.isNotBlank()) {
             Text(
-                text = message,
-                color = if (movingTooFast) DiveColors.Warning else DiveColors.TextPrimary,
+                text = guidanceText,
+                color = DiveColors.TextPrimary,
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .padding(top = 72.dp)
-                    .background(DiveColors.DeepBlack.copy(alpha = 0.78f), RoundedCornerShape(14.dp))
+                    .background(Color(0x33000000), RoundedCornerShape(8.dp))
                     .padding(horizontal = 14.dp, vertical = 8.dp),
             )
         }
+        if (!finalizing) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 84.dp)
+                    .size(74.dp)
+                    .background(
+                        if (active) Color(0xFF8A8A8A).copy(alpha = if (canStop) 1f else 0.55f) else Color.White,
+                        CircleShape,
+                    )
+                    .border(2.dp, Color.White.copy(alpha = 0.84f), CircleShape)
+                    .clickable(enabled = !active || canStop, onClick = onShutter),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (active) {
+                    Box(
+                        modifier = Modifier
+                            .size(24.dp)
+                            .background(Color.White, RoundedCornerShape(3.dp)),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawPanoramaChevron(
+    center: Offset,
+    direction: PanoramaCorrection,
+    color: Color,
+) {
+    val half = 7.dp.toPx()
+    val depth = 7.dp.toPx()
+    val stroke = 3.dp.toPx()
+    when (direction) {
+        PanoramaCorrection.Left -> {
+            drawLine(color, Offset(center.x + depth, center.y - half), center, stroke, cap = StrokeCap.Round)
+            drawLine(color, center, Offset(center.x + depth, center.y + half), stroke, cap = StrokeCap.Round)
+        }
+        PanoramaCorrection.Right -> {
+            drawLine(color, Offset(center.x - depth, center.y - half), center, stroke, cap = StrokeCap.Round)
+            drawLine(color, center, Offset(center.x - depth, center.y + half), stroke, cap = StrokeCap.Round)
+        }
+        PanoramaCorrection.Up -> {
+            drawLine(color, Offset(center.x - half, center.y + depth), center, stroke, cap = StrokeCap.Round)
+            drawLine(color, center, Offset(center.x + half, center.y + depth), stroke, cap = StrokeCap.Round)
+        }
+        PanoramaCorrection.Down -> {
+            drawLine(color, Offset(center.x - half, center.y - depth), center, stroke, cap = StrokeCap.Round)
+            drawLine(color, center, Offset(center.x + half, center.y - depth), stroke, cap = StrokeCap.Round)
+        }
+        PanoramaCorrection.None -> Unit
     }
 }
 

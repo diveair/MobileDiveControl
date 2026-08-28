@@ -14,11 +14,23 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import kotlin.math.abs
+import kotlin.math.atan
+import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlin.math.tan
 
-internal const val PANORAMA_TARGET_RADIANS: Float = 1.9198622f // 110 degrees
-internal const val PANORAMA_FRAME_STEP_RADIANS: Float = 0.20943952f // 12 degrees
+// Samsung's normal-lens Panorama presenter uses 330 degrees for a horizontal sweep and
+// 380 degrees for a vertical sweep. The latter intentionally permits a little over one turn so
+// the compositor can close the cylinder without leaving a gap.
+internal const val PANORAMA_HORIZONTAL_TARGET_RADIANS: Float = 5.7595863f // 330 degrees
+internal const val PANORAMA_VERTICAL_TARGET_RADIANS: Float = 6.6322513f // 380 degrees
+internal const val PANORAMA_WIDE_HORIZONTAL_TARGET_RADIANS: Float = 5.5850534f // 320 degrees
+internal const val PANORAMA_WIDE_VERTICAL_TARGET_RADIANS: Float = 6.1086526f // 350 degrees
+internal const val PANORAMA_FRAME_STEP_RADIANS: Float = 0.17453292f // 10-degree keyframes
+
+internal enum class PanoramaWarningLevel { None, Low, High }
+internal enum class PanoramaCorrection { None, Up, Down, Left, Right }
 
 /**
  * Fast-changing Panorama telemetry stays outside CameraState for the same reason as the video
@@ -31,26 +43,30 @@ internal object PanoramaCaptureState {
     val frameCount: MutableState<Int> = mutableIntStateOf(0)
     val movingTooFast: MutableState<Boolean> = mutableStateOf(false)
     val direction: MutableState<String> = mutableStateOf("Right")
+    val directionLocked: MutableState<Boolean> = mutableStateOf(false)
     val message: MutableState<String> = mutableStateOf("")
+    val crossAxisRadians: MutableState<Float> = mutableFloatStateOf(0f)
+    val warningLevel: MutableState<PanoramaWarningLevel> =
+        mutableStateOf(PanoramaWarningLevel.None)
+    val correction: MutableState<PanoramaCorrection> =
+        mutableStateOf(PanoramaCorrection.None)
+    val canStop: MutableState<Boolean> = mutableStateOf(false)
     val referenceFrame: MutableState<Bitmap?> = mutableStateOf(null)
 
-    fun replaceReferenceFrame(bitmap: Bitmap?) {
-        val oldReference = referenceFrame.value
-        referenceFrame.value = bitmap
-        oldReference?.let { oldBitmap ->
-            if (oldBitmap !== referenceFrame.value && !oldBitmap.isRecycled) oldBitmap.recycle()
-        }
-    }
-
     fun reset() {
-        replaceReferenceFrame(null)
         active.value = false
         finalizing.value = false
         progress.value = 0f
         frameCount.value = 0
         movingTooFast.value = false
         direction.value = "Right"
+        directionLocked.value = false
         message.value = ""
+        crossAxisRadians.value = 0f
+        warningLevel.value = PanoramaWarningLevel.None
+        correction.value = PanoramaCorrection.None
+        canStop.value = false
+        referenceFrame.value = null
     }
 }
 
@@ -66,6 +82,31 @@ internal data class PanoramaFrameOffset(
     val correlation: Double,
 )
 
+internal data class PanoramaProjectionSize(val width: Int, val height: Int)
+
+internal fun panoramaCylindricalProjectionSize(
+    sourceWidth: Int,
+    sourceHeight: Int,
+    horizontal: Boolean,
+    horizontalFovRadians: Float,
+): PanoramaProjectionSize {
+    require(sourceWidth > 0 && sourceHeight > 0)
+    val horizontalFov = horizontalFovRadians.coerceIn(0.61086524f, 2.0943952f)
+    val focalPixels = sourceWidth / (2.0 * tan(horizontalFov / 2.0))
+    val verticalFov = 2.0 * atan(sourceHeight / (2.0 * focalPixels))
+    return if (horizontal) {
+        PanoramaProjectionSize(
+            width = sourceWidth,
+            height = (sourceHeight * cos(horizontalFov / 2.0)).roundToInt().coerceAtLeast(1),
+        )
+    } else {
+        PanoramaProjectionSize(
+            width = (sourceWidth * cos(verticalFov / 2.0)).roundToInt().coerceAtLeast(1),
+            height = sourceHeight,
+        )
+    }
+}
+
 /**
  * Selects and signs the gyro axis for the requested on-screen sweep. Android sensor coordinates
  * remain in the phone's natural portrait frame, so landscape rotations swap and/or invert them.
@@ -77,22 +118,7 @@ internal fun panoramaSweepAxisRate(
     gyroX: Float,
     gyroY: Float,
 ): Float {
-    val rightwardRate: Float
-    val upwardRate: Float
-    when (displayRotation) {
-        1 -> {
-            rightwardRate = gyroX
-            upwardRate = gyroY
-        }
-        3 -> {
-            rightwardRate = -gyroX
-            upwardRate = -gyroY
-        }
-        else -> {
-            rightwardRate = -gyroY
-            upwardRate = gyroX
-        }
-    }
+    val (rightwardRate, upwardRate) = panoramaScreenAxisRates(displayRotation, gyroX, gyroY)
     return when (direction) {
         "Left" -> -rightwardRate
         "Up" -> upwardRate
@@ -101,27 +127,69 @@ internal fun panoramaSweepAxisRate(
     }
 }
 
+internal data class PanoramaScreenAxisRates(
+    val rightward: Float,
+    val upward: Float,
+)
+
+internal fun panoramaScreenAxisRates(
+    displayRotation: Int,
+    gyroX: Float,
+    gyroY: Float,
+): PanoramaScreenAxisRates = when (displayRotation) {
+    1 -> PanoramaScreenAxisRates(rightward = gyroX, upward = gyroY)
+    3 -> PanoramaScreenAxisRates(rightward = -gyroX, upward = -gyroY)
+    else -> PanoramaScreenAxisRates(rightward = -gyroY, upward = gyroX)
+}
+
+/** Motion perpendicular to the selected sweep, used by the native-style pitch/yaw guide. */
+internal fun panoramaCrossAxisRate(
+    direction: String,
+    displayRotation: Int,
+    gyroX: Float,
+    gyroY: Float,
+): Float {
+    val axes = panoramaScreenAxisRates(displayRotation, gyroX, gyroY)
+    return if (direction == "Left" || direction == "Right") {
+        axes.upward
+    } else {
+        axes.rightward
+    }
+}
+
+internal fun panoramaGuideCrossFraction(crossAxisRadians: Float): Float =
+    (crossAxisRadians / 0.13962634f).coerceIn(-1f, 1f) // ±8 degrees fills the guide
+
+/** Samsung's guide promotes the largest normalized rect error at 30% and 50%. */
+internal fun panoramaWarningLevel(crossAxisRadians: Float): PanoramaWarningLevel {
+    val normalizedError = abs(panoramaGuideCrossFraction(crossAxisRadians))
+    return when {
+        normalizedError >= 0.5f -> PanoramaWarningLevel.High
+        normalizedError >= 0.3f -> PanoramaWarningLevel.Low
+        else -> PanoramaWarningLevel.None
+    }
+}
+
+internal fun panoramaCorrection(
+    direction: String,
+    crossAxisRadians: Float,
+): PanoramaCorrection {
+    if (panoramaWarningLevel(crossAxisRadians) == PanoramaWarningLevel.None) {
+        return PanoramaCorrection.None
+    }
+    return if (direction == "Left" || direction == "Right") {
+        if (crossAxisRadians > 0f) PanoramaCorrection.Down else PanoramaCorrection.Up
+    } else {
+        if (crossAxisRadians > 0f) PanoramaCorrection.Left else PanoramaCorrection.Right
+    }
+}
+
 internal fun panoramaDirectionFromGyro(
     displayRotation: Int,
     gyroX: Float,
     gyroY: Float,
 ): String {
-    val rightwardRate: Float
-    val upwardRate: Float
-    when (displayRotation) {
-        1 -> {
-            rightwardRate = gyroX
-            upwardRate = gyroY
-        }
-        3 -> {
-            rightwardRate = -gyroX
-            upwardRate = -gyroY
-        }
-        else -> {
-            rightwardRate = -gyroY
-            upwardRate = gyroX
-        }
-    }
+    val (rightwardRate, upwardRate) = panoramaScreenAxisRates(displayRotation, gyroX, gyroY)
     return if (abs(rightwardRate) >= abs(upwardRate)) {
         if (rightwardRate >= 0f) "Right" else "Left"
     } else {
@@ -129,8 +197,22 @@ internal fun panoramaDirectionFromGyro(
     }
 }
 
-internal fun panoramaProgressFraction(sweepRadians: Float): Float =
-    (sweepRadians / PANORAMA_TARGET_RADIANS).coerceIn(0f, 1f)
+internal fun panoramaTargetRadians(direction: String, wideAngle: Boolean = false): Float =
+    when {
+        direction == "Up" || direction == "Down" -> if (wideAngle) {
+            PANORAMA_WIDE_VERTICAL_TARGET_RADIANS
+        } else {
+            PANORAMA_VERTICAL_TARGET_RADIANS
+        }
+        wideAngle -> PANORAMA_WIDE_HORIZONTAL_TARGET_RADIANS
+        else -> PANORAMA_HORIZONTAL_TARGET_RADIANS
+    }
+
+internal fun panoramaProgressFraction(
+    sweepRadians: Float,
+    direction: String = "Right",
+    wideAngle: Boolean = false,
+): Float = (sweepRadians / panoramaTargetRadians(direction, wideAngle)).coerceIn(0f, 1f)
 
 /**
  * Finds the translational overlap between two equally-sized luminance planes. The camera's gyro
@@ -256,28 +338,61 @@ internal fun panoramaFrameOffset(
  */
 internal object PanoramaBitmapStitcher {
     private const val HORIZONTAL_FOV_RADIANS = 1.2217305f // 70 degrees
-    private const val VERTICAL_FOV_RADIANS = 0.91629785f // 52.5 degrees
     private const val REGISTRATION_WIDTH = 320
     private const val REGISTRATION_HEIGHT = 240
     private const val FEATHER_PIXELS = 96
 
     private data class FramePlacement(val x: Int, val y: Int)
 
-    fun stitch(frames: List<CapturedPanoramaFrame>, direction: String): Bitmap {
+    fun stitch(
+        frames: List<CapturedPanoramaFrame>,
+        direction: String,
+        horizontalFovRadians: Float = HORIZONTAL_FOV_RADIANS,
+    ): Bitmap {
         require(frames.isNotEmpty()) { "A panorama needs at least one frame" }
-        val first = frames.first().bitmap
         if (frames.size == 1) {
-            return first.copy(Bitmap.Config.ARGB_8888, false)
+            return frames.first().bitmap.copy(Bitmap.Config.ARGB_8888, false)
         }
 
+        val horizontal = direction == "Left" || direction == "Right"
+        val clampedHorizontalFov = horizontalFovRadians.coerceIn(0.61086524f, 2.0943952f)
+        val firstSource = frames.first().bitmap
+        val focalPixels = firstSource.width / (2.0 * tan(clampedHorizontalFov / 2.0))
+        val verticalFov = (2.0 * atan(firstSource.height / (2.0 * focalPixels))).toFloat()
+        val projectedFrames = frames.map { frame ->
+            CapturedPanoramaFrame(
+                bitmap = cylindricalWarp(
+                    source = frame.bitmap,
+                    horizontal = horizontal,
+                    horizontalFovRadians = clampedHorizontalFov,
+                ),
+                sweepRadians = frame.sweepRadians,
+            )
+        }
+        return try {
+            stitchProjected(
+                frames = projectedFrames,
+                direction = direction,
+                projectionFovRadians = if (horizontal) clampedHorizontalFov else verticalFov,
+            )
+        } finally {
+            projectedFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+        }
+    }
+
+    private fun stitchProjected(
+        frames: List<CapturedPanoramaFrame>,
+        direction: String,
+        projectionFovRadians: Float,
+    ): Bitmap {
+        val first = frames.first().bitmap
         val horizontal = direction == "Left" || direction == "Right"
         val placements = mutableListOf(FramePlacement(0, 0))
         for (index in 1 until frames.size) {
             val dimension = if (horizontal) first.width else first.height
-            val fov = if (horizontal) HORIZONTAL_FOV_RADIANS else VERTICAL_FOV_RADIANS
             val delta = (frames[index].sweepRadians - frames[index - 1].sweepRadians)
                 .coerceAtLeast(PANORAMA_FRAME_STEP_RADIANS * 0.35f)
-            val expectedAdvance = (dimension * delta / fov)
+            val expectedAdvance = (dimension * delta / projectionFovRadians)
                 .roundToInt()
                 .coerceIn((dimension / 32).coerceAtLeast(1), (dimension / 3).coerceAtLeast(1))
             val offset = estimateOffset(
@@ -325,6 +440,7 @@ internal object PanoramaBitmapStitcher {
         for (index in 1 until frames.size) {
             val placement = translated[index]
             drawFeatheredFrame(
+                output = output,
                 canvas = canvas,
                 bitmap = frames[index].bitmap,
                 placement = placement,
@@ -340,6 +456,113 @@ internal object PanoramaBitmapStitcher {
             occupiedBottom = maxOf(occupiedBottom, placement.y + first.height)
         }
         return output
+    }
+
+    /**
+     * Projects each still onto the same cylinder before registration. A pure yaw/pitch rotation
+     * then becomes translation instead of the perspective expansion that produced doubled edges
+     * in the former flat-frame compositor. The inscribed crop contains no black projection wedges.
+     */
+    private fun cylindricalWarp(
+        source: Bitmap,
+        horizontal: Boolean,
+        horizontalFovRadians: Float,
+    ): Bitmap {
+        val outputSize = panoramaCylindricalProjectionSize(
+            sourceWidth = source.width,
+            sourceHeight = source.height,
+            horizontal = horizontal,
+            horizontalFovRadians = horizontalFovRadians,
+        )
+        val sourcePixels = IntArray(source.width * source.height)
+        source.getPixels(sourcePixels, 0, source.width, 0, 0, source.width, source.height)
+        val outputPixels = IntArray(outputSize.width * outputSize.height)
+        val sourceCenterX = (source.width - 1) / 2.0
+        val sourceCenterY = (source.height - 1) / 2.0
+        val outputCenterX = (outputSize.width - 1) / 2.0
+        val outputCenterY = (outputSize.height - 1) / 2.0
+        val horizontalFov = horizontalFovRadians.coerceIn(0.61086524f, 2.0943952f).toDouble()
+        val focalPixels = source.width / (2.0 * tan(horizontalFov / 2.0))
+        val verticalFov = 2.0 * atan(source.height / (2.0 * focalPixels))
+
+        if (horizontal) {
+            val sourceX = DoubleArray(outputSize.width)
+            val cosine = DoubleArray(outputSize.width)
+            for (x in 0 until outputSize.width) {
+                val theta = (x - outputCenterX) * horizontalFov / outputSize.width
+                cosine[x] = cos(theta)
+                sourceX[x] = sourceCenterX + focalPixels * tan(theta)
+            }
+            for (y in 0 until outputSize.height) {
+                for (x in 0 until outputSize.width) {
+                    val sampleY = sourceCenterY + (y - outputCenterY) / cosine[x]
+                    outputPixels[y * outputSize.width + x] = bilinearPixel(
+                        sourcePixels,
+                        source.width,
+                        source.height,
+                        sourceX[x],
+                        sampleY,
+                    )
+                }
+            }
+        } else {
+            val sourceY = DoubleArray(outputSize.height)
+            val cosine = DoubleArray(outputSize.height)
+            for (y in 0 until outputSize.height) {
+                val theta = (y - outputCenterY) * verticalFov / outputSize.height
+                cosine[y] = cos(theta)
+                sourceY[y] = sourceCenterY + focalPixels * tan(theta)
+            }
+            for (y in 0 until outputSize.height) {
+                for (x in 0 until outputSize.width) {
+                    val sampleX = sourceCenterX + (x - outputCenterX) / cosine[y]
+                    outputPixels[y * outputSize.width + x] = bilinearPixel(
+                        sourcePixels,
+                        source.width,
+                        source.height,
+                        sampleX,
+                        sourceY[y],
+                    )
+                }
+            }
+        }
+        return Bitmap.createBitmap(
+            outputPixels,
+            outputSize.width,
+            outputSize.height,
+            Bitmap.Config.ARGB_8888,
+        )
+    }
+
+    private fun bilinearPixel(
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        x: Double,
+        y: Double,
+    ): Int {
+        val x0 = x.toInt().coerceIn(0, width - 1)
+        val y0 = y.toInt().coerceIn(0, height - 1)
+        val x1 = (x0 + 1).coerceAtMost(width - 1)
+        val y1 = (y0 + 1).coerceAtMost(height - 1)
+        val fx = (x - x0).coerceIn(0.0, 1.0)
+        val fy = (y - y0).coerceIn(0.0, 1.0)
+        val topLeft = pixels[y0 * width + x0]
+        val topRight = pixels[y0 * width + x1]
+        val bottomLeft = pixels[y1 * width + x0]
+        val bottomRight = pixels[y1 * width + x1]
+
+        fun channel(shift: Int): Int {
+            val top = ((topLeft shr shift) and 0xff) * (1.0 - fx) +
+                ((topRight shr shift) and 0xff) * fx
+            val bottom = ((bottomLeft shr shift) and 0xff) * (1.0 - fx) +
+                ((bottomRight shr shift) and 0xff) * fx
+            return (top * (1.0 - fy) + bottom * fy).roundToInt().coerceIn(0, 255)
+        }
+        return (channel(24) shl 24) or
+            (channel(16) shl 16) or
+            (channel(8) shl 8) or
+            channel(0)
     }
 
     private fun estimateOffset(
@@ -396,6 +619,7 @@ internal object PanoramaBitmapStitcher {
 
     @Suppress("DEPRECATION")
     private fun drawFeatheredFrame(
+        output: Bitmap,
         canvas: Canvas,
         bitmap: Bitmap,
         placement: FramePlacement,
@@ -417,11 +641,16 @@ internal object PanoramaBitmapStitcher {
         }.roundToInt().coerceAtLeast(1)
         val mainDimension = if (horizontal) bitmap.width else bitmap.height
         val feather = minOf(FEATHER_PIXELS, overlap / 2, mainDimension / 12).coerceAtLeast(1)
-        val edge = when (direction) {
-            "Left" -> right - overlap
-            "Up" -> bottom - overlap
-            else -> if (horizontal) left + overlap else top + overlap
-        }
+        val edge = findLowestDifferenceSeam(
+            output = output,
+            bitmap = bitmap,
+            placement = placement,
+            horizontal = horizontal,
+            occupiedLeft = occupiedLeft,
+            occupiedTop = occupiedTop,
+            occupiedRight = occupiedRight,
+            occupiedBottom = occupiedBottom,
+        )
         val gradient = if (horizontal) {
             if (direction == "Left") {
                 LinearGradient(
@@ -478,5 +707,76 @@ internal object PanoramaBitmapStitcher {
             },
         )
         canvas.restoreToCount(layer)
+    }
+
+    /**
+     * Selects a straight seam through the least-visible part of the registered overlap. This is
+     * deliberately content-aware: a fixed seam through a foreground edge produces the doubled
+     * subjects and hard joins that make a panorama look unlike the native result.
+     */
+    private fun findLowestDifferenceSeam(
+        output: Bitmap,
+        bitmap: Bitmap,
+        placement: FramePlacement,
+        horizontal: Boolean,
+        occupiedLeft: Int,
+        occupiedTop: Int,
+        occupiedRight: Int,
+        occupiedBottom: Int,
+    ): Float {
+        val overlapLeft = maxOf(placement.x, occupiedLeft).coerceAtLeast(0)
+        val overlapTop = maxOf(placement.y, occupiedTop).coerceAtLeast(0)
+        val overlapRight = minOf(placement.x + bitmap.width, occupiedRight)
+            .coerceAtMost(output.width)
+        val overlapBottom = minOf(placement.y + bitmap.height, occupiedBottom)
+            .coerceAtMost(output.height)
+        val mainStart = if (horizontal) overlapLeft else overlapTop
+        val mainEnd = if (horizontal) overlapRight else overlapBottom
+        val crossStart = if (horizontal) overlapTop else overlapLeft
+        val crossEnd = if (horizontal) overlapBottom else overlapRight
+        val overlapLength = mainEnd - mainStart
+        val crossLength = crossEnd - crossStart
+        if (overlapLength < 12 || crossLength < 12) return (mainStart + mainEnd) / 2f
+
+        val margin = (overlapLength / 5).coerceAtLeast(2)
+        val candidateStart = mainStart + margin
+        val candidateEnd = mainEnd - margin
+        val candidateStep = (overlapLength / 72).coerceAtLeast(1)
+        val crossStep = (crossLength / 120).coerceAtLeast(1)
+        val centre = (mainStart + mainEnd) / 2.0
+        var bestPosition = centre.roundToInt()
+        var bestScore = Double.POSITIVE_INFINITY
+        var candidate = candidateStart
+        while (candidate <= candidateEnd) {
+            var difference = 0.0
+            var samples = 0
+            var cross = crossStart
+            while (cross < crossEnd) {
+                val globalX = if (horizontal) candidate else cross
+                val globalY = if (horizontal) cross else candidate
+                val currentX = globalX - placement.x
+                val currentY = globalY - placement.y
+                if (currentX in 0 until bitmap.width && currentY in 0 until bitmap.height) {
+                    val existing = output.getPixel(globalX, globalY)
+                    val incoming = bitmap.getPixel(currentX, currentY)
+                    difference += abs(Color.red(existing) - Color.red(incoming)) +
+                        abs(Color.green(existing) - Color.green(incoming)) +
+                        abs(Color.blue(existing) - Color.blue(incoming))
+                    samples++
+                }
+                cross += crossStep
+            }
+            if (samples > 0) {
+                val normalizedDifference = difference / samples
+                val centrePenalty = abs(candidate - centre) / overlapLength * 3.0
+                val score = normalizedDifference + centrePenalty
+                if (score < bestScore) {
+                    bestScore = score
+                    bestPosition = candidate
+                }
+            }
+            candidate += candidateStep
+        }
+        return bestPosition.toFloat()
     }
 }

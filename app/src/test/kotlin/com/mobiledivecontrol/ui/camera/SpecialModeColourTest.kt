@@ -53,8 +53,57 @@ class SpecialModeColourTest {
         assertEquals(-0.2f, panoramaSweepAxisRate("Down", 1, 0.8f, 0.2f), 1e-6f)
         assertEquals("Right", panoramaDirectionFromGyro(1, 0.8f, 0.1f))
         assertEquals("Up", panoramaDirectionFromGyro(1, 0.1f, 0.8f))
-        assertEquals(1f, panoramaProgressFraction(PANORAMA_TARGET_RADIANS), 1e-6f)
+        assertEquals(1f, panoramaProgressFraction(PANORAMA_HORIZONTAL_TARGET_RADIANS), 1e-6f)
+        assertEquals(1f, panoramaProgressFraction(PANORAMA_VERTICAL_TARGET_RADIANS, "Up"), 1e-6f)
+        assertEquals(
+            1f,
+            panoramaProgressFraction(PANORAMA_WIDE_HORIZONTAL_TARGET_RADIANS, wideAngle = true),
+            1e-6f,
+        )
+        assertEquals(
+            1f,
+            panoramaProgressFraction(PANORAMA_WIDE_VERTICAL_TARGET_RADIANS, "Down", wideAngle = true),
+            1e-6f,
+        )
         assertEquals(0f, panoramaProgressFraction(-1f), 1e-6f)
+    }
+
+    @Test
+    fun `panorama guide exposes cross axis pitch and yaw independently`() {
+        // In landscape, X is the horizontal sweep/yaw rate and Y is the vertical/pitch rate.
+        assertEquals(0.25f, panoramaCrossAxisRate("Right", 1, 0.8f, 0.25f), 1e-6f)
+        assertEquals(0.25f, panoramaCrossAxisRate("Left", 1, -0.8f, 0.25f), 1e-6f)
+        assertEquals(0.8f, panoramaCrossAxisRate("Up", 1, 0.8f, 0.25f), 1e-6f)
+        assertEquals(0.8f, panoramaCrossAxisRate("Down", 1, 0.8f, -0.25f), 1e-6f)
+        assertEquals(0.5f, panoramaGuideCrossFraction(0.06981317f), 1e-5f)
+        assertEquals(-1f, panoramaGuideCrossFraction(-0.3f), 1e-6f)
+        assertEquals(PanoramaWarningLevel.None, panoramaWarningLevel(0.02f))
+        assertEquals(PanoramaWarningLevel.Low, panoramaWarningLevel(0.05f))
+        assertEquals(PanoramaWarningLevel.High, panoramaWarningLevel(0.07f))
+        assertEquals(PanoramaCorrection.Down, panoramaCorrection("Right", 0.07f))
+        assertEquals(PanoramaCorrection.Up, panoramaCorrection("Left", -0.07f))
+        assertEquals(PanoramaCorrection.Left, panoramaCorrection("Down", 0.07f))
+    }
+
+    @Test
+    fun `panorama cylinder keeps sweep dimension and crops projection wedges`() {
+        val horizontal = panoramaCylindricalProjectionSize(
+            sourceWidth = 1600,
+            sourceHeight = 1200,
+            horizontal = true,
+            horizontalFovRadians = 1.2217305f,
+        )
+        assertEquals(1600, horizontal.width)
+        assertTrue(horizontal.height in 970..990)
+
+        val vertical = panoramaCylindricalProjectionSize(
+            sourceWidth = 1600,
+            sourceHeight = 1200,
+            horizontal = false,
+            horizontalFovRadians = 1.2217305f,
+        )
+        assertTrue(vertical.width in 1410..1430)
+        assertEquals(1200, vertical.height)
     }
 
     @Test
