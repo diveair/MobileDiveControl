@@ -113,6 +113,14 @@ internal fun hyperlapseRecordingLimitMillis(value: String?): Long? = value
     ?.takeIf { it in 1..300 }
     ?.times(1_000L)
 
+internal fun proVideoPlaybackFrameRate(value: String?): Double =
+    CameraCatalog.playbackFrameRateFps(value)
+        ?.takeIf { it in setOf(23.976, 24.0, 29.97, 30.0, 48.0) }
+        ?: 30.0
+
+internal fun playbackTimestampScale(playbackFrameRate: Double): Double =
+    playbackFrameRate.roundToInt().toDouble() / playbackFrameRate
+
 @OptIn(ExperimentalSessionConfig::class, ExperimentalHighSpeedVideo::class)
 class CameraRuntimeController(
     private val context: Context,
@@ -330,13 +338,28 @@ class CameraRuntimeController(
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
     private val camera2HighSpeedRecorder = Camera2HighSpeedRecorder(context)
-    private val highSpeedClockRunnable = object : Runnable {
+    private val camera2TimeLapseRecorder = Camera2TimeLapseRecorder(context)
+    private val highSpeedVideoTranscoder = HighSpeedVideoTranscoder(context)
+    private val directRecordingClockRunnable = object : Runnable {
         override fun run() {
-            if (!camera2HighSpeedRecorder.isBusy) return
-            currentRecordingSegmentDurationMs = camera2HighSpeedRecorder.elapsedDurationMs
+            if (!directCamera2RecorderBusy()) return
+            currentRecordingSegmentDurationMs = when {
+                camera2HighSpeedRecorder.isBusy -> camera2HighSpeedRecorder.elapsedDurationMs
+                else -> camera2TimeLapseRecorder.elapsedDurationMs
+            }
             RecordingClock.durationMs.value =
                 completedRecordingDurationMs + currentRecordingSegmentDurationMs
             cameraRequestHandler.postDelayed(this, 100L)
+        }
+    }
+
+    private fun directCamera2RecorderBusy(): Boolean =
+        camera2HighSpeedRecorder.isBusy || camera2TimeLapseRecorder.isBusy
+
+    private fun stopDirectCamera2Recorder() {
+        when {
+            camera2HighSpeedRecorder.isBusy -> camera2HighSpeedRecorder.stop()
+            camera2TimeLapseRecorder.isBusy -> camera2TimeLapseRecorder.stop()
         }
     }
     /** Duration is cumulative across continuation clips within one logical recording session. */
@@ -491,9 +514,9 @@ class CameraRuntimeController(
             // Constrained high-speed capture owns a separate Camera2 session and forces 3A auto.
             // Keep harvesting preview telemetry, but never let a late CameraX callback take over
             // its session or submit a request to a CameraDevice that the rebind already closed.
-            val directHighSpeedSelected = isHighSpeedSelection(latestState)
+            val directCamera2SessionActive = directCamera2RecorderBusy()
             // Capture session + surfaces on first callback or session change
-            if (!directHighSpeedSelected && cam2Session !== session) {
+            if (!directCamera2SessionActive && cam2Session !== session) {
                 cam2Session = session
                 try {
                     val m = CaptureRequest::class.java.getDeclaredMethod("getTargets")
@@ -769,7 +792,9 @@ class CameraRuntimeController(
         resumeObserver = null
         cameraProvider?.unbindAll()
         camera2HighSpeedRecorder.release()
-        cameraRequestHandler.removeCallbacks(highSpeedClockRunnable)
+        camera2TimeLapseRecorder.release()
+        highSpeedVideoTranscoder.cancel()
+        cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
         camera = null
         imageCapture = null
         imageAnalysis = null
@@ -879,7 +904,7 @@ class CameraRuntimeController(
         val desiredLensFacing = desiredLensFacing(cameraState)
         val desiredResolution = desiredResolutionValue(cameraState)
         val desiredLens = selectedLensValue(cameraState)
-        val desiredFrameRate = currentValue(cameraState, ".frame_rate")
+        val desiredFrameRate = frameRateSessionKey(cameraState)
         val desiredHdrLogMode = resolvedSessionHdrLogMode(cameraState)
         val desiredCaptureFormat = currentValue(cameraState, ".save_format")
         val desiredAspectRatio = currentValue(cameraState, ".aspect_ratio")
@@ -1942,9 +1967,9 @@ class CameraRuntimeController(
         val previewSurface = previewView ?: return
         val desiredLensFacing = desiredLensFacing(latestState)
         val desiredResolution = desiredResolutionValue(latestState)
-        val desiredFrameRate = currentValue(latestState, ".frame_rate")
-        val desiredFrameRateFps = desiredFrameRate?.removeSuffix("fps")?.toIntOrNull()
-        val highSpeedRecording = desiredFrameRateFps != null && desiredFrameRateFps >= HIGH_SPEED_FPS_MIN
+        val selectedFrameRate = currentValue(latestState, ".frame_rate")
+        val desiredFrameRate = frameRateSessionKey(latestState)
+        val highSpeedRecording = isHighSpeedSelection(latestState)
         val desiredHdrLogMode = resolvedSessionHdrLogMode(latestState)
         val desiredCaptureFormat = currentValue(latestState, ".save_format")
         val desiredAspectRatio = currentValue(latestState, ".aspect_ratio")
@@ -2009,7 +2034,13 @@ class CameraRuntimeController(
         boundMacroStop = false
         val previewBuilder = Preview.Builder()
         val imageCaptureBuilder = ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            // The app deliberately owns the live autofocus/hold policy. MAXIMIZE_QUALITY adds
+            // CameraX's separate AfTask before every JPEG; on Samsung that task waits forever
+            // after our Camera2 focus sequence has already locked the lens. MINIMIZE_LATENCY
+            // submits the still immediately, while an explicit quality value preserves the
+            // same JPEG compression quality that MAXIMIZE_QUALITY used.
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setJpegQuality(100)
             .setOutputFormat(
                 if (desiredCaptureFormat == "Ultra HDR JPEG") {
                     ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR
@@ -2296,7 +2327,7 @@ class CameraRuntimeController(
                 Log.i(
                     TAG,
                     "Armed direct constrained-high-speed capture: " +
-                        "quality=$desiredResolution fps=$desiredFrameRateFps",
+                        "quality=$desiredResolution fps=$selectedFrameRate",
                 )
                 provider.bindToLifecycle(owner, selector, preview)
             } else {
@@ -2379,7 +2410,7 @@ class CameraRuntimeController(
     // ── Video recording ──────────────────────────────────────────────────────────────
 
     private fun startVideoRecording() {
-        if (activeRecording != null || camera2HighSpeedRecorder.isBusy || recordingSegmentFinalizingForReview) return
+        if (activeRecording != null || directCamera2RecorderBusy() || recordingSegmentFinalizingForReview) return
         if (resolvedHdrLogMode(latestState) == "LOG" && !boundLogCaptureContractSatisfied) {
             Log.e(TAG, "Refusing Log recording because the bound stream is not public HLG10")
             Toast.makeText(
@@ -2440,7 +2471,7 @@ class CameraRuntimeController(
      * for cumulative preview, then Stop publishes one continuous MediaStore video.
      */
     private fun startRecordingSegment() {
-        if (activeRecording != null || camera2HighSpeedRecorder.isBusy || recordingSegmentFinalizingForReview) return
+        if (activeRecording != null || directCamera2RecorderBusy() || recordingSegmentFinalizingForReview) return
         currentRecordingSegmentDurationMs = 0L
         RecordingClock.reviewUri.value = null
         RecordingClock.reviewFinalizing.value = false
@@ -2458,7 +2489,11 @@ class CameraRuntimeController(
     }
 
     private fun startRecordingSegmentNow() {
-        if (activeRecording != null || camera2HighSpeedRecorder.isBusy) return
+        if (activeRecording != null || directCamera2RecorderBusy()) return
+        if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse) {
+            startCamera2TimeLapseSegment()
+            return
+        }
         if (isHighSpeedSelection(latestState)) {
             startCamera2HighSpeedSegment()
             return
@@ -2485,7 +2520,7 @@ class CameraRuntimeController(
             context,
             Manifest.permission.RECORD_AUDIO,
         ) == PackageManager.PERMISSION_GRANTED &&
-            currentValue(latestState, ".audio_recording") != "Off"
+            currentValue(latestState, ".audio_recording") == "On"
         val pending = capture.output.prepareRecording(context, options).apply {
             if (hasAudio) withAudioEnabled()
         }
@@ -2543,14 +2578,115 @@ class CameraRuntimeController(
         Log.i(TAG, "Private recording segment started: $segmentFile audio=$hasAudio")
     }
 
+    private fun startCamera2TimeLapseSegment() {
+        val speedValue = currentValue(latestState, ".speed")
+        val dayNightValue = currentValue(latestState, ".day_night")
+        val speedFactor = hyperlapseSpeedFactor(speedValue, dayNightValue)
+        startCamera2VariableRateSegment(
+            captureRateFps = hyperlapseCaptureRateFps(speedFactor),
+            playbackFps = TIME_LAPSE_PLAYBACK_FPS,
+            cameraFrameRate = null,
+            modeLabel = "Hyperlapse ${speedFactor}x",
+            finalizationLabel = "Hyperlapse",
+            nightMode = dayNightValue == "Night" || speedValue?.startsWith("Night ") == true,
+        )
+    }
+
+    private fun startCamera2VariableRateSegment(
+        captureRateFps: Double,
+        playbackFps: Int,
+        cameraFrameRate: Int?,
+        modeLabel: String,
+        finalizationLabel: String,
+        nightMode: Boolean,
+    ) {
+        val sessionDirectory = recordingSessionDirectory ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+        val size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: run {
+            Log.e(TAG, "No direct variable-rate size for ${desiredResolutionValue(latestState)}")
+            releaseShutterWhiteBalance()
+            return
+        }
+        val boundCamera = camera ?: run {
+            Log.w(TAG, "$modeLabel requested without a bound preview; rebinding")
+            bindCamera(force = true)
+            camera
+        } ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+        val cameraId = Camera2CameraInfo.from(boundCamera.cameraInfo).cameraId
+        val segmentFile = File(
+            sessionDirectory,
+            "segment-${(recordingSegmentFiles.size + 1).toString().padStart(4, '0')}.mp4",
+        )
+        activeRecordingSegmentFile = segmentFile
+        val ev = currentValue(latestState, ".exposure_value", ".exposure_compensation", ".exposure")
+            ?.replace("+", "")
+            ?.toDoubleOrNull()
+        val evIndex = ev?.let { evCompensationIndex(boundCamera, it) }
+        val focusDiopters = manualFocusRequestFor(latestState)?.diopters
+        val host = previewView ?: run {
+            releaseShutterWhiteBalance()
+            return
+        }
+
+        cameraProvider?.unbindAll()
+        camera = null
+        videoCapture = null
+        imageCapture = null
+        imageAnalysis = null
+        cam2Session = null
+        cam2Surfaces = emptyList()
+        try {
+            camera2TimeLapseRecorder.start(
+                Camera2TimeLapseRecorder.Request(
+                    previewHost = host,
+                    cameraId = cameraId,
+                    size = size,
+                    captureRateFps = captureRateFps,
+                    playbackFps = playbackFps,
+                    cameraFrameRate = cameraFrameRate,
+                    modeLabel = modeLabel,
+                    outputFile = segmentFile,
+                    exposureCompensationIndex = evIndex,
+                    zoomRatio = latestState.zoomFactor.toFloat().coerceAtLeast(1f),
+                    torchEnabled = currentValue(latestState, ".flash") in setOf("On", "Torch"),
+                    focusDiopters = focusDiopters,
+                    nightMode = nightMode,
+                ),
+                onStarted = {
+                    currentRecordingSegmentDurationMs = 0L
+                    RecordingClock.paused.value = false
+                    cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
+                    cameraRequestHandler.post(directRecordingClockRunnable)
+                    Log.i(
+                        TAG,
+                        "Direct $modeLabel segment started: $segmentFile " +
+                            "capture=${captureRateFps}fps playback=${playbackFps}fps night=$nightMode",
+                    )
+                },
+                onFinalized = { result ->
+                    finalizeCamera2VariableRateSegment(segmentFile, result, finalizationLabel)
+                },
+            )
+        } catch (error: Throwable) {
+            Log.e(TAG, "Could not start direct $modeLabel recording", error)
+            activeRecordingSegmentFile = null
+            releaseShutterWhiteBalance()
+            finishRecordingSession(deleteLatest = false)
+            bindCamera(force = true)
+        }
+    }
+
     private fun startCamera2HighSpeedSegment() {
         val sessionDirectory = recordingSessionDirectory ?: run {
             releaseShutterWhiteBalance()
             return
         }
-        val fps = currentValue(latestState, ".frame_rate")
-            ?.removeSuffix("fps")
-            ?.toIntOrNull()
+        val fps = CameraCatalog.captureFrameRateFps(currentValue(latestState, ".frame_rate"))
             ?: return
         val size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: run {
             Log.e(TAG, "No direct high-speed size for ${desiredResolutionValue(latestState)}")
@@ -2571,11 +2707,18 @@ class CameraRuntimeController(
             "segment-${(recordingSegmentFiles.size + 1).toString().padStart(4, '0')}.mp4",
         )
         activeRecordingSegmentFile = segmentFile
-        val hasAudio = ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.RECORD_AUDIO,
-        ) == PackageManager.PERMISSION_GRANTED &&
-            currentValue(latestState, ".audio_recording") != "Off"
+        val playbackFrameRate = if (
+            latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.ProVideo
+        ) {
+            proVideoPlaybackFrameRate(currentValue(latestState, ".frame_rate"))
+        } else {
+            30.0
+        }
+        val encoderPlaybackFps = playbackFrameRate.roundToInt()
+        // A real-time microphone track cannot accompany video whose playback timestamps are
+        // expanded 5x-10x. Samsung's constrained-high-speed path is video-only for the same
+        // reason, even when entered from Pro Video.
+        val hasAudio = false
         val ev = currentValue(latestState, ".exposure_value", ".exposure_compensation")
             ?.replace("+", "")
             ?.toDoubleOrNull()
@@ -2597,6 +2740,7 @@ class CameraRuntimeController(
                     cameraId = cameraId,
                     size = size,
                     fps = fps,
+                    playbackFps = encoderPlaybackFps,
                     outputFile = segmentFile,
                     audioEnabled = hasAudio,
                     exposureCompensationIndex = evIndex,
@@ -2607,12 +2751,21 @@ class CameraRuntimeController(
                 onStarted = {
                     currentRecordingSegmentDurationMs = 0L
                     RecordingClock.paused.value = false
-                    cameraRequestHandler.removeCallbacks(highSpeedClockRunnable)
-                    cameraRequestHandler.post(highSpeedClockRunnable)
-                    Log.i(TAG, "Direct high-speed segment started: $segmentFile audio=$hasAudio")
+                    cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
+                    cameraRequestHandler.post(directRecordingClockRunnable)
+                    Log.i(
+                        TAG,
+                        "Direct high-speed segment started: $segmentFile capture=${fps}fps " +
+                            "playback=${playbackFrameRate}fps audio=$hasAudio",
+                    )
                 },
                 onFinalized = { result ->
-                    finalizeCamera2HighSpeedSegment(segmentFile, result)
+                    finalizeCamera2HighSpeedSegment(
+                        segmentFile = segmentFile,
+                        result = result,
+                        effectiveCaptureFps = fps,
+                        playbackFrameRate = playbackFrameRate,
+                    )
                 },
             )
         } catch (error: Throwable) {
@@ -2624,10 +2777,89 @@ class CameraRuntimeController(
         }
     }
 
-    private fun finalizeCamera2HighSpeedSegment(segmentFile: File, result: Result<Long>) {
-        cameraRequestHandler.removeCallbacks(highSpeedClockRunnable)
-        val reviewBoundary = recordingSegmentFinalizingForReview
+    private fun finalizeCamera2HighSpeedSegment(
+        segmentFile: File,
+        result: Result<Long>,
+        effectiveCaptureFps: Int,
+        playbackFrameRate: Double,
+    ) {
+        cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
         if (activeRecordingSegmentFile == segmentFile) activeRecordingSegmentFile = null
+        if (result.isFailure) {
+            completeCamera2HighSpeedSegment(segmentFile, result)
+            return
+        }
+        val convertedFile = File(
+            segmentFile.parentFile,
+            segmentFile.nameWithoutExtension + "-converted.mp4",
+        )
+        runCatching {
+            highSpeedVideoTranscoder.transcode(
+                inputFile = segmentFile,
+                outputFile = convertedFile,
+                effectiveCaptureFps = effectiveCaptureFps,
+                // Encode on the integer cadence MediaCodec supports. Fractional cinema/NTSC
+                // rates are applied exactly once by finishExactHighSpeedPlaybackRate below.
+                playbackFps = playbackFrameRate.roundToInt().toDouble(),
+            ) { converted ->
+                converted.onSuccess { segmentFile.delete() }
+                finishExactHighSpeedPlaybackRate(
+                    segmentFile = converted.getOrElse {
+                        completeCamera2HighSpeedSegment(segmentFile, Result.failure(it))
+                        return@transcode
+                    },
+                    captureResult = result,
+                    playbackFrameRate = playbackFrameRate,
+                )
+            }
+        }.onFailure { error ->
+            completeCamera2HighSpeedSegment(segmentFile, Result.failure(error))
+        }
+    }
+
+    private fun finishExactHighSpeedPlaybackRate(
+        segmentFile: File,
+        captureResult: Result<Long>,
+        playbackFrameRate: Double,
+    ) {
+        val scale = playbackTimestampScale(playbackFrameRate)
+        if (kotlin.math.abs(scale - 1.0) > 0.000_001) {
+            val retimedFile = File(
+                segmentFile.parentFile,
+                segmentFile.nameWithoutExtension + "-retimed.mp4",
+            )
+            recordingFinalizeExecutor.execute {
+                val retimed = RecordingSessionMuxer.retime(
+                    inputFile = segmentFile,
+                    outputFile = retimedFile,
+                    timestampScale = scale,
+                    playbackFrameRate = playbackFrameRate,
+                )
+                ContextCompat.getMainExecutor(context).execute {
+                    retimed
+                        .onSuccess {
+                            segmentFile.delete()
+                            Log.i(
+                                TAG,
+                                "Retimed high-speed segment to exact ${playbackFrameRate}fps: $it",
+                            )
+                            completeCamera2HighSpeedSegment(it, captureResult)
+                        }
+                        .onFailure { error ->
+                            completeCamera2HighSpeedSegment(
+                                segmentFile,
+                                Result.failure(error),
+                            )
+                        }
+                }
+            }
+            return
+        }
+        completeCamera2HighSpeedSegment(segmentFile, captureResult)
+    }
+
+    private fun completeCamera2HighSpeedSegment(segmentFile: File, result: Result<Long>) {
+        val reviewBoundary = recordingSegmentFinalizingForReview
         result.onSuccess { durationMs ->
             currentRecordingSegmentDurationMs = durationMs
             completedRecordingDurationMs += durationMs
@@ -2639,6 +2871,43 @@ class CameraRuntimeController(
             segmentFile.delete()
             RecordingClock.reviewUri.value = null
             Toast.makeText(context, "High-speed recording failed: ${error.message}", Toast.LENGTH_LONG).show()
+        }
+        currentRecordingSegmentDurationMs = 0L
+        releaseShutterWhiteBalance()
+        bindCamera(force = true)
+        if (reviewBoundary) {
+            if (recordingSegmentFiles.isEmpty()) {
+                recordingSegmentFinalizingForReview = false
+                RecordingClock.reviewFinalizing.value = false
+                runPendingRecordingAction()
+            } else {
+                buildCumulativeRecordingReview()
+            }
+        } else {
+            recordingSegmentFinalizingForReview = false
+            finishRecordingSession(deleteLatest = false)
+        }
+    }
+
+    private fun finalizeCamera2VariableRateSegment(
+        segmentFile: File,
+        result: Result<Long>,
+        modeLabel: String,
+    ) {
+        cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
+        val reviewBoundary = recordingSegmentFinalizingForReview
+        if (activeRecordingSegmentFile == segmentFile) activeRecordingSegmentFile = null
+        result.onSuccess { durationMs ->
+            currentRecordingSegmentDurationMs = durationMs
+            completedRecordingDurationMs += durationMs
+            RecordingClock.durationMs.value = completedRecordingDurationMs
+            if (segmentFile.isFile && segmentFile.length() > 0L) recordingSegmentFiles += segmentFile
+            Log.i(TAG, "Direct $modeLabel segment finalized: $segmentFile durationMs=$durationMs")
+        }.onFailure { error ->
+            Log.e(TAG, "Direct $modeLabel segment finalize failed", error)
+            segmentFile.delete()
+            RecordingClock.reviewUri.value = null
+            Toast.makeText(context, "$modeLabel failed: ${error.message}", Toast.LENGTH_LONG).show()
         }
         currentRecordingSegmentDurationMs = 0L
         releaseShutterWhiteBalance()
@@ -2703,9 +2972,9 @@ class CameraRuntimeController(
         RecordingClock.reviewUri.value = null
         RecordingClock.reviewFinalizing.value = true
         pendingRecordingAction = null
-        if (camera2HighSpeedRecorder.isBusy) {
+        if (directCamera2RecorderBusy()) {
             recordingSegmentFinalizingForReview = true
-            camera2HighSpeedRecorder.stop()
+            stopDirectCamera2Recorder()
             return
         }
         val recording = activeRecording
@@ -2747,11 +3016,11 @@ class CameraRuntimeController(
             pendingRecordingAction = CameraCommand.StopVideoRecording
             return
         }
-        if (camera2HighSpeedRecorder.isBusy) {
+        if (directCamera2RecorderBusy()) {
             pendingRecordingAction = CameraCommand.StopVideoRecording
             recordingSegmentFinalizingForReview = true
             RecordingClock.reviewFinalizing.value = true
-            camera2HighSpeedRecorder.stop()
+            stopDirectCamera2Recorder()
             return
         }
         val recording = activeRecording
@@ -2770,11 +3039,11 @@ class CameraRuntimeController(
             pendingRecordingAction = CameraCommand.DeleteVideoRecording
             return
         }
-        if (camera2HighSpeedRecorder.isBusy) {
+        if (directCamera2RecorderBusy()) {
             pendingRecordingAction = CameraCommand.DeleteVideoRecording
             recordingSegmentFinalizingForReview = true
             RecordingClock.reviewFinalizing.value = true
-            camera2HighSpeedRecorder.stop()
+            stopDirectCamera2Recorder()
             return
         }
         finishRecordingSession(deleteLatest = true)
@@ -3071,6 +3340,11 @@ class CameraRuntimeController(
             val label = highSpeedResolutionLabel(size) ?: return@forEach
             val rates = runCatching { streamMap.getHighSpeedVideoFpsRangesFor(size) }
                 .getOrDefault(emptyArray())
+            Log.i(
+                TAG,
+                "Camera2 constrained ranges ${size.width}x${size.height}: " +
+                    rates.contentToString(),
+            )
             rates.map { it.upper }
                 .filter { fps ->
                     fps >= HIGH_SPEED_FPS_MIN && encoderSupportsHighSpeed(size, fps)
@@ -3410,17 +3684,13 @@ class CameraRuntimeController(
                 // instead of being suppressed by an "already applied" latch.
                 return
             }
-        } else if (cam2Session != null && cam2Surfaces.isNotEmpty()) {
-            // ── AUTOFOCUS, still on OUR request ──────────────────────────
-            // Keeping the same writer across the AF/manual boundary is what makes the crossing
-            // invisible: only CONTROL_AF_MODE changes, inside a request whose exposure envelope,
-            // white balance and tonemap all stay exactly as they were.
-            nativeFocusActive = true
-            if (!submitNativeRepeatingRequest(cameraState, boundCamera)) {
-                return
-            }
         } else {
-            // ── CAMERAX MODE (no session captured yet) ───────────────────
+            // ── CAMERAX AUTOFOCUS MODE ───────────────────────────────────
+            // ImageCapture waits for CameraX-tagged repeating results before issuing a still.
+            // Replacing that request with our raw Camera2 repeating request left the preview
+            // alive but wedged every still capture forever at "request in-flight". Direct
+            // Camera2 ownership is therefore restricted to manual focus; autofocus and every
+            // still pre-capture sequence remain owned by CameraX.
             // EV rides applyCamera2Options' bundle, not a separate CameraX call: two writers
             // alternating on the same session is what used to make the preview pulse.
             applyFlash(cameraState)
@@ -3631,11 +3901,9 @@ class CameraRuntimeController(
     }
 
     private fun requestedFpsRange(cameraState: CameraState, boundCamera: Camera): android.util.Range<Int>? {
-        val fps = currentValue(cameraState, ".frame_rate")
-            ?.removeSuffix("fps")
-            ?.toIntOrNull()
+        val fps = CameraCatalog.captureFrameRateFps(currentValue(cameraState, ".frame_rate"))
             ?: return null
-        if (fps >= HIGH_SPEED_FPS_MIN) return null
+        if (isHighSpeedSelection(cameraState)) return null
         val ranges = Camera2CameraInfo.from(boundCamera.cameraInfo).getCameraCharacteristic(
             CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES,
         ).orEmpty()
@@ -4439,11 +4707,20 @@ class CameraRuntimeController(
         return currentValue(cameraState, ".resolution", ".megapixels")
     }
 
-    private fun isHighSpeedSelection(cameraState: CameraState): Boolean =
-        currentValue(cameraState, ".frame_rate")
-            ?.removeSuffix("fps")
-            ?.toIntOrNull()
-            ?.let { it >= HIGH_SPEED_FPS_MIN } == true
+    private fun isHighSpeedSelection(cameraState: CameraState): Boolean {
+        val fps = CameraCatalog.captureFrameRateFps(currentValue(cameraState, ".frame_rate"))
+            ?: return false
+        return fps >= HIGH_SPEED_FPS_MIN ||
+            (cameraState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion && fps >= 48)
+    }
+
+    /** The live preview graph only cares whether direct constrained capture is armed. */
+    private fun frameRateSessionKey(cameraState: CameraState): String? =
+        if (isHighSpeedSelection(cameraState)) {
+            "direct-constrained-high-speed"
+        } else {
+            currentValue(cameraState, ".frame_rate")
+        }
 
     private fun highSpeedResolutionSize(value: String?): Size? = when (value) {
         "HD 720p" -> Size(1280, 720)
@@ -4493,10 +4770,7 @@ class CameraRuntimeController(
     }
 
     private fun resolvedSessionHdrLogMode(cameraState: CameraState): String {
-        val fps = currentValue(cameraState, ".frame_rate")
-            ?.removeSuffix("fps")
-            ?.toIntOrNull()
-        return if (fps != null && fps >= HIGH_SPEED_FPS_MIN) "Off" else resolvedHdrLogMode(cameraState)
+        return if (isHighSpeedSelection(cameraState)) "Off" else resolvedHdrLogMode(cameraState)
     }
 
     private fun samsungLogAcquisitionCalibration(cameraState: CameraState) =

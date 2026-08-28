@@ -253,13 +253,32 @@ object CameraCatalog {
     fun videoShutterCapNs(camera: CameraState): Long? {
         if (profile(camera.activeMode, camera.deviceVariant).captureType != CameraCaptureType.Video) return null
         val frameRateId = modeKey(camera.activeMode) + ".frame_rate"
-        val fps = (camera.settingValues[frameRateId] ?: defaultSettingValues[frameRateId])
-            ?.removeSuffix("fps")?.toIntOrNull() ?: return null
+        val fps = captureFrameRateFps(
+            camera.settingValues[frameRateId] ?: defaultSettingValues[frameRateId],
+        ) ?: return null
         if (fps <= 0) return null
         // ROUNDED, not truncated: the native rule admits the table entry that IS one frame
         // period (1/60 at 60 fps), and 1/60 spells 16666667 ns while truncating division gives
         // 16666666 — a one-nanosecond error that would evict the native cap rung itself.
         return Math.round(1_000_000_000.0 / fps)
+    }
+
+    /** Capture column from either `30fps` or `240fps/23.976fps playback`. */
+    fun captureFrameRateFps(value: String?): Int? = value
+        ?.substringBefore('/')
+        ?.trim()
+        ?.removeSuffix("fps")
+        ?.trim()
+        ?.toIntOrNull()
+
+    /** Playback column; ordinary entries play at their capture rate. */
+    fun playbackFrameRateFps(value: String?): Double? {
+        if (value == null) return null
+        val playback = value.substringAfter('/', missingDelimiterValue = value)
+            .substringBefore("fps")
+            .trim()
+            .toDoubleOrNull()
+        return playback ?: captureFrameRateFps(value)?.toDouble()
     }
 
     /** [settingsFor] with every clamp the CameraState itself implies — the one call the reducer and UI share. */
@@ -318,7 +337,11 @@ object CameraCatalog {
                     ?.get(selectedResolution)
                     ?.takeIf { it.isNotEmpty() }
                     ?: caps!!.availableVideoFrameRates
-                clip { option -> option.removeSuffix("fps").toIntOrNull() in rates }
+                clip { option ->
+                    val fps = captureFrameRateFps(option)
+                    fps in rates ||
+                        (spec.id == "slow_motion.frame_rate" && fps == 48 && 60 in rates)
+                }
             }
             spec.id.endsWith(".resolution") && !caps?.availableVideoResolutions.isNullOrEmpty() ->
                 // Keep every resolution exposed for the selected camera. If the current FPS is
@@ -1403,7 +1426,13 @@ object CameraCatalog {
 
     private fun proVideoProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
-        val frameRates = videoFrameRates(variant)
+        val frameRates = videoFrameRates(variant).filterNot { it == "240fps" } + listOf(
+            "240fps/23.976fps playback",
+            "240fps/24fps playback",
+            "240fps/29.97fps playback",
+            "240fps/30fps playback",
+            "240fps/48fps playback",
+        )
         return CameraModeProfile(
             mode = CameraModeId.ProVideo,
             modeName = CameraModeId.ProVideo.label,
@@ -1412,7 +1441,10 @@ object CameraCatalog {
             availableResolutions = listOf("FHD", "UHD 4K", "8K"),
             availableFrameRates = frameRates,
             availableFormatOptions = listOf("Standard", "HDR", "10-bit HLG"),
-            availableExposureControls = listOf("White balance", "ISO", "Focus", "Shutter", "Exposure value", "Frame rate"),
+            availableExposureControls = listOf(
+                "White balance", "ISO", "Focus", "Shutter", "Exposure value",
+                "Frame rate / playback",
+            ),
             availableAudioControls = listOf("Microphone audio"),
             availableAssistTools = listOf("Zebra", "False colour", "Guides", "HDR", "10-bit HLG / Log grade"),
             settings = listOf(
@@ -1497,12 +1529,18 @@ object CameraCatalog {
         captureType = CameraCaptureType.Video,
         availableLenses = listOf("0.6x", "1x", "3x"),
         availableResolutions = listOf("FHD", "UHD 4K"),
-        availableFrameRates = listOf("120fps", "240fps"),
+        availableFrameRates = listOf("48fps", "60fps", "120fps", "240fps"),
         availableExposureControls = listOf("Exposure value", "Focus"),
         availableAssistTools = listOf("HDR", "Grid"),
         settings = listOf(
             choice("slow_motion.resolution", "Video size", "Core", listOf("FHD", "UHD 4K"), "FHD"),
-            choice("slow_motion.frame_rate", "Frame rate", "Core", listOf("120fps", "240fps"), "240fps"),
+            choice(
+                "slow_motion.frame_rate",
+                "Frame rate",
+                "Core",
+                listOf("48fps", "60fps", "120fps", "240fps"),
+                "240fps",
+            ),
             choice("slow_motion.lens", "Lens", "Core", listOf("0.6x", "1x", "3x"), "1x"),
             choice("slow_motion.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
             slider("slow_motion.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),

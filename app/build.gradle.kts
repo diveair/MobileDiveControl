@@ -78,6 +78,11 @@ dependencies {
     // no frame or recognition result leaves the phone.
     implementation(libs.mediapipe.tasks.vision)
 
+    // Hardware decode/encode cadence conversion for constrained high-speed recordings.
+    implementation(libs.media3.common)
+    implementation(libs.media3.effect)
+    implementation(libs.media3.transformer)
+
     // Coroutines
     implementation(libs.coroutines.core)
     implementation(libs.coroutines.android)

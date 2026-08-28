@@ -14,6 +14,7 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 /**
  * Joins CameraX's reviewable pause segments without decoding or re-encoding them.
@@ -81,6 +82,115 @@ internal object RecordingSessionMuxer {
             muxSegments(segmentFiles, destination.fd)
         }
         Uri.fromFile(outputFile)
+    }.onFailure {
+        runCatching { outputFile.delete() }
+    }
+
+    /**
+     * Losslessly changes an encoded clip's playback clock. Used for fractional cinema rates
+     * that MediaRecorder's integer-only setVideoFrameRate API cannot express (23.976/29.97).
+     */
+    fun retime(
+        inputFile: File,
+        outputFile: File,
+        timestampScale: Double,
+        playbackFrameRate: Double,
+    ): Result<File> = runCatching {
+        require(inputFile.isFile && inputFile.length() > 0L) {
+            "Missing input recording: $inputFile"
+        }
+        require(inputFile.absolutePath != outputFile.absolutePath) {
+            "Retime output must differ from its input"
+        }
+        require(timestampScale.isFinite() && timestampScale > 0.0) {
+            "Invalid timestamp scale $timestampScale"
+        }
+        require(playbackFrameRate.isFinite() && playbackFrameRate > 0.0) {
+            "Invalid playback frame rate $playbackFrameRate"
+        }
+        outputFile.parentFile?.mkdirs()
+
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(inputFile.absolutePath)
+            RandomAccessFile(outputFile, "rw").use { destination ->
+                destination.setLength(0L)
+                val muxer = MediaMuxer(
+                    destination.fd,
+                    MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
+                )
+                try {
+                    val inputToOutput = mutableMapOf<Int, Int>()
+                    var orientation = 0
+                    var hasVideo = false
+                    for (index in 0 until extractor.trackCount) {
+                        val format = extractor.getTrackFormat(index)
+                        val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                        if (!mime.startsWith("video/") && !mime.startsWith("audio/")) continue
+                        if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                            format.setLong(
+                                MediaFormat.KEY_DURATION,
+                                (format.getLong(MediaFormat.KEY_DURATION) * timestampScale)
+                                    .toLong()
+                                    .coerceAtLeast(1L),
+                            )
+                        }
+                        if (mime.startsWith("video/")) {
+                            hasVideo = true
+                            format.setInteger(
+                                MediaFormat.KEY_FRAME_RATE,
+                                playbackFrameRate.roundToInt().coerceAtLeast(1),
+                            )
+                            if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                                orientation = format.getInteger(MediaFormat.KEY_ROTATION)
+                            }
+                        }
+                        inputToOutput[index] = muxer.addTrack(format)
+                        extractor.selectTrack(index)
+                    }
+                    require(hasVideo) { "Recording has no video track" }
+                    if (orientation != 0) muxer.setOrientationHint(orientation)
+                    muxer.start()
+
+                    val buffer = ByteBuffer.allocateDirect(COPY_BUFFER_BYTES)
+                    val info = MediaCodec.BufferInfo()
+                    val firstSampleUs = extractor.sampleTime.takeIf { it >= 0L } ?: 0L
+                    val lastPtsByTrack = mutableMapOf<Int, Long>()
+                    while (true) {
+                        val inputTrack = extractor.sampleTrackIndex
+                        if (inputTrack < 0) break
+                        val outputTrack = inputToOutput[inputTrack]
+                        if (outputTrack == null) {
+                            if (!extractor.advance()) break
+                            continue
+                        }
+                        buffer.clear()
+                        val size = extractor.readSampleData(buffer, 0)
+                        if (size < 0) break
+                        val scaledPtsUs = (
+                            (extractor.sampleTime - firstSampleUs).coerceAtLeast(0L) * timestampScale
+                        ).toLong()
+                        val outputPtsUs = max(
+                            scaledPtsUs,
+                            (lastPtsByTrack[outputTrack] ?: -1L) + 1L,
+                        )
+                        info.set(0, size, outputPtsUs, extractor.sampleFlags)
+                        muxer.writeSampleData(outputTrack, buffer, info)
+                        lastPtsByTrack[outputTrack] = outputPtsUs
+                        if (!extractor.advance()) break
+                    }
+                    muxer.stop()
+                } finally {
+                    muxer.release()
+                }
+            }
+        } finally {
+            extractor.release()
+        }
+        require(outputFile.isFile && outputFile.length() > 0L) {
+            "Retimed recording is empty"
+        }
+        outputFile
     }.onFailure {
         runCatching { outputFile.delete() }
     }

@@ -425,7 +425,16 @@ class CameraCatalogTest {
         )
         val highSpeedSettings = CameraCatalog.settingsFor(highSpeed)
         assertEquals(
-            listOf("30fps", "60fps", "120fps", "240fps"),
+            listOf(
+                "30fps",
+                "60fps",
+                "120fps",
+                "240fps/23.976fps playback",
+                "240fps/24fps playback",
+                "240fps/29.97fps playback",
+                "240fps/30fps playback",
+                "240fps/48fps playback",
+            ),
             highSpeedSettings.first { it.id == "pro_video.frame_rate" }.options,
         )
         assertEquals(
@@ -448,6 +457,27 @@ class CameraCatalogTest {
                 .options
                 .none { it == "8K" },
         )
+    }
+
+    @Test
+    fun `combined pro video FPS entries expose capture and playback columns`() {
+        assertEquals(240, CameraCatalog.captureFrameRateFps("240fps/23.976fps playback"))
+        assertEquals(23.976, CameraCatalog.playbackFrameRateFps("240fps/23.976fps playback"))
+        assertEquals(60, CameraCatalog.captureFrameRateFps("60fps"))
+        assertEquals(60.0, CameraCatalog.playbackFrameRateFps("60fps"))
+
+        val settings = CameraCatalog.settingsFor(CameraModeId.ProVideo, GalaxyDeviceVariant.S26Ultra)
+        val ids = settings.map { it.id }
+        val fps = settings.first { it.id == "pro_video.frame_rate" }
+        assertTrue(ids.none { it.contains("playback_frame_rate") })
+        assertContains(fps.options, "240fps/48fps playback")
+    }
+
+    @Test
+    fun `slow motion offers every requested constrained output cadence`() {
+        val fps = CameraCatalog.settingsFor(CameraModeId.SlowMotion, GalaxyDeviceVariant.S26Ultra)
+            .first { it.id == "slow_motion.frame_rate" }
+        assertEquals(listOf("48fps", "60fps", "120fps", "240fps"), fps.options)
     }
 
     /**

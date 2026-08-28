@@ -108,8 +108,9 @@ internal fun snapScaleValuesToLadders(values: Map<String, String>): Map<String, 
     // Native demotion at restore (ProVideoPresenter.onStartPreviewCompleted): a stored Pro Video
     // shutter slower than the stored frame rate's period demotes to the slowest admitted rung,
     // so a value the fps-clipped dial cannot show never reaches the reducer.
-    val fps = (result["pro_video.frame_rate"] ?: CameraCatalog.defaultSettingValues["pro_video.frame_rate"])
-        ?.removeSuffix("fps")?.toIntOrNull()
+    val fps = CameraCatalog.captureFrameRateFps(
+        result["pro_video.frame_rate"] ?: CameraCatalog.defaultSettingValues["pro_video.frame_rate"],
+    )
     if (fps != null && fps > 0) {
         // ROUNDED, exactly like CameraCatalog.videoShutterCapNs: truncating division computes
         // 16666666 at 60 fps and evicts the legal "1/60" cap rung itself (which spells 16666667),

@@ -9,6 +9,7 @@ lifecycle = "2.8.0"
 camerax = "1.5.3"
 junit = "5.10.2"
 mediapipe = "1.0.0"
+media3 = "1.8.0"
 
 [libraries]
 kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib" }
@@ -40,6 +41,9 @@ camerax-view = { module = "androidx.camera:camera-view", version.ref = "camerax"
 camerax-video = { module = "androidx.camera:camera-video", version.ref = "camerax" }
 camerax-extensions = { module = "androidx.camera:camera-extensions", version.ref = "camerax" }
 mediapipe-tasks-vision = { module = "com.google.mediapipe:tasks-vision", version.ref = "mediapipe" }
+media3-common = { module = "androidx.media3:media3-common", version.ref = "media3" }
+media3-effect = { module = "androidx.media3:media3-effect", version.ref = "media3" }
+media3-transformer = { module = "androidx.media3:media3-transformer", version.ref = "media3" }
 
 # Test
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test" }

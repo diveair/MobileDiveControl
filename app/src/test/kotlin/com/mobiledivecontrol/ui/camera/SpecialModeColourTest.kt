@@ -27,4 +27,12 @@ class SpecialModeColourTest {
         assertEquals(300_000L, hyperlapseRecordingLimitMillis("300s"))
         assertEquals(null, hyperlapseRecordingLimitMillis("301s"))
     }
+
+    @Test
+    fun `pro video combined rate keeps capture and fractional playback distinct`() {
+        assertEquals(23.976, proVideoPlaybackFrameRate("240fps/23.976fps playback"), 1e-9)
+        assertEquals(24.0 / 23.976, playbackTimestampScale(23.976), 1e-9)
+        assertEquals(1.0, playbackTimestampScale(24.0), 1e-9)
+        assertEquals(30.0 / 29.97, playbackTimestampScale(29.97), 1e-9)
+    }
 }

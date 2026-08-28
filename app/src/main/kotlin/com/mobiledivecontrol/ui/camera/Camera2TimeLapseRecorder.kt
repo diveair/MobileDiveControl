@@ -4,7 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCaptureSession
-import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
@@ -17,7 +17,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
-import android.util.Range
 import android.util.Size
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -28,37 +27,58 @@ import androidx.core.content.ContextCompat
 import java.io.File
 import kotlin.math.max
 
+internal const val TIME_LAPSE_PLAYBACK_FPS = 30
+
+/** The initial Samsung Auto choice; explicit speed rungs remain exact. */
+internal fun hyperlapseSpeedFactor(value: String?, dayNight: String?): Int = when (value) {
+    "Night 45x" -> 45
+    "Night 15x" -> 15
+    "5x" -> 5
+    "10x" -> 10
+    "15x" -> 15
+    "30x" -> 30
+    "60x" -> 60
+    else -> if (dayNight == "Night") 15 else 10
+}
+
+internal fun hyperlapseCaptureRateFps(speedFactor: Int): Double =
+    TIME_LAPSE_PLAYBACK_FPS.toDouble() / speedFactor.coerceIn(1, 60)
+
 /**
- * Direct Camera2 fallback for Samsung devices that publish constrained-high-speed streams but
- * omit the high-speed CamcorderProfile required by CameraX Recorder. It owns only the short
- * high-speed recording session; CameraX remains the normal/LOG acquisition pipeline.
+ * Direct Camera2 + MediaRecorder time-lapse session.
+ *
+ * CameraX Recorder has no time-lapse capture-rate API; changing only its UI timer still produces
+ * an ordinary video. MediaRecorder's capture rate is the platform time-lapse contract: the camera
+ * continues to preview normally while the encoder samples at 30/speed frames per real second and
+ * writes those samples for 30 fps playback.
  */
-internal class Camera2HighSpeedRecorder(
+internal class Camera2TimeLapseRecorder(
     private val context: Context,
 ) {
     companion object {
-        private const val TAG = "DiveHighSpeed"
+        private const val TAG = "DiveTimeLapse"
     }
 
     data class Request(
         val previewHost: PreviewView,
         val cameraId: String,
         val size: Size,
-        /** Effective frame-capture cadence selected by the user. */
-        val fps: Int,
+        val captureRateFps: Double,
         val playbackFps: Int,
+        val cameraFrameRate: Int?,
+        val modeLabel: String,
         val outputFile: File,
-        val audioEnabled: Boolean,
         val exposureCompensationIndex: Int?,
         val zoomRatio: Float,
         val torchEnabled: Boolean,
-        val focusMode: String,
+        val focusDiopters: Float?,
+        val nightMode: Boolean,
     )
 
     private val handler = Handler(Looper.getMainLooper())
     private var surfaceView: SurfaceView? = null
     private var cameraDevice: CameraDevice? = null
-    private var session: CameraConstrainedHighSpeedCaptureSession? = null
+    private var session: CameraCaptureSession? = null
     private var mediaRecorder: MediaRecorder? = null
     private var request: Request? = null
     private var onStarted: (() -> Unit)? = null
@@ -71,14 +91,15 @@ internal class Camera2HighSpeedRecorder(
         get() = request != null
 
     val elapsedDurationMs: Long
-        get() = if (startedAtElapsedMs == 0L) 0L else SystemClock.elapsedRealtime() - startedAtElapsedMs
+        get() = if (startedAtElapsedMs == 0L) 0L
+        else SystemClock.elapsedRealtime() - startedAtElapsedMs
 
     fun start(
         request: Request,
         onStarted: () -> Unit,
         onFinalized: (Result<Long>) -> Unit,
     ) {
-        check(!isBusy) { "A high-speed recording is already active or starting" }
+        check(!isBusy) { "A time-lapse recording is already active or starting" }
         this.request = request
         this.onStarted = onStarted
         this.onFinalized = onFinalized
@@ -95,15 +116,20 @@ internal class Camera2HighSpeedRecorder(
         surfaceView = surface
         surface.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
-                if (this@Camera2HighSpeedRecorder.request !== request) return
+                if (this@Camera2TimeLapseRecorder.request !== request) return
                 configureAndOpen(request, holder)
             }
 
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+            override fun surfaceChanged(
+                holder: SurfaceHolder,
+                format: Int,
+                width: Int,
+                height: Int,
+            ) = Unit
 
             override fun surfaceDestroyed(holder: SurfaceHolder) {
-                if (this@Camera2HighSpeedRecorder.request === request && !finalizeDelivered) {
-                    fail(IllegalStateException("High-speed preview surface was destroyed"))
+                if (this@Camera2TimeLapseRecorder.request === request && !finalizeDelivered) {
+                    fail(IllegalStateException("Time-lapse preview surface was destroyed"))
                 }
             }
         })
@@ -125,28 +151,20 @@ internal class Camera2HighSpeedRecorder(
                 MediaRecorder()
             }
             mediaRecorder = recorder
-            if (request.audioEnabled) recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
             recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
             recorder.setVideoSize(request.size.width, request.size.height)
-            // MediaRecorder receives the full fixed 120/240 fps constrained stream here.
-            // Samsung ignores setCaptureRate for a Camera2 Surface, so the controller performs
-            // an explicit hardware cadence conversion after this raw segment is finalized.
+            recorder.setCaptureRate(request.captureRateFps)
             recorder.setVideoFrameRate(request.playbackFps)
-            val constrainedSourceFps = request.fps.coerceAtLeast(120)
-            val bitrate = max(
-                20_000_000,
-                (request.size.width.toLong() * request.size.height * constrainedSourceFps / 8L)
-                    .coerceAtMost(100_000_000L)
-                    .toInt(),
+            recorder.setVideoEncodingBitRate(
+                max(
+                    20_000_000,
+                    (request.size.width.toLong() * request.size.height * request.playbackFps / 8L)
+                        .coerceAtMost(60_000_000L)
+                        .toInt(),
+                ),
             )
-            recorder.setVideoEncodingBitRate(bitrate)
-            if (request.audioEnabled) {
-                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                recorder.setAudioSamplingRate(48_000)
-                recorder.setAudioEncodingBitRate(192_000)
-            }
             recorder.setOutputFile(request.outputFile.absolutePath)
             recorder.prepare()
 
@@ -160,7 +178,7 @@ internal class Camera2HighSpeedRecorder(
                 request.cameraId,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(device: CameraDevice) {
-                        if (this@Camera2HighSpeedRecorder.request !== request) {
+                        if (this@Camera2TimeLapseRecorder.request !== request) {
                             device.close()
                             return
                         }
@@ -170,12 +188,12 @@ internal class Camera2HighSpeedRecorder(
 
                     override fun onDisconnected(device: CameraDevice) {
                         device.close()
-                        fail(IllegalStateException("High-speed camera disconnected"))
+                        fail(IllegalStateException("Time-lapse camera disconnected"))
                     }
 
                     override fun onError(device: CameraDevice, error: Int) {
                         device.close()
-                        fail(IllegalStateException("High-speed camera open error $error"))
+                        fail(IllegalStateException("Time-lapse camera open error $error"))
                     }
                 },
                 handler,
@@ -185,6 +203,7 @@ internal class Camera2HighSpeedRecorder(
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun createSession(
         device: CameraDevice,
         holder: SurfaceHolder,
@@ -194,33 +213,35 @@ internal class Camera2HighSpeedRecorder(
         try {
             val previewSurface = holder.surface
             val recordingSurface = recorder.surface
-            device.createConstrainedHighSpeedCaptureSession(
+            device.createCaptureSession(
                 listOf(previewSurface, recordingSurface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(configured: CameraCaptureSession) {
-                        val highSpeed = configured as? CameraConstrainedHighSpeedCaptureSession
-                            ?: run {
-                                fail(IllegalStateException("Camera did not create a constrained-high-speed session"))
-                                return
-                            }
-                        if (this@Camera2HighSpeedRecorder.request !== request) {
-                            highSpeed.close()
+                        if (this@Camera2TimeLapseRecorder.request !== request) {
+                            configured.close()
                             return
                         }
-                        session = highSpeed
+                        session = configured
                         try {
-                            val constrainedRange = supportedRange(request)
                             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                                 addTarget(previewSurface)
                                 addTarget(recordingSurface)
-                                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, constrainedRange)
                                 set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                                 set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-                                if (request.focusMode == "Single AF") {
-                                    set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
-                                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                                request.cameraFrameRate?.let { fps ->
+                                    set(
+                                        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                        android.util.Range(fps, fps),
+                                    )
+                                }
+                                if (request.focusDiopters != null) {
+                                    set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                                    set(CaptureRequest.LENS_FOCUS_DISTANCE, request.focusDiopters)
                                 } else {
-                                    set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                    set(
+                                        CaptureRequest.CONTROL_AF_MODE,
+                                        CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+                                    )
                                 }
                                 request.exposureCompensationIndex?.let {
                                     set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, it)
@@ -233,20 +254,27 @@ internal class Camera2HighSpeedRecorder(
                                     if (request.torchEnabled) CameraMetadata.FLASH_MODE_TORCH
                                     else CameraMetadata.FLASH_MODE_OFF,
                                 )
+                                if (request.nightMode && supportsNightScene(request.cameraId)) {
+                                    set(
+                                        CaptureRequest.CONTROL_MODE,
+                                        CameraMetadata.CONTROL_MODE_USE_SCENE_MODE,
+                                    )
+                                    set(
+                                        CaptureRequest.CONTROL_SCENE_MODE,
+                                        CameraMetadata.CONTROL_SCENE_MODE_NIGHT,
+                                    )
+                                }
                             }
-                            highSpeed.setRepeatingBurst(
-                                highSpeed.createHighSpeedRequestList(builder.build()),
-                                null,
-                                handler,
-                            )
+                            configured.setRepeatingRequest(builder.build(), null, handler)
                             recorder.start()
                             startedAtElapsedMs = SystemClock.elapsedRealtime()
                             Log.i(
                                 TAG,
                                 "Started ${request.size.width}x${request.size.height} " +
-                                    "constrainedRange=$constrainedRange effectiveCapture=${request.fps}fps " +
-                                    "playback=${request.playbackFps}fps " +
-                                    "camera=${request.cameraId} audio=${request.audioEnabled}",
+                                    "mode=${request.modeLabel} " +
+                                    "capture=${"%.3f".format(request.captureRateFps)}fps " +
+                                    "playback=${request.playbackFps}fps camera=${request.cameraId} " +
+                                    "night=${request.nightMode}",
                             )
                             onStarted?.invoke()
                             if (stopRequested) stop()
@@ -256,7 +284,7 @@ internal class Camera2HighSpeedRecorder(
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        fail(IllegalStateException("Could not configure constrained-high-speed session"))
+                        fail(IllegalStateException("Could not configure time-lapse session"))
                     }
                 },
                 handler,
@@ -266,20 +294,12 @@ internal class Camera2HighSpeedRecorder(
         }
     }
 
-    private fun supportedRange(request: Request): Range<Int> {
+    private fun supportsNightScene(cameraId: String): Boolean {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val streamMap = manager.getCameraCharacteristics(request.cameraId).get(
-            android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
-        ) ?: throw IllegalArgumentException("Camera has no stream configuration map")
-        val ranges = streamMap.getHighSpeedVideoFpsRangesFor(request.size)
-        val requestedSourceFps = request.fps.coerceAtLeast(120)
-        return ranges
-            .filter { it.lower == it.upper && it.upper >= requestedSourceFps }
-            .minWithOrNull(compareBy<Range<Int>>({ if (it.lower == it.upper) 0 else 1 }, { it.upper - it.lower }))
-            ?: throw IllegalArgumentException(
-                "${request.size.width}x${request.size.height} has no constrained source for " +
-                    "${request.fps}fps (advertised ranges=${ranges.contentToString()})",
-            )
+        return manager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)
+            .let { it ?: intArrayOf() }
+            .contains(CameraMetadata.CONTROL_SCENE_MODE_NIGHT)
     }
 
     fun stop() {
@@ -294,44 +314,29 @@ internal class Camera2HighSpeedRecorder(
             mediaRecorder?.stop()
             val file = request?.outputFile
             if (file == null || !file.isFile || file.length() <= 0L) {
-                throw IllegalStateException("High-speed recorder produced no video")
+                throw IllegalStateException("Time-lapse recorder produced no video")
             }
-            inspectEncodedStream(file)
+            inspectEncodedStream(file, duration)
             finish(Result.success(duration))
         } catch (error: Throwable) {
             fail(error)
         }
     }
 
-    /** Read the muxed timestamps, not the requested setting, so hardware verification is honest. */
-    private fun inspectEncodedStream(file: File) {
+    private fun inspectEncodedStream(file: File, recordedDurationMs: Long) {
         runCatching {
             val extractor = MediaExtractor()
             try {
                 extractor.setDataSource(file.absolutePath)
-                val trackMimes = (0 until extractor.trackCount).map { index ->
-                    extractor.getTrackFormat(index).getString(MediaFormat.KEY_MIME).orEmpty()
-                }
-                val videoTrack = trackMimes.indexOfFirst { it.startsWith("video/") }
-                    .takeIf { it >= 0 } ?: return
-                val hasAudio = trackMimes.any { it.startsWith("audio/") }
+                val videoTrack = (0 until extractor.trackCount).firstOrNull { index ->
+                    extractor.getTrackFormat(index).getString(MediaFormat.KEY_MIME)
+                        ?.startsWith("video/") == true
+                } ?: return
                 val format = extractor.getTrackFormat(videoTrack)
-                extractor.selectTrack(videoTrack)
-                var firstUs = -1L
-                var lastUs = -1L
-                var samples = 0
-                while (samples < 480) {
-                    val timeUs = extractor.sampleTime
-                    if (timeUs < 0L) break
-                    if (firstUs < 0L) firstUs = timeUs
-                    lastUs = timeUs
-                    samples++
-                    if (!extractor.advance()) break
-                }
-                val measuredFps = if (samples > 1 && lastUs > firstUs) {
-                    (samples - 1) * 1_000_000.0 / (lastUs - firstUs)
+                val outputDurationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                    format.getLong(MediaFormat.KEY_DURATION)
                 } else {
-                    null
+                    -1L
                 }
                 val declaredFps = if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
                     format.getInteger(MediaFormat.KEY_FRAME_RATE)
@@ -341,13 +346,13 @@ internal class Camera2HighSpeedRecorder(
                 Log.i(
                     TAG,
                     "Encoded stream verified: declaredFps=$declaredFps " +
-                        "measuredFps=${measuredFps?.let { "%.2f".format(it) }} " +
-                        "samples=$samples hasAudio=$hasAudio tracks=$trackMimes format=$format",
+                        "recordedDurationMs=$recordedDurationMs outputDurationUs=$outputDurationUs " +
+                        "format=$format",
                 )
             } finally {
                 extractor.release()
             }
-        }.onFailure { error -> Log.w(TAG, "Could not inspect encoded high-speed stream", error) }
+        }.onFailure { error -> Log.w(TAG, "Could not inspect encoded time-lapse stream", error) }
     }
 
     fun release() {
@@ -357,7 +362,7 @@ internal class Camera2HighSpeedRecorder(
     }
 
     private fun fail(error: Throwable) {
-        Log.e(TAG, "High-speed recording failed", error)
+        Log.e(TAG, "Time-lapse recording failed", error)
         request?.outputFile?.delete()
         finish(Result.failure(error))
     }

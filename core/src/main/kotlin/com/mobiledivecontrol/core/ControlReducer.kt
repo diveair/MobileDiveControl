@@ -1602,6 +1602,13 @@ class ControlReducer(
 
     /** [adjustSelectedSetting] with the spec chosen by the caller — the wheel resolves its own. */
     private fun adjustSetting(state: AppState, spec: CameraSettingSpec, step: Int, repeatCount: Int = 0): Reduction {
+        if (state.camera.recording && spec.id.endsWith(".frame_rate")) {
+            val warning = "Stop recording before changing frame rate."
+            return Reduction(
+                state = state.copy(lastWarning = warning),
+                notes = listOf(warning),
+            )
+        }
         val manualFocusPreparation = if (spec.id.endsWith(".manual_focus")) {
             prepareStateForManualFocus(state)
         } else {
@@ -2015,9 +2022,9 @@ class ControlReducer(
     private fun applySettingValue(camera: CameraState, settingId: String, value: String): CameraState {
         val prefix = settingId.substringBeforeLast('.', "")
         var updatedValues = camera.settingValues + (settingId to value)
-        var selectedFps = updatedValues["$prefix.frame_rate"]
-            ?.removeSuffix("fps")
-            ?.toIntOrNull()
+        var selectedFps = CameraCatalog.captureFrameRateFps(
+            updatedValues["$prefix.frame_rate"],
+        )
         if (settingId.endsWith(".resolution")) {
             val compatibleRates = camera.capabilities?.videoFrameRatesByResolution
                 ?.get(value)

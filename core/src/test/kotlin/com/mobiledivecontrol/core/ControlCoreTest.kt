@@ -277,6 +277,27 @@ class ControlCoreTest {
     }
 
     @Test
+    fun `slow motion FPS cannot change during an active recording`() {
+        val reducer = ControlReducer()
+        val initial = CameraCatalog.launchCameraState(CameraModeId.SlowMotion)
+        val fpsIndex = CameraCatalog.settingsBarItems(initial)
+            .indexOfFirst { item ->
+                item is BottomBarItem.Setting && item.spec.id == "slow_motion.frame_rate"
+            }
+        val camera = initial.copy(
+            focusedZone = CameraUiZone.SettingsPanel,
+            settingsCursor = fpsIndex,
+            recording = true,
+        )
+        val before = camera.settingValues["slow_motion.frame_rate"]
+
+        val outcome = reducer.reduce(AppState(camera = camera), CameraCommand.NavigateDown)
+
+        assertEquals(before, outcome.state.camera.settingValues["slow_motion.frame_rate"])
+        assertEquals("Stop recording before changing frame rate.", outcome.state.lastWarning)
+    }
+
+    @Test
     fun `far left options opens an independent vertical rail`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
