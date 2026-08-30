@@ -50,9 +50,20 @@ class CameraHudOverlayLayoutTest {
 
     @Test
     fun `gallery never inherits the dive readout`() {
-        assertEquals(false, cameraDiveReadoutVisible(AppMode.Gallery))
-        assertEquals(true, cameraDiveReadoutVisible(AppMode.CameraLive))
-        assertEquals(true, cameraDiveReadoutVisible(AppMode.Safety))
+        assertEquals(false, cameraDiveReadoutVisible(AppMode.Gallery, CameraState()))
+        assertEquals(true, cameraDiveReadoutVisible(AppMode.CameraLive, CameraState()))
+        assertEquals(true, cameraDiveReadoutVisible(AppMode.Safety, CameraState()))
+    }
+
+    @Test
+    fun `panorama review owns the bottom centre without the dive readout`() {
+        assertEquals(
+            false,
+            cameraDiveReadoutVisible(
+                AppMode.CameraLive,
+                CameraState(panoramaReviewAvailable = true),
+            ),
+        )
     }
 
     @Test

@@ -79,14 +79,72 @@ class ControlCoreTest {
         assertEquals(CameraUiZone.ModeRail, railOutcome.state.camera.focusedZone)
         assertEquals("Track Heading", railOutcome.state.camera.primaryHighlightedEntry.label)
 
-        // Track Heading owns the default slot; move to Photo to open its settings.
-        core.dispatch(CameraCommand.NavigateDown)
+        // Track Heading owns the explicit live-view entry slot; select Photo by its catalog index.
+        repeat(CameraCatalog.primaryIndexForMode(CameraModeId.Photo)) {
+            core.dispatch(CameraCommand.NavigateDown)
+        }
         val settingsOutcome = core.handleNotificationPayload(
             HousingCharacteristic.ButtonEvents.shortHex,
             byteArrayOf(0x10),
             start.plusMillis(100),
         )
         assertEquals(CameraUiZone.SettingsPanel, settingsOutcome.state.camera.focusedZone)
+    }
+
+    @Test
+    fun `panorama dynamic range is one exclusive HDR LOG camera command`() {
+        val reducer = ControlReducer()
+        val initial = CameraCatalog.launchCameraState(CameraModeId.Panorama)
+
+        assertEquals("HDR", initial.settingValues["panorama.hdr_log"])
+
+        val log = reducer.reduce(
+            AppState(camera = initial),
+            CameraCommand.NudgeSetting("panorama.hdr_log", +1),
+        )
+        assertEquals("LOG", log.state.camera.settingValues["panorama.hdr_log"])
+        assertEquals(
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SetHdrLogMode("LOG"))),
+            log.effects,
+        )
+
+        val off = reducer.reduce(
+            AppState(camera = initial),
+            CameraCommand.NudgeSetting("panorama.hdr_log", -1),
+        )
+        assertEquals("Off", off.state.camera.settingValues["panorama.hdr_log"])
+        assertEquals(
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SetHdrLogMode("Off"))),
+            off.effects,
+        )
+    }
+
+    @Test
+    fun `unavailable camera settings refuse fake state changes and raise an alert`() {
+        val reducer = ControlReducer()
+        val initial = CameraCatalog.launchCameraState(CameraModeId.Photo)
+
+        val outcome = reducer.reduce(
+            AppState(camera = initial),
+            CameraCommand.NudgeSetting("photo.motion_photo", +1),
+        )
+
+        assertEquals("Off", outcome.state.camera.settingValues["photo.motion_photo"])
+        assertTrue(outcome.state.lastWarning.orEmpty().startsWith("Motion photo is unavailable"))
+        assertTrue(outcome.effects.single() is PlatformEffect.EmitAlert)
+    }
+
+    @Test
+    fun `runtime camera failure is surfaced without re-executing a camera command`() {
+        val reducer = ControlReducer()
+        val outcome = reducer.reduce(
+            AppState(),
+            CameraCommand.ReportRuntimeFailure("8K camera session could not be opened."),
+        )
+
+        assertEquals("8K camera session could not be opened.", outcome.state.lastWarning)
+        assertTrue(outcome.effects.single() is PlatformEffect.EmitAlert)
+        assertTrue(outcome.effects.none { it is PlatformEffect.ExecuteCamera })
     }
 
     @Test
@@ -113,7 +171,12 @@ class ControlCoreTest {
         val modeRail = core.dispatch(CameraCommand.Confirm)
         assertEquals(CameraUiZone.ModeRail, modeRail.state.camera.focusedZone)
         assertEquals(CameraUiZone.SettingsPanel, modeRail.state.camera.modeRailReturnZone)
-        assertEquals("Track Heading", modeRail.state.camera.primaryHighlightedEntry.label)
+        assertEquals("Photo", modeRail.state.camera.primaryHighlightedEntry.label)
+
+        repeat(CameraCatalog.primaryIndexForMode(CameraModeId.Photo)) {
+            core.dispatch(CameraCommand.NavigateUp)
+        }
+        assertEquals("Track Heading", core.state.camera.primaryHighlightedEntry.label)
 
         val tracked = core.dispatch(CameraCommand.Confirm)
         assertEquals(CameraUiZone.SettingsPanel, tracked.state.camera.focusedZone)
@@ -123,6 +186,21 @@ class ControlCoreTest {
         val moved = core.dispatch(CameraCommand.NavigateLeft)
         assertEquals(CameraUiZone.SettingsPanel, moved.state.camera.focusedZone)
         assertTrue(moved.state.camera.settingsCursor != modesCursor)
+    }
+
+    @Test
+    fun `centred mode control remembers the active mode and cycles in the requested order`() {
+        val reducer = ControlReducer()
+        val proVideo = CameraCatalog.launchCameraState(CameraModeId.ProVideo)
+
+        val opened = reducer.reduce(AppState(camera = proVideo), CameraCommand.OpenModeRail)
+        assertEquals(CameraModeId.ProVideo, opened.state.camera.primaryHighlightedEntry.mode)
+
+        val up = reducer.reduce(AppState(camera = proVideo), CameraCommand.NavigateUp)
+        assertEquals(CameraModeId.Panorama, up.state.camera.activeMode)
+
+        val down = reducer.reduce(AppState(camera = proVideo), CameraCommand.NavigateDown)
+        assertEquals(CameraModeId.SlowMotion, down.state.camera.activeMode)
     }
 
     @Test
@@ -277,6 +355,108 @@ class ControlCoreTest {
     }
 
     @Test
+    fun `hyperlapse controls use the requested housing order with no options tile`() {
+        val reducer = ControlReducer()
+        val initial = CameraCatalog.launchCameraState(CameraModeId.Hyperlapse)
+        val items = CameraCatalog.settingsBarItems(initial)
+
+        assertTrue(items.none { it is BottomBarItem.MoreSettings })
+        assertTrue(CameraCatalog.optionsMenuSettings(initial).isEmpty())
+        assertEquals(
+            listOf("hyperlapse.flash", "hyperlapse.grid"),
+            items.take(2).filterIsInstance<BottomBarItem.Setting>().map { it.spec.id },
+        )
+        val modeIndex = items.indexOfFirst { it is BottomBarItem.ModesButton }
+        assertEquals(
+            listOf(
+                "hyperlapse.manual_focus",
+                "hyperlapse.speed",
+                "hyperlapse.resolution",
+                "hyperlapse.video_format",
+            ),
+            items.drop(modeIndex + 1).take(4)
+                .filterIsInstance<BottomBarItem.Setting>()
+                .map { it.spec.id },
+        )
+        assertTrue(items.filterIsInstance<BottomBarItem.Setting>().none {
+            it.spec.id == "hyperlapse.slider_assignment"
+        })
+
+        val flashSelected = initial.copy(settingsCursor = 0)
+        val torch = reducer.reduce(
+            AppState(camera = flashSelected),
+            CameraCommand.NavigateUp,
+        ).state.camera
+        assertEquals("Torch", torch.settingValues["hyperlapse.flash"])
+
+        val resolutionSelected = initial.copy(
+            settingsCursor = items.indexOfFirst {
+                it is BottomBarItem.Setting && it.spec.id == "hyperlapse.resolution"
+            },
+        )
+        val uhd = reducer.reduce(
+            AppState(camera = resolutionSelected),
+            CameraCommand.NavigateUp,
+        ).state.camera
+        assertEquals("UHD 4K", uhd.settingValues["hyperlapse.resolution"])
+
+        val formatSelected = initial.copy(
+            settingsCursor = items.indexOfFirst {
+                it is BottomBarItem.Setting && it.spec.id == "hyperlapse.video_format"
+            },
+        )
+        val h264 = reducer.reduce(
+            AppState(camera = formatSelected),
+            CameraCommand.NavigateDown,
+        ).state.camera
+        assertEquals("H.264", h264.settingValues["hyperlapse.video_format"])
+
+        val ultraWide = initial.copy(
+            capabilities = CameraCapabilities(manualFocusSupported = false),
+            settingValues = initial.settingValues + mapOf(
+                "hyperlapse.lens" to "0.6x",
+                "hyperlapse.manual_focus" to "Fixed",
+            ),
+        )
+        val ultraWideItems = CameraCatalog.settingsBarItems(ultraWide)
+        val focusIndex = ultraWideItems.indexOfFirst {
+            it is BottomBarItem.Setting && it.spec.id == "hyperlapse.manual_focus"
+        }
+        val adjustedFocus = reducer.reduce(
+            AppState(camera = ultraWide.copy(settingsCursor = focusIndex)),
+            CameraCommand.NavigateUp,
+        ).state.camera
+        assertEquals("Fixed", adjustedFocus.settingValues["hyperlapse.manual_focus"])
+
+        val focusCapable = initial.copy(
+            settingValues = initial.settingValues + mapOf(
+                "hyperlapse.lens" to "1x",
+                "hyperlapse.manual_focus" to "AF",
+            ),
+        )
+        val focusCapableItems = CameraCatalog.settingsBarItems(focusCapable)
+        val focusCapableIndex = focusCapableItems.indexOfFirst {
+            it is BottomBarItem.Setting && it.spec.id == "hyperlapse.manual_focus"
+        }
+        val adjustedCapableFocus = reducer.reduce(
+            AppState(camera = focusCapable.copy(settingsCursor = focusCapableIndex)),
+            CameraCommand.NavigateUp,
+        ).state.camera
+        assertEquals("0.000", adjustedCapableFocus.settingValues["hyperlapse.manual_focus"])
+
+        val wrappedLeft = reducer.reduce(
+            AppState(camera = flashSelected),
+            CameraCommand.NavigateLeft,
+        ).state.camera
+        assertEquals(items.lastIndex, wrappedLeft.settingsCursor)
+        val wrappedRight = reducer.reduce(
+            AppState(camera = wrappedLeft),
+            CameraCommand.NavigateRight,
+        ).state.camera
+        assertEquals(0, wrappedRight.settingsCursor)
+    }
+
+    @Test
     fun `slow motion FPS cannot change during an active recording`() {
         val reducer = ControlReducer()
         val initial = CameraCatalog.launchCameraState(CameraModeId.SlowMotion)
@@ -347,6 +527,47 @@ class ControlCoreTest {
         assertTrue(!closed.state.camera.showMoreSettings)
         assertEquals(CameraUiZone.SettingsPanel, closed.state.camera.focusedZone)
         assertEquals(0, closed.state.camera.settingsCursor)
+    }
+
+    @Test
+    fun `pro photo options navigation wraps at both ends`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.Pro).copy(
+            focusedZone = CameraUiZone.SettingsPanel,
+        )
+        val opened = reducer.reduce(AppState(camera = camera), CameraCommand.ToggleOptionsMenu)
+        val settings = CameraCatalog.optionsMenuSettings(opened.state.camera)
+
+        val last = reducer.reduce(opened.state, CameraCommand.NavigateUp)
+        assertEquals(settings.lastIndex, last.state.camera.optionsMenuCursor)
+        val first = reducer.reduce(last.state, CameraCommand.NavigateDown)
+        assertEquals(0, first.state.camera.optionsMenuCursor)
+    }
+
+    @Test
+    fun `expert labs enforce the real 12 MP RAW JPEG computational capture contract`() {
+        val reducer = ControlReducer()
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ExpertRaw).copy(
+            settingValues = CameraCatalog.defaultSettingValues +
+                ("expert.megapixels" to "50MP") +
+                ("expert.save_format" to "RAW"),
+        )
+        val nd = reducer.reduce(
+            AppState(camera = camera),
+            CameraCommand.NudgeSetting("expert.nd_filter", +1),
+        ).state.camera
+
+        assertEquals("2 stops", nd.settingValues["expert.nd_filter"])
+        assertEquals("12MP", nd.settingValues["expert.megapixels"])
+        assertEquals("RAW + JPEG", nd.settingValues["expert.save_format"])
+
+        val multi = reducer.reduce(
+            AppState(camera = nd),
+            CameraCommand.NudgeSetting("expert.multi_exposure", +1),
+        ).state.camera
+        assertEquals("On", multi.settingValues["expert.multi_exposure"])
+        assertEquals("Off", multi.settingValues["expert.nd_filter"])
+        assertEquals("Off", multi.settingValues["expert.astrophotography"])
     }
 
     @Test
@@ -552,7 +773,9 @@ class ControlCoreTest {
 
         // Force mode to Pro and open settings panel
         core.forceMode(AppMode.CameraLive)
-        repeat(3) { core.dispatch(CameraCommand.NavigateDown) } // Photo -> Portrait -> Video -> Pro
+        repeat(modeRailSteps(CameraModeId.Photo, CameraModeId.Pro)) {
+            core.dispatch(CameraCommand.NavigateDown)
+        }
         val modeOutcome = core.dispatch(CameraCommand.Confirm)
         assertEquals(CameraModeId.Pro, modeOutcome.state.camera.activeMode)
         assertEquals(CameraUiZone.SettingsPanel, modeOutcome.state.camera.focusedZone)
@@ -666,7 +889,9 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
 
         core.forceMode(AppMode.CameraLive)
-        repeat(3) { core.dispatch(CameraCommand.NavigateDown) } // Photo -> Portrait -> Video -> Pro
+        repeat(modeRailSteps(CameraModeId.Photo, CameraModeId.Pro)) {
+            core.dispatch(CameraCommand.NavigateDown)
+        }
         val modeOutcome = core.dispatch(CameraCommand.Confirm)
         assertEquals(CameraModeId.Pro, modeOutcome.state.camera.activeMode)
         assertEquals(CameraUiZone.SettingsPanel, modeOutcome.state.camera.focusedZone)
@@ -713,7 +938,9 @@ class ControlCoreTest {
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
         core.forceMode(AppMode.CameraLive)
-        repeat(3) { core.dispatch(CameraCommand.NavigateDown) }
+        repeat(modeRailSteps(CameraModeId.Photo, CameraModeId.Pro)) {
+            core.dispatch(CameraCommand.NavigateDown)
+        }
         core.dispatch(CameraCommand.Confirm) // Pro mode, settings panel
         core.updateMeteredExposure(MeteredExposure(iso = 137, shutterNs = 5_000_000L, wbKelvin = 5_649))
 
@@ -729,7 +956,9 @@ class ControlCoreTest {
         blind.advanceBle(BleSignal.Ready)
         blind.updatePermission(PermissionKind.Camera, true)
         blind.forceMode(AppMode.CameraLive)
-        repeat(3) { blind.dispatch(CameraCommand.NavigateDown) }
+        repeat(modeRailSteps(CameraModeId.Photo, CameraModeId.Pro)) {
+            blind.dispatch(CameraCommand.NavigateDown)
+        }
         blind.dispatch(CameraCommand.Confirm)
         val stepped = blind.dispatch(CameraCommand.NudgeSetting("pro.iso", +1))
         assertEquals("50", stepped.state.camera.settingValues["pro.iso"])
@@ -747,7 +976,9 @@ class ControlCoreTest {
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
         core.forceMode(AppMode.CameraLive)
-        repeat(3) { core.dispatch(CameraCommand.NavigateDown) }
+        repeat(modeRailSteps(CameraModeId.Photo, CameraModeId.Pro)) {
+            core.dispatch(CameraCommand.NavigateDown)
+        }
         core.dispatch(CameraCommand.Confirm) // Pro mode
 
         // EV is live while everything is Auto...
@@ -775,7 +1006,7 @@ class ControlCoreTest {
         val settingsOutcome = core.dispatch(CameraCommand.Confirm)
         assertEquals(CameraUiZone.SettingsPanel, settingsOutcome.state.camera.focusedZone)
 
-        val evSelected = core.dispatch(CameraCommand.NavigateLeft)
+        val evSelected = core.dispatch(CameraCommand.NavigateRight)
         // The native quick EV bar has no Auto — it rests at 0.0, exactly like the stock dial.
         assertEquals("0.0", evSelected.state.camera.settingValues["photo.exposure_compensation"])
 
@@ -794,7 +1025,10 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
 
         core.dispatch(CameraCommand.Confirm)
-        repeat(3) {
+        val photoBar = CameraCatalog.settingsBarItems(CameraCatalog.launchCameraState(CameraModeId.Photo))
+        val modeIndex = photoBar.indexOf(BottomBarItem.ModesButton)
+        val galleryIndex = photoBar.indexOf(BottomBarItem.GalleryShortcut)
+        repeat(galleryIndex - modeIndex) {
             core.dispatch(CameraCommand.NavigateRight)
         }
 
@@ -827,6 +1061,7 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
 
         core.dispatch(CameraCommand.Confirm)
+        core.dispatch(CameraCommand.NavigateRight) // EV
         val focusSelected = core.dispatch(CameraCommand.NavigateRight)
         assertEquals("AF", focusSelected.state.camera.settingValues["photo.manual_focus"])
 
@@ -854,7 +1089,7 @@ class ControlCoreTest {
     fun `focus uses 0_005 steps and sensitivity controls repeat cadence not step size`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-            settingsCursor = 4,
+            settingsCursor = photoBarIndex("photo.manual_focus"),
             settingValues = CameraCatalog.defaultSettingValues + ("photo.manual_focus" to "0.500"),
             sliderSensitivities = CameraCatalog.defaultSliderSensitivities + ("photo.manual_focus" to SliderSensitivity(1)),
         )
@@ -887,7 +1122,7 @@ class ControlCoreTest {
         val reducer = ControlReducer(nowMs = { clock })
         val maxState = AppState(
             camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-                settingsCursor = 4,
+                settingsCursor = photoBarIndex("photo.manual_focus"),
                 settingValues = CameraCatalog.defaultSettingValues + ("photo.manual_focus" to "1.000"),
             ),
         )
@@ -931,7 +1166,7 @@ class ControlCoreTest {
     private fun focusState(value: String, level: Int, lastInputAtMs: Long): AppState =
         AppState(
             camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-                settingsCursor = 4,
+                settingsCursor = photoBarIndex("photo.manual_focus"),
                 settingValues = CameraCatalog.defaultSettingValues + ("photo.manual_focus" to value),
                 sliderSensitivities = CameraCatalog.defaultSliderSensitivities +
                     ("photo.manual_focus" to SliderSensitivity(level)),
@@ -1167,7 +1402,7 @@ class ControlCoreTest {
         assertEquals(100, inSpec.options.size)
 
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-            settingsCursor = 4,
+            settingsCursor = photoBarIndex("photo.manual_focus"),
             settingsEditing = true,
             sliderEditTarget = SliderEditTarget.FocusRampIn,
         )
@@ -1187,7 +1422,7 @@ class ControlCoreTest {
     fun `focus selection on 0_6x lens enters edit mode without switching lenses`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-            settingsCursor = 4,
+            settingsCursor = photoBarIndex("photo.manual_focus"),
             settingValues = CameraCatalog.defaultSettingValues + ("photo.lens" to "0.6x"),
         )
         val state = AppState(camera = camera)
@@ -1202,34 +1437,32 @@ class ControlCoreTest {
     fun `moving cursor from lens to focus on fixed 0_6x lens does not switch the lens`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-            settingsCursor = 1,
+            settingsCursor = photoBarIndex("photo.manual_focus") - 1,
             settingValues = CameraCatalog.defaultSettingValues + ("photo.lens" to "0.6x"),
         )
         val state = AppState(camera = camera)
 
         val outcome = reducer.reduce(state, CameraCommand.NavigateRight)
-        assertEquals(2, outcome.state.camera.settingsCursor)
+        assertEquals(photoBarIndex("photo.manual_focus"), outcome.state.camera.settingsCursor)
         assertEquals("0.6x", outcome.state.camera.settingValues["photo.lens"])
         assertEquals("AF", outcome.state.camera.settingValues["photo.manual_focus"])
         assertTrue(outcome.effects.isEmpty())
     }
 
     @Test
-    fun `focus adjustment on 0_6x lens keeps the selected lens and applies the focus step`() {
+    fun `focus adjustment on fixed 0_6x lens keeps the selected lens and focus unchanged`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-            settingsCursor = 4,
+            settingsCursor = photoBarIndex("photo.manual_focus"),
             settingValues = CameraCatalog.defaultSettingValues + ("photo.lens" to "0.6x"),
         )
         val state = AppState(camera = camera)
 
         val outcome = reducer.reduce(state, CameraCommand.NavigateUp, repeatCount = 0)
         assertEquals("0.6x", outcome.state.camera.settingValues["photo.lens"])
-        assertEquals("0.000", outcome.state.camera.settingValues["photo.manual_focus"])
-        // The lens follows the STATE, not an effect. SetManualFocus had no consumer in the
-        // runtime controller, and emitting it made every rung's outcome carry an effect —
-        // which opened the ViewModel's whole effects pipeline, an IO coroutine included, up to
-        // 1250 times a second. What matters is that the focus value landed, asserted above.
+        assertEquals("AF", outcome.state.camera.settingValues["photo.manual_focus"])
+        // The S24 0.6x physical camera reports a zero minimum-focus distance: it has no actuator.
+        // Do not emit a command or advance a value that the lens cannot physically apply.
         assertTrue(
             outcome.effects.none {
                 it is PlatformEffect.ExecuteCamera && it.command is CameraCommand.SetManualFocus
@@ -1242,7 +1475,7 @@ class ControlCoreTest {
     fun `switching to 0_6x lens does not reset focus or focus assist state`() {
         val reducer = ControlReducer()
         val camera = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
-            settingsCursor = 1,
+            settingsCursor = photoBarIndex("photo.lens"),
             settingValues = CameraCatalog.defaultSettingValues +
                 ("photo.lens" to "1x") +
                 ("photo.manual_focus" to "0.420") +
@@ -1441,5 +1674,17 @@ class ControlCoreTest {
             GalleryPreviewAction.Next,
             reducer.reduce(state, GalleryCommand.NavigateRight).state.gallery.previewAction,
         )
+    }
+
+    private fun photoBarIndex(settingId: String): Int = CameraCatalog
+        .settingsBarItems(CameraCatalog.launchCameraState(CameraModeId.Photo))
+        .indexOfFirst { item -> item is BottomBarItem.Setting && item.spec.id == settingId }
+        .also { index -> require(index >= 0) { "$settingId is absent from the Photo bar" } }
+
+    private fun modeRailSteps(from: CameraModeId, to: CameraModeId): Int {
+        val entries = CameraCatalog.primaryRailEntries
+        val fromIndex = CameraCatalog.primaryIndexForMode(from)
+        val toIndex = CameraCatalog.primaryIndexForMode(to)
+        return (toIndex - fromIndex + entries.size) % entries.size
     }
 }

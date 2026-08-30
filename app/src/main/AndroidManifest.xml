@@ -11,8 +11,9 @@
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
+    <!-- Also powers Expert RAW's offline Sky Guide projection; no location leaves the phone. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
@@ -70,5 +71,23 @@
             android:name=".service.HousingLinkService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!--
+            Optional, explicitly user-enabled bridge for operating Android/Samsung permission
+            dialogs after the phone is sealed in the housing. It is package-filtered and refuses
+            every window that is not recognisably a system permission prompt.
+        -->
+        <service
+            android:name=".accessibility.PermissionDialogHousingService"
+            android:exported="false"
+            android:label="@string/permission_dialog_accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/permission_dialog_accessibility_service" />
+        </service>
     </application>
 </manifest>

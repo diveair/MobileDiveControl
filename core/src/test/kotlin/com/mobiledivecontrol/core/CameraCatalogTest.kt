@@ -13,21 +13,38 @@ class CameraCatalogTest {
         assertEquals(
             listOf(
                 "Track Heading",
+                "Pro Video",
+                "Slow Motion",
+                "Hyperlapse",
+                "Video",
+                "Portrait Video",
                 "Photo",
                 "Portrait",
-                "Video",
-                "Pro",
-                "Expert RAW",
                 "Food",
                 "Night",
+                "Expert RAW",
+                "Pro",
                 "Panorama",
-                "Pro Video",
-                "Hyperlapse",
-                "Slow Motion",
-                "Portrait Video",
                 "Diagnostics",
             ),
             labels,
+        )
+        assertEquals(
+            listOf(
+                CameraModeId.ProVideo,
+                CameraModeId.SlowMotion,
+                CameraModeId.Hyperlapse,
+                CameraModeId.Video,
+                CameraModeId.PortraitVideo,
+                CameraModeId.Photo,
+                CameraModeId.Portrait,
+                CameraModeId.Food,
+                CameraModeId.Night,
+                CameraModeId.ExpertRaw,
+                CameraModeId.Pro,
+                CameraModeId.Panorama,
+            ),
+            CameraCatalog.centerModeCycle,
         )
     }
 
@@ -132,7 +149,7 @@ class CameraCatalogTest {
         }
 
         // Pro: the full spine. More at far left, mode token anchored after ISO,
-        // Slider always immediately left of Gallery at the far right.
+        // Guides occupies the final setting slot immediately left of Gallery.
         val proItems = CameraCatalog.settingsBarItems(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra, showMore = false)
         assertEquals(
             listOf(
@@ -145,6 +162,7 @@ class CameraCatalogTest {
                 "pro.manual_focus",
                 "pro.white_balance",
                 "pro.slider_assignment",
+                "pro.guides",
                 "gallery",
             ),
             ids(proItems),
@@ -152,6 +170,10 @@ class CameraCatalogTest {
         assertEquals(
             CameraCatalog.defaultSettingsCursor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra),
             proItems.indexOf(BottomBarItem.ModesButton),
+        )
+        assertTrue(
+            CameraCatalog.optionsMenuSettings(CameraCatalog.launchCameraState(CameraModeId.Pro))
+                .none { it.id == "pro.guides" },
         )
 
         // Pro Video: identical shape.
@@ -172,21 +194,56 @@ class CameraCatalogTest {
             ids(proVideoItems),
         )
 
-        // Photo: missing spine tiles simply drop out; the template's shape holds.
+        // Photo fits every top-level setting on the bar; Focus Assist and Focus Curve are
+        // sub-controls of the Focus editor rather than duplicate tiles.
         val photoItems = CameraCatalog.settingsBarItems(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra, showMore = false)
         assertEquals(
             listOf(
-                "more",
+                "photo.flash",
+                "photo.grid",
+                "photo.timer",
+                "photo.motion_photo",
+                "photo.save_format",
                 "photo.lens",
-                "photo.exposure_compensation",
                 "modes",
+                "photo.exposure_compensation",
                 "photo.manual_focus",
-                "photo.slider_assignment",
+                "photo.megapixels",
+                "photo.aspect_ratio",
+                "photo.filters",
                 "gallery",
             ),
             ids(photoItems),
         )
-        assertEquals(3, CameraCatalog.defaultSettingsCursor(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra))
+        assertEquals(6, CameraCatalog.defaultSettingsCursor(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra))
+        assertTrue(CameraCatalog.optionsMenuSettings(CameraCatalog.launchCameraState(CameraModeId.Photo)).isEmpty())
+
+        // Panorama keeps its native-style quick controls balanced around the mode token.
+        // EV is no longer buried in Options; HDR/LOG/Guides are directly housing-navigable.
+        val panoramaItems = CameraCatalog.settingsBarItems(
+            CameraModeId.Panorama,
+            GalaxyDeviceVariant.S26Ultra,
+            showMore = false,
+        )
+        assertEquals(
+            listOf(
+                "panorama.shutter_sound",
+                "panorama.hdr_log",
+                "panorama.lens",
+                "modes",
+                "panorama.exposure",
+                "panorama.slider_assignment",
+                "panorama.grid",
+                "gallery",
+            ),
+            ids(panoramaItems),
+        )
+        assertEquals(
+            emptyList(),
+            CameraCatalog.optionsMenuSettings(
+                CameraCatalog.launchCameraState(CameraModeId.Panorama),
+            ).map { it.id },
+        )
 
         // Opening Options never mutates the horizontal rail. Extras belong only to the
         // independent vertical collection.
@@ -196,19 +253,27 @@ class CameraCatalogTest {
         assertEquals(ids(videoClosed), videoIds)
         assertTrue(videoItems.none { it is BottomBarItem.LensShortcut })
         assertTrue(videoIds.contains("video.lens"))
-        assertTrue("video.flash" !in videoIds)
-        assertTrue("video.resolution" !in videoIds)
+        assertContains(videoIds, "video.flash")
+        assertContains(videoIds, "video.resolution")
+        assertContains(videoIds, "video.frame_rate")
+        assertContains(videoIds, "video.hdr")
+        assertContains(videoIds, "video.log")
+        assertContains(videoIds, "video.video_format")
+        assertContains(videoIds, "video.video_stabilization")
+        assertContains(videoIds, "video.audio_recording")
         assertEquals("gallery", videoIds.last())
-        assertEquals("video.slider_assignment", videoIds[videoIds.size - 2])
         assertEquals("more", videoIds.first())
 
         val videoOptions = CameraCatalog.optionsMenuSettings(
             CameraCatalog.launchCameraState(CameraModeId.Video),
         ).map { it.id }
-        assertContains(videoOptions, "video.flash")
         assertContains(videoOptions, "video.super_steady")
-        assertContains(videoOptions, "video.resolution")
-        assertContains(videoOptions, "video.frame_rate")
+        assertContains(videoOptions, "video.auto_fps")
+        assertContains(videoOptions, "video.aspect_ratio")
+        assertContains(videoOptions, "video.filters")
+        assertTrue("video.flash" !in videoOptions)
+        assertTrue("video.resolution" !in videoOptions)
+        assertTrue("video.frame_rate" !in videoOptions)
 
         // The wheel's default assignment is Focus wherever focus exists.
         val slider = proItems.filterIsInstance<BottomBarItem.Setting>()
@@ -248,16 +313,14 @@ class CameraCatalogTest {
         assertTrue("night.megapixels" !in ids(CameraModeId.Night))
 
         listOf(
-            "panorama.direction",
-            "panorama.guide",
             "panorama.exposure",
+            "panorama.hdr_log",
+            "panorama.grid",
+            "panorama.shutter_sound",
         ).forEach { assertContains(ids(CameraModeId.Panorama), it) }
-        assertEquals(
-            "Auto",
-            CameraCatalog.settingsFor(CameraModeId.Panorama, GalaxyDeviceVariant.S26Ultra)
-                .first { it.id == "panorama.direction" }
-                .defaultValue,
-        )
+        assertEquals("Off", CameraCatalog.defaultSettingValues["panorama.shutter_sound"])
+        assertTrue("panorama.direction" !in ids(CameraModeId.Panorama))
+        assertTrue("panorama.guide" !in ids(CameraModeId.Panorama))
 
         listOf(
             "hyperlapse.flash",
@@ -310,6 +373,33 @@ class CameraCatalogTest {
     }
 
     @Test
+    fun `device-check controls are classified as working or explicitly unavailable`() {
+        val allSettings = CameraModeId.entries.flatMap { mode ->
+            CameraCatalog.settingsFor(mode, GalaxyDeviceVariant.S26Ultra)
+        }
+        assertTrue(allSettings.none { it.status == CameraFeatureStatus.NeedsVerification })
+
+        val confirmedFormerChecks = setOf(
+            "food.color_temperature",
+            "expert.ocean_mode",
+            "expert.aqua_tone",
+            "video.resolution",
+            "slow_motion.focus_mode",
+        )
+        confirmedFormerChecks.forEach { id ->
+            assertEquals(
+                CameraFeatureStatus.Confirmed,
+                allSettings.first { it.id == id }.status,
+                id,
+            )
+        }
+
+        allSettings
+            .filter { it.status == CameraFeatureStatus.Unavailable }
+            .forEach { spec -> assertTrue(!spec.note.isNullOrBlank(), spec.id) }
+    }
+
+    @Test
     fun `requested Expert RAW labs controls use Samsung ranges and names`() {
         val settings = CameraCatalog.settingsFor(CameraModeId.ExpertRaw, GalaxyDeviceVariant.S26Ultra)
             .associateBy { it.id }
@@ -342,20 +432,144 @@ class CameraCatalogTest {
         val proAperture = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "pro.virtual_aperture" }
         assertEquals(aperture, proAperture.options)
+        listOf(
+            "expert.virtual_aperture",
+            "expert.nd_filter",
+            "expert.astrophotography",
+            "expert.sky_guide",
+            "expert.astro_portrait",
+            "expert.multi_exposure",
+            "expert.multi_exposure_shutter",
+            "expert.multi_exposure_overlay",
+            "expert.multi_exposure_frames",
+            "expert.ocean_capture_interval",
+            "pro.virtual_aperture",
+            "pro.save_format",
+        ).forEach { id ->
+            val spec = CameraCatalog.settingsFor(
+                if (id.startsWith("pro.")) CameraModeId.Pro else CameraModeId.ExpertRaw,
+                GalaxyDeviceVariant.S26Ultra,
+            ).first { it.id == id }
+            assertEquals(CameraFeatureStatus.Confirmed, spec.status, id)
+        }
     }
 
     @Test
-    fun `slow motion promotes FPS to housing quick bar`() {
+    fun `raw formats are clipped to the active CameraX output capability`() {
+        val unsupported = CameraCatalog.launchCameraState(CameraModeId.Pro).copy(
+            capabilities = CameraCapabilities(
+                rawCaptureSupported = false,
+                rawJpegCaptureSupported = false,
+            ),
+        )
+        assertEquals(
+            listOf("JPEG"),
+            CameraCatalog.settingsFor(unsupported).first { it.id == "pro.save_format" }.options,
+        )
+
+        val rawOnly = CameraCatalog.launchCameraState(CameraModeId.ExpertRaw).copy(
+            capabilities = CameraCapabilities(
+                rawCaptureSupported = true,
+                rawJpegCaptureSupported = false,
+            ),
+        )
+        assertEquals(
+            listOf("RAW", "JPEG"),
+            CameraCatalog.settingsFor(rawOnly).first { it.id == "expert.save_format" }.options,
+        )
+
+        val simultaneous = unsupported.copy(
+            capabilities = CameraCapabilities(
+                rawCaptureSupported = true,
+                rawJpegCaptureSupported = true,
+            ),
+        )
+        assertEquals(
+            listOf("JPEG", "RAW + JPEG"),
+            CameraCatalog.settingsFor(simultaneous).first { it.id == "pro.save_format" }.options,
+        )
+    }
+
+    @Test
+    fun `slow motion promotes every setting to housing quick bar`() {
         val camera = CameraCatalog.launchCameraState(CameraModeId.SlowMotion)
         val horizontal = CameraCatalog.settingsBarItems(camera)
             .filterIsInstance<BottomBarItem.Setting>()
             .map { it.spec.id }
         val options = CameraCatalog.optionsMenuSettings(camera).map { it.id }
 
-        assertContains(horizontal, "slow_motion.frame_rate")
-        assertTrue("slow_motion.frame_rate" !in options)
-        assertContains(options, "slow_motion.focus_mode")
-        assertContains(options, "slow_motion.hdr")
+        assertEquals(
+            listOf(
+                "slow_motion.flash",
+                "slow_motion.grid",
+                "slow_motion.hdr",
+                "slow_motion.lens",
+                "slow_motion.resolution",
+                "slow_motion.exposure",
+                "slow_motion.focus_mode",
+                "slow_motion.frame_rate",
+            ),
+            horizontal,
+        )
+        assertTrue(options.isEmpty())
+    }
+
+    @Test
+    fun `compact native mode bars expose their practical top level controls`() {
+        fun barIds(mode: CameraModeId): List<String> = CameraCatalog.settingsBarItems(
+            CameraCatalog.launchCameraState(mode),
+        ).mapNotNull { item ->
+            when (item) {
+                BottomBarItem.ModesButton -> "modes"
+                BottomBarItem.GalleryShortcut -> "gallery"
+                BottomBarItem.MoreSettings -> "more"
+                is BottomBarItem.LensShortcut -> null
+                is BottomBarItem.Setting -> item.spec.id
+            }
+        }
+
+        assertEquals(
+            listOf(
+                "portrait_video.flash", "portrait_video.grid", "portrait_video.hdr",
+                "portrait_video.resolution", "portrait_video.lens", "modes",
+                "portrait_video.exposure", "portrait_video.manual_focus",
+                "portrait_video.background_effect", "portrait_video.effect_strength",
+                "portrait_video.audio_recording", "portrait_video.frame_rate", "gallery",
+            ),
+            barIds(CameraModeId.PortraitVideo),
+        )
+        assertEquals(
+            listOf(
+                "night.timer", "night.grid", "night.lens", "modes", "night.exposure",
+                "night.capture_time", "night.aspect_ratio", "gallery",
+            ),
+            barIds(CameraModeId.Night),
+        )
+        assertEquals(
+            listOf(
+                "food.grid", "food.radial_blur", "food.color_temperature", "food.lens",
+                "modes", "food.exposure", "food.aspect_ratio", "gallery",
+            ),
+            barIds(CameraModeId.Food),
+        )
+        assertEquals(
+            listOf(
+                "portrait.flash", "portrait.grid", "portrait.timer", "portrait.beauty",
+                "portrait.lens", "modes", "portrait.exposure", "portrait.background_effect",
+                "portrait.effect_strength", "portrait.lighting", "portrait.aspect_ratio", "gallery",
+            ),
+            barIds(CameraModeId.Portrait),
+        )
+        listOf(
+            CameraModeId.SlowMotion,
+            CameraModeId.PortraitVideo,
+            CameraModeId.Night,
+            CameraModeId.Food,
+            CameraModeId.Portrait,
+            CameraModeId.Photo,
+        ).forEach { mode ->
+            assertTrue(CameraCatalog.optionsMenuSettings(CameraCatalog.launchCameraState(mode)).isEmpty(), mode.name)
+        }
     }
 
     @Test
@@ -373,8 +587,74 @@ class CameraCatalogTest {
         assertEquals("Speed", hyperlapse.getValue("hyperlapse.speed").label)
         val hyperlapseQuickBar = CameraCatalog.settingsBarItems(
             CameraCatalog.launchCameraState(CameraModeId.Hyperlapse),
-        ).filterIsInstance<BottomBarItem.Setting>().map { it.spec.id }
-        assertContains(hyperlapseQuickBar, "hyperlapse.speed")
+        )
+        fun bottomId(item: BottomBarItem): String = when (item) {
+            BottomBarItem.ModesButton -> "modes"
+            BottomBarItem.GalleryShortcut -> "gallery"
+            BottomBarItem.MoreSettings -> "more"
+            is BottomBarItem.LensShortcut -> "lens:${item.value}"
+            is BottomBarItem.Setting -> item.spec.id
+        }
+        assertEquals(
+            listOf(
+                "hyperlapse.flash",
+                "hyperlapse.grid",
+                "hyperlapse.day_night",
+                "hyperlapse.lens",
+                "hyperlapse.recording_time",
+                "hyperlapse.exposure",
+                "modes",
+                "hyperlapse.manual_focus",
+                "hyperlapse.speed",
+                "hyperlapse.resolution",
+                "hyperlapse.video_format",
+                "gallery",
+            ),
+            hyperlapseQuickBar.map(::bottomId),
+        )
+        assertEquals(
+            emptyList(),
+            CameraCatalog.optionsMenuSettings(
+                CameraCatalog.launchCameraState(CameraModeId.Hyperlapse),
+            ).map { it.id },
+        )
+        assertEquals(
+            CameraFeatureStatus.Confirmed,
+            hyperlapse.getValue("hyperlapse.day_night").status,
+        )
+        assertEquals(
+            listOf("H.264", "HEVC / H.265"),
+            hyperlapse.getValue("hyperlapse.video_format").options,
+        )
+        assertEquals("HEVC / H.265", hyperlapse.getValue("hyperlapse.video_format").defaultValue)
+
+        val ultraWideFocusCamera = CameraCatalog.launchCameraState(CameraModeId.Hyperlapse).copy(
+            capabilities = CameraCapabilities(manualFocusSupported = false),
+            settingValues = CameraCatalog.defaultSettingValues + mapOf(
+                "hyperlapse.lens" to "0.6x",
+                "hyperlapse.manual_focus" to "Fixed",
+            ),
+        )
+        val hyperlapseFocus = CameraCatalog.settingsFor(ultraWideFocusCamera)
+            .first { it.id == "hyperlapse.manual_focus" }
+        val proFocus = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
+            .first { it.id == "pro.manual_focus" }
+        assertEquals(proFocus.kind, hyperlapseFocus.kind)
+        assertEquals(proFocus.options, hyperlapseFocus.options)
+        assertEquals(proFocus.defaultValue, hyperlapseFocus.defaultValue)
+        assertEquals("Fixed", CameraCatalog.currentValue(ultraWideFocusCamera, hyperlapseFocus))
+        assertTrue(CameraCatalog.settingsFor(ultraWideFocusCamera).any {
+            it.id == "hyperlapse.focus_peaking"
+        })
+        val ultraWideBar = CameraCatalog.settingsBarItems(ultraWideFocusCamera)
+        val modeIndex = ultraWideBar.indexOfFirst { it is BottomBarItem.ModesButton }
+        assertEquals(
+            "hyperlapse.manual_focus",
+            (ultraWideBar[modeIndex + 1] as BottomBarItem.Setting).spec.id,
+        )
+        assertTrue(ultraWideBar.filterIsInstance<BottomBarItem.Setting>().none {
+            it.spec.id == "hyperlapse.slider_assignment"
+        })
 
         val portraitVideo = CameraCatalog.settingsFor(CameraModeId.PortraitVideo, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "portrait_video.background_effect" }
@@ -402,6 +682,23 @@ class CameraCatalogTest {
         assertEquals(listOf("0.6x", "1x"), lenses(CameraModeId.Panorama))
         assertEquals(listOf("1x", "2x"), lenses(CameraModeId.PortraitVideo))
         assertEquals(listOf("0.6x", "1x", "3x"), lenses(CameraModeId.SlowMotion))
+
+        val allDetectedModes = listOf(
+            CameraModeId.Photo,
+            CameraModeId.ExpertRaw,
+            CameraModeId.Pro,
+            CameraModeId.Night,
+            CameraModeId.Burst,
+            CameraModeId.SingleTake,
+            CameraModeId.Hyperlapse,
+            CameraModeId.Video,
+            CameraModeId.ProVideo,
+            CameraModeId.DualRecording,
+            CameraModeId.NightVideo,
+        )
+        allDetectedModes.forEach { mode ->
+            assertEquals(detected, lenses(mode), "Unexpected lens routing choices for $mode")
+        }
     }
 
     @Test
@@ -481,6 +778,19 @@ class CameraCatalogTest {
         assertEquals(
             listOf("JPEG", "RAW + JPEG"),
             CameraCatalog.settingsFor(pro).first { it.id == "pro.save_format" }.options,
+        )
+
+        // Hyperlapse owns a direct Camera2/MediaRecorder path. Its FHD and UHD choices must not
+        // be clipped by CameraX Recorder's quality report for the currently selected lens.
+        val cameraXReportsOnlyFhd = caps.copy(availableVideoResolutions = listOf("FHD"))
+        val hyperlapse = CameraCatalog.launchCameraState(CameraModeId.Hyperlapse).copy(
+            capabilities = cameraXReportsOnlyFhd,
+        )
+        assertEquals(
+            listOf("FHD", "UHD 4K"),
+            CameraCatalog.settingsFor(hyperlapse)
+                .first { it.id == "hyperlapse.resolution" }
+                .options,
         )
     }
 

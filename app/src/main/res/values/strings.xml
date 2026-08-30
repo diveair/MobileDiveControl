@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">DiveControl</string>
+    <string name="permission_dialog_accessibility_service_label">Housing permission controls</string>
+    <string name="permission_dialog_accessibility_service_description">Lets DiveControl housing buttons select Allow or Don’t allow only while an Android or Samsung permission prompt is visible. It does not read or control other apps.</string>
 </resources>

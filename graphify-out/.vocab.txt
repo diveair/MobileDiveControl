@@ -446,6 +446,7 @@ dot
 double
 down
 downward
+dpad
 draft
 drain
 draining

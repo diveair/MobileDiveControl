@@ -6,16 +6,22 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.CamcorderProfile
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaRecorder
+import android.media.MediaActionSound
+import android.net.Uri
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -74,6 +80,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import com.mobiledivecontrol.core.CameraCapabilities
+import com.mobiledivecontrol.core.CameraCaptureType
 import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.CameraState
@@ -93,7 +100,10 @@ import kotlin.math.atan
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Samsung Food's relative cool/warm dial, mapped onto the app's calibrated Kelvin renderer. */
 internal fun foodColourTemperatureKelvin(value: String?): Int? = value
@@ -117,9 +127,12 @@ internal fun hyperlapseRecordingLimitMillis(value: String?): Long? = value
     ?.takeIf { it in 1..300 }
     ?.times(60_000L)
 
-/** Samsung reports 0x62 when Auto should enter its low-light/night Hyperlapse cadence. */
+/**
+ * Samsung's recording-motion-speed result reports 100 when Auto should use the 45x night
+ * cadence. Value 98 is the night-auto request sent to the HAL, not the suggestion returned by it.
+ */
 internal fun hyperlapseAutoUsesNightCadence(suggestedMotionSpeedMode: Int?): Boolean =
-    suggestedMotionSpeedMode == 0x62
+    suggestedMotionSpeedMode == 100
 
 internal fun proVideoPlaybackFrameRate(value: String?): Double =
     CameraCatalog.playbackFrameRateFps(value)
@@ -131,6 +144,38 @@ internal fun playbackTimestampScale(playbackFrameRate: Double): Double =
 
 internal fun captureToPlaybackTimestampScale(captureFrameRate: Int, playbackFrameRate: Double): Double =
     captureFrameRate.toDouble() / playbackFrameRate
+
+internal enum class StillCaptureOutput {
+    Jpeg,
+    Raw,
+    RawJpeg,
+    UltraHdrJpeg,
+}
+
+internal fun stillCaptureOutput(value: String?): StillCaptureOutput = when (value) {
+    "RAW" -> StillCaptureOutput.Raw
+    "RAW + JPEG" -> StillCaptureOutput.RawJpeg
+    "Ultra HDR JPEG" -> StillCaptureOutput.UltraHdrJpeg
+    else -> StillCaptureOutput.Jpeg
+}
+
+internal fun imageCaptureOutputFormat(value: String?): Int = when (stillCaptureOutput(value)) {
+    StillCaptureOutput.Raw -> ImageCapture.OUTPUT_FORMAT_RAW
+    StillCaptureOutput.RawJpeg -> ImageCapture.OUTPUT_FORMAT_RAW_JPEG
+    StillCaptureOutput.UltraHdrJpeg -> ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR
+    StillCaptureOutput.Jpeg -> ImageCapture.OUTPUT_FORMAT_JPEG
+}
+
+/**
+ * Samsung's runningPhysicalId vendor result is an internal sensor identifier (for example 58),
+ * not the public Camera2 physical ID (for example 2). Validate an optical route with the public
+ * focal-length result instead; that value is in the same unit and namespace as discovery.
+ */
+internal fun cameraFocalLengthMatches(
+    expectedMm: Float?,
+    actualMm: Float?,
+    toleranceMm: Float = 0.05f,
+): Boolean = expectedMm == null || actualMm == null || abs(expectedMm - actualMm) <= toleranceMm
 
 /**
  * Direct Camera2 recording owns exceptional stream sizes only while the shutter is active.
@@ -184,8 +229,11 @@ class CameraRuntimeController(
         private const val PANORAMA_MAX_FRAMES = 40
         private const val PANORAMA_TOO_FAST_RADIANS_PER_SECOND = 1.25f
         private const val PANORAMA_THUMBNAIL_INTERVAL_MS = 100L
-        private val PANORAMA_CAPTURE_SIZE = Size(1280, 960)
-        private val PANORAMA_STORED_FRAME_SIZE = Size(960, 720)
+        private const val PANORAMA_VIEWFINDER_INTERVAL_MS = 33L
+        private const val PANORAMA_VIEWFINDER_WIDTH_PX = 640
+        private const val PANORAMA_PROCESS_TIMEOUT_MS = 120_000L
+        private val PANORAMA_CAPTURE_SIZE = Size(3648, 2736)
+        private val PANORAMA_STORED_FRAME_SIZE = Size(3648, 2736)
 
         /** The native app's vendor "manual kelvin" AWB mode (AeAfController branch B). */
         /** XYZ (D65) to linear sRGB. */
@@ -296,6 +344,8 @@ class CameraRuntimeController(
         val exposure: String?,
         val lens: String?,
         val hdrLog: String?,
+        /** Hyperlapse Day/Night changes the repeating preview request, not only recording. */
+        val dayNight: String?,
         val whiteBalance: String?,
         val filter: String?,
         val manualFocus: String?,
@@ -321,6 +371,15 @@ class CameraRuntimeController(
     )
 
     private data class CaptureMetadataSnapshot(val json: String)
+
+    /** A stitched panorama remains private here until the diver explicitly saves or deletes it. */
+    private data class PendingPanoramaReview(
+        val file: File,
+        val displayName: String,
+        val saveLocation: com.mobiledivecontrol.core.RecordingSaveLocation,
+        val metadata: CaptureMetadataSnapshot?,
+        val previewBitmap: Bitmap,
+    )
 
     private data class PhysicalLensProfile(
         val logicalCameraId: String,
@@ -469,7 +528,7 @@ class CameraRuntimeController(
     private var boundCaptureFormat: String? = null
     private var boundAspectRatio: String? = null
     private var boundMode: com.mobiledivecontrol.core.CameraModeId? = null
-    private var boundExpectedPhysicalCameraId: String? = null
+    private var boundExpectedFocalLengthMm: Float? = null
     private var boundHdrExtension: Boolean = false
     @Volatile private var boundLogCaptureContractSatisfied: Boolean = false
     @Volatile private var maximumInformationRequestModes = MaximumInformationRequestModes()
@@ -531,14 +590,58 @@ class CameraRuntimeController(
     private var focusPeakingProcessor: FocusPeakingSurfaceProcessor? = null
     private val cameraRequestHandler = Handler(Looper.getMainLooper())
     private var photoTimerGeneration = 0
+    private enum class ExpertSequenceKind {
+        VirtualAperture,
+        Nd,
+        Astro,
+        AstroPortrait,
+        MultiContinuous,
+        MultiManual,
+        OceanInterval,
+    }
+    private data class ExpertCaptureFrame(
+        val rawFile: File?,
+        val jpegFile: File?,
+    )
+    private var expertSequenceGeneration = 0
+    private var expertSequenceKind: ExpertSequenceKind? = null
+    private var expertFrameCaptureInFlight = false
+    private var expertCaptureDirectory: File? = null
+    private val expertCapturedFrames = mutableListOf<ExpertCaptureFrame>()
+    private var expertRequestedOutput = StillCaptureOutput.Jpeg
+    private var expertMetadataSnapshot: CaptureMetadataSnapshot? = null
+    private var expertOriginalFlashMode: Int? = null
+    private var oceanIntervalMillis = 0L
     private var recordingLimitGeneration = 0
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+    private val gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
+    private var skyGuideSensorRegistered = false
+    private var skyGuideLocationManager: LocationManager? = null
+    private var skyGuideLocationListener: LocationListener? = null
+    private val skyGuideMotionListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            if (event.sensor.type != Sensor.TYPE_GRAVITY || event.values.size < 3) return
+            val elevation = panoramaGravityElevationRadians(
+                gravityX = event.values[0],
+                gravityY = event.values[1],
+                gravityZ = event.values[2],
+            )
+            ExpertRawCaptureState.skyAltitudeDegrees.value =
+                Math.toDegrees(elevation.toDouble()).toFloat().coerceIn(-90f, 90f)
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
     private var focusMotionMonitorRegistered = false
     @Volatile private var lastSignificantFocusMotionAtMs = 0L
 
     private val panoramaExecutor = Executors.newSingleThreadExecutor()
-    private val panoramaFrames = mutableListOf<CapturedPanoramaFrame>()
+    /** Live-strip composition never runs on CameraX's analysis or UI executors. */
+    private val panoramaPreviewExecutor = Executors.newSingleThreadExecutor()
+    private val panoramaFrames = mutableListOf<StoredPanoramaFrame>()
+    private val panoramaPreviewFrames = mutableListOf<CapturedPanoramaFrame>()
+    private var panoramaCaptureDirectory: File? = null
     private var panoramaCaptureActive = false
     @Volatile private var panoramaCaptureInFlight = false
     @Volatile private var panoramaFrameRequestClaimed = false
@@ -546,37 +649,109 @@ class CameraRuntimeController(
     private var panoramaRequestedRadians = 0f
     private var panoramaFinishPending = false
     private var panoramaSensorRegistered = false
-    private var panoramaGeneration = 0
+    @Volatile private var panoramaGeneration = 0
+    private var panoramaLiveThumbnailGeneration = 0
+    /** Owned and touched only by panoramaPreviewExecutor. */
+    private var panoramaLiveWorkingBitmap: Bitmap? = null
+    private var panoramaLiveWorkingDirection: String? = null
+    private var panoramaLiveWorkingSweepRadians: Float? = null
     private var panoramaLastSensorTimestampNs = 0L
     private var panoramaSweepRadians = 0f
     private var panoramaCrossAxisRadians = 0f
     private var panoramaLastCapturedRadians = 0f
     private var panoramaDirection = "Right"
     private var panoramaDirectionPending = false
+    private var panoramaDirectionProbeRadians = 0f
+    private var panoramaReverseRadians = 0f
+    private var panoramaGravityRegistered = false
+    private var panoramaBaselineElevationRadians: Float? = null
     private var panoramaMetadataSnapshot: CaptureMetadataSnapshot? = null
+    @Volatile private var panoramaCaptureProfile = PanoramaDynamicRangeProfile.Off
+    private var pendingPanoramaReview: PendingPanoramaReview? = null
     private var lastPanoramaThumbnailAtMs = 0L
+    private var lastPanoramaViewfinderAtMs = 0L
+    private var panoramaLastMeaningfulMotionAtMs = 0L
+    private var panoramaLastAnnouncementAtMs = 0L
+    private var panoramaLastAnnouncement = ""
+    private val panoramaActionSound = MediaActionSound().apply {
+        load(MediaActionSound.SHUTTER_CLICK)
+        load(MediaActionSound.STOP_VIDEO_RECORDING)
+    }
+    private val panoramaProcessTimeoutRunnable = Runnable {
+        if (!PanoramaCaptureState.finalizing.value) return@Runnable
+        panoramaGeneration++
+        PanoramaCaptureState.finalizing.value = false
+        PanoramaCaptureState.savingProgress.value = 0
+        PanoramaCaptureState.message.value = "Can't create panorama. Processing timed out."
+        val timedOutThumbnail = PanoramaCaptureState.liveThumbnail.value
+        PanoramaCaptureState.liveThumbnail.value = null
+        timedOutThumbnail?.let { bitmap ->
+            cameraRequestHandler.postDelayed({ runCatching { bitmap.recycle() } }, 500L)
+        }
+        setPanoramaCaptureLocks(false)
+        Toast.makeText(context, "Panorama processing timed out", Toast.LENGTH_LONG).show()
+    }
 
     private val panoramaMotionListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
-            if (!panoramaCaptureActive || event.sensor.type != Sensor.TYPE_GYROSCOPE || event.values.size < 2) return
+            if (!panoramaCaptureActive) return
+            if (event.sensor.type == Sensor.TYPE_GRAVITY && event.values.size >= 3) {
+                val elevation = panoramaGravityElevationRadians(
+                    gravityX = event.values[0],
+                    gravityY = event.values[1],
+                    gravityZ = event.values[2],
+                )
+                val baseline = panoramaBaselineElevationRadians
+                if (baseline == null) {
+                    panoramaBaselineElevationRadians = elevation
+                    panoramaCrossAxisRadians = 0f
+                } else {
+                    val measured = panoramaGravityCrossAxisRadians(
+                        baselineElevationRadians = baseline,
+                        currentElevationRadians = elevation,
+                    ).coerceIn(-0.43633232f, 0.43633232f)
+                    // Native pitch guidance follows stable attitude instead of raw gyro drift.
+                    panoramaCrossAxisRadians = panoramaCrossAxisRadians * 0.78f + measured * 0.22f
+                }
+                updatePanoramaCrossAxisGuidance()
+                return
+            }
+            if (event.sensor.type != Sensor.TYPE_GYROSCOPE || event.values.size < 2) return
             val previousTimestamp = panoramaLastSensorTimestampNs
             panoramaLastSensorTimestampNs = event.timestamp
             if (previousTimestamp == 0L) return
             val elapsedSeconds = ((event.timestamp - previousTimestamp) / 1_000_000_000f)
                 .coerceIn(0f, 0.08f)
             val displayRotation = previewView?.display?.rotation ?: 1
-            if (panoramaDirectionPending &&
-                maxOf(kotlin.math.abs(event.values[0]), kotlin.math.abs(event.values[1])) >= 0.08f
-            ) {
-                panoramaDirection = panoramaDirectionFromGyro(
-                    displayRotation = displayRotation,
-                    gyroX = event.values[0],
-                    gyroY = event.values[1],
+            val rightwardRate = panoramaScreenAxisRates(
+                displayRotation = displayRotation,
+                gyroX = event.values[0],
+                gyroY = event.values[1],
+            ).rightward
+            if (panoramaDirectionPending) {
+                if (kotlin.math.abs(rightwardRate) >= 0.05f) {
+                    panoramaDirectionProbeRadians = (
+                        panoramaDirectionProbeRadians + rightwardRate * elapsedSeconds
+                        ).coerceIn(-0.17453292f, 0.17453292f)
+                }
+                val lockedDirection = panoramaDirectionFromAccumulatedMotion(
+                    panoramaDirectionProbeRadians,
                 )
+                if (lockedDirection == null) {
+                    PanoramaCaptureState.movingTooFast.value = false
+                    setPanoramaGuidance("Pan slowly in any direction.")
+                    return
+                }
+                panoramaDirection = lockedDirection
                 panoramaDirectionPending = false
                 PanoramaCaptureState.direction.value = panoramaDirection
                 PanoramaCaptureState.directionLocked.value = true
-                Log.i(TAG, "Panorama auto direction: $panoramaDirection")
+                panoramaLastMeaningfulMotionAtMs = SystemClock.elapsedRealtime()
+                Log.i(
+                    TAG,
+                    "Panorama auto direction: $panoramaDirection " +
+                        "probe=$panoramaDirectionProbeRadians",
+                )
             }
             val sweepRate = panoramaSweepAxisRate(
                 direction = panoramaDirection,
@@ -584,27 +759,59 @@ class CameraRuntimeController(
                 gyroX = event.values[0],
                 gyroY = event.values[1],
             )
-            val crossAxisRate = panoramaCrossAxisRate(
-                direction = panoramaDirection,
-                displayRotation = displayRotation,
-                gyroX = event.values[0],
-                gyroY = event.values[1],
-            )
-            panoramaCrossAxisRadians = (
-                panoramaCrossAxisRadians + crossAxisRate * elapsedSeconds
-                ).coerceIn(-0.34906584f, 0.34906584f)
-            PanoramaCaptureState.crossAxisRadians.value = panoramaCrossAxisRadians
-            val warningLevel = panoramaWarningLevel(panoramaCrossAxisRadians)
-            PanoramaCaptureState.warningLevel.value = warningLevel
-            PanoramaCaptureState.correction.value = panoramaCorrection(
-                direction = panoramaDirection,
-                crossAxisRadians = panoramaCrossAxisRadians,
-            )
-            if (kotlin.math.abs(sweepRate) < 0.035f) {
+            if (!panoramaGravityRegistered) {
+                val crossAxisRate = panoramaCrossAxisRate(
+                    direction = panoramaDirection,
+                    displayRotation = displayRotation,
+                    gyroX = event.values[0],
+                    gyroY = event.values[1],
+                )
+                panoramaCrossAxisRadians = (
+                    panoramaCrossAxisRadians + crossAxisRate * elapsedSeconds
+                    ).coerceIn(-0.43633232f, 0.43633232f)
+                updatePanoramaCrossAxisGuidance()
+            }
+            val crossAxisWarning = panoramaWarningLevel(panoramaCrossAxisRadians)
+            val now = SystemClock.elapsedRealtime()
+            val rollRate = event.values.getOrElse(2) { 0f }
+            if (sweepRate < -0.08f && !panoramaDirectionPending) {
                 PanoramaCaptureState.movingTooFast.value = false
-                PanoramaCaptureState.message.value = ""
+                PanoramaCaptureState.warningLevel.value = PanoramaWarningLevel.High
+                panoramaReverseRadians += -sweepRate * elapsedSeconds
+                if (panoramaShouldFinishOnReverse(
+                        reverseRadians = panoramaReverseRadians,
+                        sweepRadians = panoramaSweepRadians,
+                        capturedFrames = panoramaFrames.size,
+                    )
+                ) {
+                    Log.i(
+                        TAG,
+                        "Panorama reverse finish: reverse=$panoramaReverseRadians " +
+                            "sweep=$panoramaSweepRadians frames=${panoramaFrames.size}",
+                    )
+                    finishPanoramaCapture()
+                    return
+                }
+                setPanoramaGuidance("Pan in one direction.")
                 return
             }
+            if (kotlin.math.abs(rollRate) > 0.75f) {
+                PanoramaCaptureState.movingTooFast.value = false
+                PanoramaCaptureState.warningLevel.value = PanoramaWarningLevel.High
+                setPanoramaGuidance("Keep phone steady")
+                return
+            }
+            if (kotlin.math.abs(sweepRate) < 0.035f) {
+                PanoramaCaptureState.movingTooFast.value = false
+                setPanoramaGuidance(if (
+                    !panoramaDirectionPending &&
+                    panoramaSweepRadians > 0f &&
+                    now - panoramaLastMeaningfulMotionAtMs > 1_200L
+                ) "Pan slowly" else "")
+                return
+            }
+            panoramaReverseRadians = 0f
+            panoramaLastMeaningfulMotionAtMs = now
             val wideAngle = boundLensValue == "0.6x"
             val targetRadians = panoramaTargetRadians(panoramaDirection, wideAngle)
             panoramaSweepRadians = (panoramaSweepRadians + sweepRate * elapsedSeconds)
@@ -616,8 +823,17 @@ class CameraRuntimeController(
             )
             PanoramaCaptureState.movingTooFast.value =
                 kotlin.math.abs(sweepRate) > PANORAMA_TOO_FAST_RADIANS_PER_SECOND
-            PanoramaCaptureState.message.value =
-                if (PanoramaCaptureState.movingTooFast.value) "Move slowly" else ""
+            setPanoramaGuidance(when {
+                PanoramaCaptureState.movingTooFast.value -> "Move slowly"
+                crossAxisWarning != PanoramaWarningLevel.None -> when (PanoramaCaptureState.correction.value) {
+                    PanoramaCorrection.Up -> "Tilt up"
+                    PanoramaCorrection.Down -> "Tilt down"
+                    PanoramaCorrection.Left -> "Move left"
+                    PanoramaCorrection.Right -> "Move right"
+                    PanoramaCorrection.None -> "Keep phone steady"
+                }
+                else -> ""
+            })
             if (!panoramaCaptureInFlight &&
                 panoramaSweepRadians - panoramaLastCapturedRadians >= PANORAMA_FRAME_STEP_RADIANS
             ) {
@@ -631,6 +847,15 @@ class CameraRuntimeController(
         }
 
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
+
+    private fun updatePanoramaCrossAxisGuidance() {
+        PanoramaCaptureState.crossAxisRadians.value = panoramaCrossAxisRadians
+        PanoramaCaptureState.warningLevel.value = panoramaWarningLevel(panoramaCrossAxisRadians)
+        PanoramaCaptureState.correction.value = panoramaCorrection(
+            direction = panoramaDirection,
+            crossAxisRadians = panoramaCrossAxisRadians,
+        )
     }
 
     private val focusMotionListener = object : SensorEventListener {
@@ -804,19 +1029,26 @@ class CameraRuntimeController(
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
             val lp = samsungFocusLensPosition(result)
             val physicalId = runningPhysicalCameraId(result)
+            val focalLengthMm = result.get(CaptureResult.LENS_FOCAL_LENGTH)
             val noiseReductionMode = result.get(CaptureResult.NOISE_REDUCTION_MODE)
             val edgeMode = result.get(CaptureResult.EDGE_MODE)
+            val controlMode = result.get(CaptureResult.CONTROL_MODE)
+            val sceneMode = result.get(CaptureResult.CONTROL_SCENE_MODE)
+            val tonemapMode = result.get(CaptureResult.TONEMAP_MODE)
+            val aeLocked = result.get(CaptureResult.CONTROL_AE_LOCK)
+            val awbLocked = result.get(CaptureResult.CONTROL_AWB_LOCK)
             val videoStabilizationMode = result.get(
                 CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE,
             )
-            val expectedPhysicalId = boundExpectedPhysicalCameraId
+            val expectedFocalLengthMm = boundExpectedFocalLengthMm
             if (activeRecording != null && boundHdrLogMode == "LOG" &&
-                physicalId != null && expectedPhysicalId != null && physicalId != expectedPhysicalId
+                !cameraFocalLengthMatches(expectedFocalLengthMm, focalLengthMm)
             ) {
                 Log.e(
                     TAG,
                     "Log physical-camera contract changed while recording: " +
-                        "expected=$expectedPhysicalId actual=$physicalId",
+                        "expectedFocal=${expectedFocalLengthMm}mm actualFocal=${focalLengthMm}mm " +
+                        "vendorPhysical=$physicalId",
                 )
             }
             // evIdx is the HAL's echo of CONTROL_AE_EXPOSURE_COMPENSATION — the on-metal proof
@@ -829,11 +1061,13 @@ class CameraRuntimeController(
             Log.d(
                 TAG,
                 "CaptureResult fd=$fd af=$af afState=$afState lpEcho=$lp lpActual=$lastObservedVendorLensPos " +
-                    "wanted=$lastCommandedLensPos physical=$physicalId native=$nativeFocusActive " +
+                    "wanted=$lastCommandedLensPos physical=$physicalId focal=${focalLengthMm}mm native=$nativeFocusActive " +
                     "iso=$lastAeSensitivity expNs=$lastAeExposureNs evIdx=$evEcho " +
                     "wbK=$meteredWbKelvin evMeter=$meteredEvTenths " +
                     "wbAnchor=${lastAutoWbAnchor?.kelvin} gains=$resultGains " +
-                    "nr=$noiseReductionMode edge=$edgeMode eis=$videoStabilizationMode",
+                    "nr=$noiseReductionMode edge=$edgeMode tone=$tonemapMode " +
+                    "control=$controlMode scene=$sceneMode aeLock=$aeLocked awbLock=$awbLocked " +
+                    "eis=$videoStabilizationMode",
             )
         }
     }
@@ -934,6 +1168,93 @@ class CameraRuntimeController(
         focusMotionMonitorRegistered = false
     }
 
+    private fun updateSkyGuideTracking(cameraState: CameraState) {
+        val enabled = cameraState.activeMode ==
+            com.mobiledivecontrol.core.CameraModeId.ExpertRaw &&
+            currentValue(cameraState, ".sky_guide") == "On"
+        if (!enabled) {
+            stopSkyGuideTracking()
+            return
+        }
+        if (!skyGuideSensorRegistered) {
+            gravitySensor?.let { sensor ->
+                skyGuideSensorRegistered = sensorManager.registerListener(
+                    skyGuideMotionListener,
+                    sensor,
+                    SensorManager.SENSOR_DELAY_GAME,
+                )
+            }
+        }
+        updateSkyGuideObserverLocation()
+    }
+
+    private fun stopSkyGuideTracking() {
+        if (skyGuideSensorRegistered) {
+            sensorManager.unregisterListener(skyGuideMotionListener)
+            skyGuideSensorRegistered = false
+        }
+        val listener = skyGuideLocationListener
+        if (listener != null) {
+            runCatching { skyGuideLocationManager?.removeUpdates(listener) }
+            skyGuideLocationListener = null
+            skyGuideLocationManager = null
+        }
+    }
+
+    private fun updateSkyGuideObserverLocation() {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) !=
+            PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return
+        val manager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        val providers = runCatching { manager.getProviders(true) }.getOrDefault(emptyList())
+        val latest = providers
+            .mapNotNull { provider -> runCatching { manager.getLastKnownLocation(provider) }.getOrNull() }
+            .maxByOrNull { it.time }
+        latest?.let(::publishSkyGuideLocation)
+
+        // A permission grant does not guarantee Android already has a cached fix. Ask the live
+        // providers and keep the listener only until the first usable coordinate arrives. The
+        // observer location then remains local and is reused by the offline sky projection.
+        if (skyGuideLocationListener != null || providers.isEmpty()) return
+        val listener = LocationListener { location ->
+            publishSkyGuideLocation(location)
+            skyGuideLocationListener?.let { active ->
+                runCatching { manager.removeUpdates(active) }
+            }
+            skyGuideLocationListener = null
+            skyGuideLocationManager = null
+        }
+        skyGuideLocationListener = listener
+        skyGuideLocationManager = manager
+        val requested = providers
+            .filterNot { it == LocationManager.PASSIVE_PROVIDER }
+            .any { provider ->
+                runCatching {
+                    manager.requestLocationUpdates(
+                        provider,
+                        0L,
+                        0f,
+                        listener,
+                        Looper.getMainLooper(),
+                    )
+                }.onFailure { error ->
+                    Log.w(TAG, "Sky Guide location request failed for $provider", error)
+                }.isSuccess
+            }
+        if (!requested) {
+            skyGuideLocationListener = null
+            skyGuideLocationManager = null
+        }
+    }
+
+    private fun publishSkyGuideLocation(location: Location) {
+        if (!location.latitude.isFinite() || !location.longitude.isFinite()) return
+        ExpertRawCaptureState.observerLatitudeDegrees.value = location.latitude
+        ExpertRawCaptureState.observerLongitudeDegrees.value = location.longitude
+    }
+
     /**
      * Eviction-recovery net. When another camera app takes the device and the user returns,
      * CameraX reopens the camera on its own — but a downstream failure (GL pipe, stale native
@@ -999,6 +1320,10 @@ class CameraRuntimeController(
 
     fun detach() {
         photoTimerGeneration++
+        cancelExpertSequence("", announce = false)
+        ExpertRawCaptureState.reset()
+        stopSkyGuideTracking()
+        discardPendingPanoramaReview(deleteFile = true)
         cancelPanoramaCapture("Camera closed")
         stopFocusMotionMonitor()
         resumeObserver?.let { observer -> lifecycleOwner?.lifecycle?.removeObserver(observer) }
@@ -1008,6 +1333,7 @@ class CameraRuntimeController(
         camera2HighSpeedRecorder.release()
         camera2TimeLapseRecorder.release()
         highSpeedVideoTranscoder.cancel()
+        panoramaActionSound.release()
         cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
         camera = null
         imageCapture = null
@@ -1022,7 +1348,7 @@ class CameraRuntimeController(
         boundCaptureFormat = null
         boundAspectRatio = null
         boundMode = null
-        boundExpectedPhysicalCameraId = null
+        boundExpectedFocalLengthMm = null
         boundHdrExtension = false
         boundLogCaptureContractSatisfied = false
         maximumInformationRequestModes = MaximumInformationRequestModes()
@@ -1103,6 +1429,11 @@ class CameraRuntimeController(
         latestSurfaceAmbientKpa = surfaceAmbientKpa
         latestWaterTemperatureC = waterTemperatureC
         latestHeadingDegrees = headingDegrees
+        headingDegrees?.let {
+            ExpertRawCaptureState.skyAzimuthDegrees.value =
+                (((it % 360.0) + 360.0) % 360.0).toFloat()
+        }
+        updateSkyGuideTracking(cameraState)
         when {
             underwater && !previousUnderwater -> seedUnderwaterWhiteBalance(cameraState, now)
             !underwater && previousUnderwater -> {
@@ -2173,6 +2504,9 @@ class CameraRuntimeController(
     fun execute(command: CameraCommand) {
         when (command) {
             CameraCommand.CapturePhoto -> capturePhoto()
+            CameraCommand.PanoramaReviewReady -> Unit
+            CameraCommand.SavePanorama -> savePendingPanorama()
+            CameraCommand.DeletePanorama -> discardPendingPanoramaReview(deleteFile = true)
             CameraCommand.OpenGallery -> openGallery()
             CameraCommand.RestartCamera -> bindCamera(force = true)
             CameraCommand.ToggleVideoRecording,
@@ -2186,6 +2520,14 @@ class CameraRuntimeController(
             CameraCommand.PreviewVideoRecording -> Unit
             is CameraCommand.SetZoom -> applyLiveZoom(command.value)
             else -> Unit
+        }
+    }
+
+    /** A camera request is never allowed to disappear into Logcat while the UI implies success. */
+    private fun reportRuntimeFailure(message: String) {
+        ContextCompat.getMainExecutor(context).execute {
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+            onCameraCommand?.invoke(CameraCommand.ReportRuntimeFailure(message))
         }
     }
 
@@ -2274,13 +2616,7 @@ class CameraRuntimeController(
             // same JPEG compression quality that MAXIMIZE_QUALITY used.
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .setJpegQuality(100)
-            .setOutputFormat(
-                if (desiredCaptureFormat == "Ultra HDR JPEG") {
-                    ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR
-                } else {
-                    ImageCapture.OUTPUT_FORMAT_JPEG
-                },
-            )
+            .setOutputFormat(imageCaptureOutputFormat(desiredCaptureFormat))
         val panoramaMode = latestState.activeMode ==
             com.mobiledivecontrol.core.CameraModeId.Panorama
         val analysisTargetSize = if (panoramaMode) PANORAMA_CAPTURE_SIZE else Size(640, 480)
@@ -2411,16 +2747,27 @@ class CameraRuntimeController(
             it.setAnalyzer(focusAssistExecutor) { image ->
                 val now = SystemClock.elapsedRealtime()
                 claimPanoramaAnalysisFrame()?.let { request ->
-                    val bitmap = runCatching { decodePanoramaAnalysisFrame(image) }
-                        .onFailure { error -> Log.e(TAG, "Could not copy panorama analysis frame", error) }
-                        .getOrNull()
-                    cameraRequestHandler.post {
-                        completePanoramaAnalysisFrame(
-                            bitmap = bitmap,
-                            generation = request.first,
-                            requestedRadians = request.second,
+                    persistPanoramaAnalysisFrame(
+                        image = image,
+                        generation = request.first,
+                        requestedRadians = request.second,
+                    )
+                }
+                if (panoramaMode &&
+                    !PanoramaCaptureState.finalizing.value &&
+                    now - lastPanoramaViewfinderAtMs >= PANORAMA_VIEWFINDER_INTERVAL_MS
+                ) {
+                    lastPanoramaViewfinderAtMs = now
+                    runCatching {
+                        decodePanoramaSampledFrame(
+                            image,
+                            PANORAMA_VIEWFINDER_WIDTH_PX,
+                            activePanoramaDynamicRangeProfile(),
                         )
                     }
+                        .onFailure { error -> Log.w(TAG, "Could not update panorama viewfinder", error) }
+                        .getOrNull()
+                        ?.let(::publishPanoramaViewfinder)
                 }
                 if (panoramaMode &&
                     !panoramaCaptureActive &&
@@ -2428,7 +2775,9 @@ class CameraRuntimeController(
                     now - lastPanoramaThumbnailAtMs >= PANORAMA_THUMBNAIL_INTERVAL_MS
                 ) {
                     lastPanoramaThumbnailAtMs = now
-                    runCatching { decodePanoramaThumbnail(image) }
+                    runCatching {
+                        decodePanoramaThumbnail(image, activePanoramaDynamicRangeProfile())
+                    }
                         .onFailure { error -> Log.w(TAG, "Could not update panorama thumbnail", error) }
                         .getOrNull()
                         ?.let(::publishPanoramaThumbnail)
@@ -2570,14 +2919,25 @@ class CameraRuntimeController(
         videoInterop.setSessionCaptureCallback(sessionCaptureCallback)
         val video = videoBuilder.build()
         Log.i(TAG, "Video dynamic range=$requestedDynamicRange requestedMode=$desiredHdrLogMode")
-        videoCapture = video.takeUnless { panoramaMode }
+        // Photo modes do not need an encoder surface. In particular, RAW+JPEG already asks
+        // CameraX for two still outputs; retaining VideoCapture beside those outputs can exceed
+        // the S24's guaranteed stream-combination budget and make the preview appear frozen.
+        val photoMode = latestState.activeMode.captureType == CameraCaptureType.Photo
+        videoCapture = video.takeUnless { panoramaMode || photoMode }
 
         val useCaseGroup = UseCaseGroup.Builder()
             .addUseCase(preview)
-            .addEffect(effect)
             .also { builder ->
+                // Panorama already owns a full-resolution ImageAnalysis stream. Running its
+                // preview through the focus/exposure GL effect produced a valid inner analysis
+                // thumbnail beside a black full-screen Preview surface on the S24. Panorama has
+                // no focus-peaking control, so bind its Preview directly.
+                if (!panoramaMode) builder.addEffect(effect)
                 when {
                     panoramaMode -> builder.addUseCase(analysis)
+                    photoMode -> builder
+                        .addUseCase(capture)
+                        .addUseCase(analysis)
                     !maximumInformationLog -> builder
                         .addUseCase(video)
                         .addUseCase(capture)
@@ -2627,7 +2987,7 @@ class CameraRuntimeController(
                 val reduced = UseCaseGroup.Builder()
                     .addUseCase(preview)
                     .addUseCase(capture)
-                    .addUseCase(video)
+                    .also { builder -> if (!photoMode) builder.addUseCase(video) }
                     .addEffect(effect)
                     .build()
                 try {
@@ -2677,7 +3037,7 @@ class CameraRuntimeController(
         boundCaptureFormat = desiredCaptureFormat
         boundAspectRatio = desiredAspectRatio
         boundMode = latestState.activeMode
-        boundExpectedPhysicalCameraId = activeLensProfile?.physicalCameraId
+        boundExpectedFocalLengthMm = activeLensProfile?.focalLengthMm
 
         // Detect device capabilities from the bound camera
 
@@ -2980,6 +3340,7 @@ class CameraRuntimeController(
             ?.takeIf { it == 24 || it == 30 }
             ?: run {
                 Log.e(TAG, "8K record requested without a supported 24/30 fps selection")
+                reportRuntimeFailure("8K recording requires a supported 24 or 30 fps selection.")
                 releaseShutterWhiteBalance()
                 finishRecordingSession(deleteLatest = false)
                 return
@@ -2989,6 +3350,7 @@ class CameraRuntimeController(
             bindCamera(force = true)
             camera
         } ?: run {
+            reportRuntimeFailure("8K camera session could not be opened.")
             releaseShutterWhiteBalance()
             return
         }
@@ -3065,6 +3427,7 @@ class CameraRuntimeController(
             )
         } catch (error: Throwable) {
             Log.e(TAG, "Could not start direct 8K recording", error)
+            reportRuntimeFailure("8K recording failed to start: ${error.message ?: "camera rejected the session"}")
             activeRecordingSegmentFile = null
             releaseShutterWhiteBalance()
             finishRecordingSession(deleteLatest = false)
@@ -3137,16 +3500,20 @@ class CameraRuntimeController(
         startCamera2VariableRateSegment(
             captureRateFps = hyperlapseCaptureRateFps(speedFactor),
             playbackFps = TIME_LAPSE_PLAYBACK_FPS,
+            videoCodec = hyperlapseVideoCodec(currentValue(latestState, ".video_format")),
             cameraFrameRate = null,
             modeLabel = "Hyperlapse ${speedFactor}x",
             finalizationLabel = "Hyperlapse",
-            nightMode = dayNightValue == "Night" || speedValue?.startsWith("Night ") == true,
+            // Day/Night is authoritative. Speed selects cadence; it must not silently force
+            // low-light processing after the diver explicitly selects Day.
+            nightMode = dayNightValue == "Night",
         )
     }
 
     private fun startCamera2VariableRateSegment(
         captureRateFps: Double,
         playbackFps: Int,
+        videoCodec: TimeLapseVideoCodec,
         cameraFrameRate: Int?,
         modeLabel: String,
         finalizationLabel: String,
@@ -3158,6 +3525,7 @@ class CameraRuntimeController(
         }
         val size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: run {
             Log.e(TAG, "No direct variable-rate size for ${desiredResolutionValue(latestState)}")
+            reportRuntimeFailure("${desiredResolutionValue(latestState)} is not available for $modeLabel.")
             releaseShutterWhiteBalance()
             return
         }
@@ -3200,6 +3568,7 @@ class CameraRuntimeController(
                     size = size,
                     captureRateFps = captureRateFps,
                     playbackFps = playbackFps,
+                    videoCodec = videoCodec,
                     cameraFrameRate = cameraFrameRate,
                     modeLabel = modeLabel,
                     outputFile = segmentFile,
@@ -3217,7 +3586,8 @@ class CameraRuntimeController(
                     Log.i(
                         TAG,
                         "Direct $modeLabel segment started: $segmentFile " +
-                            "capture=${captureRateFps}fps playback=${playbackFps}fps night=$nightMode",
+                            "capture=${captureRateFps}fps playback=${playbackFps}fps " +
+                            "codec=$videoCodec night=$nightMode",
                     )
                 },
                 onFinalized = { result ->
@@ -3226,6 +3596,7 @@ class CameraRuntimeController(
             )
         } catch (error: Throwable) {
             Log.e(TAG, "Could not start direct $modeLabel recording", error)
+            reportRuntimeFailure("$modeLabel failed to start: ${error.message ?: "camera rejected the session"}")
             activeRecordingSegmentFile = null
             releaseShutterWhiteBalance()
             finishRecordingSession(deleteLatest = false)
@@ -3242,6 +3613,7 @@ class CameraRuntimeController(
             ?: return
         val size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: run {
             Log.e(TAG, "No direct high-speed size for ${desiredResolutionValue(latestState)}")
+            reportRuntimeFailure("${desiredResolutionValue(latestState)} is not available for high-speed recording.")
             releaseShutterWhiteBalance()
             return
         }
@@ -3250,6 +3622,7 @@ class CameraRuntimeController(
             bindCamera(force = true)
             camera
         } ?: run {
+            reportRuntimeFailure("High-speed camera session could not be opened.")
             releaseShutterWhiteBalance()
             return
         }
@@ -3322,6 +3695,7 @@ class CameraRuntimeController(
             )
         } catch (error: Throwable) {
             Log.e(TAG, "Could not start direct high-speed recording", error)
+            reportRuntimeFailure("High-speed recording failed to start: ${error.message ?: "camera rejected the session"}")
             activeRecordingSegmentFile = null
             releaseShutterWhiteBalance()
             finishRecordingSession(deleteLatest = false)
@@ -3423,7 +3797,7 @@ class CameraRuntimeController(
             Log.e(TAG, "Direct high-speed segment finalize failed", error)
             segmentFile.delete()
             RecordingClock.reviewUri.value = null
-            Toast.makeText(context, "High-speed recording failed: ${error.message}", Toast.LENGTH_LONG).show()
+            reportRuntimeFailure("High-speed recording failed: ${error.message ?: "invalid output"}")
         }
         currentRecordingSegmentDurationMs = 0L
         releaseShutterWhiteBalance()
@@ -3482,7 +3856,7 @@ class CameraRuntimeController(
             Log.e(TAG, "Direct $modeLabel segment finalize failed", error)
             segmentFile.delete()
             RecordingClock.reviewUri.value = null
-            Toast.makeText(context, "$modeLabel failed: ${error.message}", Toast.LENGTH_LONG).show()
+            reportRuntimeFailure("$modeLabel failed: ${error.message ?: "invalid output"}")
         }
         currentRecordingSegmentDurationMs = 0L
         releaseShutterWhiteBalance()
@@ -3787,6 +4161,9 @@ class CameraRuntimeController(
             } else {
                 false
             }
+            val cameraXOutputFormats = selectedCameraInfo
+                ?.let { ImageCapture.getImageCaptureCapabilities(it).supportedOutputFormats }
+                .orEmpty()
             val caps = CameraCapabilities(
                 isoMin = isoRange?.lower,
                 isoMax = isoRange?.upper,
@@ -3804,6 +4181,9 @@ class CameraRuntimeController(
                 videoStabilizationSupported =
                     CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON in stabilizationModes,
                 ultraHdrJpegSupported = ultraHdrSupported,
+                rawCaptureSupported = ImageCapture.OUTPUT_FORMAT_RAW in cameraXOutputFormats ||
+                    ImageCapture.OUTPUT_FORMAT_RAW_JPEG in cameraXOutputFormats,
+                rawJpegCaptureSupported = ImageCapture.OUTPUT_FORMAT_RAW_JPEG in cameraXOutputFormats,
             )
             sensorColorCalibration = runCatching { readSensorColorCalibration(chars) }.getOrNull()
             Log.i(
@@ -4276,6 +4656,7 @@ class CameraRuntimeController(
             exposure = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure"),
             lens = currentValue(cameraState, ".lens"),
             hdrLog = resolvedHdrLogMode(cameraState),
+            dayNight = currentValue(cameraState, ".day_night"),
             whiteBalance = resolvedWhiteBalanceValue(cameraState),
             filter = filterValue,
             manualFocus = currentValue(cameraState, ".manual_focus"),
@@ -4959,6 +5340,10 @@ class CameraRuntimeController(
 
     private fun capturePhoto() {
         if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Panorama) {
+            if (pendingPanoramaReview != null || latestState.panoramaReviewAvailable) {
+                Toast.makeText(context, "Choose Save or Delete", Toast.LENGTH_SHORT).show()
+                return
+            }
             if (panoramaCaptureActive) {
                 if (panoramaFrames.size >= 2) {
                     finishPanoramaCapture()
@@ -5002,12 +5387,36 @@ class CameraRuntimeController(
             return
         }
 
+        cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
         panoramaGeneration++
-        panoramaFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+        panoramaLiveThumbnailGeneration++
+        panoramaPreviewExecutor.execute {
+            panoramaLiveWorkingBitmap?.recycle()
+            panoramaLiveWorkingBitmap = null
+            panoramaLiveWorkingDirection = null
+            panoramaLiveWorkingSweepRadians = null
+        }
+        panoramaFrames.forEach { frame -> runCatching { frame.file.delete() } }
         panoramaFrames.clear()
-        val oldReferenceFrame = PanoramaCaptureState.referenceFrame.value
+        panoramaPreviewFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+        panoramaPreviewFrames.clear()
+        panoramaCaptureDirectory?.let { directory -> runCatching { directory.deleteRecursively() } }
+        panoramaCaptureDirectory = File(
+            context.cacheDir,
+            "panorama-frames/session-${System.currentTimeMillis()}-${System.nanoTime()}",
+        ).also { directory ->
+            if (!directory.mkdirs() && !directory.isDirectory) {
+                Toast.makeText(context, "Could not create panorama workspace", Toast.LENGTH_LONG).show()
+                return
+            }
+        }
+        val idleReferenceFrame = PanoramaCaptureState.referenceFrame.value
+        val liveViewfinderFrame = PanoramaCaptureState.viewfinderFrame.value
+        val oldLiveThumbnail = PanoramaCaptureState.liveThumbnail.value
         PanoramaCaptureState.reset()
-        oldReferenceFrame?.let { frame ->
+        PanoramaCaptureState.referenceFrame.value = idleReferenceFrame
+        PanoramaCaptureState.viewfinderFrame.value = liveViewfinderFrame
+        oldLiveThumbnail?.let { frame ->
             cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 500L)
         }
         panoramaCaptureActive = true
@@ -5018,10 +5427,19 @@ class CameraRuntimeController(
         panoramaSweepRadians = 0f
         panoramaCrossAxisRadians = 0f
         panoramaLastCapturedRadians = 0f
-        val requestedDirection = currentValue(latestState, ".direction") ?: "Auto"
-        panoramaDirectionPending = requestedDirection == "Auto"
-        panoramaDirection = requestedDirection.takeUnless { it == "Auto" } ?: "Right"
+        panoramaReverseRadians = 0f
+        panoramaBaselineElevationRadians = null
+        panoramaLastMeaningfulMotionAtMs = SystemClock.elapsedRealtime()
+        panoramaLastAnnouncementAtMs = 0L
+        panoramaLastAnnouncement = ""
+        // Samsung Panorama always determines the sweep from the user's first deliberate motion.
+        panoramaDirectionPending = true
+        panoramaDirection = "Right"
+        panoramaDirectionProbeRadians = 0f
         panoramaMetadataSnapshot = captureMetadataSnapshot()
+        panoramaCaptureProfile = PanoramaDynamicRangeProfile.fromSetting(
+            resolvedHdrLogMode(latestState),
+        )
         PanoramaCaptureState.active.value = true
         PanoramaCaptureState.finalizing.value = false
         PanoramaCaptureState.progress.value = 0f
@@ -5030,19 +5448,25 @@ class CameraRuntimeController(
         PanoramaCaptureState.crossAxisRadians.value = 0f
         PanoramaCaptureState.direction.value = panoramaDirection
         PanoramaCaptureState.directionLocked.value = !panoramaDirectionPending
-        PanoramaCaptureState.message.value = if (panoramaDirectionPending) {
-            "Pan slowly in any direction."
-        } else {
-            "Pan ${panoramaDirection.lowercase()}"
-        }
-        setPanorama3ALock(true)
-        val sensor = gyroscope
-        panoramaSensorRegistered = sensor != null && sensorManager.registerListener(
+        setPanoramaGuidance("Pan slowly in any direction.")
+        playPanoramaActionSound(MediaActionSound.SHUTTER_CLICK)
+        setPanoramaCaptureLocks(true)
+        val gyroRegistered = gyroscope != null && sensorManager.registerListener(
             panoramaMotionListener,
-            sensor,
+            gyroscope,
             SensorManager.SENSOR_DELAY_GAME,
         )
-        Log.i(TAG, "Panorama started: direction=$panoramaDirection gyro=$panoramaSensorRegistered")
+        panoramaGravityRegistered = gravitySensor != null && sensorManager.registerListener(
+            panoramaMotionListener,
+            gravitySensor,
+            SensorManager.SENSOR_DELAY_GAME,
+        )
+        panoramaSensorRegistered = gyroRegistered || panoramaGravityRegistered
+        Log.i(
+            TAG,
+            "Panorama started: direction=$panoramaDirection gyro=$gyroRegistered " +
+                "gravity=$panoramaGravityRegistered",
+        )
         takePanoramaFrame()
     }
 
@@ -5074,42 +5498,120 @@ class CameraRuntimeController(
             }
         }
 
-    private fun completePanoramaAnalysisFrame(
-        bitmap: Bitmap?,
+    /**
+     * Persists the selected RGBA buffer without encoding it. JPEG compression previously kept the
+     * capture claim open for about two seconds per keyframe, leaving only six widely separated
+     * frames in a normal sweep. A packed raw write maintains the 10-degree cadence while Preview
+     * continues on its independent surface.
+     */
+    private fun persistPanoramaAnalysisFrame(
+        image: androidx.camera.core.ImageProxy,
         generation: Int,
         requestedRadians: Float,
     ) {
-        synchronized(panoramaFrameRequestLock) {
-            panoramaCaptureInFlight = false
-            panoramaFrameRequestClaimed = false
-        }
         if (generation != panoramaGeneration) {
-            bitmap?.recycle()
+            synchronized(panoramaFrameRequestLock) {
+                panoramaCaptureInFlight = false
+                panoramaFrameRequestClaimed = false
+            }
             return
         }
-        if (bitmap == null) {
-            handlePanoramaFrameFailure("Could not copy panorama frame")
+        val directory = panoramaCaptureDirectory
+        if (directory == null) {
+            synchronized(panoramaFrameRequestLock) {
+                panoramaCaptureInFlight = false
+                panoramaFrameRequestClaimed = false
+            }
+            handlePanoramaFrameFailure("Panorama workspace is unavailable")
             return
         }
-        val normalized = normalizePanoramaFrame(bitmap)
-        if (normalized !== bitmap) bitmap.recycle()
-        panoramaFrames += CapturedPanoramaFrame(normalized, requestedRadians)
-        panoramaLastCapturedRadians = requestedRadians
-        PanoramaCaptureState.frameCount.value = panoramaFrames.size
-        PanoramaCaptureState.canStop.value = panoramaFrames.size >= 2
-        Log.d(
-            TAG,
-            "Panorama stream frame ${panoramaFrames.size}: " +
-                "${normalized.width}x${normalized.height} sweep=$requestedRadians",
-        )
-        when {
-            panoramaFinishPending -> finalizePanoramaFrames()
-            panoramaSweepRadians >= panoramaTargetRadians(
-                direction = panoramaDirection,
-                wideAngle = boundLensValue == "0.6x",
-            ) -> finishPanoramaCapture()
-            panoramaSweepRadians - panoramaLastCapturedRadians >= PANORAMA_FRAME_STEP_RADIANS ->
-                takePanoramaFrame()
+        val plane = image.planes.firstOrNull()
+        val file = File(directory, "frame-${System.nanoTime()}.rgba")
+        val frameSharpness = centreSharpness(image).coerceAtLeast(0.0)
+        val frameIso = lastAeSensitivity
+        val frameExposureNs = lastAeExposureNs
+        val previewBitmap = runCatching {
+            decodePanoramaSampledFrame(image, 480, panoramaCaptureProfile)
+        }
+            .onFailure { error -> Log.w(TAG, "Could not build panorama live keyframe", error) }
+            .getOrNull()
+        val stored = runCatching {
+            require(plane != null && plane.pixelStride == 4) {
+                "Panorama analysis stream is not RGBA"
+            }
+            val packedRowBytes = image.width * 4
+            val requiredBufferBytes = (image.height - 1) * plane.rowStride + packedRowBytes
+            val source = plane.buffer.duplicate().apply { rewind() }
+            require(requiredBufferBytes <= source.limit()) { "Incomplete panorama analysis buffer" }
+            FileOutputStream(file).channel.use { channel ->
+                if (plane.rowStride == packedRowBytes) {
+                    source.limit(packedRowBytes * image.height)
+                    while (source.hasRemaining()) channel.write(source)
+                } else {
+                    for (rowIndex in 0 until image.height) {
+                        val rowStart = rowIndex * plane.rowStride
+                        val row = source.duplicate().apply {
+                            position(rowStart)
+                            limit(rowStart + packedRowBytes)
+                        }.slice()
+                        while (row.hasRemaining()) channel.write(row)
+                    }
+                }
+            }
+            StoredPanoramaFrame(
+                file = file,
+                sweepRadians = requestedRadians,
+                rawWidth = image.width,
+                rawHeight = image.height,
+                rotationDegrees = image.imageInfo.rotationDegrees,
+                maximumWidth = PANORAMA_STORED_FRAME_SIZE.width,
+                maximumHeight = PANORAMA_STORED_FRAME_SIZE.height,
+                sensitivityIso = frameIso,
+                exposureTimeNs = frameExposureNs,
+                sharpness = frameSharpness,
+            )
+        }
+        cameraRequestHandler.post {
+            synchronized(panoramaFrameRequestLock) {
+                panoramaCaptureInFlight = false
+                panoramaFrameRequestClaimed = false
+            }
+            if (generation != panoramaGeneration) {
+                file.delete()
+                previewBitmap?.recycle()
+                return@post
+            }
+            stored.onSuccess { frame ->
+                panoramaFrames += frame
+                previewBitmap?.let { preview ->
+                    panoramaPreviewFrames += CapturedPanoramaFrame(preview, requestedRadians)
+                }
+                panoramaLastCapturedRadians = requestedRadians
+                PanoramaCaptureState.frameCount.value = panoramaFrames.size
+                PanoramaCaptureState.canStop.value = panoramaFrames.size >= 2
+                if (previewBitmap != null) updatePanoramaLiveThumbnail(generation)
+                Log.d(
+                    TAG,
+                    "Panorama stream frame ${panoramaFrames.size}: " +
+                        "${frame.rawWidth}x${frame.rawHeight} raw=${file.length()} " +
+                        "sweep=$requestedRadians iso=${frame.sensitivityIso} " +
+                        "expNs=${frame.exposureTimeNs} sharp=${frame.sharpness}",
+                )
+                when {
+                    panoramaFinishPending -> finalizePanoramaFrames()
+                    panoramaSweepRadians >= panoramaTargetRadians(
+                        direction = panoramaDirection,
+                        wideAngle = boundLensValue == "0.6x",
+                    ) -> finishPanoramaCapture()
+                    panoramaSweepRadians - panoramaLastCapturedRadians >= PANORAMA_FRAME_STEP_RADIANS ->
+                        takePanoramaFrame()
+                }
+            }.onFailure { error ->
+                file.delete()
+                previewBitmap?.recycle()
+                Log.e(TAG, "Could not persist panorama keyframe", error)
+                handlePanoramaFrameFailure("Could not store panorama frame")
+            }
         }
     }
 
@@ -5130,6 +5632,14 @@ class CameraRuntimeController(
         PanoramaCaptureState.active.value = false
         PanoramaCaptureState.finalizing.value = true
         PanoramaCaptureState.message.value = "Saving panorama…"
+        previewView?.announceForAccessibility("Saving panorama")
+        playPanoramaActionSound(MediaActionSound.STOP_VIDEO_RECORDING)
+        PanoramaCaptureState.savingProgress.value = 0
+        cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
+        cameraRequestHandler.postDelayed(
+            panoramaProcessTimeoutRunnable,
+            PANORAMA_PROCESS_TIMEOUT_MS,
+        )
         unregisterPanoramaSensor()
         val waitForClaimedFrame = synchronized(panoramaFrameRequestLock) {
             if (panoramaCaptureInFlight && panoramaFrameRequestClaimed) {
@@ -5155,8 +5665,8 @@ class CameraRuntimeController(
         val frames = panoramaFrames.toList()
         panoramaFrames.clear()
         if (frames.isEmpty()) {
-            PanoramaCaptureState.reset()
-            setPanorama3ALock(false)
+            cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
+            cancelPanoramaCapture("No panorama frames were captured")
             Toast.makeText(context, "No panorama frames were captured", Toast.LENGTH_LONG).show()
             return
         }
@@ -5164,37 +5674,88 @@ class CameraRuntimeController(
         val direction = panoramaDirection
         val snapshot = panoramaMetadataSnapshot
         panoramaMetadataSnapshot = null
+        val dynamicRangeProfile = panoramaCaptureProfile
         val saveLocation = latestState.recordingSaveLocation
         val displayName = "DiveControl_Panorama_${System.currentTimeMillis()}.jpg"
         val horizontalFovRadians = Math.toRadians(horizontalFovDegrees()).toFloat()
-        panoramaExecutor.execute {
+        val targetCrossPixels = if (boundLensValue == "0.6x") 1808 else 1728
+        val stitchStartedAtMs = SystemClock.elapsedRealtime()
+        Log.i(TAG, "Panorama stitch started: frames=${frames.size}")
+        // Every queued live-strip reader must finish before the full-size source frames can be
+        // recycled by the stitcher. The two executors keep both operations off Preview/analysis.
+        panoramaPreviewExecutor.execute {
+            panoramaExecutor.execute {
             val result = runCatching {
-                val stitched = PanoramaBitmapStitcher.stitch(
+                val stitched = PanoramaBitmapStitcher.stitchStored(
                     frames = frames,
                     direction = direction,
                     horizontalFovRadians = horizontalFovRadians,
+                    targetCrossPixels = targetCrossPixels,
+                    dynamicRangeProfile = dynamicRangeProfile,
+                    onProgress = { progress ->
+                        cameraRequestHandler.post {
+                            if (generation == panoramaGeneration && PanoramaCaptureState.finalizing.value) {
+                                PanoramaCaptureState.savingProgress.value = progress
+                            }
+                        }
+                    },
                 )
                 try {
-                    publishPanorama(stitched, displayName, saveLocation)
+                    check(generation == panoramaGeneration) { "Panorama save was cancelled" }
+                    stagePanoramaReview(
+                        bitmap = stitched,
+                        displayName = displayName,
+                        saveLocation = saveLocation,
+                        metadata = snapshot,
+                    )
                 } finally {
                     stitched.recycle()
                 }
             }
-            frames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+            frames.forEach { frame -> runCatching { frame.file.delete() } }
+            panoramaCaptureDirectory?.let { directory -> runCatching { directory.deleteRecursively() } }
+            panoramaCaptureDirectory = null
+            val previewFrames = panoramaPreviewFrames.toList()
+            panoramaPreviewFrames.clear()
+            panoramaPreviewExecutor.execute {
+                panoramaLiveWorkingBitmap?.recycle()
+                panoramaLiveWorkingBitmap = null
+                panoramaLiveWorkingDirection = null
+                panoramaLiveWorkingSweepRadians = null
+                previewFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+            }
             ContextCompat.getMainExecutor(context).execute mainThread@{
                 if (generation != panoramaGeneration) return@mainThread
-                result.onSuccess { uri ->
-                    snapshot?.let { metadata ->
-                        panoramaExecutor.execute {
-                            writeMetadataSidecar(displayName, saveLocation, metadata)
+                cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
+                result.onSuccess { review ->
+                    val previousReview = pendingPanoramaReview
+                    pendingPanoramaReview = review
+                    PanoramaCaptureState.reviewBitmap.value = review.previewBitmap
+                    previousReview?.let { old ->
+                        runCatching { old.file.delete() }
+                        if (old.previewBitmap !== review.previewBitmap) {
+                            cameraRequestHandler.postDelayed(
+                                { runCatching { old.previewBitmap.recycle() } },
+                                500L,
+                            )
                         }
                     }
-                    Log.i(TAG, "Panorama saved: frames=${frames.size} uri=$uri")
-                    PanoramaCaptureState.message.value = "Panorama saved"
-                    Toast.makeText(context, "Panorama saved", Toast.LENGTH_SHORT).show()
+                    Log.i(
+                        TAG,
+                        "Panorama ready for review: frames=${frames.size} " +
+                            "processingMs=${SystemClock.elapsedRealtime() - stitchStartedAtMs} " +
+                            "stagedBytes=${review.file.length()}",
+                    )
+                    PanoramaCaptureState.message.value = "Panorama ready"
+                    PanoramaCaptureState.savingProgress.value = 100
+                    previewView?.announceForAccessibility(
+                        "Panorama preview ready. Choose Save or Delete.",
+                    )
+                    onCameraCommand?.invoke(CameraCommand.PanoramaReviewReady)
                 }.onFailure { error ->
                     Log.e(TAG, "Panorama stitch/save failed", error)
                     PanoramaCaptureState.message.value = "Can't create panorama. Not enough detail in scene."
+                    previewView?.announceForAccessibility("Can't create panorama")
                     Toast.makeText(
                         context,
                         "Panorama failed: ${error.message}",
@@ -5206,54 +5767,151 @@ class CameraRuntimeController(
                 PanoramaCaptureState.progress.value = 0f
                 PanoramaCaptureState.movingTooFast.value = false
                 PanoramaCaptureState.crossAxisRadians.value = 0f
-                setPanorama3ALock(false)
+                val completedLiveThumbnail = PanoramaCaptureState.liveThumbnail.value
+                PanoramaCaptureState.liveThumbnail.value = null
+                completedLiveThumbnail?.let { bitmap ->
+                    cameraRequestHandler.postDelayed({ runCatching { bitmap.recycle() } }, 500L)
+                }
+                setPanoramaCaptureLocks(false)
                 cameraRequestHandler.postDelayed({
-                    if (!PanoramaCaptureState.active.value && !PanoramaCaptureState.finalizing.value) {
+                    if (!PanoramaCaptureState.active.value &&
+                        !PanoramaCaptureState.finalizing.value &&
+                        pendingPanoramaReview == null
+                    ) {
                         PanoramaCaptureState.message.value = ""
                     }
                 }, 1_200L)
+            }
+            }
+        }
+    }
+
+    /** Builds Samsung's continuously accumulated miniature from captured keyframes. */
+    private fun updatePanoramaLiveThumbnail(generation: Int) {
+        val previewGeneration = ++panoramaLiveThumbnailGeneration
+        val direction = panoramaDirection
+        val frame = panoramaPreviewFrames.lastOrNull() ?: return
+        val directionSeedFrames = panoramaPreviewFrames.toList()
+        panoramaPreviewExecutor.execute {
+            val thumbnail = runCatching {
+                if (panoramaLiveWorkingDirection != direction) {
+                    panoramaLiveWorkingBitmap?.recycle()
+                    panoramaLiveWorkingBitmap = PanoramaLiveThumbnailBuilder.build(
+                        directionSeedFrames,
+                        direction,
+                    )
+                    panoramaLiveWorkingSweepRadians = directionSeedFrames.last().sweepRadians
+                    panoramaLiveWorkingDirection = direction
+                } else {
+                    val next = PanoramaLiveThumbnailBuilder.append(
+                        existing = panoramaLiveWorkingBitmap,
+                        frame = frame,
+                        direction = direction,
+                        previousSweepRadians = panoramaLiveWorkingSweepRadians,
+                    )
+                    panoramaLiveWorkingBitmap?.recycle()
+                    panoramaLiveWorkingBitmap = next
+                    panoramaLiveWorkingSweepRadians = frame.sweepRadians
+                }
+                panoramaLiveWorkingBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+            }.getOrNull()
+            cameraRequestHandler.post {
+                if (thumbnail == null ||
+                    generation != panoramaGeneration ||
+                    previewGeneration != panoramaLiveThumbnailGeneration
+                ) {
+                    thumbnail?.recycle()
+                    return@post
+                }
+                val previous = PanoramaCaptureState.liveThumbnail.value
+                PanoramaCaptureState.liveThumbnail.value = thumbnail
+                previous?.takeUnless { it === thumbnail }?.let { bitmap ->
+                    cameraRequestHandler.postDelayed({ runCatching { bitmap.recycle() } }, 500L)
+                }
             }
         }
     }
 
     private fun cancelPanoramaCapture(message: String) {
+        cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
         panoramaGeneration++
+        panoramaLiveThumbnailGeneration++
         panoramaCaptureActive = false
         panoramaCaptureInFlight = false
         panoramaFrameRequestClaimed = false
         panoramaFinishPending = false
         panoramaDirectionPending = false
         unregisterPanoramaSensor()
-        panoramaFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+        val framesToDelete = panoramaFrames.toList()
         panoramaFrames.clear()
+        val framesToRecycle = panoramaPreviewFrames.toList()
+        panoramaPreviewFrames.clear()
+        val directoryToDelete = panoramaCaptureDirectory
+        panoramaCaptureDirectory = null
         panoramaMetadataSnapshot = null
+        panoramaCaptureProfile = PanoramaDynamicRangeProfile.Off
         panoramaCrossAxisRadians = 0f
+        panoramaReverseRadians = 0f
+        panoramaBaselineElevationRadians = null
         val oldReferenceFrame = PanoramaCaptureState.referenceFrame.value
+        val oldViewfinderFrame = PanoramaCaptureState.viewfinderFrame.value
+        val oldLiveThumbnail = PanoramaCaptureState.liveThumbnail.value
         PanoramaCaptureState.reset()
         oldReferenceFrame?.let { frame ->
             cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 500L)
         }
+        oldLiveThumbnail?.let { frame ->
+            cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 500L)
+        }
+        oldViewfinderFrame?.let { frame ->
+            cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 150L)
+        }
+        panoramaPreviewExecutor.execute {
+            panoramaLiveWorkingBitmap?.recycle()
+            panoramaLiveWorkingBitmap = null
+            panoramaLiveWorkingDirection = null
+            panoramaLiveWorkingSweepRadians = null
+            framesToRecycle.forEach { frame -> runCatching { frame.bitmap.recycle() } }
+            framesToDelete.forEach { frame -> runCatching { frame.file.delete() } }
+            directoryToDelete?.let { directory -> runCatching { directory.deleteRecursively() } }
+        }
         if (message.isNotBlank()) PanoramaCaptureState.message.value = message
-        setPanorama3ALock(false)
+        setPanoramaCaptureLocks(false)
     }
 
     private fun unregisterPanoramaSensor() {
         if (!panoramaSensorRegistered) return
         sensorManager.unregisterListener(panoramaMotionListener)
         panoramaSensorRegistered = false
+        panoramaGravityRegistered = false
         panoramaLastSensorTimestampNs = 0L
     }
 
-    private fun setPanorama3ALock(locked: Boolean) {
+    private fun setPanoramaGuidance(message: String) {
+        PanoramaCaptureState.message.value = message
+        if (message.isBlank()) return
+        val now = SystemClock.elapsedRealtime()
+        if (message == panoramaLastAnnouncement && now - panoramaLastAnnouncementAtMs < 1_500L) return
+        if (now - panoramaLastAnnouncementAtMs < 650L) return
+        panoramaLastAnnouncement = message
+        panoramaLastAnnouncementAtMs = now
+        previewView?.announceForAccessibility(message)
+    }
+
+    /**
+     * Keep colour continuous across the sweep, but deliberately leave AE live. Locking both at
+     * the first keyframe was the source of clipped windows/highlights later in the panorama.
+     */
+    private fun setPanoramaCaptureLocks(locked: Boolean) {
         val boundCamera = camera ?: return
         runCatching {
             val options = CaptureRequestOptions.Builder()
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, locked)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, false)
                 .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, locked)
                 .build()
             Camera2CameraControl.from(boundCamera.cameraControl).addCaptureRequestOptions(options)
         }.onFailure { error ->
-            Log.w(TAG, "Could not ${if (locked) "lock" else "unlock"} panorama 3A", error)
+            Log.w(TAG, "Could not update panorama exposure/colour locks", error)
         }
         if (!locked) {
             lastAppliedSessionSignature = null
@@ -5288,16 +5946,16 @@ class CameraRuntimeController(
         return orientPanoramaBitmap(decoded, image.imageInfo.rotationDegrees)
     }
 
-    /**
-     * Builds the native guide's live miniature directly from the RGBA analysis plane. Sampling
-     * only 264 pixels across keeps this below one percent of the work of copying a full frame and
-     * avoids the PreviewView bitmap reads which previously stalled the visible camera surface.
-     */
-    private fun decodePanoramaThumbnail(image: androidx.camera.core.ImageProxy): Bitmap? {
+    /** Samples an RGBA analysis frame without ever allocating its full multi-megapixel Bitmap. */
+    private fun decodePanoramaSampledFrame(
+        image: androidx.camera.core.ImageProxy,
+        requestedWidth: Int,
+        dynamicRangeProfile: PanoramaDynamicRangeProfile,
+    ): Bitmap? {
         val plane = image.planes.firstOrNull() ?: return null
         if (plane.pixelStride < 4) return null
         val buffer = plane.buffer.duplicate().apply { rewind() }
-        val sampleWidth = 264
+        val sampleWidth = requestedWidth.coerceIn(1, image.width)
         val sampleHeight = (sampleWidth * image.height.toFloat() / image.width)
             .roundToInt()
             .coerceAtLeast(1)
@@ -5313,8 +5971,10 @@ class CameraRuntimeController(
                 val green = buffer.get(offset + 1).toInt() and 0xff
                 val blue = buffer.get(offset + 2).toInt() and 0xff
                 val alpha = buffer.get(offset + 3).toInt() and 0xff
-                pixels[y * sampleWidth + x] =
-                    (alpha shl 24) or (red shl 16) or (green shl 8) or blue
+                pixels[y * sampleWidth + x] = panoramaProfileArgb(
+                    (alpha shl 24) or (red shl 16) or (green shl 8) or blue,
+                    dynamicRangeProfile,
+                )
             }
         }
         val sampled = Bitmap.createBitmap(
@@ -5323,7 +5983,19 @@ class CameraRuntimeController(
             sampleHeight,
             Bitmap.Config.ARGB_8888,
         )
-        val oriented = orientPanoramaBitmap(sampled, image.imageInfo.rotationDegrees)
+        return orientPanoramaBitmap(sampled, image.imageInfo.rotationDegrees)
+    }
+
+    /**
+     * Builds the native guide's live miniature directly from the RGBA analysis plane. Sampling
+     * only 264 pixels across keeps this below one percent of the work of copying a full frame and
+     * avoids the PreviewView bitmap reads which previously stalled the visible camera surface.
+     */
+    private fun decodePanoramaThumbnail(
+        image: androidx.camera.core.ImageProxy,
+        dynamicRangeProfile: PanoramaDynamicRangeProfile,
+    ): Bitmap? {
+        val oriented = decodePanoramaSampledFrame(image, 264, dynamicRangeProfile) ?: return null
         val targetRatio = 1.5f
         val currentRatio = oriented.width.toFloat() / oriented.height
         val cropWidth = if (currentRatio > targetRatio) {
@@ -5399,22 +6071,30 @@ class CameraRuntimeController(
         }
     }
 
-    private fun normalizePanoramaFrame(bitmap: Bitmap): Bitmap {
-        val reference = panoramaFrames.firstOrNull()?.bitmap
-        val targetWidth: Int
-        val targetHeight: Int
-        if (reference != null) {
-            targetWidth = reference.width
-            targetHeight = reference.height
-        } else {
-            val scale = minOf(
-                1f,
-                PANORAMA_STORED_FRAME_SIZE.width.toFloat() / bitmap.width,
-                PANORAMA_STORED_FRAME_SIZE.height.toFloat() / bitmap.height,
-            )
-            targetWidth = (bitmap.width * scale).roundToInt().coerceAtLeast(1)
-            targetHeight = (bitmap.height * scale).roundToInt().coerceAtLeast(1)
+    /** Publishes the live RGBA analysis feed as Panorama's reliable full-screen viewfinder. */
+    private fun publishPanoramaViewfinder(frame: Bitmap) {
+        cameraRequestHandler.post {
+            if (latestState.activeMode != com.mobiledivecontrol.core.CameraModeId.Panorama) {
+                frame.recycle()
+                return@post
+            }
+            val previous = PanoramaCaptureState.viewfinderFrame.value
+            PanoramaCaptureState.viewfinderFrame.value = frame
+            previous?.takeUnless { it === frame }?.let { bitmap ->
+                // Give Compose two display frames to release the previous ImageBitmap safely.
+                cameraRequestHandler.postDelayed({ runCatching { bitmap.recycle() } }, 100L)
+            }
         }
+    }
+
+    private fun normalizePanoramaFrame(bitmap: Bitmap): Bitmap {
+        val scale = minOf(
+            1f,
+            PANORAMA_STORED_FRAME_SIZE.width.toFloat() / bitmap.width,
+            PANORAMA_STORED_FRAME_SIZE.height.toFloat() / bitmap.height,
+        )
+        val targetWidth = (bitmap.width * scale).roundToInt().coerceAtLeast(1)
+        val targetHeight = (bitmap.height * scale).roundToInt().coerceAtLeast(1)
         return if (bitmap.width == targetWidth && bitmap.height == targetHeight) {
             bitmap
         } else {
@@ -5422,17 +6102,61 @@ class CameraRuntimeController(
         }
     }
 
-    private fun publishPanorama(
+    private fun stagePanoramaReview(
         bitmap: Bitmap,
         displayName: String,
         saveLocation: com.mobiledivecontrol.core.RecordingSaveLocation,
-    ): android.net.Uri {
+        metadata: CaptureMetadataSnapshot?,
+    ): PendingPanoramaReview {
+        val directory = File(context.noBackupFilesDir, "panorama-review").also { reviewDirectory ->
+            check(reviewDirectory.isDirectory || reviewDirectory.mkdirs()) {
+                "Could not create panorama review workspace"
+            }
+        }
+        val stagedFile = File(directory, displayName)
+        val previewScale = minOf(
+            1f,
+            2_400f / bitmap.width.toFloat(),
+            1_400f / bitmap.height.toFloat(),
+        )
+        val previewWidth = (bitmap.width * previewScale).roundToInt().coerceAtLeast(1)
+        val previewHeight = (bitmap.height * previewScale).roundToInt().coerceAtLeast(1)
+        val previewBitmap = if (previewWidth == bitmap.width && previewHeight == bitmap.height) {
+            bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        } else {
+            Bitmap.createScaledBitmap(bitmap, previewWidth, previewHeight, true)
+        }
+        try {
+            FileOutputStream(stagedFile).use { stream ->
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
+                    "JPEG encoder rejected the panorama"
+                }
+            }
+            check(stagedFile.isFile && stagedFile.length() > 0L) {
+                "Panorama staging file is empty"
+            }
+            return PendingPanoramaReview(
+                file = stagedFile,
+                displayName = displayName,
+                saveLocation = saveLocation,
+                metadata = metadata,
+                previewBitmap = previewBitmap,
+            )
+        } catch (error: Throwable) {
+            runCatching { stagedFile.delete() }
+            previewBitmap.recycle()
+            throw error
+        }
+    }
+
+    /** Copies the already-encoded staged JPEG byte-for-byte; Save never recompresses the stitch. */
+    private fun publishPanorama(review: PendingPanoramaReview): android.net.Uri {
         val resolver = context.contentResolver
         val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.DISPLAY_NAME, review.displayName)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, saveLocation.relativePath)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, review.saveLocation.relativePath)
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
         }
@@ -5440,8 +6164,8 @@ class CameraRuntimeController(
             ?: error("MediaStore could not create the panorama")
         try {
             resolver.openOutputStream(uri, "w")?.use { stream ->
-                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
-                    "JPEG encoder rejected the panorama"
+                review.file.inputStream().use { input ->
+                    input.copyTo(stream)
                 }
             } ?: error("MediaStore returned no panorama output stream")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -5459,9 +6183,98 @@ class CameraRuntimeController(
         }
     }
 
+    private fun savePendingPanorama() {
+        val review = pendingPanoramaReview ?: run {
+            Toast.makeText(context, "Panorama preview is unavailable", Toast.LENGTH_SHORT).show()
+            return
+        }
+        pendingPanoramaReview = null
+        if (PanoramaCaptureState.reviewBitmap.value === review.previewBitmap) {
+            PanoramaCaptureState.reviewBitmap.value = null
+        }
+        PanoramaCaptureState.message.value = "Saving panorama…"
+        panoramaExecutor.execute {
+            val result = runCatching { publishPanorama(review) }
+            result.onSuccess {
+                review.metadata?.let { metadata ->
+                    runCatching {
+                        writeMetadataSidecar(review.displayName, review.saveLocation, metadata)
+                    }.onFailure { error ->
+                        Log.w(TAG, "Panorama saved but metadata sidecar failed", error)
+                    }
+                }
+                runCatching { review.file.delete() }
+            }
+            ContextCompat.getMainExecutor(context).execute {
+                result.onSuccess { uri ->
+                    Log.i(TAG, "Panorama saved from review: uri=$uri")
+                    PanoramaCaptureState.message.value = "Panorama saved"
+                    previewView?.announceForAccessibility("Panorama saved")
+                    Toast.makeText(context, "Panorama saved", Toast.LENGTH_SHORT).show()
+                    cameraRequestHandler.postDelayed(
+                        { runCatching { review.previewBitmap.recycle() } },
+                        500L,
+                    )
+                }.onFailure { error ->
+                    pendingPanoramaReview = review
+                    PanoramaCaptureState.reviewBitmap.value = review.previewBitmap
+                    PanoramaCaptureState.message.value = "Could not save panorama"
+                    onCameraCommand?.invoke(CameraCommand.PanoramaReviewReady)
+                    Log.e(TAG, "Panorama review save failed", error)
+                    Toast.makeText(
+                        context,
+                        "Could not save panorama: ${error.message}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                cameraRequestHandler.postDelayed({
+                    if (pendingPanoramaReview == null) PanoramaCaptureState.message.value = ""
+                }, 1_200L)
+            }
+        }
+    }
+
+    private fun discardPendingPanoramaReview(deleteFile: Boolean) {
+        val review = pendingPanoramaReview
+        pendingPanoramaReview = null
+        val displayed = PanoramaCaptureState.reviewBitmap.value
+        PanoramaCaptureState.reviewBitmap.value = null
+        if (deleteFile) review?.let { runCatching { it.file.delete() } }
+        val bitmap = review?.previewBitmap ?: displayed
+        bitmap?.let { pendingBitmap ->
+            cameraRequestHandler.postDelayed({ runCatching { pendingBitmap.recycle() } }, 500L)
+        }
+        if (review != null && deleteFile) {
+            PanoramaCaptureState.message.value = "Panorama deleted"
+            Log.i(TAG, "Staged panorama deleted: ${review.file.name}")
+            cameraRequestHandler.postDelayed({
+                if (pendingPanoramaReview == null) PanoramaCaptureState.message.value = ""
+            }, 1_200L)
+        }
+    }
+
     private fun beginPhotoCapture() {
         underwaterCaptureFrozen = underwaterModeEnabled(latestState)
-        withShutterWhiteBalance(::capturePhotoNow)
+        withShutterWhiteBalance {
+            when (latestState.activeMode) {
+                com.mobiledivecontrol.core.CameraModeId.ExpertRaw -> captureExpertRawPhoto()
+                com.mobiledivecontrol.core.CameraModeId.Pro -> {
+                    if (virtualApertureStrength(currentValue(latestState, ".virtual_aperture")) > 0.001) {
+                        startExpertSequence(
+                            kind = ExpertSequenceKind.VirtualAperture,
+                            label = "Virtual aperture",
+                            frameCount = 1,
+                            intervalMillis = 0L,
+                            blendMode = ExpertRawBlendMode.Average,
+                            applyAperture = true,
+                        )
+                    } else {
+                        capturePhotoNow()
+                    }
+                }
+                else -> capturePhotoNow()
+            }
+        }
     }
 
     private fun releaseUnderwaterCaptureFreeze() {
@@ -5470,51 +6283,618 @@ class CameraRuntimeController(
         requestUnderwaterWhiteBalanceApply()
     }
 
-    private fun capturePhotoNow() {
+    private fun captureExpertRawPhoto() {
+        when (expertSequenceKind) {
+            ExpertSequenceKind.OceanInterval -> {
+                cancelExpertSequence("Ocean interval stopped")
+                releaseShutterWhiteBalance()
+                releaseUnderwaterCaptureFreeze()
+                return
+            }
+            ExpertSequenceKind.MultiManual -> {
+                captureNextManualMultiExposure()
+                return
+            }
+            null -> Unit
+            else -> {
+                cancelExpertSequence("Capture cancelled")
+                releaseShutterWhiteBalance()
+                releaseUnderwaterCaptureFreeze()
+                return
+            }
+        }
+
+        val oceanInterval = currentValue(latestState, ".ocean_capture_interval")
+            ?.removeSuffix("s")
+            ?.toLongOrNull()
+            ?.times(1_000L)
+            ?: 0L
+        if (oceanInterval > 0L) {
+            startOceanInterval(oceanInterval)
+            return
+        }
+
+        if (currentValue(latestState, ".multi_exposure") == "On") {
+            val frameCount = currentValue(latestState, ".multi_exposure_frames")
+                ?.toIntOrNull()
+                ?.coerceIn(2, 9)
+                ?: 2
+            val blend = multiExposureBlendMode(currentValue(latestState, ".multi_exposure_overlay"))
+            if (currentValue(latestState, ".multi_exposure_shutter") == "Manual") {
+                beginManualMultiExposure(frameCount, blend)
+            } else {
+                startExpertSequence(
+                    kind = ExpertSequenceKind.MultiContinuous,
+                    label = "Multi exposure",
+                    frameCount = frameCount,
+                    intervalMillis = 350L,
+                    blendMode = blend,
+                    applyAperture = virtualApertureStrength(
+                        currentValue(latestState, ".virtual_aperture"),
+                    ) > 0.001,
+                )
+            }
+            return
+        }
+
+        val astroPlan = astroCapturePlan(currentValue(latestState, ".astrophotography"))
+        if (astroPlan != null) {
+            val portrait = currentValue(latestState, ".astro_portrait") == "On"
+            startExpertSequence(
+                kind = if (portrait) ExpertSequenceKind.AstroPortrait else ExpertSequenceKind.Astro,
+                label = if (portrait) "Astro Portrait" else "Astrophotography",
+                frameCount = astroPlan.frameCount,
+                intervalMillis = astroPlan.intervalMillis,
+                blendMode = if (portrait) ExpertRawBlendMode.Bright else ExpertRawBlendMode.Average,
+                applyAperture = portrait || virtualApertureStrength(
+                    currentValue(latestState, ".virtual_aperture"),
+                ) > 0.001,
+            )
+            return
+        }
+
+        val ndValue = currentValue(latestState, ".nd_filter")
+        val ndFrames = ndCaptureFrameCount(ndValue)
+        if (ndFrames > 1) {
+            startExpertSequence(
+                kind = ExpertSequenceKind.Nd,
+                label = "ND $ndValue",
+                frameCount = ndFrames,
+                intervalMillis = 125L,
+                blendMode = ExpertRawBlendMode.Average,
+                applyAperture = virtualApertureStrength(
+                    currentValue(latestState, ".virtual_aperture"),
+                ) > 0.001,
+            )
+            return
+        }
+
+        if (virtualApertureStrength(currentValue(latestState, ".virtual_aperture")) > 0.001) {
+            startExpertSequence(
+                kind = ExpertSequenceKind.VirtualAperture,
+                label = "Virtual aperture",
+                frameCount = 1,
+                intervalMillis = 0L,
+                blendMode = ExpertRawBlendMode.Average,
+                applyAperture = true,
+            )
+        } else {
+            capturePhotoNow()
+        }
+    }
+
+    private fun startExpertSequence(
+        kind: ExpertSequenceKind,
+        label: String,
+        frameCount: Int,
+        intervalMillis: Long,
+        blendMode: ExpertRawBlendMode,
+        applyAperture: Boolean,
+    ) {
+        if (expertSequenceKind != null) return
         val capture = imageCapture ?: run {
+            releaseShutterWhiteBalance()
+            releaseUnderwaterCaptureFreeze()
+            reportRuntimeFailure("Camera is not ready for $label.")
+            return
+        }
+        val directory = createExpertCaptureDirectory() ?: run {
+            releaseShutterWhiteBalance()
+            releaseUnderwaterCaptureFreeze()
+            reportRuntimeFailure("Could not create the $label capture workspace.")
+            return
+        }
+        expertSequenceGeneration++
+        val generation = expertSequenceGeneration
+        expertSequenceKind = kind
+        expertCaptureDirectory = directory
+        expertCapturedFrames.clear()
+        expertRequestedOutput = stillCaptureOutput(currentValue(latestState, ".save_format"))
+        expertMetadataSnapshot = captureMetadataSnapshot()
+        ExpertRawCaptureState.begin("$label 0/$frameCount")
+        if (kind == ExpertSequenceKind.AstroPortrait) {
+            expertOriginalFlashMode = capture.flashMode
+            capture.flashMode = ImageCapture.FLASH_MODE_ON
+        }
+
+        fun captureAt(index: Int) {
+            if (generation != expertSequenceGeneration || expertSequenceKind != kind) return
+            captureTemporaryFrame(directory, index) { result ->
+                if (generation != expertSequenceGeneration || expertSequenceKind != kind) {
+                    result.getOrNull()?.let(::deleteExpertFrame)
+                    return@captureTemporaryFrame
+                }
+                result.onFailure { error ->
+                    failExpertSequence("$label failed", error)
+                }.onSuccess { frame ->
+                    expertCapturedFrames += frame
+                    if (kind == ExpertSequenceKind.AstroPortrait && index == 0) {
+                        capture.flashMode = ImageCapture.FLASH_MODE_OFF
+                    }
+                    val captured = index + 1
+                    ExpertRawCaptureState.update(
+                        "$label $captured/$frameCount",
+                        captured.toDouble() / frameCount * 0.72,
+                    )
+                    if (captured >= frameCount) {
+                        processExpertFrames(label, blendMode, applyAperture)
+                    } else {
+                        cameraRequestHandler.postDelayed(
+                            { captureAt(captured) },
+                            intervalMillis,
+                        )
+                    }
+                }
+            }
+        }
+        captureAt(0)
+    }
+
+    private fun beginManualMultiExposure(frameCount: Int, blendMode: ExpertRawBlendMode) {
+        val directory = createExpertCaptureDirectory() ?: run {
+            releaseShutterWhiteBalance()
+            releaseUnderwaterCaptureFreeze()
+            reportRuntimeFailure("Could not create the multi-exposure workspace.")
+            return
+        }
+        expertSequenceGeneration++
+        expertSequenceKind = ExpertSequenceKind.MultiManual
+        expertCaptureDirectory = directory
+        expertCapturedFrames.clear()
+        expertRequestedOutput = stillCaptureOutput(currentValue(latestState, ".save_format"))
+        expertMetadataSnapshot = captureMetadataSnapshot()
+        ExpertRawCaptureState.begin("Multi exposure 0/$frameCount")
+        captureNextManualMultiExposure(frameCount, blendMode)
+    }
+
+    private fun captureNextManualMultiExposure(
+        configuredCount: Int? = null,
+        configuredBlend: ExpertRawBlendMode? = null,
+    ) {
+        if (expertFrameCaptureInFlight) {
+            Toast.makeText(context, "Exposure is still saving", Toast.LENGTH_SHORT).show()
             releaseShutterWhiteBalance()
             releaseUnderwaterCaptureFreeze()
             return
         }
-        val name = "DiveControl_${System.currentTimeMillis()}.jpg"
+        val directory = expertCaptureDirectory ?: run {
+            cancelExpertSequence("Multi exposure reset")
+            releaseShutterWhiteBalance()
+            releaseUnderwaterCaptureFreeze()
+            return
+        }
+        val frameCount = configuredCount ?: currentValue(latestState, ".multi_exposure_frames")
+            ?.toIntOrNull()
+            ?.coerceIn(2, 9)
+            ?: 2
+        val blend = configuredBlend
+            ?: multiExposureBlendMode(currentValue(latestState, ".multi_exposure_overlay"))
+        val index = expertCapturedFrames.size
+        val generation = expertSequenceGeneration
+        captureTemporaryFrame(directory, index) { result ->
+            if (generation != expertSequenceGeneration ||
+                expertSequenceKind != ExpertSequenceKind.MultiManual
+            ) {
+                result.getOrNull()?.let(::deleteExpertFrame)
+                return@captureTemporaryFrame
+            }
+            result.onFailure { error ->
+                failExpertSequence("Multi exposure failed", error)
+            }.onSuccess { frame ->
+                expertCapturedFrames += frame
+                val captured = expertCapturedFrames.size
+                ExpertRawCaptureState.update(
+                    "Multi exposure $captured/$frameCount",
+                    captured.toDouble() / frameCount * 0.72,
+                )
+                if (captured >= frameCount) {
+                    processExpertFrames(
+                        label = "Multi exposure",
+                        blendMode = blend,
+                        applyAperture = virtualApertureStrength(
+                            currentValue(latestState, ".virtual_aperture"),
+                        ) > 0.001,
+                    )
+                } else {
+                    releaseShutterWhiteBalance()
+                    releaseUnderwaterCaptureFreeze()
+                }
+            }
+        }
+    }
+
+    private fun startOceanInterval(intervalMillis: Long) {
+        expertSequenceGeneration++
+        val generation = expertSequenceGeneration
+        expertSequenceKind = ExpertSequenceKind.OceanInterval
+        oceanIntervalMillis = intervalMillis
+        ExpertRawCaptureState.begin("Ocean interval ${intervalMillis / 1_000}s")
+        var count = 0
+        fun captureNext() {
+            if (generation != expertSequenceGeneration ||
+                expertSequenceKind != ExpertSequenceKind.OceanInterval
+            ) return
+            capturePhotoNow { success ->
+                if (!success) {
+                    cancelExpertSequence("Ocean interval stopped")
+                    return@capturePhotoNow
+                }
+                count++
+                ExpertRawCaptureState.update("Ocean interval • $count saved", 0.0)
+                cameraRequestHandler.postDelayed({
+                    if (generation == expertSequenceGeneration &&
+                        expertSequenceKind == ExpertSequenceKind.OceanInterval
+                    ) {
+                        underwaterCaptureFrozen = underwaterModeEnabled(latestState)
+                        withShutterWhiteBalance(::captureNext)
+                    }
+                }, intervalMillis)
+            }
+        }
+        captureNext()
+    }
+
+    private fun createExpertCaptureDirectory(): File? = File(
+        context.cacheDir,
+        "expert-raw/session-${System.currentTimeMillis()}-${System.nanoTime()}",
+    ).takeIf { it.mkdirs() || it.isDirectory }
+
+    private fun captureTemporaryFrame(
+        directory: File,
+        index: Int,
+        callback: (Result<ExpertCaptureFrame>) -> Unit,
+    ) {
+        val capture = imageCapture ?: run {
+            callback(Result.failure(IllegalStateException("Camera is not ready")))
+            return
+        }
+        expertFrameCaptureInFlight = true
+        val rawFile = File(directory, "frame-${index.toString().padStart(3, '0')}.dng")
+        val jpegFile = File(directory, "frame-${index.toString().padStart(3, '0')}.jpg")
+        val outputKind = when (capture.outputFormat) {
+            ImageCapture.OUTPUT_FORMAT_RAW -> StillCaptureOutput.Raw
+            ImageCapture.OUTPUT_FORMAT_RAW_JPEG -> StillCaptureOutput.RawJpeg
+            ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR -> StillCaptureOutput.UltraHdrJpeg
+            else -> StillCaptureOutput.Jpeg
+        }
+        val expected = if (outputKind == StillCaptureOutput.RawJpeg) 2 else 1
+        val remaining = AtomicInteger(expected)
+        val terminal = AtomicBoolean(false)
+        val savedCallback = object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                if (remaining.decrementAndGet() != 0 || !terminal.compareAndSet(false, true)) return
+                expertFrameCaptureInFlight = false
+                val frame = ExpertCaptureFrame(
+                    rawFile = rawFile.takeIf { it.isFile && it.length() > 0L },
+                    jpegFile = jpegFile.takeIf { it.isFile && it.length() > 0L },
+                )
+                if (frame.jpegFile == null) {
+                    callback(Result.failure(IllegalStateException("A JPEG companion is required for computational capture")))
+                } else {
+                    callback(Result.success(frame))
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                if (!terminal.compareAndSet(false, true)) return
+                expertFrameCaptureInFlight = false
+                rawFile.delete()
+                jpegFile.delete()
+                callback(Result.failure(exception))
+            }
+        }
+        val rawOutput = ImageCapture.OutputFileOptions.Builder(rawFile).build()
+        val jpegOutput = ImageCapture.OutputFileOptions.Builder(jpegFile).build()
+        try {
+            when (outputKind) {
+                StillCaptureOutput.RawJpeg -> capture.takePicture(
+                    rawOutput,
+                    jpegOutput,
+                    ContextCompat.getMainExecutor(context),
+                    savedCallback,
+                )
+                StillCaptureOutput.Raw -> capture.takePicture(
+                    rawOutput,
+                    ContextCompat.getMainExecutor(context),
+                    savedCallback,
+                )
+                StillCaptureOutput.Jpeg,
+                StillCaptureOutput.UltraHdrJpeg -> capture.takePicture(
+                    jpegOutput,
+                    ContextCompat.getMainExecutor(context),
+                    savedCallback,
+                )
+            }
+        } catch (error: Exception) {
+            expertFrameCaptureInFlight = false
+            rawFile.delete()
+            jpegFile.delete()
+            callback(Result.failure(error))
+        }
+    }
+
+    private fun processExpertFrames(
+        label: String,
+        blendMode: ExpertRawBlendMode,
+        applyAperture: Boolean,
+    ) {
+        val generation = expertSequenceGeneration
+        val frames = expertCapturedFrames.toList()
+        val directory = expertCaptureDirectory ?: return
+        val requestedOutput = expertRequestedOutput
+        val metadata = expertMetadataSnapshot
+        val aperture = currentValue(latestState, ".virtual_aperture")
+        ExpertRawCaptureState.update("$label processing", 0.75)
+        recordingFinalizeExecutor.execute {
+            val result = ExpertRawImageProcessor.combineJpegs(
+                files = frames.mapNotNull { it.jpegFile },
+                mode = blendMode,
+            ) { progress ->
+                ContextCompat.getMainExecutor(context).execute {
+                    if (generation == expertSequenceGeneration) {
+                        ExpertRawCaptureState.update("$label processing", 0.75 + progress * 0.17)
+                    }
+                }
+            }.mapCatching { combined ->
+                val processed = if (applyAperture) {
+                    ExpertRawImageProcessor.applyVirtualAperture(combined, aperture)
+                } else {
+                    combined
+                }
+                val outputFile = File(directory, "processed.jpg")
+                ExpertRawImageProcessor.writeJpeg(processed, outputFile).getOrThrow()
+                processed.recycle()
+                val baseName = "DiveControl_${System.currentTimeMillis()}"
+                val saveLocation = latestState.recordingSaveLocation
+                val published = mutableListOf<Uri>()
+                if (requestedOutput == StillCaptureOutput.Raw ||
+                    requestedOutput == StillCaptureOutput.RawJpeg
+                ) {
+                    val raw = frames.firstNotNullOfOrNull { it.rawFile }
+                        ?: error("The RAW frame was not written")
+                    published += publishExpertFile(
+                        raw,
+                        "$baseName.dng",
+                        "image/x-adobe-dng",
+                        saveLocation,
+                    )
+                }
+                if (requestedOutput != StillCaptureOutput.Raw) {
+                    published += publishExpertFile(
+                        outputFile,
+                        "$baseName.jpg",
+                        "image/jpeg",
+                        saveLocation,
+                    )
+                }
+                metadata?.let { snapshot ->
+                    writeMetadataSidecar(
+                        if (requestedOutput == StillCaptureOutput.Raw) "$baseName.dng" else "$baseName.jpg",
+                        saveLocation,
+                        snapshot,
+                    )
+                }
+                published
+            }
+            ContextCompat.getMainExecutor(context).execute {
+                if (generation != expertSequenceGeneration) return@execute
+                result.onSuccess {
+                    completeExpertSequence("$label saved")
+                }.onFailure { error ->
+                    failExpertSequence("$label processing failed", error)
+                }
+            }
+        }
+    }
+
+    private fun publishExpertFile(
+        source: File,
+        displayName: String,
+        mimeType: String,
+        saveLocation: com.mobiledivecontrol.core.RecordingSaveLocation,
+    ): Uri {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, saveLocation.relativePath)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+        }
+        val resolver = context.contentResolver
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: error("MediaStore rejected $displayName")
+        try {
+            resolver.openOutputStream(uri, "w")?.use { output ->
+                source.inputStream().use { input -> input.copyTo(output) }
+            } ?: error("Could not open $displayName for writing")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                resolver.update(uri, ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }, null, null)
+            }
+            return uri
+        } catch (error: Exception) {
+            resolver.delete(uri, null, null)
+            throw error
+        }
+    }
+
+    private fun completeExpertSequence(message: String) {
+        restoreExpertFlashMode()
+        expertSequenceKind = null
+        expertFrameCaptureInFlight = false
+        ExpertRawCaptureState.finish(message)
+        releaseShutterWhiteBalance()
+        releaseUnderwaterCaptureFreeze()
+        cleanupExpertCaptureFiles()
+        cameraRequestHandler.postDelayed({
+            if (expertSequenceKind == null) ExpertRawCaptureState.reset()
+        }, 1_800L)
+    }
+
+    private fun failExpertSequence(message: String, error: Throwable) {
+        Log.e(TAG, message, error)
+        reportRuntimeFailure("$message: ${error.message ?: "camera pipeline error"}")
+        cancelExpertSequence(message, announce = true)
+        releaseShutterWhiteBalance()
+        releaseUnderwaterCaptureFreeze()
+    }
+
+    private fun cancelExpertSequence(message: String, announce: Boolean = true) {
+        expertSequenceGeneration++
+        restoreExpertFlashMode()
+        expertSequenceKind = null
+        expertFrameCaptureInFlight = false
+        oceanIntervalMillis = 0L
+        cleanupExpertCaptureFiles()
+        if (announce && message.isNotBlank()) {
+            ExpertRawCaptureState.finish(message)
+            cameraRequestHandler.postDelayed({
+                if (expertSequenceKind == null) ExpertRawCaptureState.reset()
+            }, 1_400L)
+        } else {
+            ExpertRawCaptureState.reset()
+        }
+    }
+
+    private fun restoreExpertFlashMode() {
+        val original = expertOriginalFlashMode ?: return
+        expertOriginalFlashMode = null
+        runCatching { imageCapture?.flashMode = original }
+    }
+
+    private fun cleanupExpertCaptureFiles() {
+        expertCapturedFrames.forEach(::deleteExpertFrame)
+        expertCapturedFrames.clear()
+        expertCaptureDirectory?.deleteRecursively()
+        expertCaptureDirectory = null
+        expertMetadataSnapshot = null
+    }
+
+    private fun deleteExpertFrame(frame: ExpertCaptureFrame) {
+        frame.rawFile?.delete()
+        frame.jpegFile?.delete()
+    }
+
+    private fun capturePhotoNow(onFinished: (Boolean) -> Unit = {}) {
+        val capture = imageCapture ?: run {
+            releaseShutterWhiteBalance()
+            releaseUnderwaterCaptureFreeze()
+            onFinished(false)
+            return
+        }
+        val baseName = "DiveControl_${System.currentTimeMillis()}"
+        val jpegName = "$baseName.jpg"
+        val rawName = "$baseName.dng"
         val saveLocation = latestState.recordingSaveLocation
         val metadataSnapshot = captureMetadataSnapshot()
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(
-                    MediaStore.MediaColumns.RELATIVE_PATH,
-                    saveLocation.relativePath,
+        fun output(name: String, mimeType: String) = ImageCapture.OutputFileOptions.Builder(
+            context.contentResolver,
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, saveLocation.relativePath)
+                }
+            },
+        ).build()
+        val jpegOutput = output(jpegName, "image/jpeg")
+        val rawOutput = output(rawName, "image/x-adobe-dng")
+        val captureOutput = stillCaptureOutput(currentValue(latestState, ".save_format"))
+        val expectedResults = if (captureOutput == StillCaptureOutput.RawJpeg) 2 else 1
+        val remainingResults = AtomicInteger(expectedResults)
+        val terminal = AtomicBoolean(false)
+        val metadataName = if (captureOutput == StillCaptureOutput.Raw) rawName else jpegName
+
+        fun finishSuccess() {
+            if (remainingResults.decrementAndGet() != 0 || !terminal.compareAndSet(false, true)) return
+            metadataSnapshot?.let { snapshot ->
+                recordingFinalizeExecutor.execute {
+                    writeMetadataSidecar(metadataName, saveLocation, snapshot)
+                }
+            }
+            releaseShutterWhiteBalance()
+            releaseUnderwaterCaptureFreeze()
+            onFinished(true)
+        }
+
+        val callback = object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                val format = outputFileResults.imageFormat
+                Log.i(
+                    TAG,
+                    "Photo saved: base=$baseName format=$format " +
+                        "kind=$captureOutput uri=${outputFileResults.savedUri}",
+                )
+                finishSuccess()
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                if (!terminal.compareAndSet(false, true)) return
+                Log.e(TAG, "Photo capture failed ($captureOutput)", exception)
+                releaseShutterWhiteBalance()
+                releaseUnderwaterCaptureFreeze()
+                onFinished(false)
+                reportRuntimeFailure(
+                    "${captureOutput.name.replace("RawJpeg", "RAW + JPEG")} capture failed: " +
+                        (exception.message ?: "camera rejected the output"),
                 )
             }
         }
-        val output = ImageCapture.OutputFileOptions.Builder(
-            context.contentResolver,
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            values,
-        ).build()
-        capture.takePicture(
-            output,
-            ContextCompat.getMainExecutor(context),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                    metadataSnapshot?.let { snapshot ->
-                        recordingFinalizeExecutor.execute {
-                            writeMetadataSidecar(name, saveLocation, snapshot)
-                        }
-                    }
-                    releaseShutterWhiteBalance()
-                    releaseUnderwaterCaptureFreeze()
-                }
 
-                override fun onError(exception: ImageCaptureException) {
-                    Log.e(TAG, "Photo capture failed", exception)
-                    releaseShutterWhiteBalance()
-                    releaseUnderwaterCaptureFreeze()
-                }
-            },
-        )
+        try {
+            when (captureOutput) {
+                StillCaptureOutput.RawJpeg -> capture.takePicture(
+                    rawOutput,
+                    jpegOutput,
+                    ContextCompat.getMainExecutor(context),
+                    callback,
+                )
+                StillCaptureOutput.Raw -> capture.takePicture(
+                    rawOutput,
+                    ContextCompat.getMainExecutor(context),
+                    callback,
+                )
+                StillCaptureOutput.Jpeg,
+                StillCaptureOutput.UltraHdrJpeg -> capture.takePicture(
+                    jpegOutput,
+                    ContextCompat.getMainExecutor(context),
+                    callback,
+                )
+            }
+        } catch (error: IllegalArgumentException) {
+            if (terminal.compareAndSet(false, true)) {
+                Log.e(TAG, "Photo output is not supported by the bound camera", error)
+                releaseShutterWhiteBalance()
+                releaseUnderwaterCaptureFreeze()
+                onFinished(false)
+                reportRuntimeFailure(
+                    "${captureOutput.name.replace("RawJpeg", "RAW + JPEG")} is not supported by this lens.",
+                )
+            }
+        }
     }
 
     /**
@@ -5641,6 +7021,15 @@ class CameraRuntimeController(
         boundCamera.cameraControl.setZoomRatio(clamped.toFloat())
     }
 
+    private fun sceneModeAvailable(boundCamera: Camera, sceneMode: Int): Boolean = runCatching {
+        Camera2CameraInfo.from(boundCamera.cameraInfo)
+            .getCameraCharacteristic(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)
+            ?.contains(sceneMode) == true
+    }.getOrDefault(false)
+
+    private fun panoramaHdrSceneAvailable(boundCamera: Camera): Boolean =
+        sceneModeAvailable(boundCamera, CameraMetadata.CONTROL_SCENE_MODE_HDR)
+
     private fun applyCamera2Options(cameraState: CameraState, boundCamera: Camera) {
         // This method is only called in CameraX mode (auto focus).
         // When nativeFocusActive is true, submitNativeRepeatingRequest handles everything.
@@ -5685,19 +7074,133 @@ class CameraRuntimeController(
         // --- Effect mode ---
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_EFFECT_MODE, CameraMetadata.CONTROL_EFFECT_MODE_OFF)
 
+        val panoramaProcessing = cameraState.activeMode ==
+            com.mobiledivecontrol.core.CameraModeId.Panorama
+        val hyperlapseNight = cameraState.activeMode ==
+            com.mobiledivecontrol.core.CameraModeId.Hyperlapse &&
+            currentValue(cameraState, ".day_night") == "Night"
+        val hdrLogMode = resolvedHdrLogMode(cameraState)
+
         // --- HDR / public 10-bit wide-dynamic-range video / Off ---
         if (!boundHdrExtension) {
-            when (resolvedHdrLogMode(cameraState)) {
-                "HDR" -> {
+            when {
+                hyperlapseNight && sceneModeAvailable(
+                    boundCamera,
+                    CameraMetadata.CONTROL_SCENE_MODE_NIGHT,
+                ) -> {
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_MODE,
+                        CameraMetadata.CONTROL_MODE_USE_SCENE_MODE,
+                    )
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_SCENE_MODE,
+                        CameraMetadata.CONTROL_SCENE_MODE_NIGHT,
+                    )
+                }
+                panoramaProcessing && hdrLogMode == "HDR" && panoramaHdrSceneAvailable(boundCamera) -> {
+                    // Camera ID 2 on the S24 exposes public scene mode 18. This lets Samsung's
+                    // sensor-domain HDR run before the RGBA analysis frame reaches our stitcher.
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_MODE,
+                        CameraMetadata.CONTROL_MODE_USE_SCENE_MODE,
+                    )
+                    builder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_SCENE_MODE,
+                        CameraMetadata.CONTROL_SCENE_MODE_HDR,
+                    )
+                }
+                panoramaProcessing -> {
+                    // Off and LOG both keep the public scene-mode HDR processor out of the
+                    // analysis stream. LOG's lower-processing request controls are applied
+                    // below without replacing ImageAnalysis with a video-only 10-bit surface.
+                    builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                }
+                hdrLogMode == "HDR" -> {
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
                 }
-                "LOG" -> {
+                hdrLogMode == "LOG" -> {
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                 }
                 else -> {
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                 }
+            }
+        }
+        if (panoramaProcessing) {
+            val info = Camera2CameraInfo.from(boundCamera.cameraInfo)
+            val toneModes = info.getCameraCharacteristic(
+                CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES,
+            ) ?: intArrayOf()
+            val edgeModes = info.getCameraCharacteristic(
+                CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES,
+            ) ?: intArrayOf()
+            val noiseModes = info.getCameraCharacteristic(
+                CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES,
+            ) ?: intArrayOf()
+            val aeRanges = info.getCameraCharacteristic(
+                CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES,
+            ) ?: emptyArray()
+            if (hdrLogMode != "LOG" && toneModes.contains(CameraMetadata.TONEMAP_MODE_HIGH_QUALITY)) {
+                builder.setCaptureRequestOption(
+                    CaptureRequest.TONEMAP_MODE,
+                    CameraMetadata.TONEMAP_MODE_HIGH_QUALITY,
+                )
+            }
+            if (hdrLogMode != "LOG" && edgeModes.contains(CameraMetadata.EDGE_MODE_HIGH_QUALITY)) {
+                builder.setCaptureRequestOption(
+                    CaptureRequest.EDGE_MODE,
+                    CameraMetadata.EDGE_MODE_HIGH_QUALITY,
+                )
+            }
+            if (hdrLogMode != "LOG" && noiseModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+                builder.setCaptureRequestOption(
+                    CaptureRequest.NOISE_REDUCTION_MODE,
+                    CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY,
+                )
+            }
+            aeRanges.firstOrNull { range -> range.lower == 30 && range.upper == 30 }?.let { range ->
+                // Prevent AE from solving a darker section with a long, motion-soft exposure.
+                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+            }
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, false)
+        }
+        if (hyperlapseNight) {
+            val info = Camera2CameraInfo.from(boundCamera.cameraInfo)
+            val noiseModes = info.getCameraCharacteristic(
+                CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES,
+            ) ?: intArrayOf()
+            if (noiseModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+                builder.setCaptureRequestOption(
+                    CaptureRequest.NOISE_REDUCTION_MODE,
+                    CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY,
+                )
+            }
+            if (!sceneModeAvailable(boundCamera, CameraMetadata.CONTROL_SCENE_MODE_NIGHT)) {
+                // Some Samsung physical-camera IDs omit the public NIGHT scene even though the
+                // logical camera offers Night Hyperlapse. In that case keep AE active and allow
+                // a low-light preview cadence instead of leaving the Day request unchanged.
+                val aeRanges = info.getCameraCharacteristic(
+                    CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES,
+                ) ?: emptyArray()
+                aeRanges
+                    .filter { range -> range.lower in 1..15 && range.upper <= 30 }
+                    .minWithOrNull(
+                        compareBy<android.util.Range<Int>> { range -> range.lower }
+                            .thenByDescending { range -> range.upper },
+                    )
+                    ?.let { range ->
+                        builder.setCaptureRequestOption(
+                            CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                            range,
+                        )
+                    }
+                builder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    CameraMetadata.CONTROL_AE_MODE_ON,
+                )
+                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, false)
             }
         }
         applyMaximumInformationLogControls(builder, cameraState)
@@ -5740,7 +7243,8 @@ class CameraRuntimeController(
                 builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
                 builder.setCaptureRequestOption(
                     CaptureRequest.CONTROL_AWB_LOCK,
-                    shutterAwbLockActive && CameraCatalog.isWhiteBalanceAutoShutter(wbValue),
+                    panoramaCaptureActive ||
+                        (shutterAwbLockActive && CameraCatalog.isWhiteBalanceAutoShutter(wbValue)),
                 )
             }
         } else {
@@ -5783,11 +7287,18 @@ class CameraRuntimeController(
             // the vendor focus key. One writer, one bundle, no 3A tug-of-war.
             val userEv = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure")
                 ?.replace("+", "")?.toDoubleOrNull()
-            if (userEv != null) {
-                val effectiveEv = SamsungLogProfile.effectiveAutoExposureEv(
-                    userEv = userEv,
-                    calibration = samsungLogAcquisitionCalibration(cameraState),
-                )
+            // Panorama's neutral point is intentionally 0.3 EV highlight-safe; its EV control
+            // remains relative to that mode baseline, like Samsung's own panorama metering.
+            val requestedEv = if (panoramaProcessing) (userEv ?: 0.0) - 0.3 else userEv
+            if (requestedEv != null) {
+                val effectiveEv = if (userEv != null && !panoramaProcessing) {
+                    SamsungLogProfile.effectiveAutoExposureEv(
+                        userEv = userEv,
+                        calibration = samsungLogAcquisitionCalibration(cameraState),
+                    )
+                } else {
+                    requestedEv
+                }
                 builder.setCaptureRequestOption(
                     CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
                     evCompensationIndex(boundCamera, effectiveEv),
@@ -5804,6 +7315,7 @@ class CameraRuntimeController(
             cam2Control.setCaptureRequestOptions(builder.build())
         } catch (e: Exception) {
             Log.e(TAG, "Camera2 options FAILED", e)
+            reportRuntimeFailure("Camera setting was rejected: ${e.message ?: "Camera2 request failed"}")
         }
     }
 
@@ -5946,8 +7458,25 @@ class CameraRuntimeController(
         return if (hdr == "On" || hdr == "HDR") "HDR" else "Off"
     }
 
+    private fun activePanoramaDynamicRangeProfile(): PanoramaDynamicRangeProfile =
+        if (panoramaCaptureActive || PanoramaCaptureState.finalizing.value) {
+            panoramaCaptureProfile
+        } else {
+            PanoramaDynamicRangeProfile.fromSetting(resolvedHdrLogMode(latestState))
+        }
+
     private fun resolvedSessionHdrLogMode(cameraState: CameraState): String {
-        return if (isHighSpeedSelection(cameraState)) "Off" else resolvedHdrLogMode(cameraState)
+        // A wide-dynamic-range session here means a 10-bit VideoCapture surface. Still modes
+        // such as Panorama must retain ImageAnalysis, so their HDR/LOG choices stay request- and
+        // stitch-level controls rather than switching to the video-only maximum-information graph.
+        return if (
+            isHighSpeedSelection(cameraState) ||
+            cameraState.activeMode.captureType != CameraCaptureType.Video
+        ) {
+            "Off"
+        } else {
+            resolvedHdrLogMode(cameraState)
+        }
     }
 
     private fun samsungLogAcquisitionCalibration(cameraState: CameraState) =
@@ -5955,6 +7484,11 @@ class CameraRuntimeController(
             deviceModel = Build.MODEL.orEmpty(),
             lensValue = currentValue(cameraState, ".lens"),
         ).takeIf { resolvedHdrLogMode(cameraState) == "LOG" }
+
+    private fun playPanoramaActionSound(sound: Int) {
+        if (currentValue(latestState, ".shutter_sound") != "On") return
+        runCatching { panoramaActionSound.play(sound) }
+    }
 
     private fun currentValue(cameraState: CameraState, vararg suffixes: String): String? {
         val settings = CameraCatalog.settingsFor(cameraState.activeMode, cameraState.deviceVariant)

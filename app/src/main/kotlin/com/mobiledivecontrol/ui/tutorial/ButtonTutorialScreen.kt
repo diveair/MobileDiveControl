@@ -120,6 +120,7 @@ fun IntroCarouselScreen(
     missingPermissions: List<String>,
     modifier: Modifier = Modifier,
     onDismiss: () -> Unit = {},
+    onPermissionsSetup: () -> Unit = {},
 ) {
     // Once the link has been up, a later drop is a *loss* rather than a "still looking" — the diver
     // needs the difference, because one is normal startup and the other means something broke.
@@ -282,7 +283,11 @@ fun IntroCarouselScreen(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black)
-            .pointerInput(Unit) { detectTapGestures { onDismiss() } },
+            .pointerInput(phase) {
+                detectTapGestures {
+                    if (phase == IntroPhase.NeedsPermissions) onPermissionsSetup() else onDismiss()
+                }
+            },
     ) {
         HousingDiagram(
             frame = if (phase == IntroPhase.Carousel) {

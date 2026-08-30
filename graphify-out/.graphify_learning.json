@@ -1,11 +1,16 @@
 {
-  "generated_at": "2026-08-27T18:24:06.025372+00:00",
+  "generated_at": "2026-08-30T14:10:22.501044+00:00",
   "nodes": {
     "app_src_main_kotlin_com_mobiledivecontrol_mainactivity_mainactivity": {
-      "code_fingerprint": "6d530ffb47073170b0cd45977aeb075b031a3306f146acb25baa8540dd54a0cb",
+      "code_fingerprint": "ba849e1da8e57b015f76698bbc67e7b19f3c91a57d18451c7949f4d00526899e",
       "label": "MainActivity",
-      "last": "2026-08-23T23:29:16.031535+00:00",
+      "last": "2026-08-29T21:40:07.857943+00:00",
       "provenance": [
+        {
+          "date": "2026-08-29T21:40:07.857943+00:00",
+          "outcome": "useful",
+          "q": "phone is connected again"
+        },
         {
           "date": "2026-08-23T23:29:16.031535+00:00",
           "outcome": "useful",
@@ -17,10 +22,10 @@
           "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
         }
       ],
-      "score": 1.8297893,
+      "score": 2.698455273,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/MainActivity.kt",
       "status": "preferred",
-      "uses": 2
+      "uses": 3
     },
     "app_src_main_kotlin_com_mobiledivecontrol_platform_compassheadingmonitor_compassheadingmonitor": {
       "code_fingerprint": "f7a7b178aa364258d1c6b22791533b7554dd8022f9b1b2c2c54a56ccac59ec9c",
@@ -44,7 +49,7 @@
           "q": "How should the compass heading and target arrow adapt to landscape display rotation and phone tilt?"
         }
       ],
-      "score": 0.914237803,
+      "score": 0.856493768,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/platform/CompassHeadingMonitor.kt",
       "status": "contested",
       "uses": 2,
@@ -81,7 +86,7 @@
           "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
         }
       ],
-      "score": 5.469810645,
+      "score": 5.124332761,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/platform/GalleryRepository.kt",
       "status": "preferred",
       "uses": 6
@@ -97,67 +102,165 @@
           "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
         }
       ],
-      "score": 0.913591685,
+      "score": 0.855888459,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/service/HousingLinkService.kt",
       "status": "tentative",
       "uses": 1
     },
-    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_cameraruntimecontroller_cameraruntimecontroller": {
-      "code_fingerprint": "3f7d71095631b44e808d11a7e80807ce16b33bb71419a1ba5c3338caa66a9914",
-      "label": "CameraRuntimeController",
-      "last": "2026-08-27T18:19:04.137732+00:00",
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_camera2highspeedrecorder_camera2highspeedrecorder": {
+      "code_fingerprint": "3aa36820a321ec1d28f7ce5aef107af7d91c79e69d457e08e2cd0c54014b4c4b",
+      "label": "Camera2HighSpeedRecorder",
+      "last": "2026-08-28T12:33:43.068510+00:00",
       "neg": 1,
       "provenance": [
         {
-          "date": "2026-08-27T18:19:04.137732+00:00",
+          "date": "2026-08-28T12:33:43.068510+00:00",
           "outcome": "useful",
-          "q": "In the other screen on initial startup I saw Barometric reading at 85.2kPa, Water Pressure at 101.2kPa, Vacuum at -16.4kPa. So I need to understand how those variables are used to calculate the depth currently. Also, those settings (from the other state) need to be accessible in the menu below all of the camera modes as the last option and need a way to go into that menu and back out of it"
+          "q": "check the app now because the camera preview appears unresponsive as i move the phone the camera preview is not updating. This occurred when i adjusted the framerate"
         },
         {
-          "date": "2026-08-24T01:31:25.180327+00:00",
-          "outcome": "useful",
-          "q": "Is the LOG profile on the app the exact same as the log profile in the native camera app?"
+          "date": "2026-08-28T01:33:29.706169+00:00",
+          "outcome": "corrected",
+          "q": "Why did the camera preview flicker between 48, 60, and 120 fps but not visibly change at 240 fps?"
         },
         {
-          "date": "2026-08-24T00:44:06.665240+00:00",
+          "date": "2026-08-27T22:05:05.145034+00:00",
           "outcome": "useful",
-          "q": "do it"
-        },
-        {
-          "date": "2026-08-24T00:11:33.850215+00:00",
-          "outcome": "useful",
-          "q": "whats your detailed plan and hwat is the math to do this as intelligently as possible"
-        },
-        {
-          "date": "2026-08-23T23:45:26.760615+00:00",
-          "outcome": "useful",
-          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
+          "q": "Slow Motion needs housing-controlled frame rate, focus, and HDR; Portrait Video needs native effects, EV, focus, and HDR; Hyperlapse needs Samsung's speed order, day/night, recording time, EV, and focus; Panorama needs its guide; Food needs blur and temperature; Pro and Expert RAW need virtual aperture; Expert RAW needs Ocean, multi exposure, astrophoto, astro portrait, and ND settings."
         }
       ],
-      "score": 13.817568285,
-      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt",
+      "score": 0.950212788,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/Camera2HighSpeedRecorder.kt",
       "status": "contested",
-      "uses": 16,
+      "uses": 2,
       "verdict": "useful"
     },
-    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_camerashellscreen": {
-      "code_fingerprint": "1e3b91afcf778993390c0538ca71e0f13a47e2e302aae3c5f6ef395481deb3fe",
-      "label": "CameraShellScreen.kt",
-      "last": "2026-08-27T18:19:04.137732+00:00",
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_cameraruntimecontroller_cameraruntimecontroller": {
+      "code_fingerprint": "5c8b198aad4f81d5d68c92631817784661ca7cf761540d547c7c03ebb17d1cf7",
+      "label": "CameraRuntimeController",
+      "last": "2026-08-30T08:46:25.890274+00:00",
+      "neg": 13,
       "provenance": [
         {
-          "date": "2026-08-27T18:19:04.137732+00:00",
+          "date": "2026-08-30T08:46:25.890274+00:00",
+          "outcome": "corrected",
+          "q": "Audit every camera menu option labelled DEVICE CHECK so working features are verified, non-working features cannot fail silently, put Panorama options directly on its bar, and put Pro Guides immediately left of Gallery outside Options."
+        },
+        {
+          "date": "2026-08-30T07:51:35.426437+00:00",
+          "outcome": "corrected",
+          "q": "focus is not working for hyperlapse; adjusting it is doing nothing at 0.6 lens; put the guides setting to the right of flash setting"
+        },
+        {
+          "date": "2026-08-30T07:41:36.837814+00:00",
           "outcome": "useful",
-          "q": "In the other screen on initial startup I saw Barometric reading at 85.2kPa, Water Pressure at 101.2kPa, Vacuum at -16.4kPa. So I need to understand how those variables are used to calculate the depth currently. Also, those settings (from the other state) need to be accessible in the menu below all of the camera modes as the last option and need a way to go into that menu and back out of it"
+          "q": "I noticed the Hyperlapse focus setting is FIXED instead of settable like Pro; the EV value is not visible; move Resolution immediately left of recording format without pushing Gallery off-screen; is Auto 18x and does its speed calculation match Samsung?"
+        },
+        {
+          "date": "2026-08-30T04:20:47.479927+00:00",
+          "outcome": "useful",
+          "q": "In Hyperlapse, replace Zoom or Focus with the Pro-mode Focus control in the same position relative to Hyperlapse; keep EV to its right; add H.264 and HEVC/H.265 encoding."
+        },
+        {
+          "date": "2026-08-30T03:23:44.316694+00:00",
+          "outcome": "corrected",
+          "q": "I want you to check hyperlapse's functionality and all available options in our app and inside the hyperlapse mode in native samsung camera app. Verify all settings work the exact same. do not alter our app's menu"
         }
       ],
-      "score": 0.999919273,
+      "score": 15.777602046,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt",
+      "status": "contested",
+      "uses": 31,
+      "verdict": "useful"
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_cameraruntimecontroller_cameraruntimecontroller_applysessionstate": {
+      "code_fingerprint": "5c8b198aad4f81d5d68c92631817784661ca7cf761540d547c7c03ebb17d1cf7",
+      "label": ".applySessionState()",
+      "last": "2026-08-30T00:56:28.915592+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-30T00:56:28.915592+00:00",
+          "outcome": "useful",
+          "q": "For Hyperlapse, move the EV to the bottom menu, as well as the recording time, speed, and guides (with the same icons we have in Panorama). I also need the resolution to have more than 1 setting. Also fix the Day/Night setting."
+        }
+      ],
+      "score": 0.987342713,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_cameraruntimecontroller_cameraruntimecontroller_resolutionfor": {
+      "code_fingerprint": "5c8b198aad4f81d5d68c92631817784661ca7cf761540d547c7c03ebb17d1cf7",
+      "label": ".resolutionFor()",
+      "last": "2026-08-30T00:56:28.915592+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-30T00:56:28.915592+00:00",
+          "outcome": "useful",
+          "q": "For Hyperlapse, move the EV to the bottom menu, as well as the recording time, speed, and guides (with the same icons we have in Panorama). I also need the resolution to have more than 1 setting. Also fix the Day/Night setting."
+        }
+      ],
+      "score": 0.987342713,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraRuntimeController.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_camerashellscreen": {
+      "code_fingerprint": "ddf0227421ff527d56ae01b8c529dccd6d32f60b401e13be8c7d67390ed3e772",
+      "label": "CameraShellScreen.kt",
+      "last": "2026-08-30T00:07:05.242855+00:00",
+      "neg": 6,
+      "provenance": [
+        {
+          "date": "2026-08-30T00:07:05.242855+00:00",
+          "outcome": "corrected",
+          "q": "the fibinacii spiral icons are too small"
+        },
+        {
+          "date": "2026-08-29T23:51:15.793937+00:00",
+          "outcome": "corrected",
+          "q": "your spacing is terrible. We have lots of room to the left of lens and I cannot evebn see zoom let alone gallery. I think lens should be to the left of Panorama, EV should be to the right of Panorama. I think LOG, HDR should be one menu. Guides needs to have icons for each guide type rather than the name. Gallery needs to be visible bottom right, and zoom to the immediate left of guides should be there. Also, the depth heading and temp UI when SAVE/DELETE are on screen needs to not block the SAVE/DELETE / PANORAMA READY UI. Also I do not like the audible shutter, make it a setting that can be adjusted."
+        },
+        {
+          "date": "2026-08-29T23:32:15.564463+00:00",
+          "outcome": "corrected",
+          "q": "In Panorama mode, move EV out of Options into a Pro-style quick control, add HDR and LOG toggles, make Guides its own quick item around the centered Panorama control, and always show a full-screen live camera image instead of a black screen with only the inner preview."
+        },
+        {
+          "date": "2026-08-29T21:56:16.518879+00:00",
+          "outcome": "corrected",
+          "q": "I realized that the preview button is redundant, the preview should just show up and say save or delete instead on that menu"
+        },
+        {
+          "date": "2026-08-29T19:30:09.865726+00:00",
+          "outcome": "useful",
+          "q": "done taken. Also, the panorama should be previewable once taken via a similar menu to what video has, but it should be preview save or delete"
+        }
+      ],
+      "score": -0.078833808,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraShellScreen.kt",
+      "status": "contested",
+      "uses": 6,
+      "verdict": "dead end"
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_camerashellscreen_recordingpausedchooser": {
+      "code_fingerprint": "ddf0227421ff527d56ae01b8c529dccd6d32f60b401e13be8c7d67390ed3e772",
+      "label": "RecordingPausedChooser()",
+      "last": "2026-08-28T17:57:24.079059+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T17:57:24.079059+00:00",
+          "outcome": "useful",
+          "q": "on stopping a hyperlapse I need the same UI that video gets so that save/preview/stop/pause/resume options are available."
+        }
+      ],
+      "score": 0.958326104,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/CameraShellScreen.kt",
       "status": "tentative",
       "uses": 1
     },
     "app_src_main_kotlin_com_mobiledivecontrol_ui_camera_recordingsessionmuxer_recordingsessionmuxer": {
-      "code_fingerprint": "567d76463fcb651ee87506e7343b1e66431f9cab77f14252bcb69ac2e84d720b",
+      "code_fingerprint": "b75df47a0d2ea9b128e87b305001749f2af4f841ea25f54497f918f7ffcc27bf",
       "label": "RecordingSessionMuxer",
       "last": "2026-08-23T18:13:16.706467+00:00",
       "provenance": [
@@ -167,7 +270,7 @@
           "q": "How should the paused recording controls and Save To album chooser work?"
         }
       ],
-      "score": 0.911564191,
+      "score": 0.853989023,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/camera/RecordingSessionMuxer.kt",
       "status": "tentative",
       "uses": 1
@@ -183,8 +286,24 @@
           "q": "In the other screen on initial startup I saw Barometric reading at 85.2kPa, Water Pressure at 101.2kPa, Vacuum at -16.4kPa. So I need to understand how those variables are used to calculate the depth currently. Also, those settings (from the other state) need to be accessible in the menu below all of the camera modes as the last option and need a way to go into that menu and back out of it"
         }
       ],
-      "score": 0.999919273,
+      "score": 0.936763523,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/components/DepthGauge.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_ui_diagnostics_diagnosticsscreen": {
+      "code_fingerprint": "1fca298eabec0fe291a7dda0b9a3308fecbfebeeb21328b38801d577f56525e0",
+      "label": "DiagnosticsScreen.kt",
+      "last": "2026-08-27T18:39:15.310184+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-27T18:39:15.310184+00:00",
+          "outcome": "useful",
+          "q": "1) Sensors & Diagnostics should just be 1 concise word instead of both.\n2) The nav buttons need to be at the bottom in the menu\nand they must be navigable using the housing's buttons\nAdditional correction: the word Battery and its % is cut off inside Device & Connection inside the Diagnostics menu."
+        }
+      ],
+      "score": 0.93706698,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/diagnostics/DiagnosticsScreen.kt",
       "status": "tentative",
       "uses": 1
     },
@@ -219,10 +338,31 @@
           "q": "move back to where delete is and delete where back is"
         }
       ],
-      "score": 6.375023053,
+      "score": 5.972371185,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/ui/gallery/GalleryScreen.kt",
       "status": "preferred",
       "uses": 7
+    },
+    "app_src_main_kotlin_com_mobiledivecontrol_viewmodel_camerasessionstore_camerasessionstore": {
+      "code_fingerprint": "a7e3ab37adf7af550d095adae183511b58e1ade5e70a74974e78a02c1bbc0df8",
+      "label": "CameraSessionStore",
+      "last": "2026-08-30T08:18:39.564494+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-30T08:18:39.564494+00:00",
+          "outcome": "useful",
+          "q": "Fit as many Options-menu items as possible into the bottom menu bars for Hyperlapse, Slow Motion, Portrait Video, Night, Food, Video, Portrait, and Photo; make the centered camera-mode selector remember the last mode and cycle in the requested circular order."
+        },
+        {
+          "date": "2026-08-27T22:05:05.145034+00:00",
+          "outcome": "useful",
+          "q": "Slow Motion needs housing-controlled frame rate, focus, and HDR; Portrait Video needs native effects, EV, focus, and HDR; Hyperlapse needs Samsung's speed order, day/night, recording time, EV, and focus; Panorama needs its guide; Food needs blur and temperature; Pro and Expert RAW need virtual aperture; Expert RAW needs Ocean, multi exposure, astrophoto, astro portrait, and ND settings."
+        }
+      ],
+      "score": 1.934539413,
+      "source_file": "app/src/main/kotlin/com/mobiledivecontrol/viewmodel/CameraSessionStore.kt",
+      "status": "preferred",
+      "uses": 2
     },
     "app_src_main_kotlin_com_mobiledivecontrol_viewmodel_diveviewmodel_diveviewmodel": {
       "code_fingerprint": "11e9c80e63ecf2e3a881b2ba5ffb2392f1334c7f581b395ace2de4cf506eb8b4",
@@ -255,7 +395,7 @@
           "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
         }
       ],
-      "score": 4.57647927,
+      "score": 4.287424954,
       "source_file": "app/src/main/kotlin/com/mobiledivecontrol/viewmodel/DiveViewModel.kt",
       "status": "preferred",
       "uses": 5
@@ -276,7 +416,7 @@
           "q": "How should DiveControl distinguish Bluetooth-off from housing-disconnected, render the off banner edge-to-edge, and reconnect automatically?"
         }
       ],
-      "score": 1.8297893,
+      "score": 1.714218255,
       "source_file": "",
       "status": "preferred",
       "uses": 2
@@ -292,7 +432,7 @@
           "q": "Fix DiveControl LOG to match Samsung Camera Log and assess additional dynamic range"
         }
       ],
-      "score": 0.919005172,
+      "score": 0.860960026,
       "source_file": "",
       "status": "tentative",
       "uses": 1
@@ -300,38 +440,40 @@
     "capturerequest": {
       "code_fingerprint": "",
       "label": "CaptureRequest",
-      "last": "2026-08-24T01:31:25.180327+00:00",
+      "last": "2026-08-30T07:51:35.426437+00:00",
+      "neg": 3,
       "provenance": [
         {
-          "date": "2026-08-24T01:31:25.180327+00:00",
-          "outcome": "useful",
-          "q": "Is the LOG profile on the app the exact same as the log profile in the native camera app?"
+          "date": "2026-08-30T07:51:35.426437+00:00",
+          "outcome": "corrected",
+          "q": "focus is not working for hyperlapse; adjusting it is doing nothing at 0.6 lens; put the guides setting to the right of flash setting"
         },
         {
-          "date": "2026-08-24T00:44:06.665240+00:00",
+          "date": "2026-08-30T04:20:47.479927+00:00",
           "outcome": "useful",
-          "q": "do it"
+          "q": "In Hyperlapse, replace Zoom or Focus with the Pro-mode Focus control in the same position relative to Hyperlapse; keep EV to its right; add H.264 and HEVC/H.265 encoding."
         },
         {
-          "date": "2026-08-24T00:11:33.850215+00:00",
-          "outcome": "useful",
-          "q": "whats your detailed plan and hwat is the math to do this as intelligently as possible"
+          "date": "2026-08-30T03:23:44.316694+00:00",
+          "outcome": "corrected",
+          "q": "I want you to check hyperlapse's functionality and all available options in our app and inside the hyperlapse mode in native samsung camera app. Verify all settings work the exact same. do not alter our app's menu"
         },
         {
-          "date": "2026-08-23T23:45:26.760615+00:00",
+          "date": "2026-08-30T00:56:28.915592+00:00",
           "outcome": "useful",
-          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
+          "q": "For Hyperlapse, move the EV to the bottom menu, as well as the recording time, speed, and guides (with the same icons we have in Panorama). I also need the resolution to have more than 1 setting. Also fix the Day/Night setting."
         },
         {
-          "date": "2026-08-23T22:56:30.874466+00:00",
-          "outcome": "useful",
-          "q": "Autofocus no longer adjusts smoothly, rapidly, or responsively; check the changes against the repository baseline."
+          "date": "2026-08-30T00:27:17.532341+00:00",
+          "outcome": "corrected",
+          "q": "switching between HDR and LOG profiles is not currently working (I see no change in Panorama)"
         }
       ],
-      "score": 5.498228458,
+      "score": 6.099592857,
       "source_file": "",
-      "status": "preferred",
-      "uses": 6
+      "status": "contested",
+      "uses": 10,
+      "verdict": "useful"
     },
     "color": {
       "code_fingerprint": "",
@@ -344,7 +486,7 @@
           "q": "Fix DiveControl LOG to match Samsung Camera Log and assess additional dynamic range"
         }
       ],
-      "score": 0.919005172,
+      "score": 0.860960026,
       "source_file": "",
       "status": "tentative",
       "uses": 1
@@ -365,49 +507,67 @@
           "q": "Why did continuous autofocus pulse and how should it hold focus without becoming unresponsive?"
         }
       ],
-      "score": 1.829679776,
+      "score": 1.714115648,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/AutofocusHoldPolicy.kt",
       "status": "preferred",
       "uses": 2
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_cameracatalog_cameracatalog": {
-      "code_fingerprint": "19cf9d35fec7aba2af1f0f83455f37263e767f571a2c0d7649c9f4416ed5a12e",
+      "code_fingerprint": "3e63749fcd559971e3194fbd72dde98a546d22fe4b162e5c25d86147ab1a986a",
       "label": "CameraCatalog",
-      "last": "2026-08-24T01:31:25.180327+00:00",
+      "last": "2026-08-30T08:46:25.890274+00:00",
+      "neg": 9,
       "provenance": [
         {
-          "date": "2026-08-24T01:31:25.180327+00:00",
-          "outcome": "useful",
-          "q": "Is the LOG profile on the app the exact same as the log profile in the native camera app?"
+          "date": "2026-08-30T08:46:25.890274+00:00",
+          "outcome": "corrected",
+          "q": "Audit every camera menu option labelled DEVICE CHECK so working features are verified, non-working features cannot fail silently, put Panorama options directly on its bar, and put Pro Guides immediately left of Gallery outside Options."
         },
         {
-          "date": "2026-08-24T00:44:06.665240+00:00",
-          "outcome": "useful",
-          "q": "do it"
+          "date": "2026-08-30T07:51:35.426437+00:00",
+          "outcome": "corrected",
+          "q": "focus is not working for hyperlapse; adjusting it is doing nothing at 0.6 lens; put the guides setting to the right of flash setting"
         },
         {
-          "date": "2026-08-24T00:11:33.850215+00:00",
+          "date": "2026-08-30T07:41:36.837814+00:00",
           "outcome": "useful",
-          "q": "whats your detailed plan and hwat is the math to do this as intelligently as possible"
+          "q": "I noticed the Hyperlapse focus setting is FIXED instead of settable like Pro; the EV value is not visible; move Resolution immediately left of recording format without pushing Gallery off-screen; is Auto 18x and does its speed calculation match Samsung?"
         },
         {
-          "date": "2026-08-23T23:45:26.760615+00:00",
+          "date": "2026-08-30T07:02:44.183620+00:00",
           "outcome": "useful",
-          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
+          "q": "Flash then resolution then Day / Night then lens then recording time then EV then Hyperlapse then focus then speed  then video format then guides then  gallery"
         },
         {
-          "date": "2026-08-23T23:26:23.188620+00:00",
+          "date": "2026-08-30T06:54:01.426486+00:00",
           "outcome": "useful",
-          "q": "write me a github summary of what we made today"
+          "q": "move resolution to be just left of gallery; swap positions with speed and guides"
         }
       ],
-      "score": 4.584703949,
+      "score": 9.117190918,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/CameraCatalog.kt",
-      "status": "preferred",
-      "uses": 5
+      "status": "contested",
+      "uses": 19,
+      "verdict": "useful"
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_cameracatalog_cameracatalog_settingsbaritems": {
+      "code_fingerprint": "3e63749fcd559971e3194fbd72dde98a546d22fe4b162e5c25d86147ab1a986a",
+      "label": ".settingsBarItems()",
+      "last": "2026-08-30T00:56:28.915592+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-30T00:56:28.915592+00:00",
+          "outcome": "useful",
+          "q": "For Hyperlapse, move the EV to the bottom menu, as well as the recording time, speed, and guides (with the same icons we have in Panorama). I also need the resolution to have more than 1 setting. Also fix the Day/Night setting."
+        }
+      ],
+      "score": 0.987342713,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/CameraCatalog.kt",
+      "status": "tentative",
+      "uses": 1
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts": {
-      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
       "label": "Contracts.kt",
       "last": "2026-08-23T17:07:14.272588+00:00",
       "provenance": [
@@ -427,44 +587,186 @@
           "q": "move back to where delete is and delete where back is"
         }
       ],
-      "score": 2.730920698,
+      "score": 2.558433428,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 3
     },
-    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_camerastate": {
-      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
-      "label": "CameraState",
-      "last": "2026-08-24T00:44:06.665240+00:00",
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_bottombaritem": {
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
+      "label": "BottomBarItem",
+      "last": "2026-08-30T04:20:47.479927+00:00",
       "provenance": [
         {
-          "date": "2026-08-24T00:44:06.665240+00:00",
+          "date": "2026-08-30T04:20:47.479927+00:00",
           "outcome": "useful",
-          "q": "do it"
+          "q": "In Hyperlapse, replace Zoom or Focus with the Pro-mode Focus control in the same position relative to Hyperlapse; keep EV to its right; add H.264 and HEVC/H.265 encoding."
         },
         {
-          "date": "2026-08-24T00:11:33.850215+00:00",
+          "date": "2026-08-30T00:56:28.915592+00:00",
           "outcome": "useful",
-          "q": "whats your detailed plan and hwat is the math to do this as intelligently as possible"
-        },
-        {
-          "date": "2026-08-23T23:45:26.760615+00:00",
-          "outcome": "useful",
-          "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
-        },
-        {
-          "date": "2026-08-23T22:47:48.115489+00:00",
-          "outcome": "useful",
-          "q": "When the TRACK HEADING menu option is open the Depth/heading/arrow/temperature are higher up than when it is closed. I need that fixed. Only menu's that actually interfere with these UI bounding boxes should move them up and just out of the way of the menu's while they are open and then move back when they are closed. The side menu where TRACK HEADING is located does not interfere at all"
+          "q": "For Hyperlapse, move the EV to the bottom menu, as well as the recording time, speed, and guides (with the same icons we have in Panorama). I also need the resolution to have more than 1 setting. Also fix the Day/Night setting."
         }
       ],
-      "score": 3.666141867,
+      "score": 1.977927403,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
-      "uses": 4
+      "uses": 2
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_cameracommand": {
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
+      "label": "CameraCommand",
+      "last": "2026-08-29T21:56:16.518879+00:00",
+      "neg": 2,
+      "provenance": [
+        {
+          "date": "2026-08-29T21:56:16.518879+00:00",
+          "outcome": "corrected",
+          "q": "I realized that the preview button is redundant, the preview should just show up and say save or delete instead on that menu"
+        },
+        {
+          "date": "2026-08-29T21:40:07.857943+00:00",
+          "outcome": "useful",
+          "q": "phone is connected again"
+        },
+        {
+          "date": "2026-08-29T19:30:09.865726+00:00",
+          "outcome": "useful",
+          "q": "done taken. Also, the panorama should be previewable once taken via a similar menu to what video has, but it should be preview save or delete"
+        },
+        {
+          "date": "2026-08-28T22:27:32.440322+00:00",
+          "outcome": "corrected",
+          "q": "panorama must work the same on our app as the native camera app"
+        },
+        {
+          "date": "2026-08-28T19:00:57.921332+00:00",
+          "outcome": "useful",
+          "q": "panorama mode does not work like the native app panorama, fix that"
+        }
+      ],
+      "score": 0.978746814,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "contested",
+      "uses": 3,
+      "verdict": "useful"
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_cameramodeid_hyperlapse": {
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
+      "label": "Hyperlapse",
+      "last": "2026-08-30T07:51:35.426437+00:00",
+      "neg": 2,
+      "provenance": [
+        {
+          "date": "2026-08-30T07:51:35.426437+00:00",
+          "outcome": "corrected",
+          "q": "focus is not working for hyperlapse; adjusting it is doing nothing at 0.6 lens; put the guides setting to the right of flash setting"
+        },
+        {
+          "date": "2026-08-30T07:41:36.837814+00:00",
+          "outcome": "useful",
+          "q": "I noticed the Hyperlapse focus setting is FIXED instead of settable like Pro; the EV value is not visible; move Resolution immediately left of recording format without pushing Gallery off-screen; is Auto 18x and does its speed calculation match Samsung?"
+        },
+        {
+          "date": "2026-08-30T07:02:44.183620+00:00",
+          "outcome": "useful",
+          "q": "Flash then resolution then Day / Night then lens then recording time then EV then Hyperlapse then focus then speed  then video format then guides then  gallery"
+        },
+        {
+          "date": "2026-08-30T06:54:01.426486+00:00",
+          "outcome": "useful",
+          "q": "move resolution to be just left of gallery; swap positions with speed and guides"
+        },
+        {
+          "date": "2026-08-30T06:45:34.749485+00:00",
+          "outcome": "useful",
+          "q": "in Hyperlapse switch guides with EV. switch video format with speed,"
+        }
+      ],
+      "score": 4.925489888,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "contested",
+      "uses": 7,
+      "verdict": "useful"
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_cameramodeid_panorama": {
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
+      "label": "Panorama",
+      "last": "2026-08-30T00:27:17.532341+00:00",
+      "neg": 8,
+      "provenance": [
+        {
+          "date": "2026-08-30T00:27:17.532341+00:00",
+          "outcome": "corrected",
+          "q": "switching between HDR and LOG profiles is not currently working (I see no change in Panorama)"
+        },
+        {
+          "date": "2026-08-30T00:07:05.242855+00:00",
+          "outcome": "corrected",
+          "q": "the fibinacii spiral icons are too small"
+        },
+        {
+          "date": "2026-08-29T23:51:15.793937+00:00",
+          "outcome": "corrected",
+          "q": "your spacing is terrible. We have lots of room to the left of lens and I cannot evebn see zoom let alone gallery. I think lens should be to the left of Panorama, EV should be to the right of Panorama. I think LOG, HDR should be one menu. Guides needs to have icons for each guide type rather than the name. Gallery needs to be visible bottom right, and zoom to the immediate left of guides should be there. Also, the depth heading and temp UI when SAVE/DELETE are on screen needs to not block the SAVE/DELETE / PANORAMA READY UI. Also I do not like the audible shutter, make it a setting that can be adjusted."
+        },
+        {
+          "date": "2026-08-29T23:32:15.564463+00:00",
+          "outcome": "corrected",
+          "q": "In Panorama mode, move EV out of Options into a Pro-style quick control, add HDR and LOG toggles, make Guides its own quick item around the centered Panorama control, and always show a full-screen live camera image instead of a black screen with only the inner preview."
+        },
+        {
+          "date": "2026-08-29T22:21:32.697579+00:00",
+          "outcome": "corrected",
+          "q": "in panorama mode I dont want the white circle on screen"
+        }
+      ],
+      "score": -2.969553975,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "contested",
+      "uses": 5,
+      "verdict": "dead end"
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_camerastate": {
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
+      "label": "CameraState",
+      "last": "2026-08-30T03:23:44.316694+00:00",
+      "neg": 4,
+      "provenance": [
+        {
+          "date": "2026-08-30T03:23:44.316694+00:00",
+          "outcome": "corrected",
+          "q": "I want you to check hyperlapse's functionality and all available options in our app and inside the hyperlapse mode in native samsung camera app. Verify all settings work the exact same. do not alter our app's menu"
+        },
+        {
+          "date": "2026-08-29T21:56:16.518879+00:00",
+          "outcome": "corrected",
+          "q": "I realized that the preview button is redundant, the preview should just show up and say save or delete instead on that menu"
+        },
+        {
+          "date": "2026-08-29T21:40:07.857943+00:00",
+          "outcome": "useful",
+          "q": "phone is connected again"
+        },
+        {
+          "date": "2026-08-28T23:21:06.121630+00:00",
+          "outcome": "useful",
+          "q": "make sure our app is the same as the camera app"
+        },
+        {
+          "date": "2026-08-28T22:52:16.348373+00:00",
+          "outcome": "corrected",
+          "q": "verify the camera app and our app have the exact function by function ui feature by ui feature functionality for the panorama mode"
+        }
+      ],
+      "score": 2.441912535,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "contested",
+      "uses": 7,
+      "verdict": "useful"
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_camerauizone": {
-      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
       "label": "CameraUiZone",
       "last": "2026-08-23T22:47:48.115489+00:00",
       "provenance": [
@@ -479,13 +781,13 @@
           "q": "If I click on the camera mode setting using the Menu/OK button then click track heading, pressing left/right should keep me navigating inside the camera navbar but instead it forces me to navigate in the camera mode UI"
         }
       ],
-      "score": 1.830048916,
+      "score": 1.714461473,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 2
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_gallerycommand": {
-      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
       "label": "GalleryCommand",
       "last": "2026-08-23T17:07:14.272588+00:00",
       "provenance": [
@@ -500,13 +802,13 @@
           "q": "Redesign the gallery Back button with TOP and BOTTOM chevrons and centered BACK; center video Play/Pause and move Delete after Details."
         }
       ],
-      "score": 1.821082302,
+      "score": 1.706061198,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 2
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_gallerystate": {
-      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
       "label": "GalleryState",
       "last": "2026-08-23T17:26:31.635427+00:00",
       "provenance": [
@@ -521,13 +823,13 @@
           "q": "The gallery once inside a photo/video needs a easy way to navigate back to the gallery and needs a timeline that clearly shows where the video is playing/paused at. Currently there is no way after previewing a photo/video to navigate back to the gallery folder grid, or the folders grid or then to the camera"
         }
       ],
-      "score": 1.819541213,
+      "score": 1.704617445,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 2
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_meteredexposure": {
-      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
       "label": "MeteredExposure",
       "last": "2026-08-24T00:44:06.665240+00:00",
       "provenance": [
@@ -547,13 +849,45 @@
           "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
         }
       ],
-      "score": 2.750553608,
+      "score": 2.576826307,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "preferred",
       "uses": 3
     },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_pausevideorecording": {
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
+      "label": "PauseVideoRecording",
+      "last": "2026-08-28T17:57:24.079059+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T17:57:24.079059+00:00",
+          "outcome": "useful",
+          "q": "on stopping a hyperlapse I need the same UI that video gets so that save/preview/stop/pause/resume options are available."
+        }
+      ],
+      "score": 0.958326104,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_previewvideorecording": {
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
+      "label": "PreviewVideoRecording",
+      "last": "2026-08-29T19:30:09.865726+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-29T19:30:09.865726+00:00",
+          "outcome": "useful",
+          "q": "done taken. Also, the panorama should be previewable once taken via a similar menu to what video has, but it should be preview save or delete"
+        }
+      ],
+      "score": 0.982186705,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "tentative",
+      "uses": 1
+    },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_recordingsavelocation": {
-      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
       "label": "RecordingSaveLocation",
       "last": "2026-08-23T19:38:10.720088+00:00",
       "provenance": [
@@ -563,13 +897,29 @@
           "q": "Fix the paused recording controls, SAVE TO album workflow, album ordering, empty-grid Back focus, and gallery Back visuals"
         }
       ],
-      "score": 0.912806798,
+      "score": 0.855153146,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_resumevideorecording": {
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
+      "label": "ResumeVideoRecording",
+      "last": "2026-08-28T17:57:24.079059+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T17:57:24.079059+00:00",
+          "outcome": "useful",
+          "q": "on stopping a hyperlapse I need the same UI that video gets so that save/preview/stop/pause/resume options are available."
+        }
+      ],
+      "score": 0.958326104,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "tentative",
       "uses": 1
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_contracts_safetystate": {
-      "code_fingerprint": "db69c765b82cc057d2b24e697deb34df68ba0405667fe857bbb4f0f37d6f1640",
+      "code_fingerprint": "3333c4fdd07a825e795671c33a77632dd20738d69bf75022ae5f57c21665100d",
       "label": "SafetyState",
       "last": "2026-08-23T23:45:26.760615+00:00",
       "provenance": [
@@ -579,46 +929,48 @@
           "q": "Plan a depth- and lighting-aware automatic underwater white-balance mode between AS and AC, incorporating underwater colour grading sources and best practices"
         }
       ],
-      "score": 0.916435482,
+      "score": 0.858552639,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/Contracts.kt",
       "status": "tentative",
       "uses": 1
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_controlreducer_controlreducer": {
-      "code_fingerprint": "f59d0f05a4ca92b1f1e52e565f5ae6f9c01b551e132a5646eb85db73ae62fe0e",
+      "code_fingerprint": "cc6a8c1ba497273fe65f0ff1c71393889cd4454b91f5be17f685a02939ec9f95",
       "label": "ControlReducer",
-      "last": "2026-08-27T18:19:04.137732+00:00",
+      "last": "2026-08-30T08:46:25.890274+00:00",
+      "neg": 5,
       "provenance": [
         {
-          "date": "2026-08-27T18:19:04.137732+00:00",
-          "outcome": "useful",
-          "q": "In the other screen on initial startup I saw Barometric reading at 85.2kPa, Water Pressure at 101.2kPa, Vacuum at -16.4kPa. So I need to understand how those variables are used to calculate the depth currently. Also, those settings (from the other state) need to be accessible in the menu below all of the camera modes as the last option and need a way to go into that menu and back out of it"
+          "date": "2026-08-30T08:46:25.890274+00:00",
+          "outcome": "corrected",
+          "q": "Audit every camera menu option labelled DEVICE CHECK so working features are verified, non-working features cannot fail silently, put Panorama options directly on its bar, and put Pro Guides immediately left of Gallery outside Options."
         },
         {
-          "date": "2026-08-23T23:29:16.031535+00:00",
-          "outcome": "useful",
-          "q": "Can Bluetooth be auto turned on if the app detects it is off"
+          "date": "2026-08-30T07:51:35.426437+00:00",
+          "outcome": "corrected",
+          "q": "focus is not working for hyperlapse; adjusting it is doing nothing at 0.6 lens; put the guides setting to the right of flash setting"
         },
         {
-          "date": "2026-08-23T23:26:23.188620+00:00",
+          "date": "2026-08-30T07:41:36.837814+00:00",
           "outcome": "useful",
-          "q": "write me a github summary of what we made today"
+          "q": "I noticed the Hyperlapse focus setting is FIXED instead of settable like Pro; the EV value is not visible; move Resolution immediately left of recording format without pushing Gallery off-screen; is Auto 18x and does its speed calculation match Samsung?"
         },
         {
-          "date": "2026-08-23T21:30:59.897602+00:00",
-          "outcome": "useful",
-          "q": "If I click on the camera mode setting using the Menu/OK button then click track heading, pressing left/right should keep me navigating inside the camera navbar but instead it forces me to navigate in the camera mode UI"
+          "date": "2026-08-29T23:51:15.793937+00:00",
+          "outcome": "corrected",
+          "q": "your spacing is terrible. We have lots of room to the left of lens and I cannot evebn see zoom let alone gallery. I think lens should be to the left of Panorama, EV should be to the right of Panorama. I think LOG, HDR should be one menu. Guides needs to have icons for each guide type rather than the name. Gallery needs to be visible bottom right, and zoom to the immediate left of guides should be there. Also, the depth heading and temp UI when SAVE/DELETE are on screen needs to not block the SAVE/DELETE / PANORAMA READY UI. Also I do not like the audible shutter, make it a setting that can be adjusted."
         },
         {
-          "date": "2026-08-23T19:38:10.720088+00:00",
-          "outcome": "useful",
-          "q": "Fix the paused recording controls, SAVE TO album workflow, album ordering, empty-grid Back focus, and gallery Back visuals"
+          "date": "2026-08-29T21:56:16.518879+00:00",
+          "outcome": "corrected",
+          "q": "I realized that the preview button is redundant, the preview should just show up and say save or delete instead on that menu"
         }
       ],
-      "score": 11.029767798,
+      "score": 10.236909003,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/ControlReducer.kt",
-      "status": "preferred",
-      "uses": 12
+      "status": "contested",
+      "uses": 17,
+      "verdict": "useful"
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_headingmath_headingmath": {
       "code_fingerprint": "66bfafd714a8b242d7655b583a246edc16277cc2abecdca6c3e5c23574f63e5a",
@@ -642,7 +994,7 @@
           "q": "How should the compass heading and target arrow adapt to landscape display rotation and phone tilt?"
         }
       ],
-      "score": 0.914237803,
+      "score": 0.856493768,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/HeadingMath.kt",
       "status": "contested",
       "uses": 2,
@@ -659,10 +1011,31 @@
           "q": "The Arrow needs to be a triangle like the standard Navigation triangle arrow. Also, check how stable you are holding the compass heading, it appears to drift and I cannot have that be the case. check all of your rotation code and the tilt code to make sure your perspective calculation is correct and intuitive"
         }
       ],
-      "score": 0.914460351,
+      "score": 0.856702259,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/HeadingStabilizer.kt",
       "status": "tentative",
       "uses": 1
+    },
+    "core_src_main_kotlin_com_mobiledivecontrol_core_inputrouter_inputrouter": {
+      "code_fingerprint": "c67daf34855a5163d446373207e3a8cd5017de56f6a7444c9131174394fe2715",
+      "label": "InputRouter",
+      "last": "2026-08-28T16:41:40.844680+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T16:41:40.844680+00:00",
+          "outcome": "useful",
+          "q": "Panorama mode - shutter does not start the panorama functionality. This mode must work exactly like the native camera app Panorama mode. Hyperlapse mode - shutter starts what looks like a normal record rather than a dual seconds counter that on the left measures the length of the hyperlapse and on the right measures how long the hyperlapse has been running. This mode should work exactly like the native camera app mode. Implement a menu for adjusting the time interval between frames like native Hyperlapse. Fix these 2 modes."
+        },
+        {
+          "date": "2026-08-27T18:39:15.310184+00:00",
+          "outcome": "useful",
+          "q": "1) Sensors & Diagnostics should just be 1 concise word instead of both.\n2) The nav buttons need to be at the bottom in the menu\nand they must be navigable using the housing's buttons\nAdditional correction: the word Battery and its % is cut off inside Device & Connection inside the Diagnostics menu."
+        }
+      ],
+      "score": 1.89422948,
+      "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/InputRouter.kt",
+      "status": "preferred",
+      "uses": 2
     },
     "core_src_main_kotlin_com_mobiledivecontrol_core_underwaterwhitebalance_underwaterwhitebalanceestimator": {
       "code_fingerprint": "aacd5fb529c36f4b0c8a8cac59d839eae93d2808d78af174fb0d26c9751ccd3d",
@@ -675,26 +1048,86 @@
           "q": "do it"
         }
       ],
-      "score": 0.917298515,
+      "score": 0.859361162,
       "source_file": "core/src/main/kotlin/com/mobiledivecontrol/core/UnderwaterWhiteBalance.kt",
       "status": "tentative",
       "uses": 1
     },
-    "core_src_test_kotlin_com_mobiledivecontrol_core_controlcoretest_controlcoretest": {
-      "code_fingerprint": "da94d19eff8a6d9641d2c378b2e1c1439f622748e4aa316de58c572102c67f69",
-      "label": "ControlCoreTest",
-      "last": "2026-08-23T21:30:59.897602+00:00",
+    "core_src_test_kotlin_com_mobiledivecontrol_core_cameracatalogtest_cameracatalogtest": {
+      "code_fingerprint": "3f04b9891ccb90ded653f9861dbc721b4a21ee31456a2ce456716e8c18946538",
+      "label": "CameraCatalogTest",
+      "last": "2026-08-30T07:51:35.426437+00:00",
+      "neg": 1,
       "provenance": [
         {
-          "date": "2026-08-23T21:30:59.897602+00:00",
+          "date": "2026-08-30T07:51:35.426437+00:00",
+          "outcome": "corrected",
+          "q": "focus is not working for hyperlapse; adjusting it is doing nothing at 0.6 lens; put the guides setting to the right of flash setting"
+        },
+        {
+          "date": "2026-08-30T07:41:36.837814+00:00",
           "outcome": "useful",
-          "q": "If I click on the camera mode setting using the Menu/OK button then click track heading, pressing left/right should keep me navigating inside the camera navbar but instead it forces me to navigate in the camera mode UI"
+          "q": "I noticed the Hyperlapse focus setting is FIXED instead of settable like Pro; the EV value is not visible; move Resolution immediately left of recording format without pushing Gallery off-screen; is Auto 18x and does its speed calculation match Samsung?"
+        },
+        {
+          "date": "2026-08-30T07:02:44.183620+00:00",
+          "outcome": "useful",
+          "q": "Flash then resolution then Day / Night then lens then recording time then EV then Hyperlapse then focus then speed  then video format then guides then  gallery"
+        },
+        {
+          "date": "2026-08-30T06:54:01.426486+00:00",
+          "outcome": "useful",
+          "q": "move resolution to be just left of gallery; swap positions with speed and guides"
+        },
+        {
+          "date": "2026-08-30T06:45:34.749485+00:00",
+          "outcome": "useful",
+          "q": "in Hyperlapse switch guides with EV. switch video format with speed,"
         }
       ],
-      "score": 0.914460656,
+      "score": 3.917838857,
+      "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/CameraCatalogTest.kt",
+      "status": "contested",
+      "uses": 5,
+      "verdict": "useful"
+    },
+    "core_src_test_kotlin_com_mobiledivecontrol_core_controlcoretest_controlcoretest": {
+      "code_fingerprint": "fcd55b60a501b1ce330972b7c06bd7da555d17445e39c30e9ae0b624451e12dc",
+      "label": "ControlCoreTest",
+      "last": "2026-08-30T07:51:35.426437+00:00",
+      "neg": 1,
+      "provenance": [
+        {
+          "date": "2026-08-30T07:51:35.426437+00:00",
+          "outcome": "corrected",
+          "q": "focus is not working for hyperlapse; adjusting it is doing nothing at 0.6 lens; put the guides setting to the right of flash setting"
+        },
+        {
+          "date": "2026-08-30T07:41:36.837814+00:00",
+          "outcome": "useful",
+          "q": "I noticed the Hyperlapse focus setting is FIXED instead of settable like Pro; the EV value is not visible; move Resolution immediately left of recording format without pushing Gallery off-screen; is Auto 18x and does its speed calculation match Samsung?"
+        },
+        {
+          "date": "2026-08-30T07:02:44.183620+00:00",
+          "outcome": "useful",
+          "q": "Flash then resolution then Day / Night then lens then recording time then EV then Hyperlapse then focus then speed  then video format then guides then  gallery"
+        },
+        {
+          "date": "2026-08-30T06:54:01.426486+00:00",
+          "outcome": "useful",
+          "q": "move resolution to be just left of gallery; swap positions with speed and guides"
+        },
+        {
+          "date": "2026-08-30T06:45:34.749485+00:00",
+          "outcome": "useful",
+          "q": "in Hyperlapse switch guides with EV. switch video format with speed,"
+        }
+      ],
+      "score": 3.835617236,
       "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/ControlCoreTest.kt",
-      "status": "tentative",
-      "uses": 1
+      "status": "contested",
+      "uses": 5,
+      "verdict": "useful"
     },
     "core_src_test_kotlin_com_mobiledivecontrol_core_gallerymenuflowtest_gallerymenuflowtest": {
       "code_fingerprint": "2ad67e2927521c0241846a00d660d3855fa1cbaffacd6ce36e46e9dfbf813234",
@@ -707,13 +1140,13 @@
           "q": "Implement gallery Back-row navigation with Create Album as the intermediate Right target, add the compact Back arrow and TOP/BOTTOM chevrons, and prevent video autoplay on preview or Next/Previous"
         }
       ],
-      "score": 0.910880659,
+      "score": 0.853348664,
       "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/GalleryMenuFlowTest.kt",
       "status": "tentative",
       "uses": 1
     },
     "core_src_test_kotlin_com_mobiledivecontrol_core_inputroutertest_inputroutertest": {
-      "code_fingerprint": "88324eff173ff6d9332984a58a07d960d41562a622f54a0276a9f359e73cc8b7",
+      "code_fingerprint": "eb50035832ed5666ab5390b3b4c1feba44b9d9cdf80955d426a831e90e3f5bc0",
       "label": "InputRouterTest",
       "last": "2026-08-23T14:22:59.005558+00:00",
       "provenance": [
@@ -723,8 +1156,40 @@
           "q": "lets work on the gallery menu: albums grid, navigable media grid, full-screen preview controls, move, rename, and delete"
         }
       ],
-      "score": 0.908202085,
+      "score": 0.850839271,
       "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/InputRouterTest.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "core_src_test_kotlin_com_mobiledivecontrol_core_recordingreviewflowtest_recordingreviewflowtest": {
+      "code_fingerprint": "17f1965c8884fb27ed0b0cc1ba65b002d65cca26363ec639d4ba0ab18a77e003",
+      "label": "RecordingReviewFlowTest",
+      "last": "2026-08-28T17:57:24.079059+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T17:57:24.079059+00:00",
+          "outcome": "useful",
+          "q": "on stopping a hyperlapse I need the same UI that video gets so that save/preview/stop/pause/resume options are available."
+        }
+      ],
+      "score": 0.958326104,
+      "source_file": "core/src/test/kotlin/com/mobiledivecontrol/core/RecordingReviewFlowTest.kt",
+      "status": "tentative",
+      "uses": 1
+    },
+    "docs_color_workflow_divecontrol_pro_video": {
+      "code_fingerprint": "879e81367d5dba6135e9b3999cc9045b42fdcb6574d62ffb67976316c5e78adf",
+      "label": "DiveControl Pro Video",
+      "last": "2026-08-28T15:27:39.025956+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T15:27:39.025956+00:00",
+          "outcome": "useful",
+          "q": "check all of your frame rates and all resolution settings I cant have it freezing like that"
+        }
+      ],
+      "score": 0.956026236,
+      "source_file": "docs/COLOR_WORKFLOW.md",
       "status": "tentative",
       "uses": 1
     },
@@ -739,7 +1204,7 @@
           "q": "Fix DiveControl LOG to match Samsung Camera Log and assess additional dynamic range"
         }
       ],
-      "score": 0.919005172,
+      "score": 0.860960026,
       "source_file": "",
       "status": "tentative",
       "uses": 1
@@ -755,7 +1220,23 @@
           "q": "Fix DiveControl LOG to match Samsung Camera Log and assess additional dynamic range"
         }
       ],
-      "score": 0.919005172,
+      "score": 0.860960026,
+      "source_file": "",
+      "status": "tentative",
+      "uses": 1
+    },
+    "tonemapcurve": {
+      "code_fingerprint": "",
+      "label": "TonemapCurve",
+      "last": "2026-08-29T19:12:18.308818+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-29T19:12:18.308818+00:00",
+          "outcome": "useful",
+          "q": "so I want a fix to the \"Samsung still applies proprietary HDR/local tone mapping and motion fusion, so its highlights and moving-frame sharpness are somewhat better. The stitching geometry and workflow are now functionally equivalent, but the pixel processing is not literally Samsung’s private algorithm.  \" issue with our app"
+        }
+      ],
+      "score": 0.981905296,
       "source_file": "",
       "status": "tentative",
       "uses": 1
@@ -771,7 +1252,7 @@
           "q": "Is the LOG profile on the app the exact same as the log profile in the native camera app?"
         }
       ],
-      "score": 0.917995073,
+      "score": 0.860013725,
       "source_file": "",
       "status": "tentative",
       "uses": 1

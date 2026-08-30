@@ -72,6 +72,10 @@ fun DiagnosticsScreen(
                     InfoRow("BLE State", state.bleConnectionState.name)
                     InfoRow("Connected", if (state.housing.connected) "Yes" else "No")
                     InfoRow("Input", if (state.housing.inputEnabled) "Enabled" else "Disabled")
+                    InfoRow(
+                        "Popup Control",
+                        if (state.permissions.accessibility) "Housing enabled" else "Setup required",
+                    )
                     InfoRow("Battery", state.housing.batteryPercent?.let { "$it%" } ?: "—")
                 }
             }

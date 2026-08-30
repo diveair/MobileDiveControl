@@ -165,6 +165,18 @@ private fun kelvinMagnitude(option: String): Double? = option.removeSuffix("K").
 
 private fun exposureMagnitude(option: String): Double? = option.replace("+", "").toDoubleOrNull()
 
+/** Collapses the previous two Panorama toggles into the single exclusive dynamic-range choice. */
+internal fun migrateLegacyPanoramaDynamicRange(values: Map<String, String>): Map<String, String> {
+    if ("panorama.hdr" !in values && "panorama.log" !in values) return values
+    val selected = when {
+        values["panorama.log"] == "On" -> "LOG"
+        values["panorama.hdr"] == "On" -> "HDR"
+        else -> "Off"
+    }
+    return values - setOf("panorama.hdr", "panorama.log") +
+        ("panorama.hdr_log" to selected)
+}
+
 class CameraSessionStore(context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
 
@@ -173,10 +185,12 @@ class CameraSessionStore(context: Context) {
             ?.let { stored -> runCatching { CameraModeId.valueOf(stored) }.getOrNull() }
             ?: CameraModeId.Photo
 
-        val settingValues = migrateLegacyPanoramaDirection(
-            migrateLegacyAssistDefaults(
-                normalizeRestoredSettingValues(
-                    CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES),
+        val settingValues = removeLegacyPanoramaControls(
+            migrateLegacyPanoramaDynamicRange(
+                migrateLegacyAssistDefaults(
+                    normalizeRestoredSettingValues(
+                        CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES),
+                    ),
                 ),
             ),
         )
@@ -294,15 +308,12 @@ class CameraSessionStore(context: Context) {
         return result
     }
 
-    /**
-     * Builds before automatic panorama steering always persisted "Right", including when the
-     * user had never selected a direction. Replace that legacy value once so an updated install
-     * gets the native-camera behaviour; choices made after this migration remain untouched.
-     */
-    private fun migrateLegacyPanoramaDirection(values: Map<String, String>): Map<String, String> {
-        if (preferences.getBoolean(KEY_PANORAMA_DIRECTION_MIGRATED, false)) return values
-        preferences.edit().putBoolean(KEY_PANORAMA_DIRECTION_MIGRATED, true).apply()
-        return values + ("panorama.direction" to "Auto")
+    /** Samsung Panorama always auto-detects direction and always shows its capture guide. */
+    private fun removeLegacyPanoramaControls(values: Map<String, String>): Map<String, String> {
+        if (!preferences.getBoolean(KEY_PANORAMA_DIRECTION_MIGRATED, false)) {
+            preferences.edit().putBoolean(KEY_PANORAMA_DIRECTION_MIGRATED, true).apply()
+        }
+        return values - setOf("panorama.direction", "panorama.guide")
     }
 
     private companion object {

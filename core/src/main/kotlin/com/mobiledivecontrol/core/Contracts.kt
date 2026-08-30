@@ -99,6 +99,8 @@ enum class CameraSettingKind {
 enum class CameraFeatureStatus {
     Confirmed,
     NeedsVerification,
+    /** Listed for parity/reference, but deliberately non-adjustable until a real pipeline exists. */
+    Unavailable,
 }
 
 @JvmInline
@@ -222,6 +224,12 @@ enum class RecordingPausedAction {
     Delete,
 }
 
+/** Ordered exactly as the completed-panorama chooser is painted and traversed. */
+enum class PanoramaReviewAction {
+    Save,
+    Delete,
+}
+
 enum class RecordingSaveConfirmationAction {
     Back,
     Confirm,
@@ -262,6 +270,10 @@ data class CameraState(
     val recordingSaveLocation: RecordingSaveLocation = RecordingSaveLocation.Default,
     val recordingSaveLocations: List<RecordingSaveLocation> = listOf(RecordingSaveLocation.Default),
     val recordingSaveLocationIndex: Int = 0,
+    /** True after stitching succeeds and until the staged panorama is saved or deleted. */
+    val panoramaReviewAvailable: Boolean = false,
+    /** The selected action in the completed-panorama chooser. */
+    val panoramaReviewAction: PanoramaReviewAction = PanoramaReviewAction.Save,
     /**
      * What this phone's camera hardware actually offers, probed at bind time by the platform
      * layer. Null until the probe reports (or forever, in the simulator) — the static catalog
@@ -624,6 +636,10 @@ sealed interface ControlCommand
 
 sealed interface CameraCommand : ControlCommand {
     data object CapturePhoto : CameraCommand
+    /** Runtime-to-reducer event emitted only after a stitched JPEG is safely staged. */
+    data object PanoramaReviewReady : CameraCommand
+    data object SavePanorama : CameraCommand
+    data object DeletePanorama : CameraCommand
     data object ToggleVideoRecording : CameraCommand
     data object StartVideoRecording : CameraCommand
     data object StopVideoRecording : CameraCommand
@@ -666,6 +682,8 @@ sealed interface CameraCommand : ControlCommand {
     data class SetCaptureFormat(val value: String) : CameraCommand
     data class SetHdrLogMode(val value: String) : CameraCommand
     data class SetFilter(val value: String) : CameraCommand
+    /** Runtime acknowledgement that a requested camera operation was rejected or failed. */
+    data class ReportRuntimeFailure(val message: String) : CameraCommand
     /** One single tick of a slider setting — the ramp engine's unit of motion. */
     data class NudgeSetting(val settingId: String, val step: Int) : CameraCommand
     data class UpdateDetectedLenses(val lenses: List<String>) : CameraCommand
@@ -877,6 +895,10 @@ data class CameraCapabilities(
     val videoFrameRatesByResolution: Map<String, List<Int>> = emptyMap(),
     val videoStabilizationSupported: Boolean? = null,
     val ultraHdrJpegSupported: Boolean? = null,
+    /** True only when CameraX can write a sensor RAW frame as an Adobe DNG. */
+    val rawCaptureSupported: Boolean? = null,
+    /** True only when the active camera can deliver DNG and JPEG from the same exposure. */
+    val rawJpegCaptureSupported: Boolean? = null,
 )
 
 sealed interface BottomBarItem {

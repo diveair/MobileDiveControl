@@ -51,6 +51,7 @@ import com.mobiledivecontrol.ui.tutorial.SealCapPromptScreen
 fun DiveControlScreen(
     state: AppState,
     cameraPermissionGranted: Boolean = false,
+    locationPrerequisitesReady: Boolean = false,
     lifecycleOwner: androidx.lifecycle.LifecycleOwner? = null,
     useMetric: Boolean = true,
     effects: List<PlatformEffect> = emptyList(),
@@ -68,6 +69,7 @@ fun DiveControlScreen(
     onIntroDismiss: () -> Unit = {},
     permissionsGranted: Boolean = false,
     missingPermissions: List<String> = emptyList(),
+    onPermissionsSetup: () -> Unit = {},
     capPromptVisible: Boolean = false,
     onCapPromptDismiss: () -> Unit = {},
     bluetoothEnabled: Boolean = true,
@@ -77,6 +79,7 @@ fun DiveControlScreen(
         DiveControlContent(
             state = state,
             cameraPermissionGranted = cameraPermissionGranted,
+            locationPrerequisitesReady = locationPrerequisitesReady,
             lifecycleOwner = lifecycleOwner,
             useMetric = useMetric,
             effects = effects,
@@ -101,6 +104,7 @@ fun DiveControlScreen(
                 bleState = state.bleConnectionState,
                 missingPermissions = missingPermissions,
                 onDismiss = onIntroDismiss,
+                onPermissionsSetup = onPermissionsSetup,
                 modifier = Modifier.fillMaxSize(),
             )
         } else if (capPromptVisible) {
@@ -118,6 +122,7 @@ fun DiveControlScreen(
 private fun DiveControlContent(
     state: AppState,
     cameraPermissionGranted: Boolean,
+    locationPrerequisitesReady: Boolean,
     lifecycleOwner: androidx.lifecycle.LifecycleOwner?,
     useMetric: Boolean,
     effects: List<PlatformEffect>,
@@ -153,6 +158,7 @@ private fun DiveControlContent(
                     cameraState = state.camera,
                     safetyState = state.safety,
                     cameraPermissionGranted = cameraPermissionGranted,
+                    locationPrerequisitesReady = locationPrerequisitesReady,
                     lifecycleOwner = lifecycleOwner,
                     effects = effects,
                     onEffectsConsumed = onEffectsConsumed,
@@ -162,11 +168,13 @@ private fun DiveControlContent(
                     onPointingGesture = onPointingGesture,
                     onCameraCommand = onCameraCommand,
                     headingDegrees = compassReading.headingDegrees,
+                    warningMessage = cameraFailureBannerMessage(state.lastWarning),
                 )
                 AppMode.CameraAdjust -> CameraShellScreen(
                     cameraState = state.camera,
                     safetyState = state.safety,
                     cameraPermissionGranted = cameraPermissionGranted,
+                    locationPrerequisitesReady = locationPrerequisitesReady,
                     lifecycleOwner = lifecycleOwner,
                     effects = effects,
                     onEffectsConsumed = onEffectsConsumed,
@@ -176,6 +184,7 @@ private fun DiveControlContent(
                     onPointingGesture = onPointingGesture,
                     onCameraCommand = onCameraCommand,
                     headingDegrees = compassReading.headingDegrees,
+                    warningMessage = cameraFailureBannerMessage(state.lastWarning),
                 )
                 AppMode.Safety -> SafetyScreen(safety = state.safety)
                 AppMode.Diagnostics -> DiagnosticsScreen(
@@ -190,6 +199,20 @@ private fun DiveControlContent(
             }
         }
     }
+}
+
+/**
+ * The camera's amber banner is reserved for failures the camera controls can resolve. Connection,
+ * permission, and seal states already have dedicated UI; repeating them here creates the exact
+ * stacked "HOUSING DISCONNECTED" / "HOUSING NOT CONNECTED" duplication the user cannot dismiss.
+ */
+internal fun cameraFailureBannerMessage(message: String?): String? {
+    val value = message?.trim()?.takeIf(String::isNotEmpty) ?: return null
+    val duplicateStatus = value.startsWith("Housing ", ignoreCase = true) ||
+        value.startsWith("Bluetooth ", ignoreCase = true) ||
+        value.contains(" Permission:", ignoreCase = true) ||
+        value.startsWith("Verified vacuum held across restart", ignoreCase = true)
+    return value.takeUnless { duplicateStatus }
 }
 
 /**

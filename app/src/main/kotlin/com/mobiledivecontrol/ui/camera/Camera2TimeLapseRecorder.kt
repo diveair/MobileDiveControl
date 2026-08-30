@@ -29,7 +29,22 @@ import kotlin.math.max
 
 internal const val TIME_LAPSE_PLAYBACK_FPS = 30
 
-/** Explicit rungs stay exact; Auto follows Samsung's low-light suggestion with a safe fallback. */
+internal enum class TimeLapseVideoCodec {
+    H264,
+    HEVC,
+}
+
+/** Accept persisted aliases while exposing only the two physically distinct encoders. */
+internal fun hyperlapseVideoCodec(value: String?): TimeLapseVideoCodec = when (value) {
+    "HEVC", "H.265", "HEVC / H.265", "H.265 / HEVC" -> TimeLapseVideoCodec.HEVC
+    else -> TimeLapseVideoCodec.H264
+}
+
+/**
+ * Explicit rungs stay exact. The public recorder cannot change capture rate mid-recording, so
+ * Auto starts from Samsung's nominal 5x Auto cadence and uses 45x when the native vendor result
+ * (or the user's Night selection) requests the night cadence.
+ */
 internal fun hyperlapseSpeedFactor(
     value: String?,
     dayNight: String?,
@@ -44,7 +59,7 @@ internal fun hyperlapseSpeedFactor(
     "60x" -> 60
     else -> if (
         dayNight == "Night" || hyperlapseAutoUsesNightCadence(samsungSuggestedMotionSpeedMode)
-    ) 15 else 10
+    ) 45 else 5
 }
 
 internal fun hyperlapseCaptureRateFps(speedFactor: Int): Double =
@@ -77,6 +92,7 @@ internal class Camera2TimeLapseRecorder(
         val size: Size,
         val captureRateFps: Double,
         val playbackFps: Int,
+        val videoCodec: TimeLapseVideoCodec,
         val cameraFrameRate: Int?,
         val modeLabel: String,
         val outputFile: File,
@@ -175,7 +191,12 @@ internal class Camera2TimeLapseRecorder(
             mediaRecorder = recorder
             recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            recorder.setVideoEncoder(
+                when (request.videoCodec) {
+                    TimeLapseVideoCodec.H264 -> MediaRecorder.VideoEncoder.H264
+                    TimeLapseVideoCodec.HEVC -> MediaRecorder.VideoEncoder.HEVC
+                },
+            )
             recorder.setVideoSize(request.size.width, request.size.height)
             recorder.setCaptureRate(request.captureRateFps)
             recorder.setVideoFrameRate(request.playbackFps)
@@ -280,15 +301,8 @@ internal class Camera2TimeLapseRecorder(
                                     if (request.torchEnabled) CameraMetadata.FLASH_MODE_TORCH
                                     else CameraMetadata.FLASH_MODE_OFF,
                                 )
-                                if (request.nightMode && supportsNightScene(request.cameraId)) {
-                                    set(
-                                        CaptureRequest.CONTROL_MODE,
-                                        CameraMetadata.CONTROL_MODE_USE_SCENE_MODE,
-                                    )
-                                    set(
-                                        CaptureRequest.CONTROL_SCENE_MODE,
-                                        CameraMetadata.CONTROL_SCENE_MODE_NIGHT,
-                                    )
+                                if (request.nightMode) {
+                                    applyNightTuning(this, request.cameraId)
                                 }
                             }
                             configured.setRepeatingRequest(builder.build(), null, handler)
@@ -322,12 +336,48 @@ internal class Camera2TimeLapseRecorder(
         }
     }
 
-    private fun supportsNightScene(cameraId: String): Boolean {
+    private fun applyNightTuning(builder: CaptureRequest.Builder, cameraId: String) {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        return manager.getCameraCharacteristics(cameraId)
+        val characteristics = manager.getCameraCharacteristics(cameraId)
+        val sceneModes = characteristics
             .get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)
-            .let { it ?: intArrayOf() }
-            .contains(CameraMetadata.CONTROL_SCENE_MODE_NIGHT)
+            ?: intArrayOf()
+        if (sceneModes.contains(CameraMetadata.CONTROL_SCENE_MODE_NIGHT)) {
+            builder.set(
+                CaptureRequest.CONTROL_MODE,
+                CameraMetadata.CONTROL_MODE_USE_SCENE_MODE,
+            )
+            builder.set(
+                CaptureRequest.CONTROL_SCENE_MODE,
+                CameraMetadata.CONTROL_SCENE_MODE_NIGHT,
+            )
+            return
+        }
+
+        // Samsung does not expose its vendor Night Hyperlapse processor to third-party apps on
+        // every physical camera. Keep Day/Night functional on those IDs with public Camera2:
+        // lower AE's permitted cadence and request the best available temporal noise reduction.
+        val aeRanges = characteristics
+            .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?: emptyArray()
+        aeRanges
+            .filter { range -> range.lower in 1..15 && range.upper <= 30 }
+            .minWithOrNull(
+                compareBy<android.util.Range<Int>> { range -> range.lower }
+                    .thenByDescending { range -> range.upper },
+            )
+            ?.let { range ->
+                builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+            }
+        val noiseModes = characteristics
+            .get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+            ?: intArrayOf()
+        if (noiseModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+            builder.set(
+                CaptureRequest.NOISE_REDUCTION_MODE,
+                CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY,
+            )
+        }
     }
 
     fun stop() {

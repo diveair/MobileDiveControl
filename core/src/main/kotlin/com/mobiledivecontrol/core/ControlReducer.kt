@@ -268,12 +268,48 @@ class ControlReducer(
 
     private fun reduceCamera(state: AppState, command: CameraCommand, repeatCount: Int = 0): Reduction = when (command) {
         CameraCommand.CapturePhoto -> {
-            val nextCamera = state.camera.copy(captureCounter = state.camera.captureCounter + 1)
-            if (!state.permissions.camera) {
-                warning(state, "Camera Permission: Disabled")
+            if (state.camera.panoramaReviewAvailable) {
+                Reduction(state = state)
+            } else {
+                val nextCamera = state.camera.copy(captureCounter = state.camera.captureCounter + 1)
+                if (!state.permissions.camera) {
+                    warning(state, "Camera Permission: Disabled")
+                } else {
+                    Reduction(
+                        state = state.copy(camera = nextCamera),
+                        effects = listOf(PlatformEffect.ExecuteCamera(command)),
+                    )
+                }
+            }
+        }
+        CameraCommand.PanoramaReviewReady -> Reduction(
+            state = state.copy(
+                camera = state.camera.copy(
+                    panoramaReviewAvailable = true,
+                    panoramaReviewAction = PanoramaReviewAction.Save,
+                    focusedZone = CameraUiZone.LiveView,
+                    showMoreSettings = false,
+                    settingsEditing = false,
+                ),
+            ),
+        )
+        CameraCommand.SavePanorama,
+        CameraCommand.DeletePanorama -> {
+            if (!state.camera.panoramaReviewAvailable) {
+                Reduction(state = state)
             } else {
                 Reduction(
-                    state = state.copy(camera = nextCamera),
+                    state = state.copy(
+                        camera = state.camera.copy(
+                            panoramaReviewAvailable = false,
+                            panoramaReviewAction = PanoramaReviewAction.Save,
+                            captureCounter = if (command == CameraCommand.SavePanorama) {
+                                state.camera.captureCounter + 1
+                            } else {
+                                state.camera.captureCounter
+                            },
+                        ),
+                    ),
                     effects = listOf(PlatformEffect.ExecuteCamera(command)),
                 )
             }
@@ -514,10 +550,14 @@ class ControlReducer(
         CameraCommand.ToggleGrid,
         CameraCommand.ToggleFocusPeaking,
         CameraCommand.RestartCamera -> emitCameraEffect(state, command)
+        is CameraCommand.ReportRuntimeFailure -> warning(state, command.message)
         is CameraCommand.NudgeSetting -> {
             val spec = CameraCatalog.settingsFor(state.camera)
                 .firstOrNull { it.id == command.settingId }
-            if (spec == null || CameraCatalog.evMeterLocked(state.camera, spec)) {
+            if (spec?.status == CameraFeatureStatus.Unavailable) {
+                val reason = spec.note?.takeIf(String::isNotBlank) ?: "No working camera pipeline is available."
+                warning(state, "${spec.label} is unavailable — $reason")
+            } else if (spec == null || CameraCatalog.evMeterLocked(state.camera, spec)) {
                 // Missing spec, or the native EV meter rule: with both ISO and shutter manual
                 // the compensation index does nothing, so the detent is refused, not absorbed.
                 Reduction(state = state)
@@ -807,7 +847,7 @@ class ControlReducer(
     private fun handleWheel(state: AppState, step: Int): Reduction {
         val repeatCount = 0
         val camera = state.camera
-        if (camera.recording && camera.recordingPaused) {
+        if (camera.panoramaReviewAvailable || camera.recording && camera.recordingPaused) {
             return Reduction(state = state)
         }
         if (camera.focusedZone == CameraUiZone.SettingsPanel && camera.settingsEditing) {
@@ -839,6 +879,24 @@ class ControlReducer(
         val maxZoom = camera.capabilities?.zoomMaxRatio ?: 8.0
         val zoom = (camera.zoomFactor + step * 0.1).coerceIn(1.0, maxZoom)
         return reduceCamera(state, CameraCommand.SetZoom(zoom))
+    }
+
+    /** Both housing axes traverse the three completed-panorama actions as one circular rail. */
+    private fun panoramaReviewNavigation(state: AppState, step: Int): Reduction? {
+        val camera = state.camera
+        if (!camera.panoramaReviewAvailable) return null
+        if (step == 0) return Reduction(state = state)
+        val actions = PanoramaReviewAction.entries
+        val current = actions.indexOf(camera.panoramaReviewAction).coerceAtLeast(0)
+        return Reduction(
+            state = state.copy(
+                camera = camera.copy(
+                    panoramaReviewAction = actions[
+                        ((current + step) % actions.size + actions.size) % actions.size
+                    ],
+                ),
+            ),
+        )
     }
 
     /** Housing navigation for the paused action rail and its save-location control. */
@@ -903,6 +961,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraUp(state: AppState, repeatCount: Int = 0): Reduction {
+        panoramaReviewNavigation(state, -1)?.let { return it }
         pausedChooserNavigation(state, verticalStep = -1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
@@ -938,6 +997,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraDown(state: AppState, repeatCount: Int = 0): Reduction {
+        panoramaReviewNavigation(state, +1)?.let { return it }
         pausedChooserNavigation(state, verticalStep = +1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
@@ -973,6 +1033,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraLeft(state: AppState, repeatCount: Int = 0): Reduction {
+        panoramaReviewNavigation(state, -1)?.let { return it }
         pausedChooserNavigation(state, horizontalStep = -1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
@@ -1004,6 +1065,7 @@ class ControlReducer(
     }
 
     private fun navigateCameraRight(state: AppState, repeatCount: Int = 0): Reduction {
+        panoramaReviewNavigation(state, +1)?.let { return it }
         pausedChooserNavigation(state, horizontalStep = +1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
@@ -1024,6 +1086,13 @@ class ControlReducer(
     }
 
     private fun confirmCameraSelection(state: AppState): Reduction {
+        if (state.camera.panoramaReviewAvailable) {
+            val command = when (state.camera.panoramaReviewAction) {
+                PanoramaReviewAction.Save -> CameraCommand.SavePanorama
+                PanoramaReviewAction.Delete -> CameraCommand.DeletePanorama
+            }
+            return reduceCamera(state, command)
+        }
         // OK mirrors the shutter while the paused chooser is up: confirm the selected action.
         if (state.camera.recording && state.camera.recordingPaused) {
             if (state.camera.recordingLocationChooserVisible) {
@@ -1076,6 +1145,10 @@ class ControlReducer(
     }
 
     private fun backOutCameraUi(state: AppState): Reduction {
+        if (state.camera.panoramaReviewAvailable) {
+            // Never discard an unsaved panorama through an incidental housing Back press.
+            return Reduction(state = state)
+        }
         // Back closes a clip preview first. From the chooser itself it keeps the session by
         // starting a continuation clip, which is still the least destructive answer.
         if (state.camera.recording && state.camera.recordingPaused) {
@@ -1168,7 +1241,9 @@ class ControlReducer(
             focusedZone = CameraUiZone.ModeRail,
             modeRailReturnZone = returnZone,
             railLevel = CameraRailLevel.Primary,
-            highlightedPrimaryIndex = 0,
+            // Reopening the centred Mode menu resumes on the last active/persisted mode instead
+            // of jumping to the first action entry and losing the user's place.
+            highlightedPrimaryIndex = CameraCatalog.primaryIndexForMode(camera.activeMode),
             highlightedSecondaryIndex = CameraCatalog.secondaryIndexForMode(camera.activeMode),
             settingsEditing = false,
             sliderEditTarget = SliderEditTarget.Value,
@@ -1505,8 +1580,8 @@ class ControlReducer(
         val settings = CameraCatalog.optionsMenuSettings(state.camera)
         if (settings.size <= 1) return Reduction(state = state)
         val current = state.camera.optionsMenuCursor.coerceIn(0, settings.lastIndex)
-        val next = if (state.camera.activeMode == CameraModeId.ProVideo) {
-            // The housing has no touch shortcut underwater. A circular Pro Video rail makes the
+        val next = if (state.camera.activeMode in setOf(CameraModeId.Pro, CameraModeId.ProVideo)) {
+            // The housing has no touch shortcut underwater. Circular Pro options make the
             // first and last controls one detent apart and the Compose list follows the wrapped
             // cursor so the opposite end becomes visible immediately.
             ((current + delta) % settings.size + settings.size) % settings.size
@@ -1554,10 +1629,11 @@ class ControlReducer(
     }
 
     private fun cycleModeFromSettingsBar(state: AppState, step: Int): Reduction {
-        val currentIndex = CameraCatalog.primaryIndexForMode(state.camera.activeMode)
-        val size = CameraCatalog.primaryRailEntries.size
+        val modes = CameraCatalog.centerModeCycle
+        val currentIndex = modes.indexOf(state.camera.activeMode).coerceAtLeast(0)
+        val size = modes.size
         val nextIndex = (currentIndex + step + size) % size
-        val nextMode = CameraCatalog.primaryRailEntries[nextIndex].mode ?: return Reduction(state = state)
+        val nextMode = modes[nextIndex]
         return activateMode(state, nextMode, returnToLiveView = false, openSettings = true)
     }
 
@@ -1608,6 +1684,10 @@ class ControlReducer(
 
     /** [adjustSelectedSetting] with the spec chosen by the caller — the wheel resolves its own. */
     private fun adjustSetting(state: AppState, spec: CameraSettingSpec, step: Int, repeatCount: Int = 0): Reduction {
+        if (spec.status == CameraFeatureStatus.Unavailable) {
+            val reason = spec.note?.takeIf(String::isNotBlank) ?: "No working camera pipeline is available."
+            return warning(state, "${spec.label} is unavailable — $reason")
+        }
         if (state.camera.recording && spec.id.endsWith(".frame_rate")) {
             val warning = "Stop recording before changing frame rate."
             return Reduction(
@@ -1733,7 +1813,11 @@ class ControlReducer(
                 if (!supportsManualFocusForSelectedLens(preparedCamera, spec)) {
                     return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
                 }
-                val currentValue = preparedCamera.settingValues[spec.id] ?: spec.defaultValue
+                // Persisted values can outlive a capability/catalog change (Hyperlapse used to
+                // save the synthetic value "Fixed" for the ultra-wide lens).  Start from the
+                // catalog's canonical value so the first housing detent enters the real Pro
+                // focus ladder instead of displaying a settable rail that silently ignores it.
+                val currentValue = CameraCatalog.currentValue(preparedCamera, spec)
                 val currentIndex = spec.options.indexOf(currentValue).coerceAtLeast(0)
                 val now = nowMs()
                 // CLAMPED. lastFocusInputAtMs starts at 0 while the clock is epoch millis, so an
@@ -2028,6 +2112,59 @@ class ControlReducer(
     private fun applySettingValue(camera: CameraState, settingId: String, value: String): CameraState {
         val prefix = settingId.substringBeforeLast('.', "")
         var updatedValues = camera.settingValues + (settingId to value)
+        val expertLabCaptureActivated = when (settingId) {
+            "expert.virtual_aperture" -> value != "F16.0"
+            "expert.nd_filter" -> value != "Off"
+            "expert.astrophotography" -> value != "Off"
+            "expert.sky_guide" -> value == "On"
+            "expert.astro_portrait" -> value == "On"
+            "expert.multi_exposure" -> value == "On"
+            else -> false
+        }
+        if (expertLabCaptureActivated) {
+            // Samsung exposes special photo options only at 12 MP. Keep that real stream limit
+            // and ensure there is a JPEG companion for the computational result while retaining
+            // a sensor DNG from the same sequence.
+            updatedValues = updatedValues +
+                ("expert.megapixels" to "12MP") +
+                ("expert.save_format" to "RAW + JPEG")
+        }
+        when {
+            settingId == "expert.nd_filter" && value != "Off" -> {
+                updatedValues = updatedValues +
+                    ("expert.astrophotography" to "Off") +
+                    ("expert.astro_portrait" to "Off") +
+                    ("expert.multi_exposure" to "Off")
+            }
+            settingId == "expert.astrophotography" && value != "Off" -> {
+                updatedValues = updatedValues +
+                    ("expert.nd_filter" to "Off") +
+                    ("expert.multi_exposure" to "Off")
+            }
+            settingId == "expert.astro_portrait" && value == "On" -> {
+                updatedValues = updatedValues +
+                    ("expert.astrophotography" to
+                        (updatedValues["expert.astrophotography"]?.takeUnless { it == "Off" } ?: "4 min")) +
+                    ("expert.nd_filter" to "Off") +
+                    ("expert.multi_exposure" to "Off")
+            }
+            settingId == "expert.multi_exposure" && value == "On" -> {
+                updatedValues = updatedValues +
+                    ("expert.nd_filter" to "Off") +
+                    ("expert.astrophotography" to "Off") +
+                    ("expert.astro_portrait" to "Off")
+            }
+            settingId == "expert.sky_guide" && value == "On" &&
+                updatedValues["expert.astrophotography"] == "Off" -> {
+                updatedValues = updatedValues + ("expert.astrophotography" to "4 min")
+            }
+            settingId == "expert.ocean_capture_interval" && value != "Off" -> {
+                updatedValues = updatedValues + ("expert.ocean_mode" to "On")
+            }
+            settingId == "pro.virtual_aperture" && value != "F16.0" -> {
+                updatedValues = updatedValues + ("pro.megapixels" to "12MP")
+            }
+        }
         var selectedFps = CameraCatalog.captureFrameRateFps(
             updatedValues["$prefix.frame_rate"],
         )
@@ -2593,11 +2730,11 @@ class ControlReducer(
             else -> return true
         }
         val currentLens = camera.settingValues[lensSettingId] ?: "Auto"
-        // "Auto" mode always supports focus (hardware decides)
-        // "0.6x" on most phones is fixed focus — let the runtime controller handle
-        // the actual check via the detected focus capabilities
-        // For the core reducer, we allow all lenses but "fixed" won't produce focus commands
-        return currentLens != "fixed"
+        // The S24 0.6x ultra-wide reports LENS_INFO_MINIMUM_FOCUS_DISTANCE = 0.0 and has no
+        // focus actuator. Keep the stored focus value for the next focus-capable lens, but do not
+        // present housing detents as successful optical changes on fixed-focus hardware.
+        if (currentLens == "0.6x" || currentLens == "fixed") return false
+        return camera.capabilities?.manualFocusSupported != false
     }
 
 
@@ -2639,7 +2776,8 @@ class ControlReducer(
         "single_take.megapixels",
         "video.megapixels" -> CameraCommand.SetPhotoResolution(value)
         "photo.save_format",
-        "expert.save_format" -> CameraCommand.SetCaptureFormat(value)
+        "expert.save_format",
+        "pro.save_format" -> CameraCommand.SetCaptureFormat(value)
         "pro.iso",
         "expert.iso",
         "pro_video.iso" -> value.toIntOrNull()?.let { CameraCommand.SetIso(it) }
@@ -2686,7 +2824,8 @@ class ControlReducer(
         "pro_video.focus_curve",
         "portrait_video.focus_curve",
         "hyperlapse.focus_curve" -> null // Focus curve is handled locally in the app, no camera command needed
-        "photo.hdr_log" -> CameraCommand.SetHdrLogMode(value)
+        "photo.hdr_log",
+        "panorama.hdr_log" -> CameraCommand.SetHdrLogMode(value)
         "video.hdr",
         "night_video.hdr",
         "portrait_video.hdr",
@@ -2733,11 +2872,18 @@ class ControlReducer(
         // other subsystems (BLE, permissions) are left alone.
         val safetyWarningCleared = state.safety.warning != null && result.state.warning == null
         val carriedWarning = state.lastWarning
-            .takeUnless { safetyWarningCleared && it == state.safety.warning }
+            .takeUnless {
+                (safetyWarningCleared && it == state.safety.warning) ||
+                    isInformationalVacuumRestoreNote(it)
+            }
 
         val nextState = state.copy(
             safety = result.state,
-            lastWarning = result.note ?: result.state.warning ?: carriedWarning,
+            // SafetyMachineResult.note is diagnostic narration, not a warning. Promoting a
+            // successful restart-adoption note into lastWarning rendered it as a full-width
+            // amber camera failure banner indefinitely. Only a real SafetyState.warning belongs
+            // on that surface; notes remain available in Reduction.notes and diagnostics logs.
+            lastWarning = result.state.warning ?: carriedWarning,
         )
         return Reduction(
             state = nextState,
@@ -2745,6 +2891,9 @@ class ControlReducer(
             notes = listOfNotNull(result.note),
         )
     }
+
+    private fun isInformationalVacuumRestoreNote(message: String?): Boolean =
+        message?.startsWith("Verified vacuum held across restart") == true
 
     private fun reduceGalleryGrid(state: AppState, command: GalleryCommand): Reduction {
         val gallery = state.gallery

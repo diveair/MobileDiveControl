@@ -38,6 +38,7 @@ import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.launch
 import com.mobiledivecontrol.core.HeadingMath
 import com.mobiledivecontrol.ui.camera.PointingGesture
+import com.mobiledivecontrol.accessibility.PermissionDialogHousingBridge
 
 /**
  * Bridges the pure Kotlin [ControlCore] (BLE communication layer)
@@ -432,6 +433,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onButtonPayload(payload: ByteArray) {
+        if (PermissionDialogHousingBridge.handleButtonPayload(payload)) return
         if (interceptForIntro(HousingCharacteristic.ButtonEvents.shortHex, payload)) return
         if (interceptForCapPrompt(HousingCharacteristic.ButtonEvents.shortHex, payload)) return
         val outcome = controlCore.handleButtonPayload(payload)
@@ -451,6 +453,9 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onNotification(characteristic: String, payload: ByteArray) {
+        if (HousingCharacteristic.from(characteristic) == HousingCharacteristic.ButtonEvents &&
+            PermissionDialogHousingBridge.handleButtonPayload(payload)
+        ) return
         if (interceptForIntro(characteristic, payload)) return
         if (interceptForCapPrompt(characteristic, payload)) return
         val outcome = controlCore.handleNotificationPayload(characteristic, payload)

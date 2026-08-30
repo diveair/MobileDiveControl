@@ -1,6 +1,7 @@
 package com.mobiledivecontrol.ui.camera
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -22,6 +23,14 @@ class SpecialModeColourTest {
     }
 
     @Test
+    fun `lens route validation compares focal lengths not Samsung internal sensor ids`() {
+        assertTrue(cameraFocalLengthMatches(2.2f, 2.2f))
+        assertTrue(cameraFocalLengthMatches(5.4f, 5.42f))
+        assertFalse(cameraFocalLengthMatches(5.4f, 7.0f))
+        assertTrue(cameraFocalLengthMatches(null, 7.0f))
+    }
+
+    @Test
     fun `hyperlapse recording limit accepts Samsung minute choices through 300`() {
         assertEquals(null, hyperlapseRecordingLimitMillis("∞"))
         assertEquals(600_000L, hyperlapseRecordingLimitMillis("10m"))
@@ -38,21 +47,33 @@ class SpecialModeColourTest {
         assertEquals(2.0, hyperlapseFrameIntervalSeconds(60), 1e-9)
         assertEquals(2_000L, hyperlapsePlaybackDurationMs(10_000L, 5))
         assertEquals(0L, hyperlapsePlaybackDurationMs(-1L, 10))
-        assertEquals(10, hyperlapseSpeedFactor("Auto", "Day", 10))
-        assertEquals(15, hyperlapseSpeedFactor("Auto", "Day", 0x62))
+        assertEquals(5, hyperlapseSpeedFactor("Auto", "Day", 10))
+        assertEquals(45, hyperlapseSpeedFactor("Auto", "Day", 100))
+        assertEquals(5, hyperlapseSpeedFactor("Auto", "Day", 98))
+        assertEquals(45, hyperlapseSpeedFactor("Auto", "Night", 10))
         assertEquals("00:00:00", hyperlapseClockText(-1L))
         assertEquals("01:01:01", hyperlapseClockText(3_661_999L))
     }
 
     @Test
+    fun `hyperlapse video format resolves H264 and all HEVC H265 aliases`() {
+        assertEquals(TimeLapseVideoCodec.H264, hyperlapseVideoCodec("H.264"))
+        assertEquals(TimeLapseVideoCodec.H264, hyperlapseVideoCodec(null))
+        assertEquals(TimeLapseVideoCodec.HEVC, hyperlapseVideoCodec("HEVC"))
+        assertEquals(TimeLapseVideoCodec.HEVC, hyperlapseVideoCodec("H.265"))
+        assertEquals(TimeLapseVideoCodec.HEVC, hyperlapseVideoCodec("HEVC / H.265"))
+    }
+
+    @Test
     fun `panorama motion follows the on screen sweep axis in landscape`() {
-        // Android display rotations 1 and 3 are the two landscape orientations.
-        assertEquals(0.8f, panoramaSweepAxisRate("Right", 1, 0.8f, 0.2f), 1e-6f)
-        assertEquals(0.8f, panoramaSweepAxisRate("Left", 1, -0.8f, 0.2f), 1e-6f)
-        assertEquals(0.2f, panoramaSweepAxisRate("Up", 1, 0.8f, 0.2f), 1e-6f)
-        assertEquals(-0.2f, panoramaSweepAxisRate("Down", 1, 0.8f, 0.2f), 1e-6f)
-        assertEquals("Right", panoramaDirectionFromGyro(1, 0.8f, 0.1f))
-        assertEquals("Up", panoramaDirectionFromGyro(1, 0.1f, 0.8f))
+        // Measured on the S24: clockwise/right in rotation 1 reports negative gyro X.
+        assertEquals(0.8f, panoramaSweepAxisRate("Right", 1, -0.8f, 0.2f), 1e-6f)
+        assertEquals(0.8f, panoramaSweepAxisRate("Left", 1, 0.8f, 0.2f), 1e-6f)
+        assertEquals(0.2f, panoramaSweepAxisRate("Up", 1, -0.8f, 0.2f), 1e-6f)
+        assertEquals(-0.2f, panoramaSweepAxisRate("Down", 1, -0.8f, 0.2f), 1e-6f)
+        assertEquals("Right", panoramaDirectionFromGyro(1, -0.8f, 0.1f))
+        assertEquals("Left", panoramaDirectionFromGyro(1, 0.8f, 0.1f))
+        assertEquals("Right", panoramaDirectionFromGyro(1, -0.1f, 0.8f))
         assertEquals(1f, panoramaProgressFraction(PANORAMA_HORIZONTAL_TARGET_RADIANS), 1e-6f)
         assertEquals(1f, panoramaProgressFraction(PANORAMA_VERTICAL_TARGET_RADIANS, "Up"), 1e-6f)
         assertEquals(
@@ -69,20 +90,44 @@ class SpecialModeColourTest {
     }
 
     @Test
+    fun `panorama direction ignores shutter jitter until sustained screen motion`() {
+        assertEquals(null, panoramaDirectionFromAccumulatedMotion(0.008f))
+        assertEquals(null, panoramaDirectionFromAccumulatedMotion(-0.02f))
+        assertEquals("Right", panoramaDirectionFromAccumulatedMotion(0.06f))
+        assertEquals("Left", panoramaDirectionFromAccumulatedMotion(-0.06f))
+    }
+
+    @Test
     fun `panorama guide exposes cross axis pitch and yaw independently`() {
         // In landscape, X is the horizontal sweep/yaw rate and Y is the vertical/pitch rate.
-        assertEquals(0.25f, panoramaCrossAxisRate("Right", 1, 0.8f, 0.25f), 1e-6f)
-        assertEquals(0.25f, panoramaCrossAxisRate("Left", 1, -0.8f, 0.25f), 1e-6f)
-        assertEquals(0.8f, panoramaCrossAxisRate("Up", 1, 0.8f, 0.25f), 1e-6f)
-        assertEquals(0.8f, panoramaCrossAxisRate("Down", 1, 0.8f, -0.25f), 1e-6f)
-        assertEquals(0.5f, panoramaGuideCrossFraction(0.06981317f), 1e-5f)
+        assertEquals(0.25f, panoramaCrossAxisRate("Right", 1, -0.8f, 0.25f), 1e-6f)
+        assertEquals(0.25f, panoramaCrossAxisRate("Left", 1, 0.8f, 0.25f), 1e-6f)
+        assertEquals(0.8f, panoramaCrossAxisRate("Up", 1, -0.8f, 0.25f), 1e-6f)
+        assertEquals(0.8f, panoramaCrossAxisRate("Down", 1, -0.8f, -0.25f), 1e-6f)
+        assertEquals(0.5f, panoramaGuideCrossFraction(0.12217305f), 1e-5f)
         assertEquals(-1f, panoramaGuideCrossFraction(-0.3f), 1e-6f)
         assertEquals(PanoramaWarningLevel.None, panoramaWarningLevel(0.02f))
-        assertEquals(PanoramaWarningLevel.Low, panoramaWarningLevel(0.05f))
-        assertEquals(PanoramaWarningLevel.High, panoramaWarningLevel(0.07f))
-        assertEquals(PanoramaCorrection.Down, panoramaCorrection("Right", 0.07f))
-        assertEquals(PanoramaCorrection.Up, panoramaCorrection("Left", -0.07f))
-        assertEquals(PanoramaCorrection.Left, panoramaCorrection("Down", 0.07f))
+        assertEquals(PanoramaWarningLevel.Low, panoramaWarningLevel(0.09f))
+        assertEquals(PanoramaWarningLevel.High, panoramaWarningLevel(0.13f))
+        assertEquals(PanoramaCorrection.Down, panoramaCorrection("Right", 0.13f))
+        assertEquals(PanoramaCorrection.Up, panoramaCorrection("Left", -0.13f))
+        assertEquals(PanoramaCorrection.Left, panoramaCorrection("Down", 0.13f))
+        assertEquals(0f, panoramaGravityElevationRadians(0f, 9.81f, 0f), 1e-6f)
+        assertEquals(
+            0.5235988f,
+            panoramaGravityElevationRadians(0f, 8.495709f, 4.905f),
+            1e-4f,
+        )
+        assertEquals(0.2f, panoramaGravityCrossAxisRadians(0.1f, -0.1f), 1e-6f)
+        assertEquals(-0.2f, panoramaGravityCrossAxisRadians(-0.1f, 0.1f), 1e-6f)
+    }
+
+    @Test
+    fun `panorama reversal finishes only after a useful clockwise sweep`() {
+        assertFalse(panoramaShouldFinishOnReverse(0.2f, 0.2f, 4))
+        assertFalse(panoramaShouldFinishOnReverse(0.05f, 1.2f, 8))
+        assertFalse(panoramaShouldFinishOnReverse(0.2f, 1.2f, 1))
+        assertTrue(panoramaShouldFinishOnReverse(0.09f, 1.2f, 8))
     }
 
     @Test
@@ -149,6 +194,50 @@ class SpecialModeColourTest {
 
         assertEquals(14, offset.x)
         assertEquals(0, offset.y)
+    }
+
+    @Test
+    fun `panorama exposure matching preserves endpoints and joins adaptive midtones`() {
+        assertEquals(1f, panoramaExposureMatchGamma(120, 122), 1e-6f)
+        assertTrue(panoramaExposureMatchGamma(90, 130) < 1f)
+        assertTrue(panoramaExposureMatchGamma(170, 110) > 1f)
+        assertEquals(1f, panoramaExposureMatchGamma(255, 120), 1e-6f)
+        assertEquals(0.72f, panoramaExposureMatchGamma(20, 240), 1e-6f)
+        assertEquals(1.38f, panoramaExposureMatchGamma(240, 20), 1e-6f)
+    }
+
+    @Test
+    fun `panorama off hdr and log have distinct deterministic transfer curves`() {
+        assertEquals(128, panoramaProfileTone(128, PanoramaDynamicRangeProfile.Off))
+        assertTrue(panoramaProfileTone(128, PanoramaDynamicRangeProfile.Hdr) > 128)
+        assertTrue(panoramaProfileTone(0, PanoramaDynamicRangeProfile.Log) > 0)
+        assertTrue(panoramaProfileTone(255, PanoramaDynamicRangeProfile.Log) < 255)
+        val offRange = panoramaProfileTone(255, PanoramaDynamicRangeProfile.Off) -
+            panoramaProfileTone(0, PanoramaDynamicRangeProfile.Off)
+        val logRange = panoramaProfileTone(255, PanoramaDynamicRangeProfile.Log) -
+            panoramaProfileTone(0, PanoramaDynamicRangeProfile.Log)
+        assertTrue(logRange < offRange)
+    }
+
+    @Test
+    fun `panorama profile transform preserves alpha and off preserves the source`() {
+        val source = 0x7f3c78c8
+        assertEquals(source, panoramaProfileArgb(source, PanoramaDynamicRangeProfile.Off))
+        val hdr = panoramaProfileArgb(source, PanoramaDynamicRangeProfile.Hdr)
+        val log = panoramaProfileArgb(source, PanoramaDynamicRangeProfile.Log)
+        assertEquals(source ushr 24, hdr ushr 24)
+        assertEquals(source ushr 24, log ushr 24)
+        assertTrue(hdr != source)
+        assertTrue(log != source)
+        assertTrue(hdr != log)
+    }
+
+    @Test
+    fun `panorama motion fusion retains more of the sharper overlap`() {
+        assertTrue(panoramaSharpnessRetentionBias(24.0, 12.0) > 0f)
+        assertTrue(panoramaSharpnessRetentionBias(12.0, 24.0) < 0f)
+        assertEquals(0f, panoramaSharpnessRetentionBias(16.0, 16.0), 1e-6f)
+        assertEquals(0.18f, panoramaSharpnessRetentionBias(100.0, 1.0), 1e-6f)
     }
 
     @Test

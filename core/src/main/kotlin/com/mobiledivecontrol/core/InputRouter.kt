@@ -184,6 +184,9 @@ class InputRouter {
     }
 
     private fun cameraShutterCommand(cameraState: CameraState): CameraCommand {
+        if (cameraState.panoramaReviewAvailable) {
+            return CameraCommand.Confirm
+        }
         if (cameraState.activeMode.captureType != CameraCaptureType.Video) {
             return CameraCommand.CapturePhoto
         }

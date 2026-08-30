@@ -2,6 +2,7 @@ package com.mobiledivecontrol.ui.camera
 
 import android.view.ViewGroup
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,12 +26,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.LifecycleOwner
 import com.mobiledivecontrol.core.CameraState
 import com.mobiledivecontrol.core.CameraCommand
+import com.mobiledivecontrol.core.CameraModeId
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.theme.DiveColors
@@ -40,6 +44,7 @@ fun StateDrivenCameraPreview(
     lifecycleOwner: LifecycleOwner,
     cameraState: CameraState,
     safetyState: SafetyState,
+    locationPrerequisitesReady: Boolean = false,
     effects: List<PlatformEffect>,
     onEffectsConsumed: () -> Unit,
     onDetectedLenses: ((List<String>) -> Unit)? = null,
@@ -53,19 +58,29 @@ fun StateDrivenCameraPreview(
     val context = LocalContext.current
     val controller = remember(context) { CameraRuntimeController(context) }
     var cameraReady by remember { mutableStateOf(false) }
+    val panoramaPreview = cameraState.activeMode == CameraModeId.Panorama
+    val panoramaViewfinderFrame by PanoramaCaptureState.viewfinderFrame
 
-    val previewView = remember {
+    val previewView = remember(context, panoramaPreview) {
         PreviewView(context).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
-            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+            // Panorama is composited with a Compose alignment/strip overlay. TextureView-backed
+            // COMPATIBLE mode keeps the camera image in that same visible layer; the S24's
+            // SurfaceView path could leave the overlay alive over a black full-screen surface.
+            implementationMode = if (panoramaPreview) {
+                PreviewView.ImplementationMode.COMPATIBLE
+            } else {
+                PreviewView.ImplementationMode.PERFORMANCE
+            }
             scaleType = PreviewView.ScaleType.FILL_CENTER
         }
     }
 
     DisposableEffect(lifecycleOwner, previewView) {
+        cameraReady = false
         controller.attach(
             previewView = previewView,
             lifecycleOwner = lifecycleOwner,
@@ -85,7 +100,7 @@ fun StateDrivenCameraPreview(
         }
     }
 
-    LaunchedEffect(cameraState, safetyState, headingDegrees) {
+    LaunchedEffect(cameraState, safetyState, headingDegrees, locationPrerequisitesReady) {
         controller.applyState(
             cameraState = cameraState,
             waterPressureKpa = safetyState.waterPressureKpa,
@@ -127,6 +142,25 @@ fun StateDrivenCameraPreview(
                     }
                 ),
         )
+
+        // On this S24, CameraX can keep Panorama's RGBA analysis stream alive while its separate
+        // Preview surface renders black. Display the same continuously updating camera frames
+        // used by the stitcher as the full-screen viewfinder, so the guide is never presented
+        // over a black field and its motion always agrees with the captured source.
+        if (panoramaPreview) {
+            panoramaViewfinderFrame
+                ?.takeUnless(android.graphics.Bitmap::isRecycled)
+                ?.let { frame ->
+                    Image(
+                        bitmap = frame.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clipToBounds(),
+                    )
+                }
+        }
 
         if (!cameraReady) {
             Box(

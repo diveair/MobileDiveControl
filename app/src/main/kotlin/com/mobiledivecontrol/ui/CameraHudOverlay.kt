@@ -159,7 +159,7 @@ fun CameraHudOverlay(
             abs(turn) < TARGET_HEADING_SYNC_TOLERANCE_DEGREES
         } == true
 
-        if (cameraDiveReadoutVisible(state.mode)) {
+        if (cameraDiveReadoutVisible(state.mode, state.camera)) {
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -361,7 +361,8 @@ internal fun cameraReadoutBottomPadding(mode: AppMode, camera: CameraState) = wh
     else -> 28.dp
 }
 
-internal fun cameraDiveReadoutVisible(mode: AppMode): Boolean = mode != AppMode.Gallery
+internal fun cameraDiveReadoutVisible(mode: AppMode, camera: CameraState): Boolean =
+    mode != AppMode.Gallery && !camera.panoramaReviewAvailable
 
 /** The selected file resolution, or the photo pixel count when that mode has no size selector. */
 internal fun currentCameraResolutionLabel(camera: CameraState): String? {

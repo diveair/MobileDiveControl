@@ -56,26 +56,39 @@ object CameraCatalog {
     val primaryRailEntries: List<CameraRailEntry> = listOf(
         // An overlay action, not a capture mode: it never tears down or rebinds CameraX.
         CameraRailEntry("track_heading", "Track Heading", action = CameraRailAction.TrackHeading),
-        // Samsung Camera 16.5.02.36 on the reference Galaxy S24 exposes these three modes on
-        // its primary rail, followed by the modes in More. Keep this list tied to what is
-        // actually installed. Expert RAW remains a download tile in Samsung Camera on this
-        // phone, but DiveControl owns an integrated Expert RAW profile, so it remains reachable
-        // from the housing even when Samsung's separate package is absent.
+        // Capture modes use the same circular order as the centred Mode control. The two action
+        // entries remain outside that capture loop so Diagnostics can still be the final item.
+        CameraRailEntry("pro_video", "Pro Video", CameraModeId.ProVideo),
+        CameraRailEntry("slow_motion", "Slow Motion", CameraModeId.SlowMotion),
+        CameraRailEntry("hyperlapse", "Hyperlapse", CameraModeId.Hyperlapse),
+        CameraRailEntry("video", "Video", CameraModeId.Video),
+        CameraRailEntry("portrait_video", "Portrait Video", CameraModeId.PortraitVideo),
         CameraRailEntry("photo", "Photo", CameraModeId.Photo),
         CameraRailEntry("portrait", "Portrait", CameraModeId.Portrait),
-        CameraRailEntry("video", "Video", CameraModeId.Video),
-        CameraRailEntry("pro", "Pro", CameraModeId.Pro),
-        CameraRailEntry("expert_raw", "Expert RAW", CameraModeId.ExpertRaw),
         CameraRailEntry("food", "Food", CameraModeId.Food),
         CameraRailEntry("night", "Night", CameraModeId.Night),
+        CameraRailEntry("expert_raw", "Expert RAW", CameraModeId.ExpertRaw),
+        CameraRailEntry("pro", "Pro", CameraModeId.Pro),
         CameraRailEntry("panorama", "Panorama", CameraModeId.Panorama),
-        CameraRailEntry("pro_video", "Pro Video", CameraModeId.ProVideo),
-        CameraRailEntry("hyperlapse", "Hyperlapse", CameraModeId.Hyperlapse),
-        CameraRailEntry("slow_motion", "Slow Motion", CameraModeId.SlowMotion),
-        CameraRailEntry("portrait_video", "Portrait Video", CameraModeId.PortraitVideo),
         // A state screen rather than a capture profile. Keeping it as an action avoids inventing
         // a camera mode with fake lenses/settings while still placing it last in the Modes menu.
         CameraRailEntry("diagnostics", "Diagnostics", action = CameraRailAction.Diagnostics),
+    )
+
+    /** Circular order used by Up/Down while the centred Mode control is selected. */
+    val centerModeCycle: List<CameraModeId> = listOf(
+        CameraModeId.ProVideo,
+        CameraModeId.SlowMotion,
+        CameraModeId.Hyperlapse,
+        CameraModeId.Video,
+        CameraModeId.PortraitVideo,
+        CameraModeId.Photo,
+        CameraModeId.Portrait,
+        CameraModeId.Food,
+        CameraModeId.Night,
+        CameraModeId.ExpertRaw,
+        CameraModeId.Pro,
+        CameraModeId.Panorama,
     )
 
     val secondaryModes: List<CameraModeId> = emptyList()
@@ -311,6 +324,14 @@ object CameraCatalog {
             return spec.copy(options = kept, defaultValue = default)
         }
         return when {
+            // Hyperlapse keeps the Pro-style focus tile on its rail across lens changes. The
+            // state-aware value and reducer expose it as Fixed on an actuator-less 0.6x lens,
+            // then restore the same manual ladder when a focus-capable lens is selected.
+            spec.id in setOf(
+                "hyperlapse.manual_focus",
+                "hyperlapse.focus_peaking",
+                "hyperlapse.focus_curve",
+            ) -> spec
             spec.id.endsWith(".manual_focus") ->
                 if (caps?.manualFocusSupported == false) null else spec
             spec.id.endsWith(".iso") && caps?.isoMin != null && caps.isoMax != null ->
@@ -355,12 +376,24 @@ object CameraCatalog {
                         (spec.id == "slow_motion.frame_rate" && fps == 48 && 60 in rates)
                 }
             }
+            spec.id == "hyperlapse.resolution" ->
+                // Hyperlapse is recorded by Camera2TimeLapseRecorder, not CameraX Recorder.
+                // CameraX's quality probe can report only one quality for a physical lens even
+                // though that lens exposes both 1920x1080 and 3840x2160 MediaRecorder streams.
+                // Keep the two native Hyperlapse sizes owned by the direct-recorder profile.
+                spec
             spec.id.endsWith(".resolution") && !caps?.availableVideoResolutions.isNullOrEmpty() ->
                 // Keep every resolution exposed for the selected camera. If the current FPS is
                 // incompatible, the reducer moves it to the closest supported rate as the user
                 // selects this resolution; hiding valid resolutions made the menu look incomplete.
                 clip { option -> option in caps!!.availableVideoResolutions }
             spec.id.endsWith(".video_stabilization") && caps?.videoStabilizationSupported == false -> null
+            spec.id in setOf("expert.save_format", "pro.save_format") &&
+                caps?.rawCaptureSupported == false ->
+                clip { option -> "RAW" !in option }
+            spec.id in setOf("expert.save_format", "pro.save_format") &&
+                caps?.rawJpegCaptureSupported == false ->
+                clip { option -> option != "RAW + JPEG" }
             spec.id.endsWith(".save_format") && caps?.ultraHdrJpegSupported == false ->
                 clip { option -> option != "Ultra HDR JPEG" }
             // No .white_balance branch by design: kelvin WB is applied app-side through
@@ -567,9 +600,19 @@ object CameraCatalog {
      *
      *   [Options] · Lens · Exposure · Shutter · ISO · [MODE] · Focus · WB · Slider · Gallery
      *
-     * Every other mode setting lives in [optionsMenuSettings]. Keeping the two collections
-     * independent is deliberate: opening the vertical Options panel must never reflow this bar,
-     * move its cursor, or replace controls the diver is operating by muscle memory.
+     * Panorama keeps its complete capture surface visible around the mode token:
+     *
+     *   Sound · HDR/LOG · Lens · [PANORAMA] · EV · Zoom · Guides · Gallery
+     *
+     * Hyperlapse and the native-style compact modes keep their capture controls on the
+     * housing-navigable rail. Modes whose complete top-level catalog fits do not retain a
+     * redundant Options tile; Video keeps it for its four secondary processing choices.
+     *
+     *   Flash · Guides · Day/Night · Lens · Duration · EV · [HYPERLAPSE] · Focus · Speed · Resolution · Format · Gallery
+     *
+     * [optionsMenuSettings] is derived from the actual bar setting IDs. Opening the vertical
+     * Options panel therefore never reflows this bar, moves its cursor, or duplicates controls
+     * the diver is operating by muscle memory.
      */
     fun settingsBarItems(
         mode: CameraModeId,
@@ -585,11 +628,42 @@ object CameraCatalog {
             allSettings.firstOrNull { spec -> suffixes.any { spec.id.endsWith(it) } }
 
         val lens = find(".lens") ?: synthesizedLensSpec(mode, variant, detectedLenses)
-        val ev = find(".exposure_value", ".exposure_compensation")
+        val flash = find(".flash")
+        val resolution = find(".resolution")
+        val ev = find(".exposure_value", ".exposure_compensation", ".exposure")
         val shutter = find(".shutter_speed")
         val iso = find(".iso")
         val focus = find(".manual_focus")
+        val focusMode = find(".focus_mode")
         val wb = find(".white_balance")
+        val guides = find(".guides", ".grid")
+        val hdr = find(".hdr")
+        val log = find(".log")
+        val frameRate = find(".frame_rate")
+        val videoFormat = find(".video_format")
+        val stabilization = find(".video_stabilization")
+        val audioRecording = find(".audio_recording")
+        val aspectRatio = find(".aspect_ratio")
+        val timer = find(".timer")
+        val filters = find(".filters")
+        val megapixels = find(".megapixels")
+        val saveFormat = find(".save_format")
+        val motionPhoto = find(".motion_photo")
+        val captureTime = find(".capture_time")
+        val colorTemperature = find(".color_temperature")
+        val radialBlur = find(".radial_blur")
+        val backgroundEffect = find(".background_effect")
+        val effectStrength = find(".effect_strength")
+        val beauty = find(".beauty")
+        val lighting = find(".lighting")
+        val panoramaDynamicRange = if (mode == CameraModeId.Panorama) find(".hdr_log") else null
+        val panoramaGuides = if (mode == CameraModeId.Panorama) guides else null
+        val panoramaShutterSound = if (mode == CameraModeId.Panorama) find(".shutter_sound") else null
+        val proGuides = if (mode == CameraModeId.Pro) guides else null
+        val hyperlapseRecordingTime = if (mode == CameraModeId.Hyperlapse) find(".recording_time") else null
+        val hyperlapseDayNight = if (mode == CameraModeId.Hyperlapse) find(".day_night") else null
+        val hyperlapseGuides = if (mode == CameraModeId.Hyperlapse) guides else null
+        val hyperlapseVideoFormat = if (mode == CameraModeId.Hyperlapse) videoFormat else null
         // Slow Motion FPS and Hyperlapse frame interval are the cadence controls a diver must be
         // able to reach without opening the long Options list. Both use the same housing Up/Down
         // editor path as every other quick control.
@@ -599,18 +673,185 @@ object CameraCatalog {
             else -> null
         }
 
-        val spine = listOfNotNull(lens, ev, shutter, iso, priorityFrameRate, focus, wb)
+        val spine = listOfNotNull(
+            lens,
+            ev,
+            shutter,
+            iso,
+            priorityFrameRate,
+            focus,
+            wb,
+            panoramaDynamicRange,
+            panoramaGuides,
+            panoramaShutterSound,
+            proGuides,
+            hyperlapseRecordingTime,
+            hyperlapseDayNight,
+            hyperlapseGuides,
+        )
         val extras = allSettings.filter { it !in spine }
         val slider = sliderAssignmentSpec(mode, allSettings)
+
+        if (mode == CameraModeId.Panorama) {
+            return buildList {
+                panoramaShutterSound?.let { add(BottomBarItem.Setting(it)) }
+                panoramaDynamicRange?.let { add(BottomBarItem.Setting(it)) }
+                lens?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.ModesButton)
+                ev?.let { add(BottomBarItem.Setting(it)) }
+                // Panorama has no manual focus/ISO/shutter target, so this assignment is Zoom.
+                add(BottomBarItem.Setting(slider))
+                panoramaGuides?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.GalleryShortcut)
+            }
+        }
+
+        if (mode == CameraModeId.Hyperlapse) {
+            return buildList {
+                flash?.let { add(BottomBarItem.Setting(it)) }
+                hyperlapseGuides?.let { add(BottomBarItem.Setting(it)) }
+                hyperlapseDayNight?.let { add(BottomBarItem.Setting(it)) }
+                lens?.let { add(BottomBarItem.Setting(it)) }
+                hyperlapseRecordingTime?.let { add(BottomBarItem.Setting(it)) }
+                // Balance the rail around its fixed mode token so every control remains
+                // visible at the right edge on the S24's landscape viewport.
+                ev?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.ModesButton)
+                // Match Pro: Focus is the first control immediately to the right of the mode.
+                focus?.let { add(BottomBarItem.Setting(it)) }
+                priorityFrameRate?.let { add(BottomBarItem.Setting(it)) }
+                resolution?.let { add(BottomBarItem.Setting(it)) }
+                hyperlapseVideoFormat?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.GalleryShortcut)
+            }
+        }
+
+        if (mode == CameraModeId.SlowMotion) {
+            return buildList {
+                flash?.let { add(BottomBarItem.Setting(it)) }
+                guides?.let { add(BottomBarItem.Setting(it)) }
+                hdr?.let { add(BottomBarItem.Setting(it)) }
+                lens?.let { add(BottomBarItem.Setting(it)) }
+                resolution?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.ModesButton)
+                ev?.let { add(BottomBarItem.Setting(it)) }
+                focusMode?.let { add(BottomBarItem.Setting(it)) }
+                frameRate?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.GalleryShortcut)
+            }
+        }
+
+        if (mode == CameraModeId.PortraitVideo) {
+            return buildList {
+                flash?.let { add(BottomBarItem.Setting(it)) }
+                guides?.let { add(BottomBarItem.Setting(it)) }
+                hdr?.let { add(BottomBarItem.Setting(it)) }
+                resolution?.let { add(BottomBarItem.Setting(it)) }
+                lens?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.ModesButton)
+                ev?.let { add(BottomBarItem.Setting(it)) }
+                focus?.let { add(BottomBarItem.Setting(it)) }
+                backgroundEffect?.let { add(BottomBarItem.Setting(it)) }
+                effectStrength?.let { add(BottomBarItem.Setting(it)) }
+                audioRecording?.let { add(BottomBarItem.Setting(it)) }
+                frameRate?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.GalleryShortcut)
+            }
+        }
+
+        if (mode == CameraModeId.Night) {
+            return buildList {
+                timer?.let { add(BottomBarItem.Setting(it)) }
+                guides?.let { add(BottomBarItem.Setting(it)) }
+                lens?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.ModesButton)
+                ev?.let { add(BottomBarItem.Setting(it)) }
+                captureTime?.let { add(BottomBarItem.Setting(it)) }
+                aspectRatio?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.GalleryShortcut)
+            }
+        }
+
+        if (mode == CameraModeId.Food) {
+            return buildList {
+                guides?.let { add(BottomBarItem.Setting(it)) }
+                radialBlur?.let { add(BottomBarItem.Setting(it)) }
+                colorTemperature?.let { add(BottomBarItem.Setting(it)) }
+                lens?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.ModesButton)
+                ev?.let { add(BottomBarItem.Setting(it)) }
+                aspectRatio?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.GalleryShortcut)
+            }
+        }
+
+        if (mode == CameraModeId.Portrait) {
+            return buildList {
+                flash?.let { add(BottomBarItem.Setting(it)) }
+                guides?.let { add(BottomBarItem.Setting(it)) }
+                timer?.let { add(BottomBarItem.Setting(it)) }
+                beauty?.let { add(BottomBarItem.Setting(it)) }
+                lens?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.ModesButton)
+                ev?.let { add(BottomBarItem.Setting(it)) }
+                backgroundEffect?.let { add(BottomBarItem.Setting(it)) }
+                effectStrength?.let { add(BottomBarItem.Setting(it)) }
+                lighting?.let { add(BottomBarItem.Setting(it)) }
+                aspectRatio?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.GalleryShortcut)
+            }
+        }
+
+        if (mode == CameraModeId.Photo) {
+            return buildList {
+                flash?.let { add(BottomBarItem.Setting(it)) }
+                guides?.let { add(BottomBarItem.Setting(it)) }
+                timer?.let { add(BottomBarItem.Setting(it)) }
+                motionPhoto?.let { add(BottomBarItem.Setting(it)) }
+                saveFormat?.let { add(BottomBarItem.Setting(it)) }
+                lens?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.ModesButton)
+                ev?.let { add(BottomBarItem.Setting(it)) }
+                focus?.let { add(BottomBarItem.Setting(it)) }
+                megapixels?.let { add(BottomBarItem.Setting(it)) }
+                aspectRatio?.let { add(BottomBarItem.Setting(it)) }
+                filters?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.GalleryShortcut)
+            }
+        }
+
+        if (mode == CameraModeId.Video) {
+            return buildList {
+                // Auto FPS, Super Steady, aspect ratio and filters remain in Options. Everything
+                // needed to define and monitor the recording itself stays on the housing rail.
+                add(BottomBarItem.MoreSettings)
+                flash?.let { add(BottomBarItem.Setting(it)) }
+                guides?.let { add(BottomBarItem.Setting(it)) }
+                hdr?.let { add(BottomBarItem.Setting(it)) }
+                log?.let { add(BottomBarItem.Setting(it)) }
+                lens?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.ModesButton)
+                ev?.let { add(BottomBarItem.Setting(it)) }
+                frameRate?.let { add(BottomBarItem.Setting(it)) }
+                resolution?.let { add(BottomBarItem.Setting(it)) }
+                videoFormat?.let { add(BottomBarItem.Setting(it)) }
+                stabilization?.let { add(BottomBarItem.Setting(it)) }
+                audioRecording?.let { add(BottomBarItem.Setting(it)) }
+                add(BottomBarItem.GalleryShortcut)
+            }
+        }
 
         return buildList {
             if (extras.isNotEmpty()) {
                 add(BottomBarItem.MoreSettings)
             }
-            listOfNotNull(lens, ev, shutter, iso, priorityFrameRate).forEach { add(BottomBarItem.Setting(it)) }
+            listOfNotNull(lens, ev, shutter, iso, priorityFrameRate)
+                .forEach { add(BottomBarItem.Setting(it)) }
             add(BottomBarItem.ModesButton)
-            listOfNotNull(focus, wb).forEach { add(BottomBarItem.Setting(it)) }
+            listOfNotNull(focus, wb)
+                .forEach { add(BottomBarItem.Setting(it)) }
             add(BottomBarItem.Setting(slider))
+            proGuides?.let { add(BottomBarItem.Setting(it)) }
             add(BottomBarItem.GalleryShortcut)
         }
     }
@@ -632,19 +873,17 @@ object CameraCatalog {
      */
     fun optionsMenuSettings(camera: CameraState): List<CameraSettingSpec> {
         val allSettings = settingsFor(camera)
-        fun isHorizontalSpine(spec: CameraSettingSpec): Boolean =
-            spec.id.endsWith(".lens") ||
-                spec.id.endsWith(".exposure_value") ||
-                spec.id.endsWith(".exposure_compensation") ||
-                spec.id.endsWith(".shutter_speed") ||
-                spec.id.endsWith(".iso") ||
-                spec.id.endsWith(".manual_focus") ||
-                spec.id.endsWith(".white_balance") ||
-                spec.id.endsWith(".focus_peaking") ||
-                spec.id.endsWith(".focus_curve") ||
-                (camera.activeMode == CameraModeId.SlowMotion && spec.id.endsWith(".frame_rate"))
-
-        val extras = allSettings.filterNot(::isHorizontalSpine)
+        val horizontalIds = settingsBarItems(camera)
+            .filterIsInstance<BottomBarItem.Setting>()
+            .mapTo(mutableSetOf()) { it.spec.id }
+        // Focus Assist and Focus Curve are edited inside the expanded Focus card and therefore
+        // remain fully reachable without consuming two duplicate quick-bar or Options entries.
+        if (horizontalIds.any { it.endsWith(".manual_focus") }) {
+            allSettings
+                .filter { it.id.endsWith(".focus_peaking") || it.id.endsWith(".focus_curve") }
+                .mapTo(horizontalIds) { it.id }
+        }
+        val extras = allSettings.filterNot { it.id in horizontalIds }
         if (camera.activeMode !in setOf(CameraModeId.Pro, CameraModeId.ProVideo)) return extras
 
         val locations = camera.recordingSaveLocations.ifEmpty { listOf(RecordingSaveLocation.Default) }
@@ -718,8 +957,20 @@ object CameraCatalog {
 
     fun currentValue(camera: CameraState, spec: CameraSettingSpec): String {
         if (spec.id.endsWith(".save_location")) return camera.recordingSaveLocation.name
+        // Old builds persisted selections for catalog-only Samsung features. Never feed one of
+        // those stale values back into the HUD or runtime after the control is classified as
+        // unavailable; the supported baseline is the only truthful current value.
+        if (spec.status == CameraFeatureStatus.Unavailable) return spec.defaultValue
         val value = camera.settingValues[spec.id] ?: spec.defaultValue
-        return if (spec.id.endsWith(".grid") || spec.id.endsWith(".guides")) {
+        return if (
+            spec.id == "hyperlapse.manual_focus" &&
+            camera.settingValues["hyperlapse.lens"] == "0.6x"
+        ) {
+            "Fixed"
+        } else if (spec.id == "hyperlapse.manual_focus" && value !in spec.options) {
+            // Migrate the former read-only "Fixed" value to the Pro-style AF default.
+            spec.defaultValue
+        } else if (spec.id.endsWith(".grid") || spec.id.endsWith(".guides")) {
             canonicalGuideValue(value)
         } else if (spec.id == "pro_video.frame_rate" && '/' !in value) {
             captureFrameRateFps(value)
@@ -990,7 +1241,7 @@ object CameraCatalog {
                     "File",
                     listOf("JPEG", "HEIF"),
                     "JPEG",
-                    CameraFeatureStatus.NeedsVerification,
+                    CameraFeatureStatus.Unavailable,
                     "HEIF output needs the Samsung vendor capture pipeline.",
                 ),
                 choice("photo.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3"),
@@ -999,7 +1250,7 @@ object CameraCatalog {
                     "photo.motion_photo",
                     "Motion photo",
                     "Core",
-                    status = CameraFeatureStatus.NeedsVerification,
+                    status = CameraFeatureStatus.Unavailable,
                     note = "Motion Photo packaging needs the Samsung vendor capture pipeline.",
                 ),
                 choice("photo.lens", "Lens", "Core", lenses, "Auto"),
@@ -1036,7 +1287,7 @@ object CameraCatalog {
                 "Portrait",
                 listOf("Blur", "Studio", "High-key mono", "Low-key mono", "Backdrop", "Color point"),
                 "Blur",
-                CameraFeatureStatus.NeedsVerification,
+                CameraFeatureStatus.Unavailable,
                 "Samsung computational portrait effects are vendor-only.",
             ),
             slider(
@@ -1045,7 +1296,7 @@ object CameraCatalog {
                 "Portrait",
                 (0..7).map(Int::toString),
                 "4",
-                CameraFeatureStatus.NeedsVerification,
+                CameraFeatureStatus.Unavailable,
                 "The native eight-step control is catalogued; rendering is vendor-only.",
                 supportsSensitivity = false,
             ),
@@ -1055,7 +1306,7 @@ object CameraCatalog {
                 "Portrait",
                 listOf("Off") + (1..8).map(Int::toString),
                 "Off",
-                CameraFeatureStatus.NeedsVerification,
+                CameraFeatureStatus.Unavailable,
                 "Samsung face-retouch processing is vendor-only.",
             ),
             slider(
@@ -1064,7 +1315,7 @@ object CameraCatalog {
                 "Portrait",
                 (0..7).map(Int::toString),
                 "4",
-                CameraFeatureStatus.NeedsVerification,
+                CameraFeatureStatus.Unavailable,
                 "The native eight-step lighting control is catalogued; rendering is vendor-only.",
                 supportsSensitivity = false,
             ),
@@ -1088,16 +1339,16 @@ object CameraCatalog {
                 "Food",
                 (-4..4).map { if (it > 0) "+$it" else it.toString() },
                 "0",
-                CameraFeatureStatus.NeedsVerification,
+                CameraFeatureStatus.Confirmed,
                 "Mapped onto DiveControl's calibrated 3200K-6800K white-balance renderer.",
                 supportsSensitivity = false,
             ),
-            toggle(
-                "food.radial_blur",
-                "Blur effect",
-                "Food",
-                "On",
-                CameraFeatureStatus.NeedsVerification,
+                toggle(
+                    "food.radial_blur",
+                    "Blur effect",
+                    "Food",
+                    "Off",
+                CameraFeatureStatus.Unavailable,
                 "The movable food focus area is a Samsung computational effect.",
             ),
             slider("food.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
@@ -1143,8 +1394,8 @@ object CameraCatalog {
                     "Expert RAW Labs",
                     virtualApertureOptions,
                     "F16.0",
-                    CameraFeatureStatus.NeedsVerification,
-                    "Control surface for Samsung's 22-step F1.4-F16 software depth-of-field feature; rendering requires compatible vendor support.",
+                    CameraFeatureStatus.Confirmed,
+                    "Applies a graduated computational depth-of-field effect to the JPEG companion; the sensor DNG remains untouched.",
                     supportsSensitivity = false,
                 ),
                 choice(
@@ -1153,8 +1404,8 @@ object CameraCatalog {
                     "Expert RAW Labs",
                     listOf("Off", "2 stops", "4 stops", "6 stops", "8 stops", "10 stops"),
                     "Off",
-                    CameraFeatureStatus.NeedsVerification,
-                    "Samsung's multi-frame virtual ND rendering is vendor-only.",
+                    CameraFeatureStatus.Confirmed,
+                    "Accumulates and averages a stop-scaled frame sequence to create real motion smoothing without a colour cast.",
                 ),
                 choice(
                     "expert.astrophotography",
@@ -1162,29 +1413,29 @@ object CameraCatalog {
                     "Expert RAW Labs",
                     listOf("Off", "4 min", "7 min", "10 min"),
                     "Off",
-                    CameraFeatureStatus.NeedsVerification,
-                    "Long multi-frame stacking and Sky Guide are supplied by Samsung's Expert RAW engine.",
+                    CameraFeatureStatus.Confirmed,
+                    "Captures and averages registered samples across the selected real duration for lower noise and stronger star detail.",
                 ),
                 toggle(
                     "expert.sky_guide",
                     "Sky Guide",
                     "Expert RAW Labs",
-                    status = CameraFeatureStatus.NeedsVerification,
-                    note = "Samsung's constellation overlay is vendor-only.",
+                    status = CameraFeatureStatus.Confirmed,
+                    note = "Shows a live heading-and-attitude sky reference with constellation linework while Astrophoto is active.",
                 ),
                 toggle(
                     "expert.astro_portrait",
                     "Astro Portrait",
                     "Expert RAW Labs",
-                    status = CameraFeatureStatus.NeedsVerification,
-                    note = "Samsung's subject-and-sky multi-frame compositing is vendor-only.",
+                    status = CameraFeatureStatus.Confirmed,
+                    note = "Captures a flash-lit subject frame and combines it with a long stacked sky sequence.",
                 ),
                 toggle(
                     "expert.multi_exposure",
                     "Multi Exposures",
                     "Expert RAW Labs",
-                    status = CameraFeatureStatus.NeedsVerification,
-                    note = "Samsung's RAW multi-frame compositor is vendor-only.",
+                    status = CameraFeatureStatus.Confirmed,
+                    note = "Combines two to nine real captures using Add, Average, Bright, or Dark pixel blending.",
                 ),
                 choice(
                     "expert.multi_exposure_shutter",
@@ -1192,8 +1443,8 @@ object CameraCatalog {
                     "Expert RAW Labs",
                     listOf("Continuous", "Manual"),
                     "Manual",
-                    CameraFeatureStatus.NeedsVerification,
-                    "Used when Multi Exposures is enabled.",
+                    CameraFeatureStatus.Confirmed,
+                    "Continuous captures the sequence automatically; Manual advances one exposure per shutter press.",
                 ),
                 choice(
                     "expert.multi_exposure_overlay",
@@ -1201,8 +1452,8 @@ object CameraCatalog {
                     "Expert RAW Labs",
                     listOf("Add", "Average", "Bright", "Dark"),
                     "Average",
-                    CameraFeatureStatus.NeedsVerification,
-                    "Used when Multi Exposures is enabled.",
+                    CameraFeatureStatus.Confirmed,
+                    "Selects the pixel compositor used for the completed multi-exposure image.",
                 ),
                 slider(
                     "expert.multi_exposure_frames",
@@ -1210,15 +1461,15 @@ object CameraCatalog {
                     "Expert RAW Labs",
                     (2..9).map(Int::toString),
                     "2",
-                    CameraFeatureStatus.NeedsVerification,
-                    "Samsung Expert RAW combines up to nine exposures.",
+                    CameraFeatureStatus.Confirmed,
+                    "Sets the real capture count from two through nine frames.",
                     supportsSensitivity = false,
                 ),
                 toggle(
                     "expert.ocean_mode",
                     "Ocean Mode",
                     "Expert RAW Labs",
-                    status = CameraFeatureStatus.NeedsVerification,
+                    status = CameraFeatureStatus.Confirmed,
                     note = "Uses DiveControl's live underwater white-balance estimator; Samsung's lens-distortion correction remains vendor-only.",
                 ),
                 slider(
@@ -1227,7 +1478,7 @@ object CameraCatalog {
                     "Ocean Mode",
                     (-4..4).map { if (it > 0) "+$it" else it.toString() },
                     "0",
-                    CameraFeatureStatus.NeedsVerification,
+                    CameraFeatureStatus.Confirmed,
                     "Fine-tunes the underwater colour balance while Ocean Mode is on.",
                     supportsSensitivity = false,
                 ),
@@ -1237,8 +1488,8 @@ object CameraCatalog {
                     "Ocean Mode",
                     listOf("Off", "2s", "5s", "10s"),
                     "Off",
-                    CameraFeatureStatus.NeedsVerification,
-                    "Samsung Ocean Mode interval shooting; DiveControl currently keeps housing shutter control manual.",
+                    CameraFeatureStatus.Confirmed,
+                    "The first shutter starts repeated Ocean captures at this interval; the next shutter stops the sequence.",
                 ),
             ),
         )
@@ -1271,8 +1522,8 @@ object CameraCatalog {
                     "File",
                     listOf("JPEG", "RAW + JPEG"),
                     "JPEG",
-                    CameraFeatureStatus.NeedsVerification,
-                    "RAW output needs the Samsung vendor capture pipeline.",
+                    CameraFeatureStatus.Confirmed,
+                    "RAW + JPEG writes a sensor DNG and full-quality JPEG from one exposure when the active lens reports CameraX RAW_JPEG support.",
                 ),
                 choice(
                     "pro.aspect_ratio",
@@ -1296,8 +1547,8 @@ object CameraCatalog {
                     "Creative",
                     virtualApertureOptions,
                     "F16.0",
-                    CameraFeatureStatus.NeedsVerification,
-                    "Control surface for virtual depth of field; the phone's physical aperture does not change and rendering requires compatible support.",
+                    CameraFeatureStatus.Confirmed,
+                    "Applies computational depth of field to the JPEG output; the physical lens and paired DNG remain unchanged.",
                     supportsSensitivity = false,
                 ),
                 *metadataSettings("pro").toTypedArray(),
@@ -1311,21 +1562,26 @@ object CameraCatalog {
         captureType = CameraCaptureType.Photo,
         availableLenses = listOf("0.6x", "1x"),
         availableResolutions = listOf("Auto"),
-        availableAssistTools = listOf("Guidelines", "Grid"),
+        availableExposureControls = listOf("Exposure value"),
+        availableAssistTools = listOf("Guides", "HDR / LOG"),
         settings = listOf(
             choice("panorama.lens", "Lens", "Core", listOf("0.6x", "1x"), "1x"),
-            choice(
-                "panorama.direction",
-                "Sweep direction",
-                "Core",
-                listOf("Auto", "Left", "Right", "Up", "Down"),
-                "Auto",
-                CameraFeatureStatus.Confirmed,
-                "Auto detects the first horizontal or vertical sweep, matching Samsung Panorama.",
-            ),
-            toggle("panorama.guide", "Panorama guide", "Assist", "On"),
             slider("panorama.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+            choice(
+                "panorama.hdr_log",
+                "HDR / LOG",
+                "Dynamic range",
+                listOf("Off", "HDR", "LOG"),
+                "HDR",
+            ),
             choice("panorama.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
+            toggle(
+                "panorama.shutter_sound",
+                "Shutter sound",
+                "Capture",
+                defaultValue = "Off",
+                note = "Optional audible cue when Panorama capture starts and stops.",
+            ),
         ),
     )
 
@@ -1350,7 +1606,7 @@ object CameraCatalog {
                     "Night",
                     listOf("Auto", "Max"),
                     "Auto",
-                    CameraFeatureStatus.NeedsVerification,
+                    CameraFeatureStatus.Unavailable,
                     "Samsung's multi-frame Night exposure is vendor-only.",
                 ),
                 choice("night.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
@@ -1404,6 +1660,7 @@ object CameraCatalog {
             availableLenses = lenses,
             availableResolutions = listOf("FHD", "UHD 4K"),
             availableFrameRates = listOf("Night 45x", "Night 15x", "Auto", "5x", "10x", "15x", "30x", "60x"),
+            availableFormatOptions = listOf("H.264", "HEVC / H.265"),
             availableExposureControls = listOf("Exposure value", "Focus"),
             availableAssistTools = listOf("Day / Night", "Focus Assist", "Grid"),
             settings = listOf(
@@ -1411,6 +1668,15 @@ object CameraCatalog {
                 choice("hyperlapse.resolution", "Video size", "Core", listOf("FHD", "UHD 4K"), "FHD"),
                 choice("hyperlapse.lens", "Lens", "Core", lenses, "1x"),
                 slider("hyperlapse.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+                choice(
+                    "hyperlapse.video_format",
+                    "Video format",
+                    "File",
+                    listOf("H.264", "HEVC / H.265"),
+                    "HEVC / H.265",
+                    CameraFeatureStatus.Confirmed,
+                    "HEVC and H.265 are two names for the same codec; this selects Android's HEVC encoder.",
+                ),
                 choice(
                     "hyperlapse.recording_time",
                     "Recording time",
@@ -1433,8 +1699,8 @@ object CameraCatalog {
                     "Core",
                     listOf("Day", "Night"),
                     "Day",
-                    CameraFeatureStatus.NeedsVerification,
-                    "Samsung's night time-lapse processing is vendor-only.",
+                    CameraFeatureStatus.Confirmed,
+                    "Night uses the camera's public NIGHT scene when available and a low-light AE/noise-reduction fallback otherwise.",
                 ),
                 slider("hyperlapse.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("hyperlapse.focus_peaking", "Focus Assist", "Assist"),
@@ -1446,7 +1712,7 @@ object CameraCatalog {
 
     private fun videoProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
-        val resolutions = listOf("8K", "UHD 4K", "FHD", "HD 720p", "QHD")
+        val resolutions = listOf("8K", "UHD 4K", "FHD", "HD 720p", "SD 480p")
         val frameRates = listOf("30fps", "60fps")
         return CameraModeProfile(
             mode = CameraModeId.Video,
@@ -1465,8 +1731,8 @@ object CameraCatalog {
                     "Core",
                     resolutions,
                     "UHD 4K",
-                    CameraFeatureStatus.NeedsVerification,
-                    "8K uses a capability-gated Samsung Camera2 + HEVC path; Super Steady QHD remains vendor-only.",
+                    CameraFeatureStatus.Confirmed,
+                    "Every entry is capability-gated; 8K uses the verified Camera2 + HEVC path.",
                 ),
                 choice("video.frame_rate", "Frame rate", "Core", frameRates, "30fps"),
                 choice("video.aspect_ratio", "Aspect ratio", "Core", videoAspectRatios(), "16:9"),
@@ -1481,7 +1747,7 @@ object CameraCatalog {
                     "Super Steady",
                     "Stabilization",
                     "Off",
-                    CameraFeatureStatus.NeedsVerification,
+                    CameraFeatureStatus.Unavailable,
                     "Standard stabilization is applied; Samsung's wide-crop Super Steady path is vendor-only.",
                 ),
                 choice("video.hdr", "HDR10+", "Dynamic range", listOf("Off", "On"), "Off"),
@@ -1571,22 +1837,22 @@ object CameraCatalog {
             choice("portrait_video.frame_rate", "Frame rate", "Core", listOf("30fps"), "30fps"),
             choice("portrait_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
             slider("portrait_video.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
-            choice(
-                "portrait_video.background_effect",
+                choice(
+                    "portrait_video.background_effect",
                 "Portrait Video Effects",
                 "Portrait",
                 listOf("Blur", "Big circle", "Colour point", "Glitch"),
                 "Blur",
-                CameraFeatureStatus.NeedsVerification,
+                    CameraFeatureStatus.Unavailable,
                 "Samsung computational portrait-video effects are vendor-only.",
             ),
-            slider(
-                "portrait_video.effect_strength",
+                slider(
+                    "portrait_video.effect_strength",
                 "Effect strength",
                 "Portrait",
                 (0..7).map(Int::toString),
                 "4",
-                CameraFeatureStatus.NeedsVerification,
+                    CameraFeatureStatus.Unavailable,
                 "The native eight-step control is catalogued; rendering is vendor-only.",
                 supportsSensitivity = false,
             ),
@@ -1620,22 +1886,22 @@ object CameraCatalog {
             choice("slow_motion.lens", "Lens", "Core", listOf("0.6x", "1x", "3x"), "1x"),
             choice("slow_motion.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
             slider("slow_motion.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
-            choice(
-                "slow_motion.focus_mode",
+                choice(
+                    "slow_motion.focus_mode",
                 "Focus",
                 "Manual",
                 listOf("Continuous AF", "Single AF"),
                 "Continuous AF",
-                CameraFeatureStatus.NeedsVerification,
+                    CameraFeatureStatus.Confirmed,
                 "Android constrained high-speed capture requires automatic 3A; this selects the supported AF behavior instead of exposing a dead manual-focus dial.",
             ),
-            choice(
-                "slow_motion.hdr",
+                choice(
+                    "slow_motion.hdr",
                 "HDR",
                 "Dynamic range",
                 listOf("Off", "On"),
                 "Off",
-                CameraFeatureStatus.NeedsVerification,
+                    CameraFeatureStatus.Unavailable,
                 "Public Android high-speed sessions record SDR; On is available only if a device vendor path accepts high-speed HDR.",
             ),
             choice("slow_motion.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
@@ -1696,7 +1962,7 @@ object CameraCatalog {
         availableResolutions = listOf("Hidden"),
         unavailableSettings = listOf("This legacy mode is intentionally hidden from the housing UI."),
         settings = emptyList(),
-        status = CameraFeatureStatus.NeedsVerification,
+        status = CameraFeatureStatus.Unavailable,
     )
 
     private fun photoLenses(variant: GalaxyDeviceVariant): List<String> = when (variant) {
