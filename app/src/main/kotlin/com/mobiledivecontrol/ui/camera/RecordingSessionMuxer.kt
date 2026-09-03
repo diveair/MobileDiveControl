@@ -195,6 +195,45 @@ internal object RecordingSessionMuxer {
         runCatching { outputFile.delete() }
     }
 
+    /** Preserve every captured frame; changing the MP4 clock does not require decoding video. */
+    fun retimeHighSpeed(inputFile: File, outputFile: File, playbackFps: Double): Result<File> = runCatching {
+        require(playbackFps.isFinite() && playbackFps > 0)
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(inputFile.absolutePath)
+            val track = (0 until extractor.trackCount).first {
+                extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
+            }
+            val format = extractor.getTrackFormat(track)
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, playbackFps.roundToInt())
+            // The source duration belongs to the sensor clock, not the playback clock.
+            format.removeKey(MediaFormat.KEY_DURATION)
+            extractor.selectTrack(track)
+            val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            try {
+                val outputTrack = muxer.addTrack(format)
+                if (format.containsKey(MediaFormat.KEY_ROTATION)) muxer.setOrientationHint(format.getInteger(MediaFormat.KEY_ROTATION))
+                muxer.start()
+                val buffer = ByteBuffer.allocateDirect(COPY_BUFFER_BYTES)
+                val info = MediaCodec.BufferInfo()
+                var frames = 0L
+                while (true) {
+                    buffer.clear()
+                    val size = extractor.readSampleData(buffer, 0)
+                    if (size < 0) break
+                    info.set(0, size, (frames * 1_000_000.0 / playbackFps).toLong(), muxerSampleFlags(extractor.sampleFlags))
+                    muxer.writeSampleData(outputTrack, buffer, info)
+                    frames++
+                    if (!extractor.advance()) break
+                }
+                require(frames > 0) { "No high-speed frames captured" }
+                muxer.stop()
+                android.util.Log.i("DiveHighSpeed", "Lossless playback clock: frames=$frames playbackFps=$playbackFps durationUs=${frames * 1_000_000.0 / playbackFps}")
+            } finally { muxer.release() }
+        } finally { extractor.release() }
+        outputFile
+    }.onFailure { outputFile.delete() }
+
     fun publishPreparedFile(
         context: Context,
         preparedFile: File,

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeViewFocused|typeViewAccessibilityFocused"
-    android:packageNames="android,com.android.permissioncontroller,com.google.android.permissioncontroller,com.samsung.android.permissioncontroller,com.android.systemui"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeWindowContentChanged|typeViewFocused|typeViewAccessibilityFocused"
+    android:packageNames="android,com.android.permissioncontroller,com.google.android.permissioncontroller,com.samsung.android.permissioncontroller,com.android.systemui,com.android.settings"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:notificationTimeout="50"
     android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows"

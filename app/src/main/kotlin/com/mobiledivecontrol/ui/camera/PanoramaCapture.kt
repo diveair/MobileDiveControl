@@ -12,6 +12,7 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Shader
+import android.util.Log
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -46,7 +47,7 @@ internal enum class PanoramaWarningLevel { None, Low, High }
 internal enum class PanoramaCorrection { None, Up, Down, Left, Right }
 
 /**
- * Panorama is backed by CameraX's 8-bit RGBA analysis stream, not the video encoder's 10-bit
+ * Panorama is backed by CameraX's 8-bit YUV analysis stream, not the video encoder's 10-bit
  * dynamic-range surface. Keep its three user-visible looks explicit so the live viewfinder and
  * final JPEG use the same deterministic transform even when a lens ignores Samsung's HDR scene
  * request. LOG is therefore a flat, grading-oriented still profile rather than a claim that the
@@ -156,7 +157,7 @@ internal object PanoramaCaptureState {
     val progress: MutableState<Float> = mutableFloatStateOf(0f)
     val frameCount: MutableState<Int> = mutableIntStateOf(0)
     val movingTooFast: MutableState<Boolean> = mutableStateOf(false)
-    val direction: MutableState<String> = mutableStateOf("Right")
+    val direction: MutableState<String> = mutableStateOf("Auto")
     val directionLocked: MutableState<Boolean> = mutableStateOf(false)
     val message: MutableState<String> = mutableStateOf("")
     val crossAxisRadians: MutableState<Float> = mutableFloatStateOf(0f)
@@ -165,8 +166,7 @@ internal object PanoramaCaptureState {
     val correction: MutableState<PanoramaCorrection> =
         mutableStateOf(PanoramaCorrection.None)
     val canStop: MutableState<Boolean> = mutableStateOf(false)
-    /** Live analysis-backed viewfinder used when Samsung's secondary Preview surface is black. */
-    val viewfinderFrame: MutableState<Bitmap?> = mutableStateOf(null)
+    /** Cropped live frame shown only inside the idle chevron guide. */
     val referenceFrame: MutableState<Bitmap?> = mutableStateOf(null)
     val liveThumbnail: MutableState<Bitmap?> = mutableStateOf(null)
     /** Screen-sized rendering of the private stitched JPEG while Preview owns the viewfinder. */
@@ -179,14 +179,13 @@ internal object PanoramaCaptureState {
         progress.value = 0f
         frameCount.value = 0
         movingTooFast.value = false
-        direction.value = "Right"
+        direction.value = "Auto"
         directionLocked.value = false
         message.value = ""
         crossAxisRadians.value = 0f
         warningLevel.value = PanoramaWarningLevel.None
         correction.value = PanoramaCorrection.None
         canStop.value = false
-        viewfinderFrame.value = null
         referenceFrame.value = null
         liveThumbnail.value = null
         reviewBitmap.value = null
@@ -197,6 +196,8 @@ internal object PanoramaCaptureState {
 internal data class CapturedPanoramaFrame(
     val bitmap: Bitmap,
     val sweepRadians: Float,
+    /** Rotation in which [bitmap] is already physically upright. */
+    val physicalDisplayRotation: Int = 1,
 )
 
 /** A full-resolution keyframe persisted between capture and the bounded-memory stitch pass. */
@@ -213,6 +214,8 @@ internal data class StoredPanoramaFrame(
     val exposureTimeNs: Long? = null,
     /** Sampled edge energy used to retain the sharper frame in an overlap. */
     val sharpness: Double = 1.0,
+    /** Physical phone rotation (0/90/180/270), independent of the landscape-locked activity. */
+    val physicalDisplayRotation: Int = 1,
 )
 
 /** Placement of the current frame relative to the previous frame. */
@@ -221,6 +224,30 @@ internal data class PanoramaFrameOffset(
     val y: Int,
     val correlation: Double,
 )
+
+/**
+ * Scores an image-registration candidate against the gyro-predicted frame advance.
+ *
+ * The previous pixel-based penalty was effectively resolution-dependent: at the 320 px
+ * registration size, a visually convincing repeated edge could move a frame by half of its
+ * expected advance for a cost of only a few thousandths.  That is exactly how repeated blinds,
+ * railings, or shelves became duplicated bands in the finished panorama.  Expressing the error
+ * as a fraction of the expected motion keeps the prior equally strong at every working size while
+ * still allowing a high-confidence correlation peak to correct gyro/FOV error.
+ */
+internal fun panoramaRegistrationScore(
+    correlation: Double,
+    advance: Int,
+    expectedAdvance: Int,
+    crossDrift: Int,
+    maximumCrossDrift: Int,
+): Double {
+    if (!correlation.isFinite() || correlation < -0.999) return -1.0
+    val expected = expectedAdvance.coerceAtLeast(1)
+    val advanceError = abs(advance - expected).toDouble() / expected
+    val crossError = abs(crossDrift).toDouble() / maximumCrossDrift.coerceAtLeast(1)
+    return correlation - advanceError * 0.22 - crossError * 0.035
+}
 
 internal data class PanoramaProjectionSize(val width: Int, val height: Int)
 
@@ -254,12 +281,41 @@ internal fun panoramaSharpnessRetentionBias(
  * full-resolution frames remain owned by the final stitcher. Only newly revealed edge pixels are
  * appended, so updating this preview is bounded and never stalls CameraX's visible preview stream.
  */
+/** Angular extent of the centre crop used by the miniature, in the selected sweep axis. */
+internal fun panoramaThumbnailFov(
+    sourceWidth: Int,
+    sourceHeight: Int,
+    frameWidth: Int,
+    frameHeight: Int,
+    horizontal: Boolean,
+    horizontalFovRadians: Float,
+): Float {
+    val focal = maxOf(sourceWidth, sourceHeight) /
+        (2.0 * tan(horizontalFovRadians.coerceIn(0.61086524f, 2.0943952f) / 2.0))
+    val cropWidth = minOf(sourceWidth.toDouble(), sourceHeight.toDouble() * frameWidth / frameHeight)
+    val cropHeight = minOf(sourceHeight.toDouble(), sourceWidth.toDouble() * frameHeight / frameWidth)
+    return (2.0 * atan((if (horizontal) cropWidth else cropHeight) / (2.0 * focal))).toFloat()
+}
+
+/** Round absolute positions so slow movement cannot accumulate one forced pixel per callback. */
+internal fun panoramaThumbnailAdvance(
+    previousSweepRadians: Float,
+    sweepRadians: Float,
+    framePixels: Int,
+    fieldOfViewRadians: Float,
+): Int {
+    if (sweepRadians <= previousSweepRadians) return 0
+    val pixelsPerRadian = framePixels / fieldOfViewRadians.coerceAtLeast(0.01f)
+    return ((sweepRadians.coerceAtLeast(0f) * pixelsPerRadian).roundToInt() -
+        (previousSweepRadians.coerceAtLeast(0f) * pixelsPerRadian).roundToInt())
+        .coerceIn(0, framePixels)
+}
+
 internal object PanoramaLiveThumbnailBuilder {
     // The S24 trace shows a 132x88 dp 3:2 centre window inside the 248x88 dp idle guide.
     private const val HORIZONTAL_FRAME_WIDTH = 198
     private const val HORIZONTAL_FRAME_HEIGHT = 132
     private const val MAX_LONG_EDGE = 1_024
-    private const val DEFAULT_ADVANCE_FRACTION = 1f / 7f
 
     private fun normalizedFrame(source: Bitmap, frameWidth: Int, frameHeight: Int): Bitmap {
         val targetRatio = frameWidth.toFloat() / frameHeight
@@ -282,22 +338,25 @@ internal object PanoramaLiveThumbnailBuilder {
         }
     }
 
-    fun build(frames: List<CapturedPanoramaFrame>, direction: String): Bitmap? {
+    fun build(
+        frames: List<CapturedPanoramaFrame>,
+        direction: String,
+        portraitFrame: Boolean = false,
+        horizontalFovRadians: Float,
+    ): Bitmap? {
         if (frames.isEmpty()) return null
         val horizontal = direction == "Left" || direction == "Right"
-        val frameWidth = if (horizontal) HORIZONTAL_FRAME_WIDTH else HORIZONTAL_FRAME_HEIGHT
-        val frameHeight = if (horizontal) HORIZONTAL_FRAME_HEIGHT else HORIZONTAL_FRAME_WIDTH
+        val frameWidth = if (portraitFrame) HORIZONTAL_FRAME_HEIGHT else HORIZONTAL_FRAME_WIDTH
+        val frameHeight = if (portraitFrame) HORIZONTAL_FRAME_WIDTH else HORIZONTAL_FRAME_HEIGHT
         val scaled = frames.map { frame -> normalizedFrame(frame.bitmap, frameWidth, frameHeight) }
         return try {
             val longDimension = if (horizontal) frameWidth else frameHeight
+            val fieldOfView = panoramaThumbnailFov(
+                frames.first().bitmap.width, frames.first().bitmap.height,
+                frameWidth, frameHeight, horizontal, horizontalFovRadians,
+            )
             val advances = frames.zipWithNext { previous, current ->
-                val delta = (current.sweepRadians - previous.sweepRadians).coerceAtLeast(0f)
-                val fraction = if (delta > 0f) {
-                    (delta / 1.2217305f).coerceIn(1f / 32f, 1f / 3f)
-                } else {
-                    DEFAULT_ADVANCE_FRACTION
-                }
-                (longDimension * fraction).roundToInt().coerceAtLeast(1)
+                panoramaThumbnailAdvance(previous.sweepRadians, current.sweepRadians, longDimension, fieldOfView)
             }
             val requestedLongEdge = longDimension + advances.sum()
             val scale = minOf(1f, MAX_LONG_EDGE.toFloat() / requestedLongEdge)
@@ -394,28 +453,35 @@ internal object PanoramaLiveThumbnailBuilder {
     /**
      * Adds exactly one keyframe to an existing miniature. Long captures therefore do constant
      * work per frame instead of repeatedly scaling every full-resolution source frame.
-     * Ownership of [existing] stays with the caller; the returned bitmap is always new.
+     * Ownership of [existing] stays with the caller; no new pixels returns [existing] unchanged.
      */
     fun append(
         existing: Bitmap?,
         frame: CapturedPanoramaFrame,
         direction: String,
         previousSweepRadians: Float?,
+        portraitFrame: Boolean = false,
+        horizontalFovRadians: Float,
     ): Bitmap {
         val horizontal = direction == "Left" || direction == "Right"
-        val frameWidth = if (horizontal) HORIZONTAL_FRAME_WIDTH else HORIZONTAL_FRAME_HEIGHT
-        val frameHeight = if (horizontal) HORIZONTAL_FRAME_HEIGHT else HORIZONTAL_FRAME_WIDTH
+        val frameWidth = if (portraitFrame) HORIZONTAL_FRAME_HEIGHT else HORIZONTAL_FRAME_WIDTH
+        val frameHeight = if (portraitFrame) HORIZONTAL_FRAME_WIDTH else HORIZONTAL_FRAME_HEIGHT
         val normalized = normalizedFrame(frame.bitmap, frameWidth, frameHeight)
         if (existing == null) return normalized
 
         val longDimension = if (horizontal) frameWidth else frameHeight
-        val delta = previousSweepRadians
-            ?.let { previous -> (frame.sweepRadians - previous).coerceAtLeast(0f) }
-            ?: 0f
-        val fraction = if (delta > 0f) {
-            (delta / 1.2217305f).coerceIn(1f / 32f, 1f / 3f)
-        } else DEFAULT_ADVANCE_FRACTION
-        val advance = (longDimension * fraction).roundToInt().coerceAtLeast(1)
+        val fieldOfView = panoramaThumbnailFov(
+            frame.bitmap.width, frame.bitmap.height, frameWidth, frameHeight,
+            horizontal, horizontalFovRadians,
+        )
+        val advance = panoramaThumbnailAdvance(
+            previousSweepRadians ?: frame.sweepRadians, frame.sweepRadians,
+            longDimension, fieldOfView,
+        )
+        if (advance == 0) {
+            if (normalized !== frame.bitmap) normalized.recycle()
+            return existing
+        }
         val requestedLongEdge = (if (horizontal) existing.width else existing.height) + advance
         val outputLongEdge = requestedLongEdge.coerceAtMost(MAX_LONG_EDGE)
         val output = Bitmap.createBitmap(
@@ -546,8 +612,135 @@ internal fun panoramaScreenAxisRates(
 ): PanoramaScreenAxisRates = when (displayRotation) {
     // Galaxy S24 empirical calibration: a clockwise/rightward landscape sweep reports -gyroX.
     1 -> PanoramaScreenAxisRates(rightward = -gyroX, upward = gyroY)
+    2 -> PanoramaScreenAxisRates(rightward = -gyroY, upward = -gyroX)
     3 -> PanoramaScreenAxisRates(rightward = gyroX, upward = -gyroY)
     else -> PanoramaScreenAxisRates(rightward = gyroY, upward = gyroX)
+}
+
+/**
+ * Resolves how the phone is physically being held even when Android keeps the activity locked to
+ * landscape. Native Panorama rotates its capture lane in this situation; relying on
+ * Display.getRotation() instead made a portrait rightward sweep look like an upward sweep and the
+ * stitcher consequently appended the same scene along the wrong bitmap axis.
+ */
+internal fun panoramaPhysicalDisplayRotation(
+    gravityX: Float,
+    gravityY: Float,
+    fallbackDisplayRotation: Int,
+): Int {
+    val horizontal = abs(gravityX)
+    val vertical = abs(gravityY)
+    if (maxOf(horizontal, vertical) < 2.5f) return fallbackDisplayRotation
+    if (vertical > horizontal * 1.15f) return if (gravityY >= 0f) 0 else 2
+    // Landscape is already calibrated against the S24's locked activity rotation. Gravity sign
+    // varies with which housing edge is down, so changing a known-good landscape mapping here
+    // would make the two housing orientations disagree.
+    if (horizontal > vertical * 1.15f) return fallbackDisplayRotation
+    return fallbackDisplayRotation
+}
+
+/** Maps a guide direction on the locked activity to the physically oriented source bitmap. */
+internal fun panoramaBitmapDirection(
+    guideDirection: String,
+    physicalDisplayRotation: Int,
+    guideDisplayRotation: Int,
+): String = panoramaDirectionBetweenDisplays(
+    // The gyro direction is expressed in the activity's locked-landscape coordinates. Portrait
+    // presentation reverses its vertical sign; applying that correction only to the guide made
+    // the guide travel Down while the physical strip and final registration still travelled
+    // Right. That disagreement selected the already-seen edge of each frame and produced the
+    // repeated/mangled columns visible in both the live strip and the saved portrait panorama.
+    direction = panoramaPreviewDirection(guideDirection, physicalDisplayRotation),
+    sourceDisplayRotation = guideDisplayRotation,
+    targetDisplayRotation = physicalDisplayRotation,
+)
+
+/** Rotates a cardinal image direction with the same transform used for its bitmap pixels. */
+internal fun panoramaDirectionBetweenDisplays(
+    direction: String,
+    sourceDisplayRotation: Int,
+    targetDisplayRotation: Int,
+): String {
+    val directions = listOf("Up", "Right", "Down", "Left")
+    val index = directions.indexOf(direction)
+    if (index < 0) return direction
+    val clockwiseQuarterTurns = (sourceDisplayRotation - targetDisplayRotation + 4) % 4
+    return directions[(index + clockwiseQuarterTurns) % directions.size]
+}
+
+/**
+ * Direction presented on the locked-landscape guide. When the phone is upright in portrait, the
+ * guide's vertical canvas axis is viewed horizontally by the user and its sign is reversed.
+ * This is presentation-only; raw-frame registration keeps [panoramaBitmapDirection].
+ */
+internal fun panoramaPreviewDirection(
+    guideDirection: String,
+    physicalDisplayRotation: Int,
+): String = if (physicalDisplayRotation == 0 || physicalDisplayRotation == 2) {
+    when (guideDirection) {
+        "Up" -> "Down"
+        "Down" -> "Up"
+        else -> guideDirection
+    }
+} else {
+    guideDirection
+}
+
+/**
+ * Preserves the source frame edge perpendicular to travel. For a 1920x1080 stream this is 1080
+ * for a landscape horizontal sweep and 1920 for a landscape vertical sweep; portrait swaps those
+ * cases exactly as Samsung's guide and saved panorama do.
+ */
+internal fun panoramaTargetCrossPixels(
+    sourceWidth: Int,
+    sourceHeight: Int,
+    normalizedShortEdge: Int,
+    bitmapDirection: String,
+    physicalDisplayRotation: Int,
+): Int {
+    val short = minOf(sourceWidth, sourceHeight).coerceAtLeast(1)
+    val long = maxOf(sourceWidth, sourceHeight).coerceAtLeast(short)
+    val normalizedLongEdge = (normalizedShortEdge.coerceAtLeast(1) * long.toFloat() / short)
+        .roundToInt()
+    val portrait = physicalDisplayRotation == 0 || physicalDisplayRotation == 2
+    val horizontal = bitmapDirection == "Left" || bitmapDirection == "Right"
+    return if (portrait == horizontal) normalizedLongEdge else normalizedShortEdge.coerceAtLeast(1)
+}
+
+/** Normalizes CameraX's target-rotation bitmap to the phone's physical capture orientation. */
+internal fun orientPanoramaBitmapForPhysicalRotation(
+    source: Bitmap,
+    physicalDisplayRotation: Int,
+): Bitmap = rotatePanoramaBitmapBetweenDisplays(
+    source = source,
+    // CameraX rotationDegrees has already normalized the analysis buffer to the app's locked
+    // landscape target. Convert that upright guide image to the phone's actual physical hold.
+    sourceDisplayRotation = 1,
+    targetDisplayRotation = physicalDisplayRotation,
+)
+
+/** Rotates a physically oriented live strip into the landscape-locked guide coordinates. */
+internal fun rotatePanoramaBitmapBetweenDisplays(
+    source: Bitmap,
+    sourceDisplayRotation: Int,
+    targetDisplayRotation: Int,
+): Bitmap {
+    val quarterTurns = (sourceDisplayRotation - targetDisplayRotation + 4) % 4
+    if (quarterTurns == 0) return source
+    val degrees = when (quarterTurns) {
+        1 -> 90f
+        2 -> 180f
+        else -> -90f
+    }
+    return Bitmap.createBitmap(
+        source,
+        0,
+        0,
+        source.width,
+        source.height,
+        Matrix().apply { postRotate(degrees) },
+        true,
+    ).also { if (it !== source) source.recycle() }
 }
 
 /** Motion perpendicular to the selected sweep, used by the native-style pitch/yaw guide. */
@@ -624,20 +817,195 @@ internal fun panoramaDirectionFromGyro(
     gyroX: Float,
     gyroY: Float,
 ): String {
-    val rightwardRate = panoramaScreenAxisRates(displayRotation, gyroX, gyroY).rightward
-    // S24 Panorama locks only a horizontal sweep; pitch is corrective guidance, not a direction.
-    return if (rightwardRate >= 0f) "Right" else "Left"
+    val axes = panoramaScreenAxisRates(displayRotation, gyroX, gyroY)
+    return if (abs(axes.rightward) >= abs(axes.upward)) {
+        if (axes.rightward >= 0f) "Right" else "Left"
+    } else {
+        if (axes.upward >= 0f) "Up" else "Down"
+    }
 }
 
 /**
  * Samsung does not commit the sweep direction from the shutter tap's first gyro sample. A small
  * net rotation must accumulate first, so button movement and hand-settling cannot flip a whole
- * panorama. Positive screen motion is rightward; opposing samples naturally cancel.
+ * panorama. The dominant screen axis wins only after it is clearly stronger than the other axis;
+ * this prevents a diagonal hand-settling movement from choosing the wrong orientation.
  */
-internal fun panoramaDirectionFromAccumulatedMotion(rightwardRadians: Float): String? = when {
-    rightwardRadians >= PANORAMA_DIRECTION_LOCK_RADIANS -> "Right"
-    rightwardRadians <= -PANORAMA_DIRECTION_LOCK_RADIANS -> "Left"
-    else -> null
+internal fun panoramaDirectionFromAccumulatedMotion(
+    rightwardRadians: Float,
+    upwardRadians: Float,
+): String? {
+    val horizontal = abs(rightwardRadians)
+    val vertical = abs(upwardRadians)
+    val dominant = maxOf(horizontal, vertical)
+    if (dominant < PANORAMA_DIRECTION_LOCK_RADIANS) return null
+    if (horizontal < vertical * 1.15f && vertical < horizontal * 1.15f) return null
+    return if (horizontal > vertical) {
+        if (rightwardRadians >= 0f) "Right" else "Left"
+    } else {
+        if (upwardRadians >= 0f) "Up" else "Down"
+    }
+}
+
+/** Compatibility overload for callers that intentionally constrain capture to a horizontal axis. */
+internal fun panoramaDirectionFromAccumulatedMotion(rightwardRadians: Float): String? =
+    panoramaDirectionFromAccumulatedMotion(rightwardRadians, 0f)
+
+/** Geometry occupied by the complete live stitch between the fixed start and moving guide frame. */
+internal data class PanoramaLiveStripRect(
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+)
+
+/**
+ * Samsung sizes the already-merged live thumbnail by its bitmap aspect ratio. The cross axis
+ * always fills the capture lane (minus the 2 dp inset on each edge); the long axis is allowed to
+ * grow until it reaches the lane boundary. This preserves image geometry and makes the stitched
+ * preview visibly extend with every newly revealed slice.
+ */
+internal fun panoramaLiveThumbnailRect(
+    direction: String,
+    groupLeft: Float,
+    groupTop: Float,
+    groupWidth: Float,
+    groupHeight: Float,
+    bitmapWidth: Int,
+    bitmapHeight: Int,
+    inset: Float,
+): PanoramaLiveStripRect {
+    val availableWidth = (groupWidth - inset * 2f).coerceAtLeast(1f)
+    val availableHeight = (groupHeight - inset * 2f).coerceAtLeast(1f)
+    val safeBitmapWidth = bitmapWidth.coerceAtLeast(1).toFloat()
+    val safeBitmapHeight = bitmapHeight.coerceAtLeast(1).toFloat()
+    return if (direction == "Left" || direction == "Right") {
+        val width = (availableHeight * safeBitmapWidth / safeBitmapHeight)
+            .coerceIn(1f, availableWidth)
+        val left = if (direction == "Left") {
+            groupLeft + groupWidth - inset - width
+        } else {
+            groupLeft + inset
+        }
+        PanoramaLiveStripRect(
+            left = left,
+            top = groupTop + inset,
+            right = left + width,
+            bottom = groupTop + inset + availableHeight,
+        )
+    } else {
+        val height = (availableWidth * safeBitmapHeight / safeBitmapWidth)
+            .coerceIn(1f, availableHeight)
+        val top = if (direction == "Up") {
+            groupTop + groupHeight - inset - height
+        } else {
+            groupTop + inset
+        }
+        PanoramaLiveStripRect(
+            left = groupLeft + inset,
+            top = top,
+            right = groupLeft + inset + availableWidth,
+            bottom = top + height,
+        )
+    }
+}
+
+/**
+ * Position of Samsung's fixed start frame and moving capture frame inside the expanded guide.
+ *
+ * The compact guide is centred before direction lock. Once the first deliberate motion selects
+ * an axis, Samsung re-anchors the start frame at the trailing edge of the available lane and lets
+ * the moving frame traverse the complete lane. Keeping the start frame at screen centre only
+ * reveals half of the available display and is why the old live stitch never stretched across it.
+ */
+internal data class PanoramaGuideTrack(
+    val startX: Float,
+    val startY: Float,
+    val currentX: Float,
+    val currentY: Float,
+)
+
+internal fun panoramaGuideTrack(
+    direction: String,
+    groupLeft: Float,
+    groupTop: Float,
+    groupWidth: Float,
+    groupHeight: Float,
+    frameWidth: Float,
+    frameHeight: Float,
+    progress: Float,
+    crossOffset: Float = 0f,
+): PanoramaGuideTrack {
+    val clampedProgress = progress.coerceIn(0f, 1f)
+    val centreX = groupLeft + groupWidth / 2f
+    val centreY = groupTop + groupHeight / 2f
+    val horizontalTravel = (groupWidth - frameWidth).coerceAtLeast(0f)
+    val verticalTravel = (groupHeight - frameHeight).coerceAtLeast(0f)
+    return when (direction) {
+        "Left" -> {
+            val startX = groupLeft + groupWidth - frameWidth / 2f
+            PanoramaGuideTrack(
+                startX = startX,
+                startY = centreY,
+                currentX = startX - horizontalTravel * clampedProgress,
+                currentY = centreY - crossOffset,
+            )
+        }
+
+        "Up" -> {
+            val startY = groupTop + groupHeight - frameHeight / 2f
+            PanoramaGuideTrack(
+                startX = centreX,
+                startY = startY,
+                currentX = centreX + crossOffset,
+                currentY = startY - verticalTravel * clampedProgress,
+            )
+        }
+
+        "Down" -> {
+            val startY = groupTop + frameHeight / 2f
+            PanoramaGuideTrack(
+                startX = centreX,
+                startY = startY,
+                currentX = centreX + crossOffset,
+                currentY = startY + verticalTravel * clampedProgress,
+            )
+        }
+
+        else -> {
+            val startX = groupLeft + frameWidth / 2f
+            PanoramaGuideTrack(
+                startX = startX,
+                startY = centreY,
+                currentX = startX + horizontalTravel * clampedProgress,
+                currentY = centreY - crossOffset,
+            )
+        }
+    }
+}
+
+internal fun panoramaLiveStripRect(
+    direction: String,
+    startX: Float,
+    startY: Float,
+    currentX: Float,
+    currentY: Float,
+    frameWidth: Float,
+    frameHeight: Float,
+): PanoramaLiveStripRect = if (direction == "Left" || direction == "Right") {
+    PanoramaLiveStripRect(
+        left = minOf(startX, currentX) - frameWidth / 2f,
+        top = currentY - frameHeight / 2f,
+        right = maxOf(startX, currentX) + frameWidth / 2f,
+        bottom = currentY + frameHeight / 2f,
+    )
+} else {
+    PanoramaLiveStripRect(
+        left = currentX - frameWidth / 2f,
+        top = minOf(startY, currentY) - frameHeight / 2f,
+        right = currentX + frameWidth / 2f,
+        bottom = maxOf(startY, currentY) + frameHeight / 2f,
+    )
 }
 
 internal fun panoramaTargetRadians(direction: String, wideAngle: Boolean = false): Float =
@@ -677,8 +1045,10 @@ internal fun panoramaFrameOffset(
     val mainDimension = if (horizontal) width else height
     val crossDimension = if (horizontal) height else width
     val expected = expectedAdvance.coerceIn(2, (mainDimension * 0.58f).roundToInt().coerceAtLeast(2))
-    val minimumAdvance = (expected * 0.48f).roundToInt().coerceAtLeast(2)
-    val maximumAdvance = (expected * 1.52f).roundToInt()
+    // Camera motion is the authoritative coarse placement. Image registration may refine it,
+    // but it must not jump to a distant copy of a repetitive feature.
+    val minimumAdvance = (expected * 0.64f).roundToInt().coerceAtLeast(2)
+    val maximumAdvance = (expected * 1.36f).roundToInt()
         .coerceIn(minimumAdvance, (mainDimension * 0.65f).roundToInt().coerceAtLeast(minimumAdvance))
     val maximumCrossDrift = (crossDimension / 10).coerceIn(2, 24)
     val mainSign = if (direction == "Left" || direction == "Up") -1 else 1
@@ -729,18 +1099,23 @@ internal fun panoramaFrameOffset(
     var bestAdvance = expected
     var bestCross = 0
     var bestScore = -1.0
+    var bestCorrelation = -1.0
     var advance = minimumAdvance
     while (advance <= maximumAdvance) {
         var cross = -maximumCrossDrift
         while (cross <= maximumCrossDrift) {
             val (offsetX, offsetY) = offsetFor(advance, cross)
             val match = correlation(offsetX, offsetY, sampleStep = 6)
-            // Resolve repetitive textures in favour of the gyro estimate without overpowering
-            // real image evidence.
-            val penalty = abs(advance - expected) * 0.00035 + abs(cross) * 0.0002
-            val score = match - penalty
+            val score = panoramaRegistrationScore(
+                correlation = match,
+                advance = advance,
+                expectedAdvance = expected,
+                crossDrift = cross,
+                maximumCrossDrift = maximumCrossDrift,
+            )
             if (score > bestScore) {
                 bestScore = score
+                bestCorrelation = match
                 bestAdvance = advance
                 bestCross = cross
             }
@@ -750,6 +1125,7 @@ internal fun panoramaFrameOffset(
     }
 
     var refinedScore = bestScore
+    var refinedCorrelation = bestCorrelation
     var refinedAdvance = bestAdvance
     var refinedCross = bestCross
     for (candidateAdvance in (bestAdvance - 3)..(bestAdvance + 3)) {
@@ -758,10 +1134,16 @@ internal fun panoramaFrameOffset(
             if (candidateCross !in -maximumCrossDrift..maximumCrossDrift) continue
             val (offsetX, offsetY) = offsetFor(candidateAdvance, candidateCross)
             val match = correlation(offsetX, offsetY, sampleStep = 2)
-            val penalty = abs(candidateAdvance - expected) * 0.00035 + abs(candidateCross) * 0.0002
-            val score = match - penalty
+            val score = panoramaRegistrationScore(
+                correlation = match,
+                advance = candidateAdvance,
+                expectedAdvance = expected,
+                crossDrift = candidateCross,
+                maximumCrossDrift = maximumCrossDrift,
+            )
             if (score > refinedScore) {
                 refinedScore = score
+                refinedCorrelation = match
                 refinedAdvance = candidateAdvance
                 refinedCross = candidateCross
             }
@@ -769,9 +1151,9 @@ internal fun panoramaFrameOffset(
     }
 
     val (fallbackX, fallbackY) = offsetFor(expected, 0)
-    if (refinedScore < 0.16) return PanoramaFrameOffset(fallbackX, fallbackY, refinedScore)
+    if (refinedScore < 0.16) return PanoramaFrameOffset(fallbackX, fallbackY, refinedCorrelation)
     val (offsetX, offsetY) = offsetFor(refinedAdvance, refinedCross)
-    return PanoramaFrameOffset(offsetX, offsetY, refinedScore)
+    return PanoramaFrameOffset(offsetX, offsetY, refinedCorrelation)
 }
 
 /**
@@ -780,6 +1162,7 @@ internal fun panoramaFrameOffset(
  * feathered at the registered seam and the common cross-axis area is cropped to remove drift edges.
  */
 internal object PanoramaBitmapStitcher {
+    private const val TAG = "PanoramaStitcher"
     private const val HORIZONTAL_FOV_RADIANS = 1.2217305f // 70 degrees
     private const val REGISTRATION_WIDTH = 320
     private const val REGISTRATION_HEIGHT = 240
@@ -830,6 +1213,148 @@ internal object PanoramaBitmapStitcher {
         }
     }
 
+    /** Full-resolution composition advances on the capture worker, once per accepted keyframe. */
+    class Incremental(
+        private val direction: String,
+        private val horizontalFovRadians: Float,
+        private val targetCrossPixels: Int,
+        private val profile: PanoramaDynamicRangeProfile,
+    ) : AutoCloseable {
+        private val horizontal = direction == "Left" || direction == "Right"
+        private var mosaic: Bitmap? = null
+        private var previousRegistration: Bitmap? = null
+        private var previousSweep = 0f
+        private var previousSharpness = 1.0
+        private var position = FramePlacement(0, 0)
+        private var originX = 0
+        private var originY = 0
+        private var commonLow = Int.MIN_VALUE
+        private var commonHigh = Int.MAX_VALUE
+        private var captureFov = horizontalFovRadians
+        private var projectionFov = horizontalFovRadians
+        private var scaleX = 1f
+        private var scaleY = 1f
+        private var registrationX = 0
+        private var registrationY = 0
+        var frameCount = 0
+            private set
+
+        fun append(frame: StoredPanoramaFrame) {
+            val source = decodeStoredFrame(frame)
+            if (frameCount == 0) {
+                val portrait = frame.physicalDisplayRotation == 0 || frame.physicalDisplayRotation == 2
+                val aspect = minOf(frame.rawWidth, frame.rawHeight).toDouble() / maxOf(frame.rawWidth, frame.rawHeight)
+                captureFov = if (portrait) (2 * atan(tan(horizontalFovRadians / 2.0) * aspect)).toFloat()
+                    else horizontalFovRadians
+            }
+            var registration: Bitmap? = null
+            var full: Bitmap? = null
+            try {
+                val sampleScale = minOf(1f, 480f / maxOf(source.width, source.height))
+                val sample = Bitmap.createScaledBitmap(source,
+                    (source.width * sampleScale).roundToInt().coerceAtLeast(1),
+                    (source.height * sampleScale).roundToInt().coerceAtLeast(1), true)
+                registration = try { cylindricalWarp(sample, horizontal, captureFov) }
+                    finally { if (sample !== source) sample.recycle() }
+                val warped = cylindricalWarp(source, horizontal, captureFov)
+                val cross = if (horizontal) warped.height else warped.width
+                full = if (targetCrossPixels < cross) {
+                    val scale = targetCrossPixels.toFloat() / cross
+                    Bitmap.createScaledBitmap(warped, (warped.width * scale).roundToInt().coerceAtLeast(1),
+                        (warped.height * scale).roundToInt().coerceAtLeast(1), true)
+                        .also { if (it !== warped) warped.recycle() }
+                } else warped
+                // Register neutral frames, then prepare their colour/detail at capture resolution.
+                // Processing the final, upscaled panorama on Stop was the remaining multi-second stall.
+                applyPanoramaProfileInPlace(checkNotNull(full), profile)
+                if (profile == PanoramaDynamicRangeProfile.Hdr) enhanceLocalToneAndDetail(checkNotNull(full))
+                val registrationImage = checkNotNull(registration)
+                val old = mosaic
+                if (old == null) {
+                    scaleX = full.width.toFloat() / registrationImage.width
+                    scaleY = full.height.toFloat() / registrationImage.height
+                    val focal = registrationImage.width / (2.0 * tan(captureFov / 2.0))
+                    projectionFov = if (horizontal) captureFov
+                        else (2.0 * atan(registrationImage.height / (2.0 * focal))).toFloat()
+                    mosaic = full
+                    full = null
+                } else {
+                    val previous = checkNotNull(previousRegistration)
+                    val dimension = if (horizontal) registrationImage.width else registrationImage.height
+                    val delta = (frame.sweepRadians - previousSweep).coerceAtLeast(PANORAMA_FRAME_STEP_RADIANS * 0.35f)
+                    val expected = (dimension * delta / projectionFov).roundToInt()
+                        .coerceIn((dimension / 32).coerceAtLeast(1), (dimension / 3).coerceAtLeast(1))
+                    val offset = estimateOffset(previous, registrationImage, direction, expected)
+                    val crossLimit = ((if (horizontal) registrationImage.height else registrationImage.width) * 0.15f).roundToInt()
+                    registrationX += offset.x
+                    registrationY += offset.y
+                    if (horizontal) registrationY = registrationY.coerceIn(-crossLimit, crossLimit)
+                    else registrationX = registrationX.coerceIn(-crossLimit, crossLimit)
+                    position = FramePlacement((registrationX * scaleX).roundToInt(), (registrationY * scaleY).roundToInt())
+                    val left = minOf(originX, position.x)
+                    val top = minOf(originY, position.y)
+                    val right = maxOf(originX + old.width, position.x + full.width)
+                    val bottom = maxOf(originY + old.height, position.y + full.height)
+                    val expanded = Bitmap.createBitmap(right - left, bottom - top, Bitmap.Config.ARGB_8888)
+                    try {
+                        val canvas = Canvas(expanded)
+                        canvas.drawBitmap(old, (originX - left).toFloat(), (originY - top).toFloat(), null)
+                        drawFeatheredFrame(expanded, canvas, full,
+                            FramePlacement(position.x - left, position.y - top), direction,
+                            originX - left, originY - top, originX - left + old.width, originY - top + old.height,
+                            frame.sharpness, previousSharpness)
+                    } catch (error: Throwable) { expanded.recycle(); throw error }
+                    mosaic = expanded
+                    old.recycle()
+                    originX = left
+                    originY = top
+                }
+                val image = checkNotNull(mosaic)
+                val crossSize = if (horizontal) full?.height ?: image.height else full?.width ?: image.width
+                val crossPosition = if (horizontal) position.y else position.x
+                commonLow = maxOf(commonLow, crossPosition)
+                commonHigh = minOf(commonHigh, crossPosition + crossSize)
+                previousRegistration?.recycle()
+                previousRegistration = registration
+                registration = null
+                previousSweep = frame.sweepRadians
+                previousSharpness = frame.sharpness
+                frameCount++
+            } finally {
+                source.recycle()
+                registration?.recycle()
+                full?.recycle()
+            }
+        }
+
+        fun finish(): Bitmap {
+            val image = checkNotNull(mosaic) { "No panorama frames" }
+            check(commonHigh > commonLow) { "Panorama frames do not overlap" }
+            val cropped = if (horizontal) Bitmap.createBitmap(image, 0, commonLow - originY, image.width, commonHigh - commonLow)
+                else Bitmap.createBitmap(image, commonLow - originX, 0, commonHigh - commonLow, image.height)
+            mosaic = null
+            if (cropped !== image) image.recycle()
+            val cross = if (horizontal) cropped.height else cropped.width
+            val scale = targetCrossPixels.toFloat() / cross
+            val result = if (cross == targetCrossPixels) cropped else Bitmap.createScaledBitmap(cropped,
+                (cropped.width * scale).roundToInt().coerceAtLeast(1),
+                (cropped.height * scale).roundToInt().coerceAtLeast(1), true)
+                .also { if (it !== cropped) cropped.recycle() }
+            try {
+                check(projectionHasOpaqueCoverage(result)) { "Panorama compositor left unmapped pixels" }
+                result.setHasAlpha(false)
+                return result
+            } catch (error: Throwable) { result.recycle(); throw error }
+        }
+
+        override fun close() {
+            mosaic?.recycle()
+            mosaic = null
+            previousRegistration?.recycle()
+            previousRegistration = null
+        }
+    }
+
     /**
      * Full-resolution variant used on-device. Pass one registers adjacent projected frames while
      * retaining only two bitmaps; pass two renders them into the final canvas one at a time. This
@@ -841,11 +1366,30 @@ internal object PanoramaBitmapStitcher {
         horizontalFovRadians: Float = HORIZONTAL_FOV_RADIANS,
         targetCrossPixels: Int? = null,
         dynamicRangeProfile: PanoramaDynamicRangeProfile = PanoramaDynamicRangeProfile.Off,
+        registrationFrames: List<CapturedPanoramaFrame>? = null,
         onProgress: ((Int) -> Unit)? = null,
     ): Bitmap {
         require(frames.isNotEmpty()) { "A panorama needs at least one frame" }
         val horizontal = direction == "Left" || direction == "Right"
         val clampedHorizontalFov = horizontalFovRadians.coerceIn(0.61086524f, 2.0943952f)
+        val portraitCapture = frames.first().physicalDisplayRotation == 0 ||
+            frames.first().physicalDisplayRotation == 2
+        val sensorAspect = frames.first().let { frame ->
+            if (frame.rawWidth > 0 && frame.rawHeight > 0) {
+                minOf(frame.rawWidth, frame.rawHeight).toFloat() /
+                    maxOf(frame.rawWidth, frame.rawHeight)
+            } else {
+                0.75f
+            }
+        }
+        // In portrait, bitmap X spans the sensor's short edge rather than its advertised
+        // landscape horizontal FOV. Deriving that short-edge FOV keeps gyro placement metrically
+        // correct after the physical-orientation normalization.
+        val captureHorizontalFov = if (portraitCapture) {
+            (2.0 * atan(tan(clampedHorizontalFov / 2.0) * sensorAspect)).toFloat()
+        } else {
+            clampedHorizontalFov
+        }
 
         fun projected(frame: StoredPanoramaFrame, registrationOnly: Boolean = false): Bitmap {
             val source = decodeStoredFrame(frame)
@@ -865,26 +1409,65 @@ internal object PanoramaBitmapStitcher {
                 source
             }
             return try {
-                cylindricalWarp(work, horizontal, clampedHorizontalFov)
+                val warped = cylindricalWarp(work, horizontal, captureHorizontalFov)
+                val requestedCross = targetCrossPixels?.coerceAtLeast(1)
+                val currentCross = if (horizontal) warped.height else warped.width
+                // Composite at the requested output resolution instead of building an oversized
+                // multi-frame canvas and shrinking it only after every blend. The saved pixel
+                // dimensions are identical, but feathering, gamma matching and JPEG staging touch
+                // substantially fewer pixels after Shutter stops.
+                if (!registrationOnly && requestedCross != null && requestedCross < currentCross) {
+                    val scale = requestedCross.toFloat() / currentCross
+                    Bitmap.createScaledBitmap(
+                        warped,
+                        (warped.width * scale).roundToInt().coerceAtLeast(1),
+                        (warped.height * scale).roundToInt().coerceAtLeast(1),
+                        true,
+                    ).also { scaled ->
+                        if (scaled !== warped) warped.recycle()
+                    }
+                } else {
+                    warped
+                }
             } finally {
                 work.recycle()
             }
         }
 
+        val registrationCandidates = registrationFrames?.takeIf { candidates ->
+            candidates.size == frames.size && candidates.none { it.bitmap.isRecycled }
+        }
+        fun registrationProjected(index: Int): Bitmap {
+            val candidate = registrationCandidates?.get(index)
+                ?: return projected(frames[index], registrationOnly = true)
+            val copied = candidate.bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                ?: return projected(frames[index], registrationOnly = true)
+            val physicallyNormalized = rotatePanoramaBitmapBetweenDisplays(
+                source = copied,
+                sourceDisplayRotation = candidate.physicalDisplayRotation,
+                targetDisplayRotation = frames[index].physicalDisplayRotation,
+            )
+            return try {
+                cylindricalWarp(physicallyNormalized, horizontal, captureHorizontalFov)
+            } finally {
+                physicallyNormalized.recycle()
+            }
+        }
+
         onProgress?.invoke(2)
-        var previous = projected(frames.first(), registrationOnly = true)
+        var previous = registrationProjected(0)
         val firstWidth = previous.width
         val firstHeight = previous.height
-        val focalPixels = firstWidth / (2.0 * tan(clampedHorizontalFov / 2.0))
+        val focalPixels = firstWidth / (2.0 * tan(captureHorizontalFov / 2.0))
         val verticalFov = (2.0 * atan(firstHeight / (2.0 * focalPixels))).toFloat()
-        val projectionFov = if (horizontal) clampedHorizontalFov else verticalFov
+        val projectionFov = if (horizontal) captureHorizontalFov else verticalFov
         val maximumGlobalCrossDrift = (
             (if (horizontal) firstHeight else firstWidth) * 0.15f
             ).roundToInt().coerceAtLeast(1)
         val placements = mutableListOf(FramePlacement(0, 0))
         try {
             for (index in 1 until frames.size) {
-                val current = projected(frames[index], registrationOnly = true)
+                val current = registrationProjected(index)
                 try {
                     val dimension = if (horizontal) firstWidth else firstHeight
                     val delta = (frames[index].sweepRadians - frames[index - 1].sweepRadians)
@@ -896,6 +1479,14 @@ internal object PanoramaBitmapStitcher {
                             (dimension / 3).coerceAtLeast(1),
                         )
                     val offset = estimateOffset(previous, current, direction, expectedAdvance)
+                    val selectedAdvance = if (horizontal) abs(offset.x) else abs(offset.y)
+                    val selectedCross = if (horizontal) offset.y else offset.x
+                    Log.i(
+                        TAG,
+                        "register frame=$index direction=$direction delta=$delta " +
+                            "expected=$expectedAdvance selected=$selectedAdvance " +
+                            "cross=$selectedCross correlation=${offset.correlation}",
+                    )
                     val prior = placements.last()
                     val nextX = prior.x + offset.x
                     val nextY = prior.y + offset.y
@@ -955,7 +1546,7 @@ internal object PanoramaBitmapStitcher {
             Bitmap.Config.ARGB_8888,
         )
         val canvas = Canvas(output)
-        canvas.drawColor(Color.BLACK)
+        canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
         val translated = fullPlacements.map { FramePlacement(it.x - cropLeft, it.y - cropTop) }
         var occupiedLeft = 0
         var occupiedTop = 0
@@ -997,6 +1588,10 @@ internal object PanoramaBitmapStitcher {
             }
             onProgress?.invoke(42 + (index + 1) * 48 / frames.size)
         }
+        check(projectionHasOpaqueCoverage(output)) {
+            "Panorama compositor left unmapped pixels"
+        }
+        output.setHasAlpha(false)
 
         val requestedCross = targetCrossPixels?.coerceAtLeast(1)
         val currentCross = if (horizontal) output.height else output.width
@@ -1042,6 +1637,10 @@ internal object PanoramaBitmapStitcher {
                 .order(ByteOrder.nativeOrder())
             decoded.copyPixelsFromBuffer(mapped)
         }
+        // CameraX analysis frames are always opaque. Keeping an incidental alpha channel here
+        // lets a device-specific RGBA/Bitmap packing quirk turn valid image pixels into transparent
+        // holes; JPEG then flattens those holes to the black bands seen in saved panoramas.
+        decoded.setHasAlpha(false)
         if (frame.rotationDegrees != 0) {
             val rotated = Bitmap.createBitmap(
                 decoded,
@@ -1055,29 +1654,23 @@ internal object PanoramaBitmapStitcher {
             if (rotated !== decoded) decoded.recycle()
             decoded = rotated
         }
-        if (decoded.height > decoded.width) {
-            val landscape = Bitmap.createBitmap(
-                decoded,
-                0,
-                0,
-                decoded.width,
-                decoded.height,
-                Matrix().apply { postRotate(90f) },
-                true,
-            )
-            if (landscape !== decoded) decoded.recycle()
-            decoded = landscape
-        }
+        decoded = orientPanoramaBitmapForPhysicalRotation(
+            decoded,
+            frame.physicalDisplayRotation,
+        )
         val scale = if (frame.maximumWidth > 0 && frame.maximumHeight > 0) {
             minOf(
                 1f,
-                frame.maximumWidth.toFloat() / decoded.width,
-                frame.maximumHeight.toFloat() / decoded.height,
+                maxOf(frame.maximumWidth, frame.maximumHeight).toFloat() / maxOf(decoded.width, decoded.height),
+                minOf(frame.maximumWidth, frame.maximumHeight).toFloat() / minOf(decoded.width, decoded.height),
             )
         } else {
             1f
         }
-        if (scale >= 1f) return decoded
+        if (scale >= 1f) {
+            decoded.setHasAlpha(false)
+            return decoded
+        }
         val normalized = Bitmap.createScaledBitmap(
             decoded,
             (decoded.width * scale).roundToInt().coerceAtLeast(1),
@@ -1085,6 +1678,7 @@ internal object PanoramaBitmapStitcher {
             true,
         )
         if (normalized !== decoded) decoded.recycle()
+        normalized.setHasAlpha(false)
         return normalized
     }
 
@@ -1152,7 +1746,7 @@ internal object PanoramaBitmapStitcher {
             Bitmap.Config.ARGB_8888,
         )
         val canvas = Canvas(output)
-        canvas.drawColor(Color.BLACK)
+        canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
         val translated = placements.map { FramePlacement(it.x - cropLeft, it.y - cropTop) }
         canvas.drawBitmap(first, translated.first().x.toFloat(), translated.first().y.toFloat(), null)
         var occupiedLeft = translated.first().x
@@ -1178,6 +1772,10 @@ internal object PanoramaBitmapStitcher {
             occupiedBottom = maxOf(occupiedBottom, placement.y + first.height)
             onProgress?.invoke(65 + index * 30 / (frames.size - 1))
         }
+        check(projectionHasOpaqueCoverage(output)) {
+            "Panorama compositor left unmapped pixels"
+        }
+        output.setHasAlpha(false)
         onProgress?.invoke(95)
         return output
     }
@@ -1205,11 +1803,12 @@ internal object PanoramaBitmapStitcher {
         val horizontalFov = horizontalFovRadians.coerceIn(0.61086524f, 2.0943952f).toDouble()
         val focalPixels = source.width / (2.0 * tan(horizontalFov / 2.0))
         val verticalFov = 2.0 * atan(source.height / (2.0 * focalPixels))
-        // drawBitmapMesh performs the same inverse cylindrical mapping in Android's optimized
-        // native graphics pipeline. The former Kotlin loop evaluated four bilinear channels for
-        // every output pixel and exceeded the save timeout once a proper 14+ frame sweep arrived.
-        val meshWidth = 64
-        val meshHeight = 48
+        // drawBitmapMesh performs the cylindrical mapping in Android's native graphics pipeline.
+        // Keep the mesh below the vertex/index sizes that have produced incomplete rasterization
+        // on Samsung builds; the projection is smooth enough that 32x24 remains sub-pixel accurate
+        // at the final panorama scale.
+        val meshWidth = 32
+        val meshHeight = 24
         val vertices = FloatArray((meshWidth + 1) * (meshHeight + 1) * 2)
         var vertexIndex = 0
         for (meshY in 0..meshHeight) {
@@ -1231,12 +1830,14 @@ internal object PanoramaBitmapStitcher {
                 vertices[vertexIndex++] = destinationY.toFloat()
             }
         }
-        return Bitmap.createBitmap(
+        val meshOutput = Bitmap.createBitmap(
             outputSize.width,
             outputSize.height,
             Bitmap.Config.ARGB_8888,
         ).also { output ->
-            Canvas(output).drawBitmapMesh(
+            Canvas(output).apply {
+                drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                drawBitmapMesh(
                 source,
                 meshWidth,
                 meshHeight,
@@ -1245,8 +1846,140 @@ internal object PanoramaBitmapStitcher {
                 null,
                 0,
                 Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG),
-            )
+                )
+            }
         }
+        if (projectionHasOpaqueCoverage(meshOutput)) {
+            meshOutput.setHasAlpha(false)
+            return meshOutput
+        }
+
+        // A partially rasterized mesh must never reach the compositor: its transparent cells are
+        // flattened into the characteristic black strips when the final JPEG is encoded. The
+        // bounded-memory inverse mapper is slower, but deterministic and is used only when the
+        // platform mesh failed its coverage check.
+        meshOutput.recycle()
+        Log.w(
+            TAG,
+            "Incomplete Android bitmap mesh; using deterministic inverse cylindrical warp",
+        )
+        return inverseCylindricalWarp(
+            source = source,
+            horizontal = horizontal,
+            horizontalFovRadians = horizontalFovRadians,
+            outputSize = outputSize,
+        )
+    }
+
+    /** Samples the inscribed projection; every interior point must be backed by an opaque pixel. */
+    private fun projectionHasOpaqueCoverage(bitmap: Bitmap): Boolean {
+        if (bitmap.width < 3 || bitmap.height < 3) return false
+        val xStep = (bitmap.width / 48).coerceAtLeast(1)
+        val yStep = (bitmap.height / 32).coerceAtLeast(1)
+        var y = 1
+        while (y < bitmap.height - 1) {
+            var x = 1
+            while (x < bitmap.width - 1) {
+                if (Color.alpha(bitmap.getPixel(x, y)) < 250) return false
+                x += xStep
+            }
+            y += yStep
+        }
+        return true
+    }
+
+    /**
+     * Reference-quality inverse projection used when Android's mesh renderer leaves holes. Rows
+     * are written directly to the destination bitmap, avoiding a second panorama-sized output
+     * array while retaining bilinear sampling.
+     */
+    private fun inverseCylindricalWarp(
+        source: Bitmap,
+        horizontal: Boolean,
+        horizontalFovRadians: Float,
+        outputSize: PanoramaProjectionSize,
+    ): Bitmap {
+        val sourcePixels = IntArray(source.width * source.height)
+        source.getPixels(sourcePixels, 0, source.width, 0, 0, source.width, source.height)
+        val output = Bitmap.createBitmap(
+            outputSize.width,
+            outputSize.height,
+            Bitmap.Config.ARGB_8888,
+        )
+        val row = IntArray(outputSize.width)
+        val sourceCenterX = (source.width - 1) / 2.0
+        val sourceCenterY = (source.height - 1) / 2.0
+        val outputCenterX = (outputSize.width - 1) / 2.0
+        val outputCenterY = (outputSize.height - 1) / 2.0
+        val horizontalFov = horizontalFovRadians.coerceIn(0.61086524f, 2.0943952f).toDouble()
+        val focalPixels = source.width / (2.0 * tan(horizontalFov / 2.0))
+        val verticalFov = 2.0 * atan(source.height / (2.0 * focalPixels))
+        val mappedMain = DoubleArray(if (horizontal) outputSize.width else outputSize.height)
+        val inverseCosine = DoubleArray(mappedMain.size)
+        for (index in mappedMain.indices) {
+            val centre = if (horizontal) outputCenterX else outputCenterY
+            val extent = if (horizontal) outputSize.width else outputSize.height
+            val fov = if (horizontal) horizontalFov else verticalFov
+            val theta = (index - centre) * fov / extent
+            inverseCosine[index] = 1.0 / cos(theta)
+            mappedMain[index] = if (horizontal) {
+                sourceCenterX + focalPixels * tan(theta)
+            } else {
+                sourceCenterY + focalPixels * tan(theta)
+            }
+        }
+
+        for (y in 0 until outputSize.height) {
+            for (x in 0 until outputSize.width) {
+                val sampleX: Double
+                val sampleY: Double
+                if (horizontal) {
+                    sampleX = mappedMain[x]
+                    sampleY = sourceCenterY + (y - outputCenterY) * inverseCosine[x]
+                } else {
+                    sampleX = sourceCenterX + (x - outputCenterX) * inverseCosine[y]
+                    sampleY = mappedMain[y]
+                }
+                row[x] = bilinearOpaquePixel(
+                    pixels = sourcePixels,
+                    width = source.width,
+                    height = source.height,
+                    x = sampleX,
+                    y = sampleY,
+                )
+            }
+            output.setPixels(row, 0, outputSize.width, 0, y, outputSize.width, 1)
+        }
+        output.setHasAlpha(false)
+        return output
+    }
+
+    private fun bilinearOpaquePixel(
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        x: Double,
+        y: Double,
+    ): Int {
+        val x0 = kotlin.math.floor(x).toInt().coerceIn(0, width - 1)
+        val y0 = kotlin.math.floor(y).toInt().coerceIn(0, height - 1)
+        val x1 = (x0 + 1).coerceAtMost(width - 1)
+        val y1 = (y0 + 1).coerceAtMost(height - 1)
+        val fx = (x - x0).coerceIn(0.0, 1.0)
+        val fy = (y - y0).coerceIn(0.0, 1.0)
+        val topLeft = pixels[y0 * width + x0]
+        val topRight = pixels[y0 * width + x1]
+        val bottomLeft = pixels[y1 * width + x0]
+        val bottomRight = pixels[y1 * width + x1]
+
+        fun channel(shift: Int): Int {
+            val top = ((topLeft ushr shift) and 0xff) * (1.0 - fx) +
+                ((topRight ushr shift) and 0xff) * fx
+            val bottom = ((bottomLeft ushr shift) and 0xff) * (1.0 - fx) +
+                ((bottomRight ushr shift) and 0xff) * fx
+            return (top * (1.0 - fy) + bottom * fy).roundToInt().coerceIn(0, 255)
+        }
+        return Color.argb(255, channel(16), channel(8), channel(0))
     }
 
     private fun estimateOffset(

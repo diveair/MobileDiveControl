@@ -44,8 +44,9 @@ import com.mobiledivecontrol.ui.tutorial.SealCapPromptScreen
  *   HUD rather than instead of it so the camera and its state survive underneath: the intro runs
  *   until the diver presses something, and tearing the preview down for it would mean a cold camera
  *   start at the exact moment they want to shoot.
- * @param permissionsGranted everything the housing link and camera need. The intro reports what is
- *   still missing rather than letting the diver arrive at a viewfinder that cannot see.
+ * @param permissionsGranted everything the housing link and camera need. Android still owns every
+ *   permission prompt, but the opaque tutorial layer remains composed behind those translucent
+ *   system windows so a fresh install never exposes the camera controls before onboarding.
  */
 @Composable
 fun DiveControlScreen(
@@ -69,6 +70,7 @@ fun DiveControlScreen(
     onIntroDismiss: () -> Unit = {},
     permissionsGranted: Boolean = false,
     missingPermissions: List<String> = emptyList(),
+    permissionDialogVisible: Boolean = false,
     onPermissionsSetup: () -> Unit = {},
     capPromptVisible: Boolean = false,
     onCapPromptDismiss: () -> Unit = {},
@@ -96,13 +98,15 @@ fun DiveControlScreen(
             bluetoothEnabled = bluetoothEnabled,
         )
 
-        // One screen for permissions, connection and the button map. It leaves composition the
-        // moment it is dismissed, which is what stops its animations running behind the camera.
-        if (introVisible) {
+        // Android owns the permission dialog itself. Keep the opaque housing artwork underneath it
+        // from the first frame; otherwise the system dialog's dimmed transparency exposes a live
+        // camera mode that the user cannot operate yet.
+        if (shouldShowIntroLayer(introVisible)) {
             IntroCarouselScreen(
                 permissionsGranted = permissionsGranted,
-                bleState = state.bleConnectionState,
                 missingPermissions = missingPermissions,
+                permissionDialogVisible = permissionDialogVisible,
+                bleState = state.bleConnectionState,
                 onDismiss = onIntroDismiss,
                 onPermissionsSetup = onPermissionsSetup,
                 modifier = Modifier.fillMaxSize(),
@@ -116,6 +120,14 @@ fun DiveControlScreen(
             )
         }
     }
+}
+
+internal fun shouldShowIntroLayer(introVisible: Boolean): Boolean = introVisible
+
+/** Camera adjustment is an overlay state, not a different screen or preview lifetime. */
+internal fun animatedContentMode(mode: AppMode): AppMode = when (mode) {
+    AppMode.CameraLive, AppMode.CameraAdjust -> AppMode.CameraLive
+    else -> mode
 }
 
 @Composable
@@ -147,30 +159,18 @@ private fun DiveControlContent(
         hudVisible = state.mode != AppMode.Diagnostics,
     ) {
         AnimatedContent(
-            targetState = state.mode,
+            // CameraLive <-> CameraAdjust used to create two CameraShellScreen instances during
+            // mode selection. The outgoing shell detached CameraX while the incoming shell built
+            // a new controller, so even the last-frame hold was disposed and the crossfade showed
+            // black. Both states are the same visual/camera destination; keep one identity.
+            targetState = animatedContentMode(state.mode),
             transitionSpec = {
                 fadeIn(tween(300)) togetherWith fadeOut(tween(200))
             },
             label = "mode_transition",
         ) { mode ->
             when (mode) {
-                AppMode.CameraLive -> CameraShellScreen(
-                    cameraState = state.camera,
-                    safetyState = state.safety,
-                    cameraPermissionGranted = cameraPermissionGranted,
-                    locationPrerequisitesReady = locationPrerequisitesReady,
-                    lifecycleOwner = lifecycleOwner,
-                    effects = effects,
-                    onEffectsConsumed = onEffectsConsumed,
-                    onDetectedLenses = onDetectedLenses,
-                    onCapabilities = onCapabilities,
-                    onMeteredExposure = onMeteredExposure,
-                    onPointingGesture = onPointingGesture,
-                    onCameraCommand = onCameraCommand,
-                    headingDegrees = compassReading.headingDegrees,
-                    warningMessage = cameraFailureBannerMessage(state.lastWarning),
-                )
-                AppMode.CameraAdjust -> CameraShellScreen(
+                AppMode.CameraLive, AppMode.CameraAdjust -> CameraShellScreen(
                     cameraState = state.camera,
                     safetyState = state.safety,
                     cameraPermissionGranted = cameraPermissionGranted,
@@ -210,6 +210,7 @@ internal fun cameraFailureBannerMessage(message: String?): String? {
     val value = message?.trim()?.takeIf(String::isNotEmpty) ?: return null
     val duplicateStatus = value.startsWith("Housing ", ignoreCase = true) ||
         value.startsWith("Bluetooth ", ignoreCase = true) ||
+        value.startsWith("GATT discovery:", ignoreCase = true) ||
         value.contains(" Permission:", ignoreCase = true) ||
         value.startsWith("Verified vacuum held across restart", ignoreCase = true)
     return value.takeUnless { duplicateStatus }

@@ -42,8 +42,10 @@ internal fun hyperlapseVideoCodec(value: String?): TimeLapseVideoCodec = when (v
 
 /**
  * Explicit rungs stay exact. The public recorder cannot change capture rate mid-recording, so
- * Auto starts from Samsung's nominal 5x Auto cadence and uses 45x when the native vendor result
- * (or the user's Night selection) requests the night cadence.
+ * Auto uses Samsung's measured 15x normal/long-exposure cadence and switches to 45x when the
+ * native vendor result (or the user's Night selection) requests the night cadence. On the S24,
+ * a 72-second native Auto recording with suggestion=0 encoded 147 frames at 30 fps (4.9 seconds),
+ * which is the expected start/stop-quantized result of a 2 fps / 15x capture cadence.
  */
 internal fun hyperlapseSpeedFactor(
     value: String?,
@@ -59,7 +61,7 @@ internal fun hyperlapseSpeedFactor(
     "60x" -> 60
     else -> if (
         dayNight == "Night" || hyperlapseAutoUsesNightCadence(samsungSuggestedMotionSpeedMode)
-    ) 45 else 5
+    ) 45 else 15
 }
 
 internal fun hyperlapseCaptureRateFps(speedFactor: Int): Double =
@@ -100,6 +102,7 @@ internal class Camera2TimeLapseRecorder(
         val zoomRatio: Float,
         val torchEnabled: Boolean,
         val focusDiopters: Float?,
+        val fixedFocusLens: Boolean,
         val nightMode: Boolean,
     )
 
@@ -110,11 +113,15 @@ internal class Camera2TimeLapseRecorder(
     private var mediaRecorder: MediaRecorder? = null
     private var request: Request? = null
     private var onStarted: (() -> Unit)? = null
+    private var onPreviewPresented: (() -> Unit)? = null
     private var onFinalized: ((Result<Long>) -> Unit)? = null
     private var startedAtElapsedMs = 0L
     private var finalizeDelivered = false
     private var stopRequested = false
     private var terminating = false
+    private val deferredStopRunnable = Runnable {
+        if (isBusy && !terminating && stopRequested) stop()
+    }
 
     val isBusy: Boolean
         get() = request != null
@@ -126,11 +133,13 @@ internal class Camera2TimeLapseRecorder(
     fun start(
         request: Request,
         onStarted: () -> Unit,
+        onPreviewPresented: () -> Unit,
         onFinalized: (Result<Long>) -> Unit,
     ) {
         check(!isBusy) { "A time-lapse recording is already active or starting" }
         this.request = request
         this.onStarted = onStarted
+        this.onPreviewPresented = onPreviewPresented
         this.onFinalized = onFinalized
         finalizeDelivered = false
         stopRequested = false
@@ -281,15 +290,33 @@ internal class Camera2TimeLapseRecorder(
                                         android.util.Range(fps, fps),
                                     )
                                 }
-                                if (request.focusDiopters != null) {
+                                if (request.fixedFocusLens) {
+                                    // A fixed-focus module has no actuator. Do not leave AF in a
+                                    // continuous mode: Samsung may still apply AF-coupled digital
+                                    // geometry/lens-correction updates even though the glass cannot
+                                    // move, which looks like focus breathing in a sparse time-lapse.
                                     set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                                } else if (request.focusDiopters != null) {
+                                    set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
                                     set(CaptureRequest.LENS_FOCUS_DISTANCE, request.focusDiopters)
                                 } else {
                                     set(
                                         CaptureRequest.CONTROL_AF_MODE,
                                         CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
                                     )
+                                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
                                 }
+                                // Hyperlapse samples sparse points from a real-time stream. Dynamic
+                                // EIS changes its crop between those points and is perceived as the
+                                // lens pumping in and out. The CameraX preview contract for this mode
+                                // is stabilization Off; carry that contract into the direct session
+                                // instead of inheriting TEMPLATE_RECORD's device-dependent default.
+                                set(
+                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF,
+                                )
                                 request.exposureCompensationIndex?.let {
                                     set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, it)
                                 }
@@ -305,7 +332,39 @@ internal class Camera2TimeLapseRecorder(
                                     applyNightTuning(this, request.cameraId)
                                 }
                             }
-                            configured.setRepeatingRequest(builder.build(), null, handler)
+                            var previewPresentationDelivered = false
+                            configured.setRepeatingRequest(
+                                builder.build(),
+                                object : CameraCaptureSession.CaptureCallback() {
+                                    override fun onCaptureCompleted(
+                                        session: CameraCaptureSession,
+                                        captureRequest: CaptureRequest,
+                                        result: android.hardware.camera2.TotalCaptureResult,
+                                    ) {
+                                        if (previewPresentationDelivered ||
+                                            this@Camera2TimeLapseRecorder.request !== request ||
+                                            terminating
+                                        ) return
+                                        previewPresentationDelivered = true
+                                        // A capture result proves the direct session is producing,
+                                        // but its SurfaceView buffer is committed asynchronously.
+                                        // Cross two display transactions before allowing Compose
+                                        // to uncover it, matching the CameraX replacement contract.
+                                        surfaceView?.postOnAnimation {
+                                            surfaceView?.postOnAnimation {
+                                                if (this@Camera2TimeLapseRecorder.request === request &&
+                                                    !terminating
+                                                ) {
+                                                    Log.i(TAG, "First direct preview frame presented")
+                                                    onPreviewPresented?.invoke()
+                                                    this@Camera2TimeLapseRecorder.onPreviewPresented = null
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                handler,
+                            )
                             recorder.start()
                             startedAtElapsedMs = SystemClock.elapsedRealtime()
                             Log.i(
@@ -386,6 +445,23 @@ internal class Camera2TimeLapseRecorder(
             stopRequested = true
             return
         }
+        val captureFps = request?.captureRateFps?.coerceAtLeast(0.01) ?: 1.0
+        // MediaRecorder throws -1007 when stop() arrives before a time-lapse encoder has received
+        // enough sparse samples to construct a valid MP4. This is easy to hit by tapping Pause or
+        // Stop immediately after Resume: at 2 fps, 431 ms still contains no complete output GOP.
+        // Enter the logical stopping state now, but keep the producer alive until two samples plus
+        // a small muxer margin are guaranteed. Repeated requests coalesce onto this same runnable.
+        val minimumSafeDurationMs = kotlin.math.ceil(2_000.0 / captureFps).toLong() + 250L
+        val remainingMs = minimumSafeDurationMs - elapsedDurationMs
+        if (remainingMs > 0L) {
+            stopRequested = true
+            handler.removeCallbacks(deferredStopRunnable)
+            handler.postDelayed(deferredStopRunnable, remainingMs)
+            Log.i(TAG, "Deferring time-lapse stop ${remainingMs}ms for encoder samples")
+            return
+        }
+        stopRequested = false
+        handler.removeCallbacks(deferredStopRunnable)
         terminating = true
         val duration = elapsedDurationMs
         try {
@@ -461,6 +537,7 @@ internal class Camera2TimeLapseRecorder(
     }
 
     private fun cleanup() {
+        handler.removeCallbacks(deferredStopRunnable)
         runCatching { session?.close() }
         runCatching { cameraDevice?.close() }
         runCatching { mediaRecorder?.reset() }
@@ -473,6 +550,7 @@ internal class Camera2TimeLapseRecorder(
         mediaRecorder = null
         request = null
         onStarted = null
+        onPreviewPresented = null
         onFinalized = null
         startedAtElapsedMs = 0L
         stopRequested = false

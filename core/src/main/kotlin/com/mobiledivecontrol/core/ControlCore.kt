@@ -163,6 +163,24 @@ class ControlCore(
         )
     }
 
+    /** Restores an engineering-test camera snapshot as one atomic state transition. */
+    fun restoreCameraSnapshot(
+        camera: CameraState,
+        mode: AppMode,
+        receivedAt: Instant = clock.instant(),
+    ): ProcessingOutcome {
+        val startedNanos = System.nanoTime()
+        val previousState = state
+        return commitReduction(
+            previousState = previousState,
+            reduction = Reduction(state = state.copy(mode = mode, camera = camera)),
+            reason = "camera_stress_snapshot_restore",
+            path = "camera_stress_restore",
+            receivedAt = receivedAt,
+            startedNanos = startedNanos,
+        )
+    }
+
     fun advanceBle(
         signal: BleSignal,
         receivedAt: Instant = clock.instant(),

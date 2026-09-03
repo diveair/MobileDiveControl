@@ -45,6 +45,7 @@ internal class HighSpeedVideoTranscoder(context: Context) {
         inputFile: File,
         outputFile: File,
         effectiveCaptureFps: Int,
+        sourceCaptureFps: Int = effectiveCaptureFps.coerceAtLeast(120),
         playbackFps: Double,
         onCompleted: (Result<File>) -> Unit,
     ) {
@@ -56,7 +57,7 @@ internal class HighSpeedVideoTranscoder(context: Context) {
         activeOutputFile = outputFile
 
         val playbackRate = playbackFps.toFloat()
-        val constrainedSourceFps = effectiveCaptureFps.coerceAtLeast(120)
+        val constrainedSourceFps = sourceCaptureFps
         val measuredSourceFps = measureFrameRate(inputFile) ?: constrainedSourceFps.toDouble()
         // Samsung's nominal 120 fps stream measures about 118.5 fps on this device. Correct for
         // that clock difference so the exported track lands on the selected playback cadence.

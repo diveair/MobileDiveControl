@@ -671,17 +671,15 @@ class CameraCatalogTest {
     }
 
     @Test
-    fun `detected lenses never widen a mode beyond Samsungs supported lens subset`() {
-        val detected = listOf("Auto", "0.6x", "1x", "2x", "3x", "5x", "front")
+    fun `detected physical and front cameras are offered in every camera mode`() {
+        val detected = listOf("Auto", "0.6x", "1x", "3x", "5x", "front")
         fun lenses(mode: CameraModeId) = CameraCatalog.settingsFor(mode, GalaxyDeviceVariant.S26Ultra, detected)
             .first { it.id.endsWith(".lens") }
             .options
 
-        assertEquals(listOf("1x", "2x", "3x"), lenses(CameraModeId.Portrait))
-        assertEquals(listOf("1x", "2x", "3x"), lenses(CameraModeId.Food))
-        assertEquals(listOf("0.6x", "1x"), lenses(CameraModeId.Panorama))
-        assertEquals(listOf("1x", "2x"), lenses(CameraModeId.PortraitVideo))
-        assertEquals(listOf("0.6x", "1x", "3x"), lenses(CameraModeId.SlowMotion))
+        CameraModeId.entries
+            .filterNot { CameraCatalog.profile(it, GalaxyDeviceVariant.S26Ultra).settings.none { spec -> spec.id.endsWith(".lens") } }
+            .forEach { mode -> assertEquals(detected, lenses(mode), mode.name) }
 
         val allDetectedModes = listOf(
             CameraModeId.Photo,
@@ -699,6 +697,18 @@ class CameraCatalogTest {
         allDetectedModes.forEach { mode ->
             assertEquals(detected, lenses(mode), "Unexpected lens routing choices for $mode")
         }
+    }
+
+    @Test
+    fun `fresh state defaults every lens bearing mode to 0_6x`() {
+        val defaults = CameraCatalog.freshInstallSettingValues
+            .filterKeys { it.endsWith(".lens") }
+
+        assertTrue(defaults.isNotEmpty())
+        defaults.forEach { (settingId, value) ->
+            assertEquals("0.6x", value, settingId)
+        }
+        assertTrue(defaults.values.none { it == "2x" })
     }
 
     @Test
@@ -917,6 +927,28 @@ class CameraCatalogTest {
         val fps = CameraCatalog.settingsFor(CameraModeId.SlowMotion, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "slow_motion.frame_rate" }
         assertEquals(listOf("48fps", "60fps", "120fps", "240fps"), fps.options)
+    }
+
+    @Test
+    fun `slow motion hides ordinary video resolutions with no high rate stream`() {
+        val caps = CameraCapabilities(
+            availableVideoFrameRates = listOf(24, 30, 60, 120, 240),
+            availableVideoResolutions = listOf("FHD", "UHD 4K"),
+            videoFrameRatesByResolution = mapOf(
+                "FHD" to listOf(24, 30, 60, 120, 240),
+                "UHD 4K" to listOf(24, 30),
+            ),
+        )
+        val camera = CameraCatalog.launchCameraState(CameraModeId.SlowMotion).copy(
+            capabilities = caps,
+        )
+
+        assertEquals(
+            listOf("FHD"),
+            CameraCatalog.settingsFor(camera)
+                .first { it.id == "slow_motion.resolution" }
+                .options,
+        )
     }
 
     /**

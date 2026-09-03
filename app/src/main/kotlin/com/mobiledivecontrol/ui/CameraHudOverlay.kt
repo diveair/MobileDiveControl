@@ -39,10 +39,11 @@ import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.BleConnectionState
 import com.mobiledivecontrol.core.CameraState
 import com.mobiledivecontrol.core.CameraCatalog
+import com.mobiledivecontrol.core.CameraModeId
 import com.mobiledivecontrol.core.NavigationArrowMesh
 import com.mobiledivecontrol.core.ProjectedArrowPoint
-import com.mobiledivecontrol.core.SealState
 import com.mobiledivecontrol.theme.DiveColors
+import com.mobiledivecontrol.ui.camera.ExpertRawCaptureState
 import com.mobiledivecontrol.ui.components.ConnectionStatus
 import com.mobiledivecontrol.ui.components.DepthGauge
 import com.mobiledivecontrol.ui.components.DualBatteryIndicator
@@ -80,18 +81,37 @@ fun CameraHudOverlay(
         // camera HUD cleanly; the paused action rail restores every status pill when it closes.
         if (state.camera.recordingLocationChooserVisible) return@Box
 
+        val skyGuideStatus = skyGuideStatusLabel(
+            camera = state.camera,
+            azimuthDegrees = ExpertRawCaptureState.skyAzimuthDegrees.value,
+            altitudeDegrees = ExpertRawCaptureState.skyAltitudeDegrees.value,
+            hasObserverLocation = ExpertRawCaptureState.observerLatitudeDegrees.value != null &&
+                ExpertRawCaptureState.observerLongitudeDegrees.value != null,
+        )
         OverlayPill(
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(start = 16.dp, top = 16.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                DualBatteryIndicator(
-                    housingPercent = state.housing.batteryPercent,
-                    phonePercent = state.phoneBatteryPercent,
-                )
-                Spacer(modifier = Modifier.width(10.dp))
-                ConnectionStatus(bleState = state.bleConnectionState)
+            Column(horizontalAlignment = Alignment.Start) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    DualBatteryIndicator(
+                        housingPercent = state.housing.batteryPercent,
+                        phonePercent = state.phoneBatteryPercent,
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    ConnectionStatus(bleState = state.bleConnectionState)
+                }
+                if (skyGuideStatus != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = skyGuideStatus,
+                        color = DiveColors.TextPrimary,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
             }
         }
 
@@ -188,12 +208,6 @@ fun CameraHudOverlay(
             }
         }
 
-        // Offset below the link banner rather than layered with it. Draw order would decide the
-        // winner if these overlapped, and a seal failure is a higher-priority alert than a link
-        // advisory — so they are given separate space instead and both stay readable. The
-        // indicator now owns the whole frame because its two ask-me stages render dead-centre;
-        // the top padding only steers its top-anchored elements.
-        val linkBannerVisible = state.bleConnectionState != BleConnectionState.Ready
         // Anchor the seal chip to the vacuum cluster's real bottom edge, not a guess: the cluster
         // is one line tall in the cap wait and two lines while the hold counts, and "SEAL PASSED"
         // belongs directly under the reading it certifies in both shapes.
@@ -203,42 +217,31 @@ fun CameraHudOverlay(
         SealCheckIndicator(
             safety = state.safety,
             housingConnected = state.housing.connected,
-            topPadding = if (linkBannerVisible) SEAL_STACKED_TOP else sealTop,
+            topPadding = sealTop,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(start = 16.dp, end = 16.dp),
         )
 
-        // Drawn last so nothing can cover it, and it disappears entirely once the link is Ready.
-        // Dead-centre when a vacuum is already established (held, restored, or primed from the
-        // boot record awaiting its first sample): that boot moment has a nearly empty screen,
-        // and the one thing happening — the link coming up — should sit where the eye rests.
-        // Otherwise it keeps its slot below the status pills, out of the tutorial flows' way.
-        val vacuumEstablished = state.safety.sealState == SealState.LeakMonitoring ||
-            state.safety.sealState == SealState.Passed ||
-            state.safety.verifiedVacuumKpa != null
+        // Every housing-link state owns the same dead-centre anchor. Keeping the placement here,
+        // outside the individual message variants, prevents reconnecting, Bluetooth-off and
+        // failure states from drifting back to the old top-of-viewfinder slot.
         HousingLinkBanner(
             bleState = state.bleConnectionState,
             bluetoothEnabled = bluetoothEnabled,
-            modifier = if (!bluetoothEnabled) {
-                // The phone-radio state is a prerequisite failure, not a floating housing
-                // advisory. Give it the complete display width so there is no ambiguous live
-                // camera strip at either edge suggesting the alert is local or dismissible.
-                Modifier
-                    .align(if (vacuumEstablished) Alignment.Center else Alignment.TopCenter)
-                    .then(if (vacuumEstablished) Modifier else Modifier.padding(top = 64.dp))
-                    .fillMaxWidth()
-            } else if (vacuumEstablished) {
-                Modifier
-                    .align(Alignment.Center)
-                    .padding(start = 16.dp, end = 16.dp)
-                    .fillMaxWidth()
-            } else {
-                Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 64.dp, start = 16.dp, end = 16.dp)
-                    .fillMaxWidth()
-            },
+            housingBatteryPercent = state.housing.batteryPercent,
+            modifier = Modifier
+                .align(Alignment.Center)
+                .then(
+                    if (bluetoothEnabled) {
+                        Modifier.padding(start = 16.dp, end = 16.dp)
+                    } else {
+                        // Bluetooth-off remains full width, but now shares the same vertical
+                        // centre as every housing-link banner.
+                        Modifier
+                    },
+                )
+                .fillMaxWidth(),
         )
     }
 }
@@ -364,6 +367,25 @@ internal fun cameraReadoutBottomPadding(mode: AppMode, camera: CameraState) = wh
 internal fun cameraDiveReadoutVisible(mode: AppMode, camera: CameraState): Boolean =
     mode != AppMode.Gallery && !camera.panoramaReviewAvailable
 
+/** Optional second line inside the battery/signal pill while Expert RAW Sky Guide is enabled. */
+internal fun skyGuideStatusLabel(
+    camera: CameraState,
+    azimuthDegrees: Float,
+    altitudeDegrees: Float,
+    hasObserverLocation: Boolean,
+): String? {
+    if (camera.activeMode != CameraModeId.ExpertRaw) return null
+    val setting = CameraCatalog.settingsFor(camera).firstOrNull { it.id == "expert.sky_guide" }
+        ?: return null
+    if (CameraCatalog.currentValue(camera, setting) != "On") return null
+    return if (hasObserverLocation) {
+        "SKY GUIDE  ${azimuthDegrees.roundToInt().toString().padStart(3, '0')}°  " +
+            "${altitudeDegrees.roundToInt()}° ALT"
+    } else {
+        "SKY GUIDE"
+    }
+}
+
 /** The selected file resolution, or the photo pixel count when that mode has no size selector. */
 internal fun currentCameraResolutionLabel(camera: CameraState): String? {
     val settings = CameraCatalog.settingsFor(camera)
@@ -407,7 +429,6 @@ internal fun detailedResolutionLabel(value: String): String = when (value) {
 }
 
 /** Clears a two-line link banner so a seal failure and a link warning can coexist. */
-private val SEAL_STACKED_TOP = 140.dp
 
 @Composable
 private fun OverlayPill(

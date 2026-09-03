@@ -593,19 +593,17 @@ class HousingLink(
      * Dumps the discovered GATT tree once per connection.
      *
      * The vendor base UUID in the protocol document is malformed, so this dump is how a single
-     * session with real hardware settles what the housing actually exposes.
+     * session with real hardware settles what the housing actually exposes. This is successful
+     * diagnostic telemetry, not a user warning; surfacing it in the HUD created a one-frame GATT
+     * summary above the legitimate CONNECTING TO HOUSING banner immediately before Ready.
      */
     private fun reportDiscovery(transport: HousingTransport, services: Set<String>) {
-        Log.i(TAG, "GATT discovery: ${services.size} services")
-        transport.discoveryReport.forEach { line -> Log.i(TAG, "GATT  $line") }
-
-        val resolved = transport.availableCharacteristics
-        emit(
-            HousingLinkEvent.Warning(
-                "GATT discovery: ${services.size} services, ${resolved.size} housing " +
-                    "characteristics resolved. Full tree in logcat tag $TAG.",
-            ),
+        Log.i(
+            TAG,
+            "GATT discovery: ${services.size} services, " +
+                "${transport.availableCharacteristics.size} housing characteristics resolved",
         )
+        transport.discoveryReport.forEach { line -> Log.i(TAG, "GATT  $line") }
     }
 
     private fun reportUnavailableFeatures(available: Set<HousingCharacteristic>) {

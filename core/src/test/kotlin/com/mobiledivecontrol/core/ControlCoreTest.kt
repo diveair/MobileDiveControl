@@ -8,6 +8,130 @@ import kotlin.test.assertTrue
 
 class ControlCoreTest {
     @Test
+    fun `mode up down never opens side menu from either closed camera focus state`() {
+        val modes = CameraCatalog.centerModeCycle
+        for (mode in modes) {
+            for (zone in listOf(CameraUiZone.LiveView, CameraUiZone.SettingsPanel)) {
+                for ((wireByte, step) in listOf(0x30 to -1, 0x61 to 1)) {
+                    val core = ControlCore(initialState = AppState(camera =
+                        CameraCatalog.launchCameraState(mode).copy(focusedZone = zone),
+                    ))
+                    core.advanceBle(BleSignal.Ready)
+                    var index = modes.indexOf(mode)
+                    val start = Instant.parse("2026-09-02T12:00:00Z")
+                    repeat(modes.size * 2) { press ->
+                        val result = core.handleButtonPayload(
+                            byteArrayOf(wireByte.toByte()),
+                            receivedAt = start.plusMillis(press * 50L),
+                        )
+                        index = (index + step + modes.size) % modes.size
+                        assertEquals(modes[index], result.state.camera.activeMode)
+                        assertEquals(CameraUiZone.SettingsPanel, result.state.camera.focusedZone)
+                        assertTrue(!result.state.camera.showMoreSettings)
+                    }
+                    val opened = core.handleButtonPayload(byteArrayOf(0x50), receivedAt = start.plusSeconds(10))
+                    assertEquals(CameraUiZone.ModeRail, opened.state.camera.focusedZone)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `housing shutter starts the correct capture in every mode and camera UI zone`() {
+        val recordingModes = setOf(
+            CameraModeId.Video, CameraModeId.ProVideo, CameraModeId.SlowMotion,
+            CameraModeId.SuperSlowMotion, CameraModeId.Hyperlapse, CameraModeId.DualRecording,
+            CameraModeId.PortraitVideo, CameraModeId.DirectorsView, CameraModeId.NightVideo,
+        )
+        for (mode in CameraModeId.entries) {
+            for (zone in CameraUiZone.entries) {
+                for (appMode in listOf(AppMode.CameraLive, AppMode.CameraAdjust)) {
+                    val core = ControlCore(initialState = AppState(
+                        mode = appMode,
+                        camera = CameraCatalog.launchCameraState(mode).copy(
+                            focusedZone = zone,
+                            settingsEditing = true,
+                            showMoreSettings = true,
+                        ),
+                    ))
+                    core.advanceBle(BleSignal.Ready)
+                    core.updatePermission(PermissionKind.Camera, true)
+                    core.updatePermission(PermissionKind.Microphone, true)
+                    val result = core.handleButtonPayload(byteArrayOf(0x20))
+                    val expected = if (mode in recordingModes) {
+                        CameraCommand.StartVideoRecording
+                    } else {
+                        CameraCommand.CapturePhoto
+                    }
+                    assertEquals(listOf(PlatformEffect.ExecuteCamera(expected)), result.effects, "$mode/$zone/$appMode")
+                    assertEquals(mode in recordingModes, result.state.camera.recording)
+                    if (mode in recordingModes) {
+                        val paused = core.handleButtonPayload(byteArrayOf(0x20), receivedAt = Instant.now().plusSeconds(2))
+                        assertEquals(listOf(PlatformEffect.ExecuteCamera(CameraCommand.PauseVideoRecording)), paused.effects)
+                        assertTrue(paused.state.camera.recordingPaused)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `pro video shutter requests missing microphone then starts on next press after grant`() {
+        val core = ControlCore(initialState = AppState(camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo)))
+        core.advanceBle(BleSignal.Ready)
+        core.updatePermission(PermissionKind.Camera, true)
+        val blocked = core.handleButtonPayload(byteArrayOf(0x20))
+        assertTrue("Microphone Permission: Disabled" in blocked.notes)
+        assertTrue(!blocked.state.camera.recording)
+        core.updatePermission(PermissionKind.Microphone, true)
+        val started = core.handleButtonPayload(byteArrayOf(0x20), receivedAt = Instant.now().plusSeconds(2))
+        assertEquals(listOf(PlatformEffect.ExecuteCamera(CameraCommand.StartVideoRecording)), started.effects)
+    }
+
+    @Test
+    fun `every video mode can record without microphone permission when audio is off`() {
+        for (mode in CameraModeId.entries.filter { it.captureType == CameraCaptureType.Video }) {
+            val camera = CameraCatalog.launchCameraState(mode)
+            val core = ControlCore(initialState = AppState(camera = camera.copy(
+                settingValues = camera.settingValues.mapValues { (id, value) ->
+                    if (id.endsWith(".audio_recording")) "Off" else value
+                },
+            )))
+            core.advanceBle(BleSignal.Ready)
+            core.updatePermission(PermissionKind.Camera, true)
+            val result = core.handleButtonPayload(byteArrayOf(0x20))
+            assertEquals(listOf(PlatformEffect.ExecuteCamera(CameraCommand.StartVideoRecording)), result.effects, mode.name)
+        }
+    }
+
+    @Test
+    fun `switching modes preserves each modes last settings`() {
+        val reducer = ControlReducer()
+        val customized = CameraCatalog.launchCameraState(CameraModeId.Photo).copy(
+            settingValues = CameraCatalog.defaultSettingValues + mapOf(
+                "photo.lens" to "3x",
+                "photo.exposure_compensation" to "+1.0",
+                "video.lens" to "front",
+                "video.resolution" to "FHD",
+            ),
+        )
+
+        val video = reducer.reduce(
+            AppState(camera = customized),
+            CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryIndexForMode(CameraModeId.Video)),
+        ).state.camera
+        val photo = reducer.reduce(
+            AppState(camera = video),
+            CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryIndexForMode(CameraModeId.Photo)),
+        ).state.camera
+
+        assertEquals("front", video.settingValues["video.lens"])
+        assertEquals("FHD", video.settingValues["video.resolution"])
+        assertEquals("3x", photo.settingValues["photo.lens"])
+        assertEquals("+1.0", photo.settingValues["photo.exposure_compensation"])
+    }
+
+    @Test
     fun `camera shutter emits capture effect when camera is permitted`() {
         val core = ControlCore()
         core.advanceBle(BleSignal.Ready)
@@ -71,11 +195,13 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
         val start = Instant.parse("2026-05-26T12:00:00Z")
 
-        val railOutcome = core.handleNotificationPayload(
+        val navbarOutcome = core.handleNotificationPayload(
             HousingCharacteristic.ButtonEvents.shortHex,
             byteArrayOf(0x10),
             start,
         )
+        assertEquals(CameraUiZone.SettingsPanel, navbarOutcome.state.camera.focusedZone)
+        val railOutcome = core.handleButtonPayload(byteArrayOf(0x50), receivedAt = start.plusMillis(50))
         assertEquals(CameraUiZone.ModeRail, railOutcome.state.camera.focusedZone)
         assertEquals("Track Heading", railOutcome.state.camera.primaryHighlightedEntry.label)
 
@@ -152,7 +278,7 @@ class ControlCoreTest {
         val core = ControlCore()
         val originalMode = core.state.camera.activeMode
 
-        core.dispatch(CameraCommand.NavigateRight)
+        core.dispatch(CameraCommand.OpenModeRail)
         val outcome = core.dispatch(CameraCommand.Confirm)
 
         assertEquals(originalMode, outcome.state.camera.activeMode)
@@ -171,11 +297,6 @@ class ControlCoreTest {
         val modeRail = core.dispatch(CameraCommand.Confirm)
         assertEquals(CameraUiZone.ModeRail, modeRail.state.camera.focusedZone)
         assertEquals(CameraUiZone.SettingsPanel, modeRail.state.camera.modeRailReturnZone)
-        assertEquals("Photo", modeRail.state.camera.primaryHighlightedEntry.label)
-
-        repeat(CameraCatalog.primaryIndexForMode(CameraModeId.Photo)) {
-            core.dispatch(CameraCommand.NavigateUp)
-        }
         assertEquals("Track Heading", core.state.camera.primaryHighlightedEntry.label)
 
         val tracked = core.dispatch(CameraCommand.Confirm)
@@ -189,12 +310,13 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `centred mode control remembers the active mode and cycles in the requested order`() {
+    fun `opening mode side menu resets to track heading without changing active mode`() {
         val reducer = ControlReducer()
         val proVideo = CameraCatalog.launchCameraState(CameraModeId.ProVideo)
 
         val opened = reducer.reduce(AppState(camera = proVideo), CameraCommand.OpenModeRail)
-        assertEquals(CameraModeId.ProVideo, opened.state.camera.primaryHighlightedEntry.mode)
+        assertEquals("Track Heading", opened.state.camera.primaryHighlightedEntry.label)
+        assertEquals(CameraModeId.ProVideo, opened.state.camera.activeMode)
 
         val up = reducer.reduce(AppState(camera = proVideo), CameraCommand.NavigateUp)
         assertEquals(CameraModeId.Panorama, up.state.camera.activeMode)
@@ -210,7 +332,7 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
 
         // Explicitly open the rail; its default is Track Heading at index 0.
-        core.dispatch(CameraCommand.NavigateRight)
+        core.dispatch(CameraCommand.OpenModeRail)
         // Navigate Up: should wrap around to last index
         val wrapUpOutcome = core.dispatch(CameraCommand.NavigateUp)
         val lastIndex = CameraCatalog.primaryRailEntries.lastIndex
@@ -229,7 +351,7 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
         val originalCameraMode = core.state.camera.activeMode
 
-        core.dispatch(CameraCommand.NavigateRight)
+        core.dispatch(CameraCommand.OpenModeRail)
         val lastEntry = core.dispatch(CameraCommand.NavigateUp)
         assertEquals("Diagnostics", lastEntry.state.camera.primaryHighlightedEntry.label)
         assertEquals(CameraRailAction.Diagnostics, lastEntry.state.camera.primaryHighlightedEntry.action)
@@ -293,6 +415,50 @@ class ControlCoreTest {
         val revoked = core.updatePermission(PermissionKind.Camera, false)
         assertEquals(AppMode.Diagnostics, revoked.state.mode)
         assertTrue(revoked.notes.contains("Camera Permission: Disabled"))
+    }
+
+    @Test
+    fun `initial accessibility sync does not strand clean install on diagnostics`() {
+        val core = ControlCore()
+
+        core.updatePermission(PermissionKind.Camera, false)
+        val accessibilityPending = core.updatePermission(PermissionKind.Accessibility, false)
+        val cameraGranted = core.updatePermission(PermissionKind.Camera, true)
+
+        assertEquals(AppMode.CameraLive, accessibilityPending.state.mode)
+        assertTrue(accessibilityPending.notes.isEmpty())
+        assertEquals(AppMode.CameraLive, cameraGranted.state.mode)
+    }
+
+    @Test
+    fun `video start requests camera and enabled microphone instead of silently recording`() {
+        val camera = CameraCatalog.launchCameraState(CameraModeId.Video)
+        val missingCamera = ControlCore(initialState = AppState(camera = camera))
+
+        val cameraBlocked = missingCamera.dispatch(CameraCommand.StartVideoRecording)
+        assertEquals(false, cameraBlocked.state.camera.recording)
+        assertTrue(cameraBlocked.notes.contains("Camera Permission: Disabled"))
+
+        val missingMicrophone = ControlCore(initialState = AppState(camera = camera))
+        missingMicrophone.updatePermission(PermissionKind.Camera, true)
+        val microphoneBlocked = missingMicrophone.dispatch(CameraCommand.StartVideoRecording)
+        assertEquals(false, microphoneBlocked.state.camera.recording)
+        assertTrue(microphoneBlocked.notes.contains("Microphone Permission: Disabled"))
+
+        val muted = ControlCore(
+            initialState = AppState(
+                camera = camera.copy(
+                    settingValues = camera.settingValues + ("video.audio_recording" to "Off"),
+                ),
+            ),
+        )
+        muted.updatePermission(PermissionKind.Camera, true)
+        val allowed = muted.dispatch(CameraCommand.StartVideoRecording)
+        assertTrue(allowed.state.camera.recording)
+        assertEquals(
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.StartVideoRecording)),
+            allowed.effects,
+        )
     }
 
     @Test
@@ -696,12 +862,13 @@ class ControlCoreTest {
         val reducer = ControlReducer()
         val caps = CameraCapabilities(
             availableVideoFrameRates = listOf(24, 30, 60, 120, 240),
-            availableVideoResolutions = listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
+            availableVideoResolutions = listOf("SD 480p", "HD 720p", "FHD", "UHD 4K", "8K"),
             videoFrameRatesByResolution = mapOf(
                 "SD 480p" to listOf(24, 30),
                 "HD 720p" to listOf(24, 30, 60, 120, 240),
                 "FHD" to listOf(24, 30, 60, 120),
                 "UHD 4K" to listOf(24, 30),
+                "8K" to listOf(24, 30),
             ),
         )
         val camera = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
@@ -729,6 +896,16 @@ class ControlCoreTest {
         assertEquals(
             CameraCatalog.proVideoFrameRateOption(30),
             uhd.settingValues["pro_video.frame_rate"],
+        )
+
+        val eightK = reducer.reduce(
+            AppState(camera = uhd),
+            CameraCommand.NudgeSetting("pro_video.resolution", +1),
+        ).state.camera
+        assertEquals("8K", eightK.settingValues["pro_video.resolution"])
+        assertEquals(
+            CameraCatalog.proVideoFrameRateOption(30),
+            eightK.settingValues["pro_video.frame_rate"],
         )
     }
 
@@ -773,7 +950,8 @@ class ControlCoreTest {
 
         // Force mode to Pro and open settings panel
         core.forceMode(AppMode.CameraLive)
-        repeat(modeRailSteps(CameraModeId.Photo, CameraModeId.Pro)) {
+        core.dispatch(CameraCommand.OpenModeRail)
+        repeat(CameraCatalog.primaryIndexForMode(CameraModeId.Pro)) {
             core.dispatch(CameraCommand.NavigateDown)
         }
         val modeOutcome = core.dispatch(CameraCommand.Confirm)
@@ -889,7 +1067,8 @@ class ControlCoreTest {
         core.updatePermission(PermissionKind.Camera, true)
 
         core.forceMode(AppMode.CameraLive)
-        repeat(modeRailSteps(CameraModeId.Photo, CameraModeId.Pro)) {
+        core.dispatch(CameraCommand.OpenModeRail)
+        repeat(CameraCatalog.primaryIndexForMode(CameraModeId.Pro)) {
             core.dispatch(CameraCommand.NavigateDown)
         }
         val modeOutcome = core.dispatch(CameraCommand.Confirm)
@@ -1469,6 +1648,83 @@ class ControlCoreTest {
             },
             "manual focus must not emit an unconsumed camera effect",
         )
+    }
+
+    @Test
+    fun `pro focus detent switches ultra wide to main lens and applies the first adjustment`() {
+        for (mode in listOf(CameraModeId.Pro, CameraModeId.ProVideo)) {
+            for (command in listOf(CameraCommand.NavigateRight, CameraCommand.NavigateLeft)) {
+                val prefix = if (mode == CameraModeId.Pro) "pro" else "pro_video"
+                val initial = CameraCatalog.launchCameraState(mode).copy(
+                    capabilities = CameraCapabilities(manualFocusSupported = false),
+                    settingValues = CameraCatalog.defaultSettingValues + ("$prefix.lens" to "0.6x"),
+                )
+                val cursor = CameraCatalog.settingsBarItems(initial).indexOfFirst {
+                    it is BottomBarItem.Setting && it.spec.id == "$prefix.manual_focus"
+                }
+                assertTrue(cursor >= 0)
+                val state = AppState(camera = initial.copy(settingsCursor = cursor))
+                val reducer = ControlReducer()
+                val selected = reducer.reduce(state, CameraCommand.Confirm)
+                assertEquals("0.6x", selected.state.camera.settingValues["$prefix.lens"])
+                assertTrue(selected.effects.isEmpty())
+
+                val changed = reducer.reduce(selected.state, command)
+                val quickChanged = reducer.reduce(state, if (command == CameraCommand.NavigateRight) {
+                    CameraCommand.NavigateUp
+                } else {
+                    CameraCommand.NavigateDown
+                })
+                assertEquals(changed.state.camera.settingValues, quickChanged.state.camera.settingValues)
+                assertEquals("1x", changed.state.camera.settingValues["$prefix.lens"])
+                assertTrue(changed.state.camera.settingValues["$prefix.manual_focus"]!!.toDoubleOrNull() != null)
+                assertEquals(
+                    PlatformEffect.ExecuteCamera(CameraCommand.SwitchLens("1x")),
+                    changed.effects.first(),
+                )
+                // Focus is consumed from state by the runtime, not an imperative command.
+                val focusSpec = changed.state.camera.selectedSetting!!
+                val expectedFocus = if (command == CameraCommand.NavigateRight) {
+                    focusSpec.options[1]
+                } else {
+                    focusSpec.options.last()
+                }
+                assertEquals(expectedFocus, changed.state.camera.settingValues["$prefix.manual_focus"])
+                val next = reducer.reduce(changed.state, command)
+                assertTrue(next.effects.none {
+                    it is PlatformEffect.ExecuteCamera && it.command is CameraCommand.SwitchLens
+                })
+                assertEquals(initial.settingValues["hyperlapse.lens"], changed.state.camera.settingValues["hyperlapse.lens"])
+            }
+        }
+    }
+
+    @Test
+    fun `pro focus assistance and active recording do not switch ultra wide lens`() {
+        for (mode in listOf(CameraModeId.Pro, CameraModeId.ProVideo)) {
+            val prefix = if (mode == CameraModeId.Pro) "pro" else "pro_video"
+            val initial = CameraCatalog.launchCameraState(mode).copy(
+                settingValues = CameraCatalog.defaultSettingValues + ("$prefix.lens" to "0.6x"),
+                settingsEditing = true,
+            )
+            val cursor = CameraCatalog.settingsBarItems(initial).indexOfFirst {
+                it is BottomBarItem.Setting && it.spec.id == "$prefix.manual_focus"
+            }
+            for (target in SliderEditTarget.entries.filter { it != SliderEditTarget.Value }) {
+                val result = ControlReducer().reduce(
+                    AppState(camera = initial.copy(settingsCursor = cursor, sliderEditTarget = target)),
+                    CameraCommand.NavigateRight,
+                )
+                assertEquals("0.6x", result.state.camera.settingValues["$prefix.lens"])
+                assertTrue(result.effects.none {
+                    it is PlatformEffect.ExecuteCamera && it.command is CameraCommand.SwitchLens
+                })
+            }
+            val recording = AppState(camera = initial.copy(settingsCursor = cursor, recording = true))
+            val result = ControlReducer().reduce(recording, CameraCommand.NavigateRight)
+            assertEquals(recording.camera, result.state.camera)
+            assertTrue(result.state.lastWarning!!.contains("Stop recording"))
+        }
     }
 
     @Test

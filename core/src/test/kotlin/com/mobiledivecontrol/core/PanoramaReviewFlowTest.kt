@@ -16,6 +16,7 @@ class PanoramaReviewFlowTest {
         camera = CameraState(
             activeMode = CameraModeId.Panorama,
             panoramaReviewAvailable = true,
+            panoramaReviewInputArmed = true,
             panoramaReviewAction = action,
         ),
     )
@@ -28,12 +29,36 @@ class PanoramaReviewFlowTest {
         )
 
         assertTrue(ready.state.camera.panoramaReviewAvailable)
+        assertFalse(ready.state.camera.panoramaReviewInputArmed)
         assertEquals(PanoramaReviewAction.Save, ready.state.camera.panoramaReviewAction)
         assertEquals(
             listOf(PanoramaReviewAction.Save, PanoramaReviewAction.Delete),
             PanoramaReviewAction.entries,
         )
         assertTrue(ready.effects.isEmpty())
+    }
+
+    @Test
+    fun `stop gesture cannot fall through into the default Save action`() {
+        val opened = reducer.reduce(
+            AppState(camera = CameraState(activeMode = CameraModeId.Panorama)),
+            CameraCommand.PanoramaReviewReady,
+        ).state
+
+        val leakedConfirm = reducer.reduce(opened, CameraCommand.Confirm)
+        assertTrue(leakedConfirm.state.camera.panoramaReviewAvailable)
+        assertTrue(leakedConfirm.effects.isEmpty())
+        val leakedTouchSave = reducer.reduce(opened, CameraCommand.SavePanorama)
+        assertTrue(leakedTouchSave.state.camera.panoramaReviewAvailable)
+        assertTrue(leakedTouchSave.effects.isEmpty())
+
+        val armed = reducer.reduce(opened, CameraCommand.ArmPanoramaReviewInput).state
+        val deliberateConfirm = reducer.reduce(armed, CameraCommand.Confirm)
+        assertFalse(deliberateConfirm.state.camera.panoramaReviewAvailable)
+        assertEquals(
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SavePanorama)),
+            deliberateConfirm.effects,
+        )
     }
 
     @Test

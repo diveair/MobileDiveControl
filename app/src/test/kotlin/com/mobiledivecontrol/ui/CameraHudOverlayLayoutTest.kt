@@ -132,4 +132,28 @@ class CameraHudOverlayLayoutTest {
             assertEquals("HDR $label", currentCameraResolutionStatusLabel(camera))
         }
     }
+
+    @Test
+    fun `sky guide status is emitted only for enabled expert raw`() {
+        val enabled = CameraCatalog.launchCameraState(CameraModeId.ExpertRaw).copy(
+            settingValues = CameraCatalog.defaultSettingValues + ("expert.sky_guide" to "On"),
+        )
+        val disabled = enabled.copy(
+            settingValues = enabled.settingValues + ("expert.sky_guide" to "Off"),
+        )
+        val wrongMode = enabled.copy(activeMode = CameraModeId.Pro)
+
+        assertEquals("SKY GUIDE", skyGuideStatusLabel(enabled, 269f, 88f, false))
+        assertEquals(null, skyGuideStatusLabel(disabled, 269f, 88f, true))
+        assertEquals(null, skyGuideStatusLabel(wrongMode, 269f, 88f, true))
+    }
+
+    @Test
+    fun `sky guide status formats live bearing inside battery pill`() {
+        val camera = CameraCatalog.launchCameraState(CameraModeId.ExpertRaw).copy(
+            settingValues = CameraCatalog.defaultSettingValues + ("expert.sky_guide" to "On"),
+        )
+
+        assertEquals("SKY GUIDE  269°  88° ALT", skyGuideStatusLabel(camera, 269.2f, 87.8f, true))
+    }
 }

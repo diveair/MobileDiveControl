@@ -50,7 +50,7 @@ class InputRouterTest {
             RecordingPausedAction.Stop to CameraCommand.StopVideoRecording,
             RecordingPausedAction.Delete to CameraCommand.DeleteVideoRecording,
         )
-        for (mode in listOf(CameraModeId.Video, CameraModeId.Hyperlapse)) {
+        for (mode in CameraModeId.entries.filter { it.captureType == CameraCaptureType.Video }) {
             expected.forEach { (action, command) ->
                 val state = readyState(
                     mode = AppMode.CameraLive,
@@ -72,7 +72,7 @@ class InputRouterTest {
 
     @Test
     fun `paused video and hyperlapse shutter confirm save location controls`() {
-        for (mode in listOf(CameraModeId.Video, CameraModeId.Hyperlapse)) {
+        for (mode in CameraModeId.entries.filter { it.captureType == CameraCaptureType.Video }) {
             for (camera in listOf(
                 CameraState(
                     activeMode = mode,

@@ -10,6 +10,18 @@ class GalleryMenuFlowTest {
     private val reducer = ControlReducer()
 
     @Test
+    fun `touch gallery shortcut opens internal gallery from every camera mode`() {
+        CameraModeId.entries.forEach { mode ->
+            val state = AppState(camera = CameraState(activeMode = mode))
+            val result = reducer.reduce(state, CameraCommand.OpenGallery)
+            assertEquals(AppMode.Gallery, result.state.mode, mode.name)
+            assertEquals(GalleryViewMode.Browser, result.state.gallery.viewMode)
+            assertEquals(listOf(PlatformEffect.LoadGalleryItems), result.effects)
+            assertEquals(state.camera, result.state.camera)
+        }
+    }
+
+    @Test
     fun `an empty album grid defaults to Back and vertical navigation cannot clear it`() {
         val loaded = reducer.reduce(
             AppState(

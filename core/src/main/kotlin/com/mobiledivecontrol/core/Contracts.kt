@@ -270,8 +270,10 @@ data class CameraState(
     val recordingSaveLocation: RecordingSaveLocation = RecordingSaveLocation.Default,
     val recordingSaveLocations: List<RecordingSaveLocation> = listOf(RecordingSaveLocation.Default),
     val recordingSaveLocationIndex: Int = 0,
-    /** True after stitching succeeds and until the staged panorama is saved or deleted. */
+    /** True from the stop boundary until the staged panorama is saved or deleted. */
     val panoramaReviewAvailable: Boolean = false,
+    /** False briefly after review opens so the stop gesture cannot also activate Save. */
+    val panoramaReviewInputArmed: Boolean = false,
     /** The selected action in the completed-panorama chooser. */
     val panoramaReviewAction: PanoramaReviewAction = PanoramaReviewAction.Save,
     /**
@@ -636,8 +638,10 @@ sealed interface ControlCommand
 
 sealed interface CameraCommand : ControlCommand {
     data object CapturePhoto : CameraCommand
-    /** Runtime-to-reducer event emitted only after a stitched JPEG is safely staged. */
+    /** Runtime-to-reducer event emitted at the stop boundary to open panorama review. */
     data object PanoramaReviewReady : CameraCommand
+    /** Arms review choices after the stop gesture has completely drained. */
+    data object ArmPanoramaReviewInput : CameraCommand
     data object SavePanorama : CameraCommand
     data object DeletePanorama : CameraCommand
     data object ToggleVideoRecording : CameraCommand

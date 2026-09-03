@@ -1,11 +1,5 @@
 package com.mobiledivecontrol.ui.components
 
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -20,10 +14,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -47,6 +40,7 @@ fun DualBatteryIndicator(
     phonePercent: Int?,
     modifier: Modifier = Modifier,
 ) {
+    val statusIconSize = with(LocalDensity.current) { MaterialTheme.typography.labelSmall.fontSize.toDp() }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier,
@@ -61,7 +55,7 @@ fun DualBatteryIndicator(
         Box(
             modifier = Modifier
                 .width(1.dp)
-                .height(16.dp)
+                .height(statusIconSize)
                 .background(DiveColors.SurfaceBorder),
         )
         Spacer(modifier = Modifier.width(7.dp))
@@ -91,51 +85,34 @@ fun BatteryIndicator(
     modifier: Modifier = Modifier,
 ) {
     val known = percent != null
-    val color by animateColorAsState(
-        targetValue = if (percent != null) DiveColors.batteryColor(percent) else DiveColors.TextMuted,
-        animationSpec = tween(500),
-        label = "battery_color_$label",
-    )
-
-    // Pulse when critically low. An unknown level never pulses — motion is reserved for facts.
-    val alpha = if (percent != null && percent <= 10) {
-        val infiniteTransition = rememberInfiniteTransition(label = "battery_pulse_$label")
-        val pulseAlpha by infiniteTransition.animateFloat(
-            initialValue = 0.4f,
-            targetValue = 1f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(800),
-                repeatMode = RepeatMode.Reverse,
-            ),
-            label = "battery_pulse_alpha_$label",
-        )
-        pulseAlpha
-    } else {
-        1f
-    }
+    val color = DiveColors.Success
+    // Match the VACUUM label, including the user's font scaling, rather than fixed dp icons.
+    val statusTextStyle = MaterialTheme.typography.labelSmall
+    val statusIconSize = with(LocalDensity.current) { statusTextStyle.fontSize.toDp() }
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = modifier.alpha(alpha),
+        modifier = modifier,
     ) {
         Icon(
             imageVector = glyph,
             contentDescription = if (known) "$deviceName battery $percent%" else "$deviceName battery unknown",
             tint = color,
-            modifier = Modifier.size(17.dp),
+            modifier = Modifier.size(statusIconSize),
         )
         Spacer(modifier = Modifier.width(2.dp))
         Text(
             text = label,
-            color = DiveColors.TextSecondary,
-            style = MaterialTheme.typography.labelSmall,
+            color = color,
+            style = statusTextStyle,
             fontWeight = FontWeight.Bold,
         )
         Spacer(modifier = Modifier.width(3.dp))
         Text(
             text = if (percent != null) "$percent%" else "--%",
             color = color,
-            style = MaterialTheme.typography.titleMedium,
+            style = statusTextStyle,
+            fontWeight = FontWeight.Bold,
         )
     }
 }

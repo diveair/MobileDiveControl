@@ -42,11 +42,7 @@ internal class UnderwaterFrameAnalyzer {
         image: ImageProxy,
         timestampMillis: Long,
     ): UnderwaterFrameObservation? {
-        val plane = image.planes.firstOrNull() ?: return null
-        val buffer = plane.buffer
-        val rowStride = plane.rowStride
-        val pixelStride = plane.pixelStride
-        if (pixelStride < 4 || rowStride <= 0) return null
+        val reader = AnalysisPixelReader(image)
         // CameraX supplies this analysis leg as 8-bit sRGB even when VideoCapture's independent
         // encoder surface is 10-bit HLG. Analyze the transfer actually present in this buffer.
         val transfer = SRGB_TO_LINEAR
@@ -73,15 +69,14 @@ internal class UnderwaterFrameAnalyzer {
 
         var y = SAMPLE_STRIDE / 2
         while (y < image.height) {
-            val row = y * rowStride
             var x = SAMPLE_STRIDE / 2
             while (x < image.width) {
                 attempted++
-                val base = row + x * pixelStride
-                if (base >= 0 && base + 2 < buffer.limit()) {
-                    val r8 = buffer.get(base).toInt() and 0xFF
-                    val g8 = buffer.get(base + 1).toInt() and 0xFF
-                    val b8 = buffer.get(base + 2).toInt() and 0xFF
+                val pixel = reader.argb(x, y)
+                if (pixel != null) {
+                    val r8 = pixel ushr 16 and 0xff
+                    val g8 = pixel ushr 8 and 0xff
+                    val b8 = pixel and 0xff
                     val maximum = maxOf(r8, g8, b8)
                     if (maximum >= 250) clipped++
                     // Once a channel lives in the bottom four 8-bit codes its chromaticity is

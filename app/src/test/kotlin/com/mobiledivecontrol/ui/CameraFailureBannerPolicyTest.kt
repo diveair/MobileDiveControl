@@ -8,6 +8,11 @@ class CameraFailureBannerPolicyTest {
     @Test
     fun `dedicated connection permission and seal statuses are not duplicated over camera`() {
         assertNull(cameraFailureBannerMessage("Housing disconnected — reconnecting"))
+        assertNull(
+            cameraFailureBannerMessage(
+                "GATT discovery: 7 services, 16 housing characteristics resolved.",
+            ),
+        )
         assertNull(cameraFailureBannerMessage("Bluetooth Permission: Disabled"))
         assertNull(cameraFailureBannerMessage("Accessibility Permission: Disabled"))
         assertNull(

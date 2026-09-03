@@ -6,6 +6,7 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
@@ -166,6 +167,25 @@ internal fun imageCaptureOutputFormat(value: String?): Int = when (stillCaptureO
     StillCaptureOutput.Jpeg -> ImageCapture.OUTPUT_FORMAT_JPEG
 }
 
+internal fun imageCaptureOutputFormat(output: StillCaptureOutput): Int = when (output) {
+    StillCaptureOutput.Raw -> ImageCapture.OUTPUT_FORMAT_RAW
+    StillCaptureOutput.RawJpeg -> ImageCapture.OUTPUT_FORMAT_RAW_JPEG
+    StillCaptureOutput.UltraHdrJpeg -> ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR
+    StillCaptureOutput.Jpeg -> ImageCapture.OUTPUT_FORMAT_JPEG
+}
+
+/**
+ * Keep the requested still output ready between shots. Only shader-assisted previews need
+ * the JPEG transaction fallback: CameraX rejects RAW/Ultra HDR together with CameraEffect.
+ */
+internal fun livePreviewCaptureOutput(
+    requested: StillCaptureOutput,
+    previewAssistanceRequired: Boolean = false,
+): StillCaptureOutput = if (previewAssistanceRequired) StillCaptureOutput.Jpeg else requested
+
+internal fun requiresDetachedStillCapture(requested: StillCaptureOutput): Boolean =
+    requested != StillCaptureOutput.Jpeg
+
 /**
  * Samsung's runningPhysicalId vendor result is an internal sensor identifier (for example 58),
  * not the public Camera2 physical ID (for example 2). Validate an optical route with the public
@@ -204,6 +224,135 @@ internal fun previewFrameRateSessionKey(
     CameraCatalog.captureFrameRateFps(frameRateValue)?.let { "${it}fps" }
 }
 
+/** The fields that require a different CameraX stream graph rather than a repeating request. */
+internal data class CameraGraphKey(
+    val lensFacing: Int,
+    val cameraId: String?,
+    val resolution: String?,
+    val frameRate: String?,
+    val lens: String?,
+    val hdrLog: String?,
+    /** Samsung applies EIS as a stream/session choice; changing it live can starve preview. */
+    val stabilization: String?,
+    val captureFormat: String?,
+    val aspectRatio: String?,
+    val mode: String,
+)
+
+/**
+ * Modes sharing the same use-case topology do not need to tear down a healthy camera session.
+ * Their exposure, focus and colour choices are repeating requests applied by [applySessionState].
+ */
+internal fun cameraGraphClass(
+    mode: com.mobiledivecontrol.core.CameraModeId,
+    detachedVideoRecorderArmed: Boolean,
+    maximumInformationLog: Boolean,
+): String = when {
+    mode == com.mobiledivecontrol.core.CameraModeId.Panorama -> "panorama"
+    mode.captureType == CameraCaptureType.Photo -> "photo"
+    detachedVideoRecorderArmed -> "detached-video"
+    maximumInformationLog -> "maximum-information-video"
+    else -> "video"
+}
+
+/**
+ * Modes that require a stable, sensor-specific stream keep every use case physically pinned.
+ * Ordinary autofocus modes use Samsung's logical router so optical transitions stay seamless.
+ * Panorama is pinned because its large analysis stream and projection calibration must not be
+ * migrated to another physical sensor by an in-place CONTROL_ZOOM_RATIO update.
+ */
+internal fun shouldPinPhysicalCameraStream(
+    mode: com.mobiledivecontrol.core.CameraModeId,
+    manualFocusRequested: Boolean,
+): Boolean = manualFocusRequested || mode in setOf(
+    com.mobiledivecontrol.core.CameraModeId.Pro,
+    com.mobiledivecontrol.core.CameraModeId.ExpertRaw,
+    com.mobiledivecontrol.core.CameraModeId.ProVideo,
+    com.mobiledivecontrol.core.CameraModeId.Panorama,
+)
+
+/**
+ * A failed bind temporarily leaves [CameraRuntimeController.camera] null. Compose continues to
+ * deliver the latest UI state during that release window; those updates must not cancel the
+ * owned release delay and call unbindAll() again. The retry reads [latestState], so a newer graph
+ * request is coalesced into that retry instead of being lost.
+ */
+internal fun shouldDeferCameraBind(
+    cameraPresent: Boolean,
+    desired: CameraGraphKey,
+    pending: CameraGraphKey?,
+    exhausted: CameraGraphKey?,
+): Boolean = !cameraPresent && (pending != null || desired == exhausted)
+
+/** CameraX uses this message when its dynamic camera inventory is temporarily empty. */
+internal fun isTransientCameraAvailabilityFailure(message: String?): Boolean {
+    val detail = message.orEmpty()
+    return detail.contains("No available camera can be found", ignoreCase = true) ||
+        detail.contains("ERROR_CAMERA_IN_USE", ignoreCase = true) ||
+        detail.contains("CAMERA_IN_USE", ignoreCase = true)
+}
+
+/**
+ * `Cams:0` is not a bad stream combination: CameraX 1.5 removed every Camera2CameraImpl after
+ * Samsung's HAL reported a device/in-use error. Retrying the same provider can never succeed;
+ * its inventory has to be rebuilt once CameraManager says the logical device is available.
+ */
+internal fun cameraProviderInventoryWasLost(message: String?): Boolean {
+    val detail = message.orEmpty()
+    return detail.contains("No available camera can be found", ignoreCase = true) &&
+        Regex("Cams\\s*:\\s*0", RegexOption.IGNORE_CASE).containsMatchIn(detail)
+}
+
+internal fun shouldRebuildProviderAtGraphReleaseFallback(
+    releasedCameraId: String?,
+    cameraReleaseConfirmed: Boolean,
+): Boolean = releasedCameraId != null && !cameraReleaseConfirmed
+
+internal const val CAMERA_GRAPH_POST_PRESENT_SETTLE_MS = 1_000L
+internal const val CAMERA_GRAPH_REQUEST_DEBOUNCE_MS = 700L
+
+internal fun cameraGraphRequestQuietRemainingMs(
+    latestRequestAtMs: Long,
+    nowMs: Long,
+    debounceRequired: Boolean = true,
+): Long = if (!debounceRequired) {
+    0L
+} else {
+    (CAMERA_GRAPH_REQUEST_DEBOUNCE_MS - (nowMs - latestRequestAtMs))
+        .coerceAtLeast(0L)
+}
+
+/**
+ * CameraX returns from bindToLifecycle before Samsung has necessarily opened/configured the
+ * camera device. Replacing that graph again before its first presented frame can overlap rear ↔
+ * front closes/opens and, more subtly, let the old PreviewView cancellation invalidate the new
+ * graph's SurfaceRequest. Coalesce user-driven requests until the active binding presents. The
+ * preview watchdog owns recovery for a graph that never presents, so navigation can never force
+ * a second graph through a surface chain that is already known to be unhealthy.
+ */
+internal fun shouldDeferGraphTransitionUntilPresented(
+    cameraPresent: Boolean,
+    currentBindingGeneration: Long,
+    lastDisplayedBindingGeneration: Long,
+    elapsedSinceFirstPresentedMs: Long?,
+): Boolean {
+    if (!cameraPresent || currentBindingGeneration <= 0L) return false
+    if (lastDisplayedBindingGeneration != currentBindingGeneration) {
+        return true
+    }
+    return elapsedSinceFirstPresentedMs != null &&
+        elapsedSinceFirstPresentedMs < CAMERA_GRAPH_POST_PRESENT_SETTLE_MS
+}
+
+/**
+ * Still aspect ratios are an ImageCapture crop and can be changed on the bound use case. Video
+ * aspect ratios select encoder surfaces, so those remain part of the stream-graph identity.
+ */
+internal fun cameraGraphAspectRatio(
+    captureType: CameraCaptureType,
+    aspectRatio: String?,
+): String? = aspectRatio.takeIf { captureType == CameraCaptureType.Video }
+
 @ExperimentalCamera2Interop
 @OptIn(
     ExperimentalSessionConfig::class,
@@ -225,15 +374,23 @@ class CameraRuntimeController(
             Quality.UHD to "UHD 4K",
         )
         private const val RESUME_STREAM_CHECK_DELAY_MS = 2_500L
+        private const val RESUME_STREAM_RETRY_MS = 500L
+        private const val PREVIEW_HEARTBEAT_FRESH_MS = 2_000L
+        private const val MAX_PREVIEW_RECOVERY_ATTEMPTS = 1
+        private const val CAMERA_GRAPH_POST_AVAILABLE_DELAY_MS = 75L
+        private const val CAMERA_GRAPH_AVAILABILITY_FALLBACK_MS = 1_500L
+        private const val CAMERA_BIND_RETRY_DELAY_MS = 350L
+        private const val MAX_CAMERA_BIND_RETRY_ATTEMPTS = 3
+        private const val CAMERA_UNAVAILABLE_POST_AVAILABLE_DELAY_MS = 150L
         private const val DEFAULT_HORIZONTAL_FOV_DEGREES = 70.0
         private const val PANORAMA_MAX_FRAMES = 40
         private const val PANORAMA_TOO_FAST_RADIANS_PER_SECOND = 1.25f
         private const val PANORAMA_THUMBNAIL_INTERVAL_MS = 100L
-        private const val PANORAMA_VIEWFINDER_INTERVAL_MS = 33L
-        private const val PANORAMA_VIEWFINDER_WIDTH_PX = 640
+        private const val PANORAMA_LIVE_PREVIEW_WIDTH = 264
+        private const val PANORAMA_LIVE_PREVIEW_STEP_RADIANS = 0.008726646f // 0.5 degree
         private const val PANORAMA_PROCESS_TIMEOUT_MS = 120_000L
-        private val PANORAMA_CAPTURE_SIZE = Size(3648, 2736)
-        private val PANORAMA_STORED_FRAME_SIZE = Size(3648, 2736)
+        private val PANORAMA_CAPTURE_SIZE = Size(4000, 3000)
+        private val PANORAMA_STORED_FRAME_SIZE = Size(4000, 3000)
 
         /** The native app's vendor "manual kelvin" AWB mode (AeAfController branch B). */
         /** XYZ (D65) to linear sRGB. */
@@ -381,6 +538,8 @@ class CameraRuntimeController(
         val previewBitmap: Bitmap,
     )
 
+    private enum class DeferredPanoramaReviewAction { Save, Delete }
+
     private data class PhysicalLensProfile(
         val logicalCameraId: String,
         val physicalCameraId: String?,
@@ -440,6 +599,9 @@ class CameraRuntimeController(
     private var extensionsManager: ExtensionsManager? = null
     private var camera: Camera? = null
     private var imageCapture: ImageCapture? = null
+    /** Non-null only from shutter press until the incompatible still output finishes saving. */
+    private var detachedStillCaptureOutput: StillCaptureOutput? = null
+    private var boundPreviewUsesEffect = false
     private var imageAnalysis: ImageAnalysis? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
@@ -448,20 +610,19 @@ class CameraRuntimeController(
     private var cachedEightKRecorderCameraId: String? = null
     private var cachedEightKRates: List<Int>? = null
     private val camera2EightKRecorder = Camera2EightKRecorder(context)
-    private val camera2HighSpeedRecorder = Camera2HighSpeedRecorder(context)
-    private val camera2TimeLapseRecorder = Camera2TimeLapseRecorder(context)
-    private val highSpeedVideoTranscoder = HighSpeedVideoTranscoder(context)
+    private val preparedRecorder = PreparedCamera2Recorder(context)
+    private var preparedRetryAfterMs = 0L
     private val directRecordingClockRunnable = object : Runnable {
         override fun run() {
             if (!directCamera2RecorderBusy()) return
             currentRecordingSegmentDurationMs = when {
                 camera2EightKRecorder.isBusy -> camera2EightKRecorder.elapsedDurationMs
-                camera2HighSpeedRecorder.isBusy -> camera2HighSpeedRecorder.elapsedDurationMs
-                else -> camera2TimeLapseRecorder.elapsedDurationMs
+                preparedRecorder.isBusy -> preparedRecorder.elapsedDurationMs
+                else -> 0L
             }
             RecordingClock.durationMs.value =
                 completedRecordingDurationMs + currentRecordingSegmentDurationMs
-            RecordingClock.playbackDurationMs.value = if (camera2TimeLapseRecorder.isBusy) {
+            RecordingClock.playbackDurationMs.value = if (preparedRecorder.config?.highSpeedFps == null && preparedRecorder.isBusy) {
                 hyperlapsePlaybackDurationMs(
                     RecordingClock.durationMs.value,
                     RecordingClock.timeLapseSpeedFactor.value,
@@ -474,13 +635,12 @@ class CameraRuntimeController(
     }
 
     private fun directCamera2RecorderBusy(): Boolean =
-        camera2EightKRecorder.isBusy || camera2HighSpeedRecorder.isBusy || camera2TimeLapseRecorder.isBusy
+        camera2EightKRecorder.isBusy || preparedRecorder.isBusy
 
     private fun stopDirectCamera2Recorder() {
         when {
             camera2EightKRecorder.isBusy -> camera2EightKRecorder.stop()
-            camera2HighSpeedRecorder.isBusy -> camera2HighSpeedRecorder.stop()
-            camera2TimeLapseRecorder.isBusy -> camera2TimeLapseRecorder.stop()
+            preparedRecorder.isBusy -> preparedRecorder.stop()
         }
     }
     /** Duration is cumulative across continuation clips within one logical recording session. */
@@ -488,6 +648,7 @@ class CameraRuntimeController(
     private var currentRecordingSegmentDurationMs = 0L
     private var recordingSegmentFinalizingForReview = false
     private var recordingSessionActive = false
+    private var recordingNeedsCadenceExport = false
     private var recordingSegmentStartGeneration = 0
     private var recordingSessionDirectory: File? = null
     private var recordingSessionDisplayName: String? = null
@@ -522,17 +683,20 @@ class CameraRuntimeController(
     private var vendorResultKeysProbed = false
     private var boundLensFacing: Int? = null
     private var boundLensValue: String? = null
+    private var boundLensGraphKey: String? = null
     private var boundResolution: String? = null
     private var boundFrameRate: String? = null
     private var boundHdrLogMode: String? = null
+    private var boundStabilizationMode: String? = null
     private var boundCaptureFormat: String? = null
     private var boundAspectRatio: String? = null
-    private var boundMode: com.mobiledivecontrol.core.CameraModeId? = null
+    private var boundGraphClass: String? = null
     private var boundExpectedFocalLengthMm: Float? = null
     private var boundHdrExtension: Boolean = false
     @Volatile private var boundLogCaptureContractSatisfied: Boolean = false
     @Volatile private var maximumInformationRequestModes = MaximumInformationRequestModes()
     private var boundFocusMode: Boolean = false // true = manual focus, false = AF
+    private var lastAppliedZoomRatio: Float? = null
     @Volatile private var latestState: CameraState = CameraState()
     /**
      * Transient capture state, deliberately outside persisted [CameraState]. Auto Shutter meters
@@ -567,6 +731,10 @@ class CameraRuntimeController(
     private var lastFocusResultLogAtMs: Long = 0L
     private var lastAppliedSessionSignature: SessionSignature? = null
     private val focusAssistExecutor = Executors.newSingleThreadExecutor()
+    // CameraEffect surface callbacks must never queue behind MediaPipe or analysis work. A
+    // delayed onInputSurface/onOutputSurface callback can strand CameraX on an upstream surface
+    // while PreviewView has no display target, even though the camera itself remains ACTIVE.
+    private val previewEffectExecutor = Executors.newSingleThreadExecutor()
     private val underwaterTraceExecutor = Executors.newSingleThreadExecutor()
     private val underwaterTrace = UnderwaterWhiteBalanceTrace(
         File(context.getExternalFilesDir(null) ?: context.filesDir, "diagnostics"),
@@ -584,6 +752,8 @@ class CameraRuntimeController(
     // Callback to report detected lenses back to the ViewModel/state
     private var onDetectedLenses: ((List<String>) -> Unit)? = null
     private var onPointingGesture: ((PointingGesture) -> Unit)? = null
+    private var onGraphReplacementRequired: (((() -> Unit)) -> Unit)? = null
+    private var onDirectPreviewPresented: (() -> Unit)? = null
     private var pointingRecognizer: PointingGestureRecognizer? = null
     // GPU-accelerated focus peaking via OpenGL shader in the CameraX preview pipeline.
     // Replaces the old CPU bitmap overlay approach which caused jitter and drift.
@@ -639,12 +809,27 @@ class CameraRuntimeController(
     private val panoramaExecutor = Executors.newSingleThreadExecutor()
     /** Live-strip composition never runs on CameraX's analysis or UI executors. */
     private val panoramaPreviewExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var samsungPanoramaEngine: SamsungPanoramaEngine? = null
+    @Volatile private var samsungPanoramaEngineInitializing = false
+    private var samsungPanoramaEngineSignature: String? = null
+    private var samsungPanoramaAcceptedFrames = 0
+    private var samsungPanoramaStopRequestedAtMs = 0L
     private val panoramaFrames = mutableListOf<StoredPanoramaFrame>()
     private val panoramaPreviewFrames = mutableListOf<CapturedPanoramaFrame>()
+    private class PanoramaWork {
+        // Accessed only by panoramaExecutor; each capture owns an independent work item.
+        var stitcher: PanoramaBitmapStitcher.Incremental? = null
+        var failure: Throwable? = null
+    }
+    private var panoramaReviewPreparing = false
+    private var deferredPanoramaReviewAction: DeferredPanoramaReviewAction? = null
+    private var panoramaWork = PanoramaWork()
     private var panoramaCaptureDirectory: File? = null
-    private var panoramaCaptureActive = false
+    @Volatile private var panoramaCaptureActive = false
     @Volatile private var panoramaCaptureInFlight = false
     @Volatile private var panoramaFrameRequestClaimed = false
+    @Volatile private var panoramaCaptureDisplayRotation = 1
+    @Volatile private var panoramaGuideDisplayRotation = 1
     private val panoramaFrameRequestLock = Any()
     private var panoramaRequestedRadians = 0f
     private var panoramaFinishPending = false
@@ -656,12 +841,13 @@ class CameraRuntimeController(
     private var panoramaLiveWorkingDirection: String? = null
     private var panoramaLiveWorkingSweepRadians: Float? = null
     private var panoramaLastSensorTimestampNs = 0L
-    private var panoramaSweepRadians = 0f
+    @Volatile private var panoramaSweepRadians = 0f
     private var panoramaCrossAxisRadians = 0f
     private var panoramaLastCapturedRadians = 0f
-    private var panoramaDirection = "Right"
-    private var panoramaDirectionPending = false
-    private var panoramaDirectionProbeRadians = 0f
+    @Volatile private var panoramaDirection = "Auto"
+    @Volatile private var panoramaDirectionPending = false
+    private var panoramaDirectionProbeRightRadians = 0f
+    private var panoramaDirectionProbeUpRadians = 0f
     private var panoramaReverseRadians = 0f
     private var panoramaGravityRegistered = false
     private var panoramaBaselineElevationRadians: Float? = null
@@ -669,7 +855,15 @@ class CameraRuntimeController(
     @Volatile private var panoramaCaptureProfile = PanoramaDynamicRangeProfile.Off
     private var pendingPanoramaReview: PendingPanoramaReview? = null
     private var lastPanoramaThumbnailAtMs = 0L
-    private var lastPanoramaViewfinderAtMs = 0L
+    private var panoramaLastLivePreviewRadians = 0f
+    private var panoramaBufferGeometryLogged = false
+    private data class PanoramaImageCrop(
+        val left: Int,
+        val top: Int,
+        val width: Int,
+        val height: Int,
+    )
+    private var panoramaResolvedImageCrop: PanoramaImageCrop? = null
     private var panoramaLastMeaningfulMotionAtMs = 0L
     private var panoramaLastAnnouncementAtMs = 0L
     private var panoramaLastAnnouncement = ""
@@ -694,8 +888,15 @@ class CameraRuntimeController(
 
     private val panoramaMotionListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
-            if (!panoramaCaptureActive) return
+            if (!panoramaCaptureActive || samsungPanoramaEngine != null) return
             if (event.sensor.type == Sensor.TYPE_GRAVITY && event.values.size >= 3) {
+                if (panoramaDirectionPending) {
+                    panoramaCaptureDisplayRotation = panoramaPhysicalDisplayRotation(
+                        gravityX = event.values[0],
+                        gravityY = event.values[1],
+                        fallbackDisplayRotation = panoramaCaptureDisplayRotation,
+                    )
+                }
                 val elevation = panoramaGravityElevationRadians(
                     gravityX = event.values[0],
                     gravityY = event.values[1],
@@ -705,7 +906,9 @@ class CameraRuntimeController(
                 if (baseline == null) {
                     panoramaBaselineElevationRadians = elevation
                     panoramaCrossAxisRadians = 0f
-                } else {
+                } else if (panoramaDirectionPending ||
+                    panoramaDirection == "Left" || panoramaDirection == "Right"
+                ) {
                     val measured = panoramaGravityCrossAxisRadians(
                         baselineElevationRadians = baseline,
                         currentElevationRadians = elevation,
@@ -713,7 +916,11 @@ class CameraRuntimeController(
                     // Native pitch guidance follows stable attitude instead of raw gyro drift.
                     panoramaCrossAxisRadians = panoramaCrossAxisRadians * 0.78f + measured * 0.22f
                 }
-                updatePanoramaCrossAxisGuidance()
+                if (panoramaDirectionPending ||
+                    panoramaDirection == "Left" || panoramaDirection == "Right"
+                ) {
+                    updatePanoramaCrossAxisGuidance()
+                }
                 return
             }
             if (event.sensor.type != Sensor.TYPE_GYROSCOPE || event.values.size < 2) return
@@ -722,35 +929,54 @@ class CameraRuntimeController(
             if (previousTimestamp == 0L) return
             val elapsedSeconds = ((event.timestamp - previousTimestamp) / 1_000_000_000f)
                 .coerceIn(0f, 0.08f)
-            val displayRotation = previewView?.display?.rotation ?: 1
-            val rightwardRate = panoramaScreenAxisRates(
+            // Guidance is drawn in the landscape-locked activity's coordinates. Physical phone
+            // rotation is applied later when raw frames are decoded for the final stitch.
+            val displayRotation = panoramaGuideDisplayRotation
+            val screenRates = panoramaScreenAxisRates(
                 displayRotation = displayRotation,
                 gyroX = event.values[0],
                 gyroY = event.values[1],
-            ).rightward
+            )
             if (panoramaDirectionPending) {
-                if (kotlin.math.abs(rightwardRate) >= 0.05f) {
-                    panoramaDirectionProbeRadians = (
-                        panoramaDirectionProbeRadians + rightwardRate * elapsedSeconds
+                if (kotlin.math.abs(screenRates.rightward) >= 0.05f) {
+                    panoramaDirectionProbeRightRadians = (
+                        panoramaDirectionProbeRightRadians + screenRates.rightward * elapsedSeconds
+                        ).coerceIn(-0.17453292f, 0.17453292f)
+                }
+                if (kotlin.math.abs(screenRates.upward) >= 0.05f) {
+                    panoramaDirectionProbeUpRadians = (
+                        panoramaDirectionProbeUpRadians + screenRates.upward * elapsedSeconds
                         ).coerceIn(-0.17453292f, 0.17453292f)
                 }
                 val lockedDirection = panoramaDirectionFromAccumulatedMotion(
-                    panoramaDirectionProbeRadians,
+                    panoramaDirectionProbeRightRadians,
+                    panoramaDirectionProbeUpRadians,
                 )
                 if (lockedDirection == null) {
                     PanoramaCaptureState.movingTooFast.value = false
-                    setPanoramaGuidance("Pan slowly in any direction.")
+                    setPanoramaGuidance("")
                     return
                 }
                 panoramaDirection = lockedDirection
                 panoramaDirectionPending = false
-                PanoramaCaptureState.direction.value = panoramaDirection
+                // Gravity elevation is the corrective axis for a horizontal sweep. In a vertical
+                // sweep it is the main axis, so yaw correction starts cleanly from the gyro.
+                if (lockedDirection == "Up" || lockedDirection == "Down") {
+                    panoramaCrossAxisRadians = 0f
+                }
+                PanoramaCaptureState.direction.value = panoramaPreviewDirection(
+                    guideDirection = panoramaDirection,
+                    physicalDisplayRotation = panoramaCaptureDisplayRotation,
+                )
                 PanoramaCaptureState.directionLocked.value = true
                 panoramaLastMeaningfulMotionAtMs = SystemClock.elapsedRealtime()
                 Log.i(
                     TAG,
                     "Panorama auto direction: $panoramaDirection " +
-                        "probe=$panoramaDirectionProbeRadians",
+                        "rightProbe=$panoramaDirectionProbeRightRadians " +
+                        "upProbe=$panoramaDirectionProbeUpRadians " +
+                        "guideRotation=$panoramaGuideDisplayRotation " +
+                        "physicalRotation=$panoramaCaptureDisplayRotation",
                 )
             }
             val sweepRate = panoramaSweepAxisRate(
@@ -759,7 +985,9 @@ class CameraRuntimeController(
                 gyroX = event.values[0],
                 gyroY = event.values[1],
             )
-            if (!panoramaGravityRegistered) {
+            if (!panoramaGravityRegistered ||
+                panoramaDirection == "Up" || panoramaDirection == "Down"
+            ) {
                 val crossAxisRate = panoramaCrossAxisRate(
                     direction = panoramaDirection,
                     displayRotation = displayRotation,
@@ -778,7 +1006,7 @@ class CameraRuntimeController(
                 PanoramaCaptureState.movingTooFast.value = false
                 PanoramaCaptureState.warningLevel.value = PanoramaWarningLevel.High
                 panoramaReverseRadians += -sweepRate * elapsedSeconds
-                if (panoramaShouldFinishOnReverse(
+                if (samsungPanoramaEngine == null && panoramaShouldFinishOnReverse(
                         reverseRadians = panoramaReverseRadians,
                         sweepRadians = panoramaSweepRadians,
                         capturedFrames = panoramaFrames.size,
@@ -834,12 +1062,12 @@ class CameraRuntimeController(
                 }
                 else -> ""
             })
-            if (!panoramaCaptureInFlight &&
+            if (samsungPanoramaEngine == null && !panoramaCaptureInFlight &&
                 panoramaSweepRadians - panoramaLastCapturedRadians >= PANORAMA_FRAME_STEP_RADIANS
             ) {
                 takePanoramaFrame()
             }
-            if (panoramaSweepRadians >= targetRadians &&
+            if (samsungPanoramaEngine == null && panoramaSweepRadians >= targetRadians &&
                 !panoramaCaptureInFlight && panoramaFrames.size >= 2
             ) {
                 finishPanoramaCapture()
@@ -891,20 +1119,64 @@ class CameraRuntimeController(
     @Volatile private var suggestedHyperlapseMotionSpeedMode: Int? = null
     private var suggestedHyperlapseResultKey: CaptureResult.Key<Int>? = null
     private var suggestedHyperlapseResultKeyProbed = false
+    @Volatile private var cameraBindGeneration = 0L
+    @Volatile
+    private var sessionCaptureCallback: CameraCaptureSession.CaptureCallback =
+        createSessionCaptureCallback(cameraBindGeneration)
 
-    private val sessionCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
+    private fun createSessionCaptureCallback(
+        generation: Long,
+    ): CameraCaptureSession.CaptureCallback = object : CameraCaptureSession.CaptureCallback() {
+        private val surfaceTracker = RepeatingSurfaceTracker<CameraCaptureSession, android.view.Surface>()
+
+        override fun onCaptureStarted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            timestamp: Long,
+            frameNumber: Long,
+        ) {
+            if (generation != cameraBindGeneration || directCamera2RecorderBusy() || preparedRecorder.ownsCamera) return
+            val intent = request.get(CaptureRequest.CONTROL_CAPTURE_INTENT)
+            // Native focus/AF requests have no CameraX tag. Never learn a stale target set
+            // from our own request, or from a one-shot JPEG/RAW capture.
+            if (request.tag == null || intent !in setOf(
+                    CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW,
+                    CameraMetadata.CONTROL_CAPTURE_INTENT_VIDEO_RECORD,
+                )) return
+            try {
+                val method = CaptureRequest::class.java.getDeclaredMethod("getTargets")
+                method.isAccessible = true
+                @Suppress("UNCHECKED_CAST")
+                val surfaces = (method.invoke(request) as? Collection<android.view.Surface>)?.toList().orEmpty()
+                if (surfaceTracker.update(session, frameNumber, true, surfaces)) {
+                    cam2Session = session
+                    cam2Surfaces = surfaces
+                    focusRampBuilder = null
+                    lastAppliedSessionSignature = null
+                    Log.i(TAG, "CameraX repeating targets changed: ${surfaces.size}; refreshing native focus route")
+                    applySessionState(latestState, force = true)
+                }
+            } catch (error: Exception) {
+                Log.w(TAG, "Could not track CameraX repeating targets", error)
+            }
+        }
+
         override fun onCaptureCompleted(
             session: CameraCaptureSession,
             request: CaptureRequest,
             result: TotalCaptureResult,
         ) {
             super.onCaptureCompleted(session, request, result)
+            // CameraX may deliver one last capture result after unbindAll() has closed that
+            // session. It must never replace the newly-bound native session or trigger AF on a
+            // closed CameraDevice; doing so visibly freezes the replacement preview.
+            if (generation != cameraBindGeneration) return
             // Constrained high-speed capture owns a separate Camera2 session and forces 3A auto.
             // Keep harvesting preview telemetry, but never let a late CameraX callback take over
             // its session or submit a request to a CameraDevice that the rebind already closed.
             val directCamera2SessionActive = directCamera2RecorderBusy()
             // Capture session + surfaces on first callback or session change
-            if (!directCamera2SessionActive && cam2Session !== session) {
+            if (!directCamera2SessionActive && cam2Session !== session && request.tag != null) {
                 cam2Session = session
                 try {
                     val m = CaptureRequest::class.java.getDeclaredMethod("getTargets")
@@ -1116,7 +1388,11 @@ class CameraRuntimeController(
         onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
         onPointingGesture: ((PointingGesture) -> Unit)? = null,
         onCameraCommand: ((CameraCommand) -> Unit)? = null,
+        onGraphReplacementRequired: (((() -> Unit)) -> Unit)? = null,
+        onDirectPreviewPresented: (() -> Unit)? = null,
     ) {
+        val attachGeneration = ++cameraAttachGeneration
+        cameraInitializationComplete = false
         this.previewView = previewView
         this.lifecycleOwner = lifecycleOwner
         installResumeWatchdog(lifecycleOwner)
@@ -1125,6 +1401,8 @@ class CameraRuntimeController(
         this.onMeteredExposure = onMeteredExposure
         this.onPointingGesture = onPointingGesture
         this.onCameraCommand = onCameraCommand
+        this.onGraphReplacementRequired = onGraphReplacementRequired
+        this.onDirectPreviewPresented = onDirectPreviewPresented
         startFocusMotionMonitor()
         wbCalibration = runCatching { loadWbCalibration() }.getOrNull()
         loadAwbCurve()
@@ -1134,6 +1412,10 @@ class CameraRuntimeController(
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener(
             {
+                if (attachGeneration != cameraAttachGeneration ||
+                    this.previewView !== previewView ||
+                    this.lifecycleOwner !== lifecycleOwner
+                ) return@addListener
                 cameraProvider = cameraProviderFuture.get()
                 // Detect capabilities using CameraManager (works regardless of extensions)
                 if (!capabilitiesDetected) {
@@ -1142,8 +1424,15 @@ class CameraRuntimeController(
                 }
                 // Initialize extensions manager for vendor HDR
                 initExtensions {
+                    if (attachGeneration != cameraAttachGeneration ||
+                        this.previewView !== previewView ||
+                        this.lifecycleOwner !== lifecycleOwner
+                    ) return@initExtensions
+                    // applyState can run while ExtensionsManager is still resolving. It must not
+                    // start a competing initial bind before this callback owns initialization.
+                    cameraInitializationComplete = true
                     bindCamera(force = true)
-                    onReady(camera != null)
+                    onReady(camera != null || preparedRecorder.ownsCamera)
                 }
             },
             ContextCompat.getMainExecutor(context),
@@ -1151,6 +1440,44 @@ class CameraRuntimeController(
     }
 
     private var resumeObserver: LifecycleEventObserver? = null
+    private var resumeObserverOwner: LifecycleOwner? = null
+    private var pendingResumeStreamCheck: Runnable? = null
+    private var lastCameraBindCompletedAtMs = 0L
+    private var resumeStreamCheckStartedAtMs = 0L
+    private var cameraInitializationComplete = false
+    private var cameraAttachGeneration = 0L
+    private var previewRecoveryAttempts = 0
+    private var previewRecoveryRebindInProgress = false
+    private var cameraProviderRebuildInProgress = false
+    private var cameraProviderRebuildGeneration = 0L
+    private var cameraBindRetryAttempts = 0
+    private var pendingCameraBindRetry: Runnable? = null
+    private var pendingCameraGraphBindAfterRelease: Runnable? = null
+    private var graphReplacementPresentationPending = false
+    private var pendingCameraAvailabilityManager: CameraManager? = null
+    private var pendingCameraAvailabilityCallback: CameraManager.AvailabilityCallback? = null
+    private var unavailableCameraRecoveryManager: CameraManager? = null
+    private var unavailableCameraRecoveryCallback: CameraManager.AvailabilityCallback? = null
+    private var pendingUnavailableCameraRecovery: Runnable? = null
+    private var pendingCameraBindGraphKey: CameraGraphKey? = null
+    private var exhaustedCameraBindGraphKey: CameraGraphKey? = null
+    private var pendingPresentedGraphTransition: Runnable? = null
+    private var presentedGraphTransitionLogged = false
+    private var latestRequestedCameraGraphKey: CameraGraphKey? = null
+    private var deferredNavigationGraphKey: CameraGraphKey? = null
+    private var pendingCaptureActionAfterGraphBind: (() -> Unit)? = null
+    private val pendingStillCapture = PendingStillCapture()
+    private val pendingStillCaptureTimeout = Runnable {
+        pendingStillCapture.fail("Timed out preparing the still output")
+    }
+    private var latestCameraGraphRequestAtMs = 0L
+    /**
+     * Setting wheels are debounced so rapid detents collapse into one CameraX replacement.
+     * Deliberate mode navigation is already one discrete detent and must begin immediately;
+     * otherwise Panorama shows the old/black surface for the whole debounce interval before its
+     * physically pinned analysis graph even starts closing.
+     */
+    private var latestCameraGraphRequestRequiresDebounce = true
 
     private fun startFocusMotionMonitor() {
         if (focusMotionMonitorRegistered) return
@@ -1263,36 +1590,584 @@ class CameraRuntimeController(
      * active recording, which a rebind would kill.
      */
     private fun installResumeWatchdog(owner: LifecycleOwner) {
-        resumeObserver?.let { observer -> lifecycleOwner?.lifecycle?.removeObserver(observer) }
+        resumeObserver?.let { observer -> resumeObserverOwner?.lifecycle?.removeObserver(observer) }
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_PAUSE && directCamera2RecorderBusy()) {
-                // Match Samsung Camera: leaving the foreground closes and saves the current
-                // segment. This prevents SurfaceView destruction and camera eviction racing to
-                // fail the same recorder, which previously crashed CameraX during its rebind.
-                onCameraCommand?.invoke(CameraCommand.StopVideoRecording) ?: stopVideoRecording()
-            } else if (event == Lifecycle.Event.ON_RESUME) {
-                cameraRequestHandler.postDelayed({
-                    val pv = previewView ?: return@postDelayed
-                    // The GL heartbeat is the authoritative health signal: PreviewView's
-                    // stream state tracks only the camera side and stays STREAMING while
-                    // the effect stage silently fails to reach the display surface.
-                    val healthy = focusPeakingProcessor?.let { processor ->
-                        SystemClock.elapsedRealtime() - processor.lastDrawSuccessAtMs < 2_000L
-                    } ?: (pv.previewStreamState.value == PreviewView.StreamState.STREAMING)
-                    if ((!healthy || camera == null) &&
-                        activeRecording == null && !directCamera2RecorderBusy()
-                    ) {
-                        Log.w(
-                            TAG,
-                            "Preview pipeline absent or dead after resume — forcing camera rebind",
-                        )
-                        bindCamera(force = true)
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> {
+                    cancelResumeStreamCheck()
+                    resumeStreamCheckStartedAtMs = 0L
+                    focusPeakingProcessor?.lastDrawSuccessAtMs = 0L
+                    if (directCamera2RecorderBusy()) {
+                        // Match Samsung Camera: leaving the foreground closes and saves the
+                        // current segment before SurfaceView destruction and camera eviction.
+                        onCameraCommand?.invoke(CameraCommand.StopVideoRecording)
+                            ?: stopVideoRecording()
                     }
-                }, RESUME_STREAM_CHECK_DELAY_MS)
+                    if (preparedRecorder.ownsCamera) preparedRecorder.suspendPreview()
+                }
+                Lifecycle.Event.ON_RESUME -> {
+                    if (cameraInitializationComplete && usesPreparedRecorder(latestState)) bindPreparedRecorder()
+                    previewRecoveryAttempts = 0
+                    resumeStreamCheckStartedAtMs = SystemClock.elapsedRealtime()
+                    // The hardware can become available while this Activity is paused. Keep the
+                    // owned recovery runnable in that case and execute it only after RESUME.
+                    pendingUnavailableCameraRecovery?.let(cameraRequestHandler::post)
+                    scheduleResumeStreamCheck(owner)
+                }
+                else -> Unit
             }
         }
         owner.lifecycle.addObserver(observer)
         resumeObserver = observer
+        resumeObserverOwner = owner
+    }
+
+    /** Keeps at most one post-resume health check alive for the current preview surface. */
+    private fun scheduleResumeStreamCheck(
+        owner: LifecycleOwner,
+        delayMs: Long = RESUME_STREAM_CHECK_DELAY_MS,
+    ) {
+        cancelResumeStreamCheck()
+        val expectedPreview = previewView ?: return
+        val expectedBindGeneration = cameraBindGeneration
+        lateinit var check: Runnable
+        check = Runnable {
+            if (pendingResumeStreamCheck !== check) return@Runnable
+            pendingResumeStreamCheck = null
+            if (!owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return@Runnable
+            val pv = previewView?.takeIf { it === expectedPreview } ?: return@Runnable
+            // A mode/setting change has already replaced the graph this check was created for.
+            // Never let an old health check tear down the newer, healthy graph.
+            if (cameraBindGeneration != expectedBindGeneration) return@Runnable
+            val now = SystemClock.elapsedRealtime()
+            if (!cameraInitializationComplete) {
+                scheduleResumeStreamCheck(owner, RESUME_STREAM_RETRY_MS)
+                return@Runnable
+            }
+            val effectProcessor = focusPeakingProcessor
+            val effectHeartbeatFresh = effectProcessor?.let { processor ->
+                processor.lastDrawSuccessAtMs > 0L &&
+                    now - processor.lastDrawSuccessAtMs < PREVIEW_HEARTBEAT_FRESH_MS
+            } ?: false
+            val presentationHealthy = previewPresentationHealthy(
+                previewStreaming = pv.previewStreamState.value == PreviewView.StreamState.STREAMING,
+                effectProcessorPresent = boundPreviewUsesEffect && effectProcessor != null,
+                effectHeartbeatFresh = effectHeartbeatFresh,
+            )
+            if (activeRecording != null || directCamera2RecorderBusy() || preparedRecorder.ownsCamera) {
+                return@Runnable
+            }
+            val resumeStartedAt = resumeStreamCheckStartedAtMs.takeIf { it > 0L } ?: now
+            val elapsedSinceBind = lastCameraBindCompletedAtMs
+                .takeIf { it > 0L }
+                ?.let { now - it }
+                ?: Long.MAX_VALUE
+            when (
+                previewRecoveryDecision(
+                    cameraPresent = camera != null,
+                    heartbeatFresh = presentationHealthy,
+                    previewAttached = pv.isAttachedToWindow && pv.width > 0 && pv.height > 0,
+                    elapsedSinceResumeMs = now - resumeStartedAt,
+                    elapsedSinceBindMs = elapsedSinceBind,
+                )
+            ) {
+                PreviewRecoveryDecision.Healthy -> {
+                    previewRecoveryAttempts = 0
+                    previewRecoveryRebindInProgress = false
+                }
+                PreviewRecoveryDecision.Wait ->
+                    scheduleResumeStreamCheck(owner, RESUME_STREAM_RETRY_MS)
+                PreviewRecoveryDecision.Rebind -> {
+                    if (cameraProviderRebuildInProgress) {
+                        // Provider shutdown/acquisition is asynchronous. A second recovery here
+                        // would race its callbacks and can bind two generations to one PreviewView.
+                        scheduleResumeStreamCheck(owner, RESUME_STREAM_RETRY_MS)
+                        return@Runnable
+                    }
+                    if (previewRecoveryAttempts >= MAX_PREVIEW_RECOVERY_ATTEMPTS) {
+                        reportRuntimeFailure(
+                            "Camera preview stopped after recovery. Change modes to retry.",
+                        )
+                        return@Runnable
+                    }
+                    previewRecoveryAttempts++
+                    Log.w(
+                        TAG,
+                        "Preview presentation dead after surface grace — rebuilding CameraX provider " +
+                            "(stream=${pv.previewStreamState.value}, effectHeartbeat=$effectHeartbeatFresh, " +
+                            "attached=${pv.isAttachedToWindow})",
+                    )
+                    previewRecoveryRebindInProgress = true
+                    // A same-provider rebind cannot repair a stale SurfaceOutput or a CameraX
+                    // inventory whose Camera2CameraImpl was evicted. Rebuild the provider once;
+                    // this method owns and cancels every other recovery callback before shutdown.
+                    rebuildCameraProviderAndBind(owner, pv, cameraAttachGeneration)
+                }
+            }
+        }
+        pendingResumeStreamCheck = check
+        cameraRequestHandler.postDelayed(check, delayMs.coerceAtLeast(1L))
+    }
+
+    private fun cancelResumeStreamCheck() {
+        pendingResumeStreamCheck?.let(cameraRequestHandler::removeCallbacks)
+        pendingResumeStreamCheck = null
+    }
+
+    private fun cancelCameraBindRetry(resetAttempts: Boolean = false) {
+        pendingCameraBindRetry?.let(cameraRequestHandler::removeCallbacks)
+        pendingCameraBindRetry = null
+        if (resetAttempts) cameraBindRetryAttempts = 0
+    }
+
+    private fun cancelUnavailableCameraRecovery() {
+        pendingUnavailableCameraRecovery?.let(cameraRequestHandler::removeCallbacks)
+        pendingUnavailableCameraRecovery = null
+        val manager = unavailableCameraRecoveryManager
+        val callback = unavailableCameraRecoveryCallback
+        unavailableCameraRecoveryManager = null
+        unavailableCameraRecoveryCallback = null
+        if (manager != null && callback != null) {
+            runCatching { manager.unregisterAvailabilityCallback(callback) }
+        }
+    }
+
+    private fun cancelCameraGraphBindAfterRelease() {
+        pendingCameraGraphBindAfterRelease?.let(cameraRequestHandler::removeCallbacks)
+        pendingCameraGraphBindAfterRelease = null
+        clearPendingCameraAvailabilityCallback()
+    }
+
+    private fun clearPendingCameraAvailabilityCallback() {
+        val manager = pendingCameraAvailabilityManager
+        val callback = pendingCameraAvailabilityCallback
+        pendingCameraAvailabilityManager = null
+        pendingCameraAvailabilityCallback = null
+        if (manager != null && callback != null) {
+            runCatching { manager.unregisterAvailabilityCallback(callback) }
+        }
+    }
+
+    /**
+     * CameraX's SurfaceView implementation completes the old graph's cancellation on the main
+     * queue. Binding its replacement in the same call stack lets that stale callback clear the
+     * replacement SurfaceRequest, producing a live camera session behind a permanently black
+     * PreviewView. Retire the EGL output, unbind, then cross one short queue boundary before the
+     * latest requested graph is allowed to acquire the preview surface.
+     */
+    private fun releaseCameraGraphThenBindLatest(
+        provider: ProcessCameraProvider,
+        owner: LifecycleOwner,
+        expectedPreview: PreviewView,
+        presentationPrepared: Boolean = false,
+    ) {
+        if (pendingCameraGraphBindAfterRelease != null) return
+        if (!presentationPrepared) {
+            if (graphReplacementPresentationPending) return
+            val presentContinuityFrame = onGraphReplacementRequired
+            if (presentContinuityFrame != null) {
+                graphReplacementPresentationPending = true
+                presentContinuityFrame {
+                    cameraRequestHandler.post {
+                        if (!graphReplacementPresentationPending) return@post
+                        graphReplacementPresentationPending = false
+                        if (previewView !== expectedPreview || lifecycleOwner !== owner) return@post
+                        releaseCameraGraphThenBindLatest(
+                            provider = provider,
+                            owner = owner,
+                            expectedPreview = expectedPreview,
+                            presentationPrepared = true,
+                        )
+                    }
+                }
+                return
+            }
+        }
+        val releasedCameraId = camera?.cameraInfo?.let { info ->
+            runCatching { Camera2CameraInfo.from(info).cameraId }.getOrNull()
+        }
+        var cameraReleaseConfirmed = releasedCameraId == null
+        // Reject every late session callback from the graph being retired immediately.
+        cameraBindGeneration++
+        val parked = focusPeakingProcessor?.suspendForDirectPreview() ?: true
+        if (!parked) {
+            CameraPipelineTelemetry.recordBindWarning(
+                "Timed out disconnecting preview effect before graph replacement",
+            )
+        }
+        nativeFocusActive = false
+        cam2Session = null
+        cam2Surfaces = emptyList()
+        lastAppliedSessionSignature = null
+
+        lateinit var bind: Runnable
+        bind = Runnable {
+            if (pendingCameraGraphBindAfterRelease !== bind) return@Runnable
+            if (shouldRebuildProviderAtGraphReleaseFallback(
+                    releasedCameraId,
+                    cameraReleaseConfirmed,
+                )
+            ) {
+                // The fallback timer fired without CameraManager ever reporting the old device
+                // available. Binding into that same provider is unsafe: CameraX accepts the use
+                // cases but its stale lifecycle graph invalidates the replacement PreviewView
+                // SurfaceRequest, leaving a permanent black screen. Rebuild CameraX so the stuck
+                // graph is fully retired while preserving the requested mode/effects.
+                pendingCameraGraphBindAfterRelease = null
+                clearPendingCameraAvailabilityCallback()
+                CameraPipelineTelemetry.recordBindWarning(
+                    "Camera $releasedCameraId did not release before graph fallback; rebuilding provider",
+                )
+                rebuildCameraProviderAndBind(
+                    owner,
+                    expectedPreview,
+                    cameraAttachGeneration,
+                )
+                return@Runnable
+            }
+            val quietRemainingMs = cameraGraphRequestQuietRemainingMs(
+                latestCameraGraphRequestAtMs,
+                SystemClock.elapsedRealtime(),
+                debounceRequired = latestCameraGraphRequestRequiresDebounce,
+            )
+            if (quietRemainingMs > 0L) {
+                cameraRequestHandler.postDelayed(bind, quietRemainingMs)
+                return@Runnable
+            }
+            pendingCameraGraphBindAfterRelease = null
+            clearPendingCameraAvailabilityCallback()
+            if (previewView !== expectedPreview || lifecycleOwner !== owner) return@Runnable
+            if (!owner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@Runnable
+            // bindCamera recomputes the key from latestState, coalescing every option selected
+            // while the old surface was being released into this one replacement graph.
+            bindCamera(force = true, surfaceReleasePrepared = true)
+        }
+        pendingCameraGraphBindAfterRelease = bind
+
+        // CameraX returns from unbindAll before Samsung's camera service has necessarily closed
+        // the logical device (including any pinned physical stream). Wait for the service's real
+        // availability edge. This is the same readiness signal a competing camera app receives
+        // and avoids guessing how long a particular mode/lens topology needs to drain.
+        if (releasedCameraId != null) {
+            val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val callback = object : CameraManager.AvailabilityCallback() {
+                override fun onCameraAvailable(cameraId: String) {
+                    if (cameraId != releasedCameraId ||
+                        pendingCameraGraphBindAfterRelease !== bind
+                    ) return
+                    cameraReleaseConfirmed = true
+                    clearPendingCameraAvailabilityCallback()
+                    cameraRequestHandler.removeCallbacks(bind)
+                    Log.d(TAG, "Camera $cameraId released; binding the latest requested graph")
+                    cameraRequestHandler.postDelayed(bind, CAMERA_GRAPH_POST_AVAILABLE_DELAY_MS)
+                }
+            }
+            pendingCameraAvailabilityManager = manager
+            pendingCameraAvailabilityCallback = callback
+            runCatching {
+                manager.registerAvailabilityCallback(
+                    ContextCompat.getMainExecutor(context),
+                    callback,
+                )
+            }.onFailure { error ->
+                clearPendingCameraAvailabilityCallback()
+                CameraPipelineTelemetry.recordBindWarning(
+                    "Could not observe camera release: ${error.message ?: error.javaClass.simpleName}",
+                )
+            }
+        }
+        provider.unbindAll()
+        camera = null
+        imageCapture = null
+        imageAnalysis = null
+        videoCapture = null
+        cameraRequestHandler.postDelayed(bind, CAMERA_GRAPH_AVAILABILITY_FALLBACK_MS)
+    }
+
+    private fun cancelPresentedGraphTransition() {
+        pendingPresentedGraphTransition?.let(cameraRequestHandler::removeCallbacks)
+        pendingPresentedGraphTransition = null
+        presentedGraphTransitionLogged = false
+    }
+
+    private fun schedulePresentedGraphTransition(delayMs: Long = 50L) {
+        if (pendingPresentedGraphTransition != null) return
+        if (!presentedGraphTransitionLogged) {
+            Log.d(TAG, "Coalescing graph change until the active binding is stably presenting")
+            presentedGraphTransitionLogged = true
+        }
+        lateinit var transition: Runnable
+        transition = Runnable {
+            if (pendingPresentedGraphTransition !== transition) return@Runnable
+            pendingPresentedGraphTransition = null
+            applyState(
+                cameraState = latestState,
+                waterPressureKpa = latestWaterPressureKpa,
+                atmosphericPressureKpa = latestAtmosphericPressureKpa,
+                surfaceAmbientKpa = latestSurfaceAmbientKpa,
+                waterTemperatureC = latestWaterTemperatureC,
+                headingDegrees = latestHeadingDegrees,
+            )
+        }
+        pendingPresentedGraphTransition = transition
+        cameraRequestHandler.postDelayed(transition, delayMs.coerceAtLeast(1L))
+    }
+
+    /**
+     * Samsung's camera service can briefly advertise a camera while refusing a new CameraX
+     * session immediately after unbind. Retrying synchronously repeats the same HAL race and, in
+     * older code, threw on main. A delayed, generation-owned retry lets the old session close and
+     * cannot overwrite a newer mode/setting bind.
+     */
+    private fun scheduleCameraBindRetry(
+        owner: LifecycleOwner,
+        failedGeneration: Long,
+        error: Throwable,
+    ) {
+        if (cameraBindGeneration != failedGeneration || pendingCameraBindRetry != null) return
+        if (cameraBindRetryAttempts >= MAX_CAMERA_BIND_RETRY_ATTEMPTS) {
+            exhaustedCameraBindGraphKey = pendingCameraBindGraphKey
+            pendingCameraBindGraphKey = null
+            reportRuntimeFailure(
+                "Camera session could not restart: ${error.message ?: error.javaClass.simpleName}",
+            )
+            return
+        }
+        val expectedPreview = previewView ?: return
+        val attempt = ++cameraBindRetryAttempts
+        lateinit var retry: Runnable
+        retry = Runnable {
+            if (pendingCameraBindRetry !== retry) return@Runnable
+            pendingCameraBindRetry = null
+            if (cameraBindGeneration != failedGeneration) return@Runnable
+            if (!owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return@Runnable
+            if (previewView !== expectedPreview || !expectedPreview.isAttachedToWindow) return@Runnable
+            Log.w(
+                TAG,
+                "Retrying CameraX bind after HAL rejection (attempt $attempt/$MAX_CAMERA_BIND_RETRY_ATTEMPTS)",
+            )
+            bindCamera(force = true, retryAttempt = true)
+        }
+        pendingCameraBindRetry = retry
+        cameraRequestHandler.postDelayed(retry, CAMERA_BIND_RETRY_DELAY_MS * attempt)
+    }
+
+    private fun scheduleCameraBindRecovery(
+        owner: LifecycleOwner,
+        failedGeneration: Long,
+        error: Throwable,
+    ) {
+        if (isTransientCameraAvailabilityFailure(error.message)) {
+            scheduleUnavailableCameraRecovery(owner, failedGeneration, error)
+        } else {
+            scheduleCameraBindRetry(owner, failedGeneration, error)
+        }
+    }
+
+    /**
+     * A competing camera client can make Samsung's HAL report every public camera unavailable.
+     * CameraX 1.5 then removes those cameras from its provider and `bindToLifecycle` reports
+     * `Cams:0`. Fixed-delay retries only hit that same empty inventory. Observe CameraManager's
+     * real availability edge and rebuild CameraX only for the lost-inventory form of the error.
+     */
+    private fun scheduleUnavailableCameraRecovery(
+        owner: LifecycleOwner,
+        failedGeneration: Long,
+        error: Throwable,
+    ) {
+        if (cameraBindGeneration != failedGeneration || cameraProviderRebuildInProgress) return
+        if (unavailableCameraRecoveryCallback != null || pendingUnavailableCameraRecovery != null) return
+        cancelCameraBindRetry(resetAttempts = true)
+        val expectedPreview = previewView ?: return
+        val expectedAttachGeneration = cameraAttachGeneration
+        val resetProvider = cameraProviderInventoryWasLost(error.message)
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val expectedCameraId = selectedCameraIdForBinding(
+            latestState,
+            desiredLensFacing(latestState),
+        )
+
+        fun queueRecovery(cameraId: String) {
+            if (pendingUnavailableCameraRecovery != null || cameraProviderRebuildInProgress) return
+            lateinit var recovery: Runnable
+            recovery = Runnable {
+                if (pendingUnavailableCameraRecovery !== recovery) return@Runnable
+                if (cameraProviderRebuildInProgress) {
+                    cancelUnavailableCameraRecovery()
+                    return@Runnable
+                }
+                if (cameraAttachGeneration != expectedAttachGeneration ||
+                    previewView !== expectedPreview || lifecycleOwner !== owner
+                ) {
+                    cancelUnavailableCameraRecovery()
+                    return@Runnable
+                }
+                // Availability callbacks are process-wide and may arrive while the app is in the
+                // background. Retain this runnable; ON_RESUME posts the exact same owned work.
+                if (!owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) ||
+                    !expectedPreview.isAttachedToWindow
+                ) return@Runnable
+                pendingUnavailableCameraRecovery = null
+                val callbackManager = unavailableCameraRecoveryManager
+                val callback = unavailableCameraRecoveryCallback
+                unavailableCameraRecoveryManager = null
+                unavailableCameraRecoveryCallback = null
+                if (callbackManager != null && callback != null) {
+                    runCatching { callbackManager.unregisterAvailabilityCallback(callback) }
+                }
+                exhaustedCameraBindGraphKey = null
+                cameraBindRetryAttempts = 0
+                Log.w(
+                    TAG,
+                    "Camera $cameraId available after HAL eviction; " +
+                        if (resetProvider) "rebuilding CameraX provider" else "retrying latest graph",
+                )
+                if (resetProvider) {
+                    rebuildCameraProviderAndBind(owner, expectedPreview, expectedAttachGeneration)
+                } else {
+                    bindCamera(force = true, retryAttempt = true)
+                }
+            }
+            pendingUnavailableCameraRecovery = recovery
+            if (owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                cameraRequestHandler.postDelayed(
+                    recovery,
+                    CAMERA_UNAVAILABLE_POST_AVAILABLE_DELAY_MS,
+                )
+            }
+        }
+
+        val callback = object : CameraManager.AvailabilityCallback() {
+            override fun onCameraAvailable(cameraId: String) {
+                if (unavailableCameraRecoveryCallback !== this) return
+                if (expectedCameraId != null && cameraId != expectedCameraId) return
+                queueRecovery(cameraId)
+            }
+        }
+        unavailableCameraRecoveryManager = manager
+        unavailableCameraRecoveryCallback = callback
+        runCatching {
+            manager.registerAvailabilityCallback(
+                ContextCompat.getMainExecutor(context),
+                callback,
+            )
+        }.onFailure { callbackError ->
+            cancelUnavailableCameraRecovery()
+            CameraPipelineTelemetry.recordBindWarning(
+                "Could not observe unavailable camera: " +
+                    (callbackError.message ?: callbackError.javaClass.simpleName),
+            )
+            scheduleCameraBindRetry(owner, failedGeneration, error)
+        }
+    }
+
+    private fun rebuildCameraProviderAndBind(
+        owner: LifecycleOwner,
+        expectedPreview: PreviewView,
+        expectedAttachGeneration: Long,
+    ) {
+        if (cameraProviderRebuildInProgress) {
+            Log.d(TAG, "CameraX provider rebuild already owns preview recovery")
+            return
+        }
+        cameraProviderRebuildInProgress = true
+        val rebuildGeneration = ++cameraProviderRebuildGeneration
+        cameraBindGeneration++ // invalidate every callback owned by the removed Camera2CameraImpl
+        cancelResumeStreamCheck()
+        cancelCameraBindRetry(resetAttempts = true)
+        cancelUnavailableCameraRecovery()
+        cancelCameraGraphBindAfterRelease()
+        graphReplacementPresentationPending = false
+        cancelPresentedGraphTransition()
+        focusPeakingProcessor?.suspendForDirectPreview()
+        nativeFocusActive = false
+        cam2Session = null
+        cam2Surfaces = emptyList()
+        lastAppliedSessionSignature = null
+        camera = null
+        imageCapture = null
+        imageAnalysis = null
+        videoCapture = null
+        cameraInitializationComplete = false
+        extensionsManager = null
+
+        val staleProvider = cameraProvider
+        cameraProvider = null
+        runCatching { staleProvider?.unbindAll() }
+        val shutdown = runCatching { staleProvider?.shutdownAsync() }
+            .onFailure { failure ->
+                CameraPipelineTelemetry.recordBindWarning(
+                    "CameraX provider shutdown failed: ${failure.message ?: failure.javaClass.simpleName}",
+                )
+            }
+            .getOrNull()
+
+        val acquireFreshProvider = Runnable {
+            if (cameraProviderRebuildGeneration != rebuildGeneration ||
+                cameraAttachGeneration != expectedAttachGeneration ||
+                previewView !== expectedPreview || lifecycleOwner !== owner
+            ) {
+                if (cameraProviderRebuildGeneration == rebuildGeneration) {
+                    cameraProviderRebuildInProgress = false
+                }
+                return@Runnable
+            }
+            val providerFuture = ProcessCameraProvider.getInstance(context)
+            providerFuture.addListener(
+                {
+                    if (cameraProviderRebuildGeneration != rebuildGeneration ||
+                        cameraAttachGeneration != expectedAttachGeneration ||
+                        previewView !== expectedPreview || lifecycleOwner !== owner
+                    ) {
+                        if (cameraProviderRebuildGeneration == rebuildGeneration) {
+                            cameraProviderRebuildInProgress = false
+                        }
+                        return@addListener
+                    }
+                    val provider = runCatching { providerFuture.get() }
+                        .onFailure { failure ->
+                            cameraProviderRebuildInProgress = false
+                            reportRuntimeFailure(
+                                "Camera service could not be rebuilt: " +
+                                    (failure.message ?: failure.javaClass.simpleName),
+                            )
+                        }
+                        .getOrNull() ?: return@addListener
+                    cameraProvider = provider
+                    initExtensions {
+                        if (cameraProviderRebuildGeneration != rebuildGeneration ||
+                            cameraAttachGeneration != expectedAttachGeneration ||
+                            previewView !== expectedPreview || lifecycleOwner !== owner
+                        ) {
+                            if (cameraProviderRebuildGeneration == rebuildGeneration) {
+                                cameraProviderRebuildInProgress = false
+                            }
+                            return@initExtensions
+                        }
+                        cameraInitializationComplete = true
+                        cameraProviderRebuildInProgress = false
+                        bindCamera(force = true, retryAttempt = true)
+                    }
+                },
+                ContextCompat.getMainExecutor(context),
+            )
+        }
+        if (shutdown == null) {
+            acquireFreshProvider.run()
+        } else {
+            shutdown.addListener(
+                {
+                    runCatching { shutdown.get() }.onFailure { failure ->
+                        CameraPipelineTelemetry.recordBindWarning(
+                            "CameraX provider shutdown completion failed: " +
+                                (failure.message ?: failure.javaClass.simpleName),
+                        )
+                    }
+                    acquireFreshProvider.run()
+                },
+                ContextCompat.getMainExecutor(context),
+            )
+        }
     }
 
     private fun initExtensions(onDone: () -> Unit) {
@@ -1319,40 +2194,68 @@ class CameraRuntimeController(
     }
 
     fun detach() {
+        cameraAttachGeneration++
+        cameraProviderRebuildGeneration++
+        cameraProviderRebuildInProgress = false
+        cameraInitializationComplete = false
         photoTimerGeneration++
+        cameraBindGeneration++
         cancelExpertSequence("", announce = false)
         ExpertRawCaptureState.reset()
         stopSkyGuideTracking()
         discardPendingPanoramaReview(deleteFile = true)
         cancelPanoramaCapture("Camera closed")
+        val panoramaEngineToRelease = samsungPanoramaEngine
+        samsungPanoramaEngine = null
+        samsungPanoramaEngineSignature = null
+        samsungPanoramaEngineInitializing = false
+        panoramaExecutor.execute { panoramaEngineToRelease?.release() }
         stopFocusMotionMonitor()
-        resumeObserver?.let { observer -> lifecycleOwner?.lifecycle?.removeObserver(observer) }
+        cancelResumeStreamCheck()
+        cancelCameraBindRetry(resetAttempts = true)
+        cancelUnavailableCameraRecovery()
+        cancelCameraGraphBindAfterRelease()
+        graphReplacementPresentationPending = false
+        cancelPresentedGraphTransition()
+        pendingCameraBindGraphKey = null
+        exhaustedCameraBindGraphKey = null
+        latestRequestedCameraGraphKey = null
+        deferredNavigationGraphKey = null
+        pendingCaptureActionAfterGraphBind = null
+        pendingStillCapture.clear()
+        cameraRequestHandler.removeCallbacks(pendingStillCaptureTimeout)
+        latestCameraGraphRequestAtMs = 0L
+        latestCameraGraphRequestRequiresDebounce = true
+        resumeObserver?.let { observer -> resumeObserverOwner?.lifecycle?.removeObserver(observer) }
         resumeObserver = null
+        resumeObserverOwner = null
         cameraProvider?.unbindAll()
         camera2EightKRecorder.release()
-        camera2HighSpeedRecorder.release()
-        camera2TimeLapseRecorder.release()
-        highSpeedVideoTranscoder.cancel()
+        preparedRecorder.release()
         panoramaActionSound.release()
         cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
         camera = null
         imageCapture = null
+        detachedStillCaptureOutput = null
         imageAnalysis = null
         previewView = null
         lifecycleOwner = null
         boundLensFacing = null
         boundLensValue = null
+        boundLensGraphKey = null
         boundResolution = null
         boundFrameRate = null
         boundHdrLogMode = null
+        boundStabilizationMode = null
         boundCaptureFormat = null
         boundAspectRatio = null
-        boundMode = null
+        boundGraphClass = null
         boundExpectedFocalLengthMm = null
         boundHdrExtension = false
         boundLogCaptureContractSatisfied = false
         maximumInformationRequestModes = MaximumInformationRequestModes()
         boundFocusMode = false
+        lastAppliedZoomRatio = null
         cam2Session = null
         cam2Surfaces = emptyList()
         nativeFocusActive = false
@@ -1379,10 +2282,16 @@ class CameraRuntimeController(
         lastAppliedSessionSignature = null
         focusPeakingProcessor?.release()
         focusPeakingProcessor = null
+        lastCameraBindCompletedAtMs = 0L
+        resumeStreamCheckStartedAtMs = 0L
+        previewRecoveryAttempts = 0
+        previewRecoveryRebindInProgress = false
         // MediaPipe's GPU delegate is thread-affine. Stop new analyzer work first, then enqueue
         // close behind any inference already running on the same executor that created it.
         onPointingGesture = null
         onCameraCommand = null
+        onGraphReplacementRequired = null
+        onDirectPreviewPresented = null
         val recognizerToClose = pointingRecognizer
         pointingRecognizer = null
         recognizerToClose?.let { recognizer ->
@@ -1450,39 +2359,176 @@ class CameraRuntimeController(
         // Peaking works in both AF and manual focus modes.
         focusPeakingProcessor?.peakingEnabled = focusAssistEnabled
         focusPeakingProcessor?.exposureAssistMode = exposureAssistMode(cameraState)
-        if (cameraProvider == null || previewView == null || lifecycleOwner == null) {
-            Log.d(TAG, "applyState: early return (provider/preview/lifecycle null)")
+        if (cameraProvider == null || previewView == null || lifecycleOwner == null ||
+            !cameraInitializationComplete
+        ) {
+            Log.d(TAG, "applyState: early return (camera graph not initialized)")
+            return
+        }
+
+        if (usesPreparedRecorder(cameraState)) {
+            bindPreparedRecorder()
+            return
+        }
+        if (preparedRecorder.ownsCamera) {
+            // A mode selection may arrive while Stop is still writing the clip's MP4 index.
+            // Let that transaction deliver its result before releasing its persistent surface.
+            if (preparedRecorder.isBusy || recordingSegmentFinalizingForReview) return
+            preparedRecorder.release()
+            bindCamera(force = true)
             return
         }
 
         val desiredLensFacing = desiredLensFacing(cameraState)
         val directCamera2Armed = isDirectCamera2Selection(cameraState)
+        val detachedVideoRecorderArmed = directCamera2Armed ||
+            cameraState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse
         val desiredResolution = previewBindingResolution(
             desiredResolutionValue(cameraState),
             directCamera2Armed,
         )
-        val desiredLens = selectedLensValue(cameraState)
+        val selectedLens = selectedLensValue(cameraState)
+        activeLensProfile = selectedLensProfile(cameraState)
+        val desiredLensGraphKey = physicalStreamGraphKey(cameraState)
         val desiredFrameRate = frameRateSessionKey(cameraState)
         val desiredHdrLogMode = resolvedSessionHdrLogMode(cameraState)
-        val desiredCaptureFormat = currentValue(cameraState, ".save_format")
+        val maximumInformationLog =
+            VideoDynamicRangePolicy.usesMaximumInformationStreamGraph(desiredHdrLogMode)
+        val desiredGraphClass = cameraGraphClass(
+            mode = cameraState.activeMode,
+            detachedVideoRecorderArmed = detachedVideoRecorderArmed,
+            maximumInformationLog = maximumInformationLog,
+        )
+        val desiredStabilizationMode = stabilizationGraphKey(cameraState)
+        val desiredCaptureFormat = captureGraphKey(cameraState)
         val desiredAspectRatio = currentValue(cameraState, ".aspect_ratio")
+        val desiredGraphAspectRatio = cameraGraphAspectRatio(
+            cameraState.activeMode.captureType,
+            desiredAspectRatio,
+        )
+        if (cameraState.activeMode.captureType != CameraCaptureType.Video) {
+            photoCropRatio(desiredAspectRatio)?.let { crop ->
+                imageCapture?.setCropAspectRatio(crop)
+            }
+        }
+        val desiredGraphKey = CameraGraphKey(
+            lensFacing = desiredLensFacing,
+            cameraId = selectedCameraIdForBinding(cameraState, desiredLensFacing),
+            resolution = desiredResolution,
+            frameRate = desiredFrameRate,
+            lens = desiredLensGraphKey,
+            hdrLog = desiredHdrLogMode,
+            stabilization = desiredStabilizationMode,
+            captureFormat = desiredCaptureFormat,
+            aspectRatio = desiredGraphAspectRatio,
+            mode = desiredGraphClass,
+        )
+        val graphRequestNowMs = SystemClock.elapsedRealtime()
+        if (latestRequestedCameraGraphKey != desiredGraphKey) {
+            latestRequestedCameraGraphKey = desiredGraphKey
+            latestCameraGraphRequestAtMs = graphRequestNowMs
+            latestCameraGraphRequestRequiresDebounce = previousMode == cameraState.activeMode
+            // Restart the quiet-period timer from the last actual graph selection. Sensor and
+            // telemetry ticks for the same selection deliberately do not extend the debounce.
+            cancelPresentedGraphTransition()
+        }
         // Dynamic range is a stream property. A repeating CaptureRequest cannot turn an 8-bit
         // encoder surface into a 10-bit one, so an HDR/LOG change must create a new session.
         val needsRebind = desiredLensFacing != boundLensFacing ||
                 desiredResolution != boundResolution ||
                 desiredFrameRate != boundFrameRate ||
-                desiredLens != boundLensValue ||
+                desiredLensGraphKey != boundLensGraphKey ||
                 desiredHdrLogMode != boundHdrLogMode ||
+                desiredStabilizationMode != boundStabilizationMode ||
                 desiredCaptureFormat != boundCaptureFormat ||
-                desiredAspectRatio != boundAspectRatio ||
-                cameraState.activeMode != boundMode
+                desiredGraphAspectRatio != boundAspectRatio ||
+                desiredGraphClass != boundGraphClass
+        deferredNavigationGraphKey = null
         if (needsRebind) {
+            if (shouldDeferCameraBind(
+                    cameraPresent = camera != null,
+                    desired = desiredGraphKey,
+                    pending = pendingCameraBindGraphKey,
+                    exhausted = exhaustedCameraBindGraphKey,
+                )
+            ) {
+                return
+            }
+            val quietRemainingMs = cameraGraphRequestQuietRemainingMs(
+                latestCameraGraphRequestAtMs,
+                graphRequestNowMs,
+                debounceRequired = latestCameraGraphRequestRequiresDebounce,
+            )
+            if (quietRemainingMs > 0L) {
+                schedulePresentedGraphTransition(quietRemainingMs)
+                return
+            }
+            val pipeline = CameraPipelineTelemetry.snapshot()
+            val elapsedSinceFirstPresentedMs = pipeline.firstDisplayedFrameAtMs
+                .takeIf {
+                    it > 0L && pipeline.lastDisplayedBindingGeneration == cameraBindGeneration
+                }
+                ?.let { SystemClock.elapsedRealtime() - it }
+            if (shouldDeferGraphTransitionUntilPresented(
+                    cameraPresent = camera != null,
+                    currentBindingGeneration = cameraBindGeneration,
+                    lastDisplayedBindingGeneration = pipeline.lastDisplayedBindingGeneration,
+                    elapsedSinceFirstPresentedMs = elapsedSinceFirstPresentedMs,
+                )
+            ) {
+                schedulePresentedGraphTransition()
+                return
+            }
+            cancelPresentedGraphTransition()
             Log.d(TAG, "applyState: rebinding camera")
             focusSlewGen++
             bindCamera(force = true)
         } else {
+            boundLensValue = selectedLens
+            boundExpectedFocalLengthMm = activeLensProfile?.focalLengthMm
             applySessionStateWithFocusSlew(cameraState)
         }
+    }
+
+    /**
+     * Returns whether applying [cameraState] must replace the active CameraX stream graph.
+     *
+     * This is intentionally based on the same stream properties as [applyState], rather than
+     * on the selected mode's name. Several modes (for example Photo, Portrait and Food) share
+     * one graph and only change repeating requests. Treating those selections as graph changes
+     * made the UI wait for an IDLE -> STREAMING edge which correctly never happened, leaving a
+     * captured transition frame permanently over a healthy preview.
+     */
+    fun requiresCameraGraphReplacement(cameraState: CameraState): Boolean {
+        if (!cameraInitializationComplete || camera == null) return false
+        val lensFacing = desiredLensFacing(cameraState)
+        val directCamera2Armed = isDirectCamera2Selection(cameraState)
+        val detachedVideoRecorderArmed = directCamera2Armed ||
+            cameraState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse
+        val resolution = previewBindingResolution(
+            desiredResolutionValue(cameraState),
+            directCamera2Armed,
+        )
+        val frameRate = frameRateSessionKey(cameraState)
+        val hdrLogMode = resolvedSessionHdrLogMode(cameraState)
+        val graphClass = cameraGraphClass(
+            mode = cameraState.activeMode,
+            detachedVideoRecorderArmed = detachedVideoRecorderArmed,
+            maximumInformationLog =
+                VideoDynamicRangePolicy.usesMaximumInformationStreamGraph(hdrLogMode),
+        )
+        return lensFacing != boundLensFacing ||
+            resolution != boundResolution ||
+            frameRate != boundFrameRate ||
+            physicalStreamGraphKey(cameraState) != boundLensGraphKey ||
+            hdrLogMode != boundHdrLogMode ||
+            stabilizationGraphKey(cameraState) != boundStabilizationMode ||
+            captureGraphKey(cameraState) != boundCaptureFormat ||
+            cameraGraphAspectRatio(
+                cameraState.activeMode.captureType,
+                currentValue(cameraState, ".aspect_ratio"),
+            ) != boundAspectRatio ||
+            graphClass != boundGraphClass
     }
 
     // ── Focus slew ────────────────────────────────────────────────────────────────────────
@@ -1749,7 +2795,7 @@ class CameraRuntimeController(
             val plane = image.planes.firstOrNull() ?: return latestSharpness
             val buffer = plane.buffer
             val rowStride = plane.rowStride
-            val pixelStride = plane.pixelStride.coerceAtLeast(4)
+            val pixelStride = plane.pixelStride.coerceAtLeast(1)
             val x0 = image.width / 3
             val x1 = image.width * 2 / 3
             val y0 = image.height / 3
@@ -1763,6 +2809,7 @@ class CameraRuntimeController(
                 while (x < x1 - SHARPNESS_STRIDE) {
                     fun luma(pixelX: Int): Int {
                         val base = row + pixelX * pixelStride
+                        if (image.format == android.graphics.ImageFormat.YUV_420_888) return buffer.get(base).toInt() and 0xff
                         val r = buffer.get(base).toInt() and 0xFF
                         val g = buffer.get(base + 1).toInt() and 0xFF
                         val b = buffer.get(base + 2).toInt() and 0xFF
@@ -2505,6 +3552,7 @@ class CameraRuntimeController(
         when (command) {
             CameraCommand.CapturePhoto -> capturePhoto()
             CameraCommand.PanoramaReviewReady -> Unit
+            CameraCommand.ArmPanoramaReviewInput -> Unit
             CameraCommand.SavePanorama -> savePendingPanorama()
             CameraCommand.DeletePanorama -> discardPendingPanoramaReview(deleteFile = true)
             CameraCommand.OpenGallery -> openGallery()
@@ -2525,31 +3573,83 @@ class CameraRuntimeController(
 
     /** A camera request is never allowed to disappear into Logcat while the UI implies success. */
     private fun reportRuntimeFailure(message: String) {
+        CameraPipelineTelemetry.recordRuntimeFailure(message)
         ContextCompat.getMainExecutor(context).execute {
             Toast.makeText(context, message, Toast.LENGTH_LONG).show()
             onCameraCommand?.invoke(CameraCommand.ReportRuntimeFailure(message))
         }
     }
 
-    private fun bindCamera(force: Boolean = false) {
+    private fun bindCamera(
+        force: Boolean = false,
+        retryAttempt: Boolean = false,
+        surfaceReleasePrepared: Boolean = false,
+    ) {
+        if (!cameraInitializationComplete) {
+            Log.d(TAG, "bindCamera: deferred until camera initialization completes")
+            return
+        }
         val provider = cameraProvider ?: return
         val owner = lifecycleOwner ?: return
         val previewSurface = previewView ?: return
+        if (usesPreparedRecorder(latestState)) {
+            bindPreparedRecorder()
+            return
+        }
+        if (preparedRecorder.ownsCamera) preparedRecorder.release()
+        cancelPresentedGraphTransition()
+        if (retryAttempt) {
+            pendingCameraBindRetry = null
+        } else {
+            // Any user-driven state change supersedes a pending recovery for the older graph.
+            cancelCameraBindRetry(resetAttempts = true)
+        }
         val desiredLensFacing = desiredLensFacing(latestState)
         val selectedCaptureResolution = desiredResolutionValue(latestState)
         val selectedFrameRate = currentValue(latestState, ".frame_rate")
         val desiredFrameRate = frameRateSessionKey(latestState)
         val directCamera2Recording = isDirectCamera2Selection(latestState)
+        val detachedVideoRecorderArmed = directCamera2Recording ||
+            latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse
         val desiredResolution = previewBindingResolution(
             selectedCaptureResolution,
             directCamera2Recording,
         )
         val desiredHdrLogMode = resolvedSessionHdrLogMode(latestState)
-        val desiredCaptureFormat = currentValue(latestState, ".save_format")
+        val desiredStabilizationMode = stabilizationGraphKey(latestState)
+        val graphStillCaptureOutput = detachedStillCaptureOutput ?: readyStillOutput(latestState)
+        val desiredCaptureOutputFormat = imageCaptureOutputFormat(graphStillCaptureOutput)
+        val desiredCaptureFormat = captureGraphKey(latestState)
+        // Ordinary RAW/Ultra HDR previews are capture-ready. Shader-assisted previews retain
+        // their compatible graph and use the bounded still transaction when required.
+        val previewEffectCompatible = graphStillCaptureOutput == StillCaptureOutput.Jpeg
         val desiredAspectRatio = currentValue(latestState, ".aspect_ratio")
+        val desiredGraphAspectRatio = cameraGraphAspectRatio(
+            latestState.activeMode.captureType,
+            desiredAspectRatio,
+        )
         val maximumInformationLog =
             VideoDynamicRangePolicy.usesMaximumInformationStreamGraph(desiredHdrLogMode)
+        val desiredGraphClass = cameraGraphClass(
+            mode = latestState.activeMode,
+            detachedVideoRecorderArmed = detachedVideoRecorderArmed,
+            maximumInformationLog = maximumInformationLog,
+        )
         activeLensProfile = selectedLensProfile(latestState)
+        val desiredLensGraphKey = physicalStreamGraphKey(latestState)
+        val selectedCameraId = selectedCameraIdForBinding(latestState, desiredLensFacing)
+        val desiredGraphKey = CameraGraphKey(
+            lensFacing = desiredLensFacing,
+            cameraId = selectedCameraId,
+            resolution = desiredResolution,
+            frameRate = desiredFrameRate,
+            lens = desiredLensGraphKey,
+            hdrLog = desiredHdrLogMode,
+            stabilization = desiredStabilizationMode,
+            captureFormat = desiredCaptureFormat,
+            aspectRatio = desiredGraphAspectRatio,
+            mode = desiredGraphClass,
+        )
         val focusCapability = selectedFocusCapability(latestState)
         val manualFocusRequest = manualFocusRequestFor(latestState)
         if (desiredLensFacing == CameraSelector.LENS_FACING_BACK) {
@@ -2561,21 +3661,43 @@ class CameraRuntimeController(
         if (!force && desiredLensFacing == boundLensFacing &&
             desiredResolution == boundResolution &&
             desiredFrameRate == boundFrameRate &&
-            selectedLensValue(latestState) == boundLensValue &&
+            desiredLensGraphKey == boundLensGraphKey &&
             desiredHdrLogMode == boundHdrLogMode &&
+            desiredStabilizationMode == boundStabilizationMode &&
             desiredCaptureFormat == boundCaptureFormat &&
-            desiredAspectRatio == boundAspectRatio &&
-            latestState.activeMode == boundMode) {
+            desiredGraphAspectRatio == boundAspectRatio &&
+            desiredGraphClass == boundGraphClass) {
             applySessionState(latestState)
             return
         }
+
+        if (camera != null && !surfaceReleasePrepared) {
+            pendingCameraBindGraphKey = desiredGraphKey
+            releaseCameraGraphThenBindLatest(provider, owner, previewSurface)
+            return
+        }
+
+        CameraPipelineTelemetry.recordBindStarted(
+            "mode=${latestState.activeMode.name} lens=${selectedLensValue(latestState)} " +
+                "capture=$selectedCaptureResolution preview=$desiredResolution " +
+                "fps=$selectedFrameRate range=$desiredFrameRate profile=$desiredHdrLogMode " +
+                "stabilization=$desiredStabilizationMode " +
+                "format=$desiredCaptureFormat aspect=$desiredAspectRatio",
+        )
+        pendingCameraBindGraphKey = desiredGraphKey
+        if (exhaustedCameraBindGraphKey != desiredGraphKey) {
+            exhaustedCameraBindGraphKey = null
+        }
+
+        val bindGeneration = ++cameraBindGeneration
+        val bindingSessionCaptureCallback = createSessionCaptureCallback(bindGeneration)
+        sessionCaptureCallback = bindingSessionCaptureCallback
 
         boundLogCaptureContractSatisfied = false
         maximumInformationRequestModes = MaximumInformationRequestModes()
 
         val selectorBuilder = CameraSelector.Builder()
             .requireLensFacing(desiredLensFacing)
-        val selectedCameraId = selectedCameraIdForBinding(latestState, desiredLensFacing)
         selectedCameraId?.let {
             selectorBuilder.addCameraFilter { cameraInfos ->
                 cameraInfos.filter { cameraInfo ->
@@ -2593,7 +3715,11 @@ class CameraRuntimeController(
         val physicalCameraId = if (
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
             desiredLensFacing == CameraSelector.LENS_FACING_BACK &&
-            selectedCameraId == backCameraProfile?.logicalCameraId
+            selectedCameraId == backCameraProfile?.logicalCameraId &&
+            shouldPinPhysicalCameraStream(
+                mode = latestState.activeMode,
+                manualFocusRequested = manualFocusRequest != null,
+            )
         ) {
             activeLensProfile?.physicalCameraId
         } else {
@@ -2616,15 +3742,19 @@ class CameraRuntimeController(
             // same JPEG compression quality that MAXIMIZE_QUALITY used.
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .setJpegQuality(100)
-            .setOutputFormat(imageCaptureOutputFormat(desiredCaptureFormat))
+            .setOutputFormat(desiredCaptureOutputFormat)
         val panoramaMode = latestState.activeMode ==
             com.mobiledivecontrol.core.CameraModeId.Panorama
+        if (panoramaMode) {
+            panoramaResolvedImageCrop = null
+            panoramaBufferGeometryLogged = false
+        }
         val analysisTargetSize = if (panoramaMode) PANORAMA_CAPTURE_SIZE else Size(640, 480)
         val analysisBuilder = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             // MediaPipe accepts RGB/RGBA. Keeping this one shared 640x480 stream avoids a second
             // CameraX use case and its extra ISP/scaler cost.
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setOutputImageFormat(if (panoramaMode) ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888 else ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .setResolutionSelector(
                 ResolutionSelector.Builder()
                     .setResolutionStrategy(
@@ -2635,6 +3765,25 @@ class CameraRuntimeController(
                     )
                     .build(),
             )
+        val selectedGraphCameraInfo = runCatching {
+            selector.filter(provider.availableCameraInfos).firstOrNull()
+        }.onFailure { error ->
+            Log.w(TAG, "Could not resolve selected camera info before graph bind", error)
+        }.getOrNull()
+        val bindStabilizationMode = selectedGraphCameraInfo?.let { info ->
+            requestedVideoStabilizationMode(latestState, info)
+        }
+        bindStabilizationMode?.let { mode ->
+            // Samsung's HAL briefly drains/recreates its producer when EIS is changed on an
+            // already-running repeating request. Baking the mode into every stream at session
+            // creation keeps the preview continuously supplied during the controlled rebind.
+            Camera2Interop.Extender(previewBuilder)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, mode)
+            Camera2Interop.Extender(imageCaptureBuilder)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, mode)
+            Camera2Interop.Extender(analysisBuilder)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, mode)
+        }
         if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse &&
             currentValue(latestState, ".speed") == "Auto"
         ) {
@@ -2690,20 +3839,20 @@ class CameraRuntimeController(
             )
         }
         Camera2Interop.Extender(previewBuilder)
-            .setSessionCaptureCallback(sessionCaptureCallback)
+            .setSessionCaptureCallback(bindingSessionCaptureCallback)
         // ALSO on ImageCapture: when the stream budget forces CameraX into StreamSharing,
         // Preview is re-parented onto a virtual camera and its interop session callback never
         // fires — the native manual-focus takeover silently died the day VideoCapture joined
         // the group. ImageCapture is never a sharing child, so its callback always reaches the
         // real session; the identity guard inside makes the duplicate registration harmless.
         Camera2Interop.Extender(imageCaptureBuilder)
-            .setSessionCaptureCallback(sessionCaptureCallback)
+            .setSessionCaptureCallback(bindingSessionCaptureCallback)
         // AND on ImageAnalysis: ImageCapture only produces results for still captures, so it
         // is silent during preview. ImageAnalysis rides the repeating request and is never a
         // stream-sharing child, which makes it the one reliable per-frame telemetry tap —
         // the source of the live lens position the AF handoff is seeded from.
         Camera2Interop.Extender(analysisBuilder)
-            .setSessionCaptureCallback(sessionCaptureCallback)
+            .setSessionCaptureCallback(bindingSessionCaptureCallback)
 
         val preview = previewBuilder
             .build()
@@ -2746,30 +3895,49 @@ class CameraRuntimeController(
             // here. The frame itself is closed immediately; nothing is read or retained.
             it.setAnalyzer(focusAssistExecutor) { image ->
                 val now = SystemClock.elapsedRealtime()
-                claimPanoramaAnalysisFrame()?.let { request ->
-                    persistPanoramaAnalysisFrame(
-                        image = image,
-                        generation = request.first,
-                        requestedRadians = request.second,
-                    )
+                if (!previewEffectCompatible) {
+                    CameraPipelineTelemetry.recordDirectPreviewFrame(now)
                 }
+                val samsungFrameSubmitted = if (panoramaMode && panoramaCaptureActive) {
+                    image.image?.let { mediaImage ->
+                        samsungPanoramaEngine?.process(mediaImage)
+                    } ?: false
+                } else {
+                    false
+                }
+                val liveSweepRadians = panoramaSweepRadians
                 if (panoramaMode &&
-                    !PanoramaCaptureState.finalizing.value &&
-                    now - lastPanoramaViewfinderAtMs >= PANORAMA_VIEWFINDER_INTERVAL_MS
+                    !samsungFrameSubmitted &&
+                    panoramaCaptureActive &&
+                    now - lastPanoramaThumbnailAtMs >= PANORAMA_THUMBNAIL_INTERVAL_MS
                 ) {
-                    lastPanoramaViewfinderAtMs = now
+                    lastPanoramaThumbnailAtMs = now
+                    panoramaLastLivePreviewRadians = liveSweepRadians
                     runCatching {
                         decodePanoramaSampledFrame(
                             image,
-                            PANORAMA_VIEWFINDER_WIDTH_PX,
-                            activePanoramaDynamicRangeProfile(),
+                            PANORAMA_LIVE_PREVIEW_WIDTH,
+                            panoramaCaptureProfile,
+                            panoramaCaptureDisplayRotation,
                         )
                     }
-                        .onFailure { error -> Log.w(TAG, "Could not update panorama viewfinder", error) }
+                        .onFailure { error -> Log.w(TAG, "Could not update live panorama strip", error) }
                         .getOrNull()
-                        ?.let(::publishPanoramaViewfinder)
-                }
-                if (panoramaMode &&
+                        ?.let { bitmap ->
+                            val generation = panoramaGeneration
+                            cameraRequestHandler.post {
+                                if (generation == panoramaGeneration && panoramaCaptureActive) {
+                                    updatePanoramaContinuousThumbnail(
+                                        generation = generation,
+                                        bitmap = bitmap,
+                                        sweepRadians = liveSweepRadians,
+                                    )
+                                } else {
+                                    bitmap.recycle()
+                                }
+                            }
+                        }
+                } else if (panoramaMode && !samsungFrameSubmitted &&
                     !panoramaCaptureActive &&
                     !PanoramaCaptureState.finalizing.value &&
                     now - lastPanoramaThumbnailAtMs >= PANORAMA_THUMBNAIL_INTERVAL_MS
@@ -2838,19 +4006,29 @@ class CameraRuntimeController(
         // alive means a rebind freezes on the last frame briefly instead of flashing
         // black — this happens on every macro-tail boundary crossing. Only detach()
         // releases it for real.
-        val processor = focusPeakingProcessor
-            ?: FocusPeakingSurfaceProcessor(ContextCompat.getMainExecutor(context)).also {
-                focusPeakingProcessor = it
+        val effect = if (previewEffectCompatible) {
+            val processor = focusPeakingProcessor
+                ?: FocusPeakingSurfaceProcessor(ContextCompat.getMainExecutor(context)).also {
+                    focusPeakingProcessor = it
+                }
+            processor.peakingEnabled = focusAssistEnabled
+            processor.exposureAssistMode = exposureAssistMode(latestState)
+            object : CameraEffect(
+                PREVIEW,
+                previewEffectExecutor,
+                processor.newBinding(bindGeneration),
+                { error -> Log.e(TAG, "Focus peaking effect error", error) },
+            ) {}
+        } else {
+            val parked = focusPeakingProcessor?.suspendForDirectPreview() ?: true
+            if (!parked) {
+                CameraPipelineTelemetry.recordBindWarning(
+                    "Timed out disconnecting preview effect before $desiredCaptureFormat bind",
+                )
             }
-        processor.peakingEnabled = focusAssistEnabled
-        processor.exposureAssistMode = exposureAssistMode(latestState)
-
-        val effect = object : CameraEffect(
-            PREVIEW,
-            focusAssistExecutor,
-            processor,
-            { error -> Log.e(TAG, "Focus peaking effect error", error) },
-        ) {}
+            Log.i(TAG, "Direct PreviewView graph: CameraEffect is incompatible with $desiredCaptureFormat")
+            null
+        }
 
         // Real video: a Recorder-backed VideoCapture rides in the same group. Highest
         // quality the device offers, falling down the ladder rather than failing the bind.
@@ -2889,6 +4067,9 @@ class CameraRuntimeController(
         // repeating telemetry/session tap. Put every session-critical option on the encoded
         // stream itself so removing the auxiliary surfaces cannot break live manual control.
         val videoInterop = Camera2Interop.Extender(videoBuilder)
+        bindStabilizationMode?.let { mode ->
+            videoInterop.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, mode)
+        }
         physicalCameraId?.let(videoInterop::setPhysicalCameraId)
         if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse &&
             currentValue(latestState, ".speed") == "Auto"
@@ -2916,31 +4097,43 @@ class CameraRuntimeController(
                 }
             }
         }
-        videoInterop.setSessionCaptureCallback(sessionCaptureCallback)
+        videoInterop.setSessionCaptureCallback(bindingSessionCaptureCallback)
         val video = videoBuilder.build()
         Log.i(TAG, "Video dynamic range=$requestedDynamicRange requestedMode=$desiredHdrLogMode")
         // Photo modes do not need an encoder surface. In particular, RAW+JPEG already asks
         // CameraX for two still outputs; retaining VideoCapture beside those outputs can exceed
         // the S24's guaranteed stream-combination budget and make the preview appear frozen.
         val photoMode = latestState.activeMode.captureType == CameraCaptureType.Photo
-        videoCapture = video.takeUnless { panoramaMode || photoMode }
+        videoCapture = video.takeUnless { panoramaMode || photoMode || detachedVideoRecorderArmed }
 
         val useCaseGroup = UseCaseGroup.Builder()
             .addUseCase(preview)
             .also { builder ->
-                // Panorama already owns a full-resolution ImageAnalysis stream. Running its
-                // preview through the focus/exposure GL effect produced a valid inner analysis
-                // thumbnail beside a black full-screen Preview surface on the S24. Panorama has
-                // no focus-peaking control, so bind its Preview directly.
-                if (!panoramaMode) builder.addEffect(effect)
+                // Every mode must keep PreviewView connected through the same EGL consumer API.
+                // Binding Panorama directly connected the SurfaceView as CAMERA; switching to a
+                // GL-backed mode then failed eglCreateWindowSurface with "already connected" and
+                // froze presentation while upstream camera frames continued. Panorama's visible
+                // viewfinder is its ImageAnalysis layer, so this pass-through stays underneath.
+                effect?.let(builder::addEffect)
                 when {
                     panoramaMode -> builder.addUseCase(analysis)
-                    photoMode -> builder
-                        .addUseCase(capture)
-                        .addUseCase(analysis)
+                    photoMode -> {
+                        builder.addUseCase(capture)
+                        // RAW + JPEG already consumes two still streams. Samsung can accept
+                        // CameraX's proposed four-stream graph then reject it asynchronously
+                        // in onConfigureFailed, bypassing the synchronous reduced-graph retry.
+                        // Keep only preview and requested still outputs for this transaction.
+                        if (detachedStillCaptureOutput == null) builder.addUseCase(analysis)
+                    }
+                    detachedVideoRecorderArmed ->
+                        // 8K, Slow Motion/high-speed and Hyperlapse hand the camera to a direct
+                        // recorder only when Shutter is pressed. Their live graph needs Preview
+                        // (including the GPU CameraEffect) plus analysis, not a dormant encoder and
+                        // an unused still surface. Samsung's HAL rejected that oversized standby
+                        // graph while switching front -> rear with CAMERA_ERROR / Broken pipe.
+                        builder.addUseCase(analysis)
                     !maximumInformationLog -> builder
                         .addUseCase(video)
-                        .addUseCase(capture)
                         .addUseCase(analysis)
                     else -> builder.addUseCase(video)
                 }
@@ -2961,6 +4154,9 @@ class CameraRuntimeController(
         cam2Session = null
         cam2Surfaces = emptyList()
         lastAppliedSessionSignature = null
+        // Replacement graphs are unbound in releaseCameraGraphThenBindLatest and reach this
+        // point only after old SurfaceView cancellation callbacks have drained. Initial binds
+        // and delayed CameraX retry binds have no live graph, so this is a harmless no-op there.
         provider.unbindAll()
         camera = try {
             if (directCamera2Recording) {
@@ -2975,27 +4171,47 @@ class CameraRuntimeController(
                 )
             }
             provider.bindToLifecycle(owner, selector, useCaseGroup)
-        } catch (error: IllegalArgumentException) {
+        } catch (error: RuntimeException) {
+            CameraPipelineTelemetry.recordBindWarning(
+                "primary bind rejected for ${latestState.activeMode.name}: " +
+                    (error.message ?: error.javaClass.simpleName),
+            )
             val triedDirectPhysicalCamera = desiredLensFacing == CameraSelector.LENS_FACING_BACK &&
                 selectedCameraId != null &&
                 selectedCameraId == activeLensProfile?.physicalCameraId &&
                 selectedCameraId != backCameraProfile?.logicalCameraId
-            if (!triedDirectPhysicalCamera && !maximumInformationLog && !panoramaMode) {
+            val transientCameraUnavailable = isTransientCameraAvailabilityFailure(error.message)
+            if (!triedDirectPhysicalCamera && !maximumInformationLog && !panoramaMode &&
+                !transientCameraUnavailable
+            ) {
                 // Preview + ImageCapture + ImageAnalysis + VideoCapture can exceed a device's
                 // stream-combination budget. Shed the analysis leg — the least critical — and
                 // try once more before giving up.
                 val reduced = UseCaseGroup.Builder()
                     .addUseCase(preview)
-                    .addUseCase(capture)
-                    .also { builder -> if (!photoMode) builder.addUseCase(video) }
-                    .addEffect(effect)
+                    .also { builder ->
+                        when {
+                            photoMode -> builder.addUseCase(capture)
+                            !detachedVideoRecorderArmed -> builder.addUseCase(video)
+                        }
+                    }
+                    .also { builder -> effect?.let(builder::addEffect) }
                     .build()
                 try {
                     provider.bindToLifecycle(owner, selector, reduced).also {
                         Log.w(TAG, "Bound without ImageAnalysis: full use-case set over stream budget.")
                     }
-                } catch (_: IllegalArgumentException) {
-                    throw error
+                } catch (reducedError: RuntimeException) {
+                    CameraPipelineTelemetry.recordBindWarning(
+                        "reduced graph also rejected for ${latestState.activeMode.name}: " +
+                            (reducedError.message ?: reducedError.javaClass.simpleName),
+                    )
+                    camera = null
+                    imageCapture = null
+                    imageAnalysis = null
+                    videoCapture = null
+                    scheduleCameraBindRecovery(owner, bindGeneration, reducedError)
+                    return
                 }
             } else if (triedDirectPhysicalCamera) {
                 Log.w(
@@ -3007,9 +4223,15 @@ class CameraRuntimeController(
                 bindCamera(force = true)
                 return
             } else {
-                // The minimal Log graph has no lower-information surface to shed. Propagate the
-                // bind failure instead of quietly adding 8-bit analysis/still streams back in.
-                throw error
+                // A transient unavailable-camera result is common while Samsung's HAL is closing
+                // the graph unbound directly above. Keep the requested graph/lens intact and retry
+                // it after a short release window instead of silently changing camera semantics.
+                camera = null
+                imageCapture = null
+                imageAnalysis = null
+                videoCapture = null
+                scheduleCameraBindRecovery(owner, bindGeneration, error)
+                return
             }
         }
         // Report this only after a candidate actually binds. The S24 physical camera selector
@@ -3026,33 +4248,95 @@ class CameraRuntimeController(
                 "The bound camera has no public 10-bit HLG encoder surface; Log recording is blocked.",
             )
         }
-        imageCapture = capture.takeUnless { maximumInformationLog || panoramaMode }
-        imageAnalysis = analysis.takeUnless { maximumInformationLog }
+        imageCapture = capture.takeIf { photoMode && !maximumInformationLog && !panoramaMode }
+        boundPreviewUsesEffect = effect != null
+        imageAnalysis = analysis.takeUnless { maximumInformationLog || detachedStillCaptureOutput != null }
         camera?.let { refreshBoundCameraCapabilities(it) }
         boundLensFacing = desiredLensFacing
         boundLensValue = selectedLensValue(latestState)
+        boundLensGraphKey = desiredLensGraphKey
         boundResolution = desiredResolution
         boundFrameRate = desiredFrameRate
         boundHdrLogMode = desiredHdrLogMode
+        boundStabilizationMode = desiredStabilizationMode
         boundCaptureFormat = desiredCaptureFormat
-        boundAspectRatio = desiredAspectRatio
-        boundMode = latestState.activeMode
+        boundAspectRatio = desiredGraphAspectRatio
+        boundGraphClass = desiredGraphClass
         boundExpectedFocalLengthMm = activeLensProfile?.focalLengthMm
+        if (panoramaMode) {
+            prepareSamsungPanoramaEngine()
+        }
+        lastCameraBindCompletedAtMs = SystemClock.elapsedRealtime()
+        CameraPipelineTelemetry.recordBindCompleted(lastCameraBindCompletedAtMs)
+        cancelCameraBindRetry(resetAttempts = true)
+        cancelUnavailableCameraRecovery()
+        pendingCameraBindGraphKey = null
+        exhaustedCameraBindGraphKey = null
+
+        // Mode, resolution and frame-rate changes happen without lifecycle events. Verify every
+        // replacement graph after the same surface-safe grace used on resume so a failed EGL
+        // connection cannot remain a silent, permanent freeze.
+        resumeStreamCheckStartedAtMs = lastCameraBindCompletedAtMs
+        if (owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            scheduleResumeStreamCheck(owner)
+        }
 
         // Detect device capabilities from the bound camera
 
         // Apply zoom once at bind time. setZoomRatio on a logical multi-camera
         // can switch the active physical camera, so we must NOT call it from
         // applySessionState (which runs on every settings change).
+        lastAppliedZoomRatio = null
         camera?.let { applyZoom(latestState, it) }
         applySessionState(latestState, force = true)
+        cameraRequestHandler.removeCallbacks(pendingStillCaptureTimeout)
+        pendingStillCapture.bound(imageCapture?.outputFormat)
+        pendingCaptureActionAfterGraphBind?.let { action ->
+            pendingCaptureActionAfterGraphBind = null
+            cameraRequestHandler.post(action)
+        }
     }
 
 
     // ── Video recording ──────────────────────────────────────────────────────────────
 
+    /**
+     * Preserve the first shutter press while startup or a deferred navigation graph is binding.
+     *
+     * The reducer changes the HUD to recording immediately. Dropping the platform action here
+     * therefore leaves a convincing but false recording state until the user presses again. One
+     * pending action is enough: bind completion consumes it at [bindCamera]'s success boundary.
+     */
+    private fun prepareDeferredCaptureGraph(action: () -> Unit): Boolean {
+        val startupNotReady = !cameraInitializationComplete || cameraProvider == null || camera == null
+        val graphBinding = pendingCameraBindGraphKey != null || pendingCameraGraphBindAfterRelease != null
+        val navigationDeferred = deferredNavigationGraphKey != null
+        if (!startupNotReady && !graphBinding && !navigationDeferred) return false
+        if (pendingCaptureActionAfterGraphBind != null) return true
+        pendingCaptureActionAfterGraphBind = action
+        Log.i(
+            TAG,
+            "Capture queued until camera ready: startup=$startupNotReady " +
+                "binding=$graphBinding deferredNavigation=$navigationDeferred",
+        )
+        if (navigationDeferred) deferredNavigationGraphKey = null
+        // During initial attach, its provider/extension callback already owns the first bind.
+        // Otherwise ensure an unexpectedly absent graph has a bind that can consume the action.
+        if (cameraInitializationComplete && cameraProvider != null && !graphBinding) {
+            bindCamera(force = true)
+        }
+        return true
+    }
+
     private fun startVideoRecording() {
         if (activeRecording != null || directCamera2RecorderBusy() || recordingSegmentFinalizingForReview) return
+        if (usesPreparedRecorder(latestState)) {
+            if (!preparedRecorder.isReady) {
+                pendingCaptureActionAfterGraphBind = { startVideoRecording() }
+                bindPreparedRecorder()
+                return
+            }
+        } else if (prepareDeferredCaptureGraph { startVideoRecording() }) return
         if (resolvedHdrLogMode(latestState) == "LOG" && !boundLogCaptureContractSatisfied) {
             Log.e(TAG, "Refusing Log recording because the bound stream is not public HLG10")
             Toast.makeText(
@@ -3082,6 +4366,8 @@ class CameraRuntimeController(
         activeRecordingSegmentFile = null
         recordingReviewFile = null
         recordingSessionActive = true
+        recordingNeedsCadenceExport = false
+        RecordingClock.reviewPlaybackSpeed.value = 1f
         completedRecordingDurationMs = 0L
         currentRecordingSegmentDurationMs = 0L
         pendingRecordingAction = null
@@ -3383,6 +4669,7 @@ class CameraRuntimeController(
             !variablePlayback
         val hdrLogMode = resolvedHdrLogMode(latestState)
 
+        cameraBindGeneration++
         cameraProvider?.unbindAll()
         camera = null
         videoCapture = null
@@ -3488,71 +4775,55 @@ class CameraRuntimeController(
         }
     }
 
-    private fun startCamera2TimeLapseSegment() {
-        val speedValue = currentValue(latestState, ".speed")
-        val dayNightValue = currentValue(latestState, ".day_night")
-        val speedFactor = hyperlapseSpeedFactor(
-            speedValue,
-            dayNightValue,
-            suggestedHyperlapseMotionSpeedMode,
-        )
-        RecordingClock.timeLapseSpeedFactor.value = speedFactor
-        startCamera2VariableRateSegment(
-            captureRateFps = hyperlapseCaptureRateFps(speedFactor),
-            playbackFps = TIME_LAPSE_PLAYBACK_FPS,
-            videoCodec = hyperlapseVideoCodec(currentValue(latestState, ".video_format")),
-            cameraFrameRate = null,
-            modeLabel = "Hyperlapse ${speedFactor}x",
-            finalizationLabel = "Hyperlapse",
-            // Day/Night is authoritative. Speed selects cadence; it must not silently force
-            // low-light processing after the diver explicitly selects Day.
-            nightMode = dayNightValue == "Night",
+    private fun usesPreparedRecorder(state: CameraState): Boolean =
+        state.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse || isHighSpeedSelection(state)
+
+    private fun preparedControls(cameraId: String): PreparedCamera2Recorder.Controls {
+        val characteristics = context.getSystemService(CameraManager::class.java).getCameraCharacteristics(cameraId)
+        val ev = currentValue(latestState, ".exposure_value", ".exposure_compensation", ".exposure")
+            ?.replace("+", "")?.toDoubleOrNull()
+        val step = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toDouble() ?: 0.0
+        val range = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        return PreparedCamera2Recorder.Controls(
+            ev = if (ev != null && step > 0.0 && range != null) (ev / step).roundToInt().coerceIn(range.lower, range.upper) else null,
+            zoom = latestState.zoomFactor.toFloat().coerceAtLeast(1f),
+            torch = currentValue(latestState, ".flash") in setOf("On", "Torch"),
+            focus = manualFocusRequestFor(latestState)?.diopters,
+            fixedFocus = selectedFocusCapability(latestState)?.supportsManualFocus == false,
+            singleAf = currentValue(latestState, ".focus_mode") == "Single AF",
         )
     }
 
-    private fun startCamera2VariableRateSegment(
-        captureRateFps: Double,
-        playbackFps: Int,
-        videoCodec: TimeLapseVideoCodec,
-        cameraFrameRate: Int?,
-        modeLabel: String,
-        finalizationLabel: String,
-        nightMode: Boolean,
-    ) {
-        val sessionDirectory = recordingSessionDirectory ?: run {
-            releaseShutterWhiteBalance()
-            return
-        }
-        val size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: run {
-            Log.e(TAG, "No direct variable-rate size for ${desiredResolutionValue(latestState)}")
-            reportRuntimeFailure("${desiredResolutionValue(latestState)} is not available for $modeLabel.")
-            releaseShutterWhiteBalance()
-            return
-        }
-        val boundCamera = camera ?: run {
-            Log.w(TAG, "$modeLabel requested without a bound preview; rebinding")
-            bindCamera(force = true)
-            camera
-        } ?: run {
-            releaseShutterWhiteBalance()
-            return
-        }
-        val cameraId = Camera2CameraInfo.from(boundCamera.cameraInfo).cameraId
-        val segmentFile = File(
-            sessionDirectory,
-            "segment-${(recordingSegmentFiles.size + 1).toString().padStart(4, '0')}.mp4",
+    private fun bindPreparedRecorder() {
+        val host = previewView ?: return
+        if (preparedRecorder.isBusy || SystemClock.elapsedRealtime() < preparedRetryAfterMs) return
+        val highSpeed = isHighSpeedSelection(latestState)
+        val id = selectedCameraIdForBinding(latestState, desiredLensFacing(latestState)) ?: return
+        val speed = hyperlapseSpeedFactor(currentValue(latestState, ".speed"), currentValue(latestState, ".day_night"), suggestedHyperlapseMotionSpeedMode)
+        val selection = PreparedCamera2Recorder.Config(
+            cameraId = id,
+            size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: return,
+            highSpeedFps = if (highSpeed) CameraCatalog.captureFrameRateFps(currentValue(latestState, ".frame_rate")) else null,
+            captureRate = hyperlapseCaptureRateFps(speed),
+            playbackFps = if (highSpeed && latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.ProVideo)
+                proVideoPlaybackFrameRate(currentValue(latestState, ".frame_rate")).roundToInt() else 30,
+            codec = if (highSpeed) TimeLapseVideoCodec.H264 else hyperlapseVideoCodec(currentValue(latestState, ".video_format")),
+            night = !highSpeed && currentValue(latestState, ".day_night") == "Night",
         )
-        activeRecordingSegmentFile = segmentFile
-        val ev = currentValue(latestState, ".exposure_value", ".exposure_compensation", ".exposure")
-            ?.replace("+", "")
-            ?.toDoubleOrNull()
-        val evIndex = ev?.let { evCompensationIndex(boundCamera, it) }
-        val focusDiopters = manualFocusRequestFor(latestState)?.diopters
-        val host = previewView ?: run {
-            releaseShutterWhiteBalance()
+        val controls = runCatching { preparedControls(id) }.getOrElse { error ->
+            preparedRetryAfterMs = SystemClock.elapsedRealtime() + 2000L
+            Log.w(TAG, "Recording camera temporarily unavailable", error)
             return
         }
-
+        if (preparedRecorder.config == selection) {
+            preparedRecorder.update(controls)
+            return
+        }
+        cancelResumeStreamCheck()
+        cancelPresentedGraphTransition()
+        cancelCameraBindRetry(resetAttempts = true)
+        cameraBindGeneration++
+        preparedRecorder.release()
         cameraProvider?.unbindAll()
         camera = null
         videoCapture = null
@@ -3560,146 +4831,52 @@ class CameraRuntimeController(
         imageAnalysis = null
         cam2Session = null
         cam2Surfaces = emptyList()
-        try {
-            camera2TimeLapseRecorder.start(
-                Camera2TimeLapseRecorder.Request(
-                    previewHost = host,
-                    cameraId = cameraId,
-                    size = size,
-                    captureRateFps = captureRateFps,
-                    playbackFps = playbackFps,
-                    videoCodec = videoCodec,
-                    cameraFrameRate = cameraFrameRate,
-                    modeLabel = modeLabel,
-                    outputFile = segmentFile,
-                    exposureCompensationIndex = evIndex,
-                    zoomRatio = latestState.zoomFactor.toFloat().coerceAtLeast(1f),
-                    torchEnabled = currentValue(latestState, ".flash") in setOf("On", "Torch"),
-                    focusDiopters = focusDiopters,
-                    nightMode = nightMode,
-                ),
-                onStarted = {
-                    currentRecordingSegmentDurationMs = 0L
-                    RecordingClock.paused.value = false
-                    cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
-                    cameraRequestHandler.post(directRecordingClockRunnable)
-                    Log.i(
-                        TAG,
-                        "Direct $modeLabel segment started: $segmentFile " +
-                            "capture=${captureRateFps}fps playback=${playbackFps}fps " +
-                            "codec=$videoCodec night=$nightMode",
-                    )
-                },
-                onFinalized = { result ->
-                    finalizeCamera2VariableRateSegment(segmentFile, result, finalizationLabel)
-                },
-            )
-        } catch (error: Throwable) {
-            Log.e(TAG, "Could not start direct $modeLabel recording", error)
-            reportRuntimeFailure("$modeLabel failed to start: ${error.message ?: "camera rejected the session"}")
-            activeRecordingSegmentFile = null
-            releaseShutterWhiteBalance()
-            finishRecordingSession(deleteLatest = false)
-            bindCamera(force = true)
-        }
+        focusRampBuilder = null
+        nativeFocusActive = false
+        deferredNavigationGraphKey = null
+        pendingCameraBindGraphKey = null
+        preparedRecorder.prepare(host, selection, controls,
+            onReady = {
+                onDirectPreviewPresented?.invoke()
+                pendingCaptureActionAfterGraphBind?.let { action ->
+                    pendingCaptureActionAfterGraphBind = null
+                    cameraRequestHandler.post(action)
+                }
+            },
+            onError = { error ->
+                preparedRetryAfterMs = SystemClock.elapsedRealtime() + 2000L
+                pendingCaptureActionAfterGraphBind = null
+                reportRuntimeFailure("Recording preview failed: ${error.message}")
+            },
+        )
     }
 
-    private fun startCamera2HighSpeedSegment() {
-        val sessionDirectory = recordingSessionDirectory ?: run {
-            releaseShutterWhiteBalance()
-            return
-        }
-        val fps = CameraCatalog.captureFrameRateFps(currentValue(latestState, ".frame_rate"))
-            ?: return
-        val size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: run {
-            Log.e(TAG, "No direct high-speed size for ${desiredResolutionValue(latestState)}")
-            reportRuntimeFailure("${desiredResolutionValue(latestState)} is not available for high-speed recording.")
-            releaseShutterWhiteBalance()
-            return
-        }
-        val boundCamera = camera ?: run {
-            Log.w(TAG, "High-speed record requested without a bound preview; rebinding")
-            bindCamera(force = true)
-            camera
-        } ?: run {
-            reportRuntimeFailure("High-speed camera session could not be opened.")
-            releaseShutterWhiteBalance()
-            return
-        }
-        val cameraId = Camera2CameraInfo.from(boundCamera.cameraInfo).cameraId
-        val segmentFile = File(
-            sessionDirectory,
-            "segment-${(recordingSegmentFiles.size + 1).toString().padStart(4, '0')}.mp4",
-        )
-        activeRecordingSegmentFile = segmentFile
-        val playbackFrameRate = if (
-            latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.ProVideo
-        ) {
-            proVideoPlaybackFrameRate(currentValue(latestState, ".frame_rate"))
-        } else {
-            30.0
-        }
-        val encoderPlaybackFps = playbackFrameRate.roundToInt()
-        // A real-time microphone track cannot accompany video whose playback timestamps are
-        // expanded 5x-10x. Samsung's constrained-high-speed path is video-only for the same
-        // reason, even when entered from Pro Video.
-        val hasAudio = false
-        val ev = currentValue(latestState, ".exposure_value", ".exposure_compensation")
-            ?.replace("+", "")
-            ?.toDoubleOrNull()
-        val evIndex = ev?.let { evCompensationIndex(boundCamera, it) }
-        val host = previewView ?: run {
-            releaseShutterWhiteBalance()
-            return
-        }
+    private fun startCamera2TimeLapseSegment() = startPreparedSegment(highSpeed = false)
+    private fun startCamera2HighSpeedSegment() = startPreparedSegment(highSpeed = true)
 
-        cameraProvider?.unbindAll()
-        camera = null
-        videoCapture = null
-        imageCapture = null
-        imageAnalysis = null
+    private fun startPreparedSegment(highSpeed: Boolean) {
+        val directory = recordingSessionDirectory ?: return
+        val file = File(directory, "segment-${(recordingSegmentFiles.size + 1).toString().padStart(4, '0')}.mp4")
+        activeRecordingSegmentFile = file
+        val fps = CameraCatalog.captureFrameRateFps(currentValue(latestState, ".frame_rate")) ?: 120
+        val playback = if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.ProVideo)
+            proVideoPlaybackFrameRate(currentValue(latestState, ".frame_rate")) else 30.0
         try {
-            camera2HighSpeedRecorder.start(
-                Camera2HighSpeedRecorder.Request(
-                    previewHost = host,
-                    cameraId = cameraId,
-                    size = size,
-                    fps = fps,
-                    playbackFps = encoderPlaybackFps,
-                    outputFile = segmentFile,
-                    audioEnabled = hasAudio,
-                    exposureCompensationIndex = evIndex,
-                    zoomRatio = latestState.zoomFactor.toFloat().coerceAtLeast(1f),
-                    torchEnabled = currentValue(latestState, ".flash") in setOf("On", "Torch"),
-                    focusMode = currentValue(latestState, ".focus_mode") ?: "Continuous AF",
-                ),
+            preparedRecorder.start(file,
                 onStarted = {
                     currentRecordingSegmentDurationMs = 0L
                     RecordingClock.paused.value = false
                     cameraRequestHandler.removeCallbacks(directRecordingClockRunnable)
                     cameraRequestHandler.post(directRecordingClockRunnable)
-                    Log.i(
-                        TAG,
-                        "Direct high-speed segment started: $segmentFile capture=${fps}fps " +
-                            "playback=${playbackFrameRate}fps audio=$hasAudio",
-                    )
                 },
                 onFinalized = { result ->
-                    finalizeCamera2HighSpeedSegment(
-                        segmentFile = segmentFile,
-                        result = result,
-                        effectiveCaptureFps = fps,
-                        playbackFrameRate = playbackFrameRate,
-                    )
+                    if (highSpeed) finalizeCamera2HighSpeedSegment(file, result, fps, playback)
+                    else finalizeCamera2VariableRateSegment(file, result, "Hyperlapse")
                 },
             )
         } catch (error: Throwable) {
-            Log.e(TAG, "Could not start direct high-speed recording", error)
-            reportRuntimeFailure("High-speed recording failed to start: ${error.message ?: "camera rejected the session"}")
-            activeRecordingSegmentFile = null
-            releaseShutterWhiteBalance()
-            finishRecordingSession(deleteLatest = false)
-            bindCamera(force = true)
+            if (highSpeed) completeCamera2HighSpeedSegment(file, Result.failure(error))
+            else finalizeCamera2VariableRateSegment(file, Result.failure(error), "Hyperlapse")
         }
     }
 
@@ -3715,73 +4892,24 @@ class CameraRuntimeController(
             completeCamera2HighSpeedSegment(segmentFile, result)
             return
         }
-        val convertedFile = File(
-            segmentFile.parentFile,
-            segmentFile.nameWithoutExtension + "-converted.mp4",
-        )
-        runCatching {
-            highSpeedVideoTranscoder.transcode(
-                inputFile = segmentFile,
-                outputFile = convertedFile,
-                effectiveCaptureFps = effectiveCaptureFps,
-                // Encode on the integer cadence MediaCodec supports. Fractional cinema/NTSC
-                // rates are applied exactly once by finishExactHighSpeedPlaybackRate below.
-                playbackFps = playbackFrameRate.roundToInt().toDouble(),
-            ) { converted ->
-                converted.onSuccess { segmentFile.delete() }
-                finishExactHighSpeedPlaybackRate(
-                    segmentFile = converted.getOrElse {
-                        completeCamera2HighSpeedSegment(segmentFile, Result.failure(it))
-                        return@transcode
-                    },
-                    captureResult = result,
-                    playbackFrameRate = playbackFrameRate,
-                )
-            }
-        }.onFailure { error ->
-            completeCamera2HighSpeedSegment(segmentFile, Result.failure(error))
-        }
-    }
-
-    private fun finishExactHighSpeedPlaybackRate(
-        segmentFile: File,
-        captureResult: Result<Long>,
-        playbackFrameRate: Double,
-    ) {
-        val scale = playbackTimestampScale(playbackFrameRate)
-        if (kotlin.math.abs(scale - 1.0) > 0.000_001) {
-            val retimedFile = File(
-                segmentFile.parentFile,
-                segmentFile.nameWithoutExtension + "-retimed.mp4",
-            )
+        if (effectiveCaptureFps >= 60) {
+            val retimedFile = File(segmentFile.parentFile, segmentFile.nameWithoutExtension + "-retimed.mp4")
             recordingFinalizeExecutor.execute {
-                val retimed = RecordingSessionMuxer.retime(
-                    inputFile = segmentFile,
-                    outputFile = retimedFile,
-                    timestampScale = scale,
-                    playbackFrameRate = playbackFrameRate,
-                )
+                val retimed = RecordingSessionMuxer.retimeHighSpeed(segmentFile, retimedFile, playbackFrameRate)
                 ContextCompat.getMainExecutor(context).execute {
-                    retimed
-                        .onSuccess {
-                            segmentFile.delete()
-                            Log.i(
-                                TAG,
-                                "Retimed high-speed segment to exact ${playbackFrameRate}fps: $it",
-                            )
-                            completeCamera2HighSpeedSegment(it, captureResult)
-                        }
-                        .onFailure { error ->
-                            completeCamera2HighSpeedSegment(
-                                segmentFile,
-                                Result.failure(error),
-                            )
-                        }
+                    retimed.onSuccess { segmentFile.delete() }
+                    completeCamera2HighSpeedSegment(retimed.getOrDefault(segmentFile),
+                        if (retimed.isSuccess) result else Result.failure(checkNotNull(retimed.exceptionOrNull())))
                 }
             }
             return
         }
-        completeCamera2HighSpeedSegment(segmentFile, captureResult)
+        // Samsung ignores MediaRecorder capture-rate sampling above the playback cadence.
+        // Keep the regular 60 fps source reviewable immediately; the player supplies slow
+        // playback, and only Save performs the 60 -> 48 frame selection and 30 fps encoding.
+        recordingNeedsCadenceExport = true
+        RecordingClock.reviewPlaybackSpeed.value = (playbackFrameRate / effectiveCaptureFps).toFloat()
+        completeCamera2HighSpeedSegment(segmentFile, result)
     }
 
     private fun completeCamera2HighSpeedSegment(segmentFile: File, result: Result<Long>) {
@@ -3818,6 +4946,7 @@ class CameraRuntimeController(
 
     /** A direct recorder can finish after ON_PAUSE; never rebind CameraX into a dead surface. */
     private fun rebindAfterDirectRecording() {
+        if (preparedRecorder.ownsCamera) return
         val owner = lifecycleOwner
         val host = previewView
         if (owner == null || host == null ||
@@ -4004,6 +5133,9 @@ class CameraRuntimeController(
         val sessionDirectory = recordingSessionDirectory
         val segments = recordingSegmentFiles.toList()
         val preparedReview = recordingReviewFile
+        val needsCadenceExport = recordingNeedsCadenceExport
+        recordingNeedsCadenceExport = false
+        RecordingClock.reviewPlaybackSpeed.value = 1f
         val displayName = recordingSessionDisplayName
             ?: "DiveControl_${System.currentTimeMillis()}.mp4"
         val saveLocation = latestState.recordingSaveLocation
@@ -4042,21 +5174,38 @@ class CameraRuntimeController(
         }
 
         recordingFinalizeExecutor.execute {
-            val result = if (preparedReview?.isFile == true && preparedReview.length() > 0L) {
-                RecordingSessionMuxer.publishPreparedFile(
-                    context = context,
-                    preparedFile = preparedReview,
-                    displayName = displayName,
-                    location = saveLocation,
-                )
-            } else {
-                RecordingSessionMuxer.publish(
-                    context = context,
-                    segmentFiles = segments,
-                    displayName = displayName,
-                    location = saveLocation,
-                )
+            val export = runCatching {
+                if (!needsCadenceExport) preparedReview else {
+                    val directory = checkNotNull(sessionDirectory)
+                    val input = preparedReview ?: File(checkNotNull(RecordingSessionMuxer.buildReview(
+                        segments, File(directory, "review.mp4"),
+                    ).getOrThrow().path))
+                    val completion = java.util.concurrent.CompletableFuture<Result<File>>()
+                    ContextCompat.getMainExecutor(context).execute {
+                        // Save owns this converter independently of the active camera mode.
+                        // Changing modes or leaving the camera UI must not cancel a saved clip.
+                        runCatching {
+                            HighSpeedVideoTranscoder(context).transcode(
+                                inputFile = input,
+                                outputFile = File(directory, "export-48fps.mp4"),
+                                effectiveCaptureFps = 48,
+                                sourceCaptureFps = 60,
+                                playbackFps = 30.0,
+                                onCompleted = { completion.complete(it) },
+                            )
+                        }.onFailure { completion.complete(Result.failure(it)) }
+                    }
+                    completion.get().getOrThrow()
+                }
             }
+            val result = export.fold(
+                onSuccess = { publishFile ->
+                    if (publishFile?.isFile == true && publishFile.length() > 0L)
+                        RecordingSessionMuxer.publishPreparedFile(context, publishFile, displayName, saveLocation)
+                    else RecordingSessionMuxer.publish(context, segments, displayName, saveLocation)
+                },
+                onFailure = { Result.failure(it) },
+            )
             result
                 .onSuccess { uri ->
                     sessionDirectory?.deleteRecursively()
@@ -4623,16 +5772,13 @@ class CameraRuntimeController(
     /**
      * Build the dynamic lens list from detected hardware and report it via callback.
      * This list includes "Auto" as the first option, then all detected physical lenses,
-     * plus "2x" (digital crop on main) if a main lens exists, and "front" if detected.
+     * plus "front" if detected. Digital crops are deliberately not presented as lenses.
      */
     private fun reportDetectedLenses() {
         val lenses = mutableListOf("Auto")
-        // Add in optical order: 0.6x, 1x, 2x (digital), 3x, 5x
+        // Add in optical order. Every entry corresponds to a real camera sensor.
         if (backLensAssignments.containsKey("0.6x")) lenses.add("0.6x")
-        if (backLensAssignments.containsKey("1x")) {
-            lenses.add("1x")
-            lenses.add("2x") // Digital crop on main lens
-        }
+        if (backLensAssignments.containsKey("1x")) lenses.add("1x")
         if (backLensAssignments.containsKey("3x")) lenses.add("3x")
         if (backLensAssignments.containsKey("5x")) lenses.add("5x")
         if (frontCameraId != null) lenses.add("front")
@@ -4655,7 +5801,14 @@ class CameraRuntimeController(
             flash = currentValue(cameraState, ".flash"),
             exposure = currentValue(cameraState, ".exposure_compensation", ".exposure_value", ".exposure"),
             lens = currentValue(cameraState, ".lens"),
-            hdrLog = resolvedHdrLogMode(cameraState),
+            // Panorama's three looks are applied to its RGBA analysis/stitch pixels. Reissuing
+            // Samsung's live tonemap/noise request for this UI-only change can strand the
+            // Preview surface even though capture results continue, so its session key is fixed.
+            hdrLog = if (cameraState.activeMode == com.mobiledivecontrol.core.CameraModeId.Panorama) {
+                "PanoramaSoftwareProfile"
+            } else {
+                resolvedHdrLogMode(cameraState)
+            },
             dayNight = currentValue(cameraState, ".day_night"),
             whiteBalance = resolvedWhiteBalanceValue(cameraState),
             filter = filterValue,
@@ -4710,6 +5863,9 @@ class CameraRuntimeController(
 
         val manualFocusRequest = manualFocusRequestFor(cameraState)
         val isManualFocus = manualFocusRequest != null
+        // On the logical rear camera this is the native seamless lens-switch path. The cached
+        // ratio makes ordinary state emissions free while a real lens change reaches the HAL.
+        applyZoom(cameraState, boundCamera)
         if (isManualFocus) {
             // Leaving auto: forget the held plane, the dial owns focus again.
             afSearchGen++
@@ -5053,24 +6209,32 @@ class CameraRuntimeController(
         }
     }
 
+    private fun stabilizationGraphKey(cameraState: CameraState): String = when {
+        resolvedHdrLogMode(cameraState) == "LOG" -> "Off"
+        currentValue(cameraState, ".video_stabilization") == "Standard" -> "On"
+        currentValue(cameraState, ".super_steady") == "On" -> "On"
+        else -> "Off"
+    }
+
     private fun requestedVideoStabilizationMode(
         cameraState: CameraState,
-        boundCamera: Camera,
+        cameraInfo: androidx.camera.core.CameraInfo,
     ): Int? {
-        if (resolvedHdrLogMode(cameraState) == "LOG") return null
-        val supported = Camera2CameraInfo.from(boundCamera.cameraInfo).getCameraCharacteristic(
+        val supported = Camera2CameraInfo.from(cameraInfo).getCameraCharacteristic(
             CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES,
         )?.toSet().orEmpty()
-        val requested = if (
-            currentValue(cameraState, ".video_stabilization") == "Standard" ||
-            currentValue(cameraState, ".super_steady") == "On"
-        ) {
+        val requested = if (stabilizationGraphKey(cameraState) == "On") {
             CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
         } else {
             CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
         }
         return requested.takeIf { it in supported }
     }
+
+    private fun requestedVideoStabilizationMode(
+        cameraState: CameraState,
+        boundCamera: Camera,
+    ): Int? = requestedVideoStabilizationMode(cameraState, boundCamera.cameraInfo)
 
     private fun applyRequestedVideoStabilization(
         builder: CaptureRequest.Builder,
@@ -5339,17 +6503,16 @@ class CameraRuntimeController(
     }
 
     private fun capturePhoto() {
+        if (prepareDeferredCaptureGraph { capturePhoto() }) return
         if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Panorama) {
             if (pendingPanoramaReview != null || latestState.panoramaReviewAvailable) {
                 Toast.makeText(context, "Choose Save or Delete", Toast.LENGTH_SHORT).show()
                 return
             }
             if (panoramaCaptureActive) {
-                if (panoramaFrames.size >= 2) {
-                    finishPanoramaCapture()
-                } else {
-                    PanoramaCaptureState.message.value = "Pan slowly in any direction."
-                }
+                // Samsung's engine owns frame sufficiency. Stop always means stop; the old
+                // custom two-frame gate produced the non-native "incomplete panorama" failure.
+                finishPanoramaCapture()
             } else {
                 startPanoramaCapture()
             }
@@ -5374,48 +6537,39 @@ class CameraRuntimeController(
     }
 
     private fun startPanoramaCapture() {
-        if (PanoramaCaptureState.finalizing.value) {
-            Toast.makeText(context, "Panorama is still saving", Toast.LENGTH_SHORT).show()
-            return
-        }
+        if (panoramaReviewPreparing) return
         if (imageAnalysis == null) {
             Log.w(TAG, "Panorama requested without ImageAnalysis; rebinding")
             bindCamera(force = true)
         }
-        if (imageAnalysis == null) {
+        val engine = samsungPanoramaEngine
+        if (imageAnalysis == null || engine == null) {
+            prepareSamsungPanoramaEngine()
+            PanoramaCaptureState.message.value = "Preparing Samsung panorama"
             Toast.makeText(context, "Panorama camera is not ready", Toast.LENGTH_SHORT).show()
             return
         }
-
-        cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
         panoramaGeneration++
         panoramaLiveThumbnailGeneration++
+        samsungPanoramaAcceptedFrames = 0
         panoramaPreviewExecutor.execute {
             panoramaLiveWorkingBitmap?.recycle()
             panoramaLiveWorkingBitmap = null
             panoramaLiveWorkingDirection = null
             panoramaLiveWorkingSweepRadians = null
         }
+        // Clear remnants from the retired Kotlin compositor. Samsung's engine owns every frame in
+        // this session and never persists per-frame bitmaps or RGBA files.
         panoramaFrames.forEach { frame -> runCatching { frame.file.delete() } }
         panoramaFrames.clear()
         panoramaPreviewFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
         panoramaPreviewFrames.clear()
         panoramaCaptureDirectory?.let { directory -> runCatching { directory.deleteRecursively() } }
-        panoramaCaptureDirectory = File(
-            context.cacheDir,
-            "panorama-frames/session-${System.currentTimeMillis()}-${System.nanoTime()}",
-        ).also { directory ->
-            if (!directory.mkdirs() && !directory.isDirectory) {
-                Toast.makeText(context, "Could not create panorama workspace", Toast.LENGTH_LONG).show()
-                return
-            }
-        }
+        panoramaCaptureDirectory = null
         val idleReferenceFrame = PanoramaCaptureState.referenceFrame.value
-        val liveViewfinderFrame = PanoramaCaptureState.viewfinderFrame.value
         val oldLiveThumbnail = PanoramaCaptureState.liveThumbnail.value
         PanoramaCaptureState.reset()
         PanoramaCaptureState.referenceFrame.value = idleReferenceFrame
-        PanoramaCaptureState.viewfinderFrame.value = liveViewfinderFrame
         oldLiveThumbnail?.let { frame ->
             cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 500L)
         }
@@ -5425,6 +6579,7 @@ class CameraRuntimeController(
         panoramaFinishPending = false
         panoramaLastSensorTimestampNs = 0L
         panoramaSweepRadians = 0f
+        panoramaLastLivePreviewRadians = 0f
         panoramaCrossAxisRadians = 0f
         panoramaLastCapturedRadians = 0f
         panoramaReverseRadians = 0f
@@ -5434,8 +6589,11 @@ class CameraRuntimeController(
         panoramaLastAnnouncement = ""
         // Samsung Panorama always determines the sweep from the user's first deliberate motion.
         panoramaDirectionPending = true
-        panoramaDirection = "Right"
-        panoramaDirectionProbeRadians = 0f
+        panoramaDirection = "Auto"
+        panoramaGuideDisplayRotation = previewView?.display?.rotation ?: 1
+        panoramaCaptureDisplayRotation = panoramaGuideDisplayRotation
+        panoramaDirectionProbeRightRadians = 0f
+        panoramaDirectionProbeUpRadians = 0f
         panoramaMetadataSnapshot = captureMetadataSnapshot()
         panoramaCaptureProfile = PanoramaDynamicRangeProfile.fromSetting(
             resolvedHdrLogMode(latestState),
@@ -5448,26 +6606,22 @@ class CameraRuntimeController(
         PanoramaCaptureState.crossAxisRadians.value = 0f
         PanoramaCaptureState.direction.value = panoramaDirection
         PanoramaCaptureState.directionLocked.value = !panoramaDirectionPending
-        setPanoramaGuidance("Pan slowly in any direction.")
+        setPanoramaGuidance("")
         playPanoramaActionSound(MediaActionSound.SHUTTER_CLICK)
         setPanoramaCaptureLocks(true)
-        val gyroRegistered = gyroscope != null && sensorManager.registerListener(
-            panoramaMotionListener,
-            gyroscope,
-            SensorManager.SENSOR_DELAY_GAME,
-        )
-        panoramaGravityRegistered = gravitySensor != null && sensorManager.registerListener(
-            panoramaMotionListener,
-            gravitySensor,
-            SensorManager.SENSOR_DELAY_GAME,
-        )
-        panoramaSensorRegistered = gyroRegistered || panoramaGravityRegistered
+        // Samsung Interface registers its own gyro listener at the native 10 ms period.
+        // The retired guidance estimator must not race Samsung's direction/scan decisions.
+        panoramaGravityRegistered = false
+        panoramaSensorRegistered = false
         Log.i(
             TAG,
-            "Panorama started: direction=$panoramaDirection gyro=$gyroRegistered " +
-                "gravity=$panoramaGravityRegistered",
+            "Samsung panorama started: direction=$panoramaDirection gyro=Samsung " +
+                "displayFallback=$panoramaGuideDisplayRotation",
         )
-        takePanoramaFrame()
+        runCatching(engine::start).onFailure { error ->
+            Log.e(TAG, "Samsung panorama start failed", error)
+            failSamsungPanorama("Samsung panorama could not start")
+        }
     }
 
     private fun takePanoramaFrame() {
@@ -5526,49 +6680,73 @@ class CameraRuntimeController(
             return
         }
         val plane = image.planes.firstOrNull()
+        val crop = panoramaImageCrop(image)
         val file = File(directory, "frame-${System.nanoTime()}.rgba")
         val frameSharpness = centreSharpness(image).coerceAtLeast(0.0)
         val frameIso = lastAeSensitivity
         val frameExposureNs = lastAeExposureNs
         val previewBitmap = runCatching {
-            decodePanoramaSampledFrame(image, 480, panoramaCaptureProfile)
+            decodePanoramaSampledFrame(
+                image,
+                480,
+                panoramaCaptureProfile,
+                panoramaCaptureDisplayRotation,
+            )
         }
             .onFailure { error -> Log.w(TAG, "Could not build panorama live keyframe", error) }
             .getOrNull()
         val stored = runCatching {
-            require(plane != null && plane.pixelStride == 4) {
-                "Panorama analysis stream is not RGBA"
-            }
-            val packedRowBytes = image.width * 4
-            val requiredBufferBytes = (image.height - 1) * plane.rowStride + packedRowBytes
-            val source = plane.buffer.duplicate().apply { rewind() }
-            require(requiredBufferBytes <= source.limit()) { "Incomplete panorama analysis buffer" }
-            FileOutputStream(file).channel.use { channel ->
-                if (plane.rowStride == packedRowBytes) {
-                    source.limit(packedRowBytes * image.height)
-                    while (source.hasRemaining()) channel.write(source)
-                } else {
-                    for (rowIndex in 0 until image.height) {
-                        val rowStart = rowIndex * plane.rowStride
-                        val row = source.duplicate().apply {
-                            position(rowStart)
-                            limit(rowStart + packedRowBytes)
-                        }.slice()
-                        while (row.hasRemaining()) channel.write(row)
+            if (image.format == android.graphics.ImageFormat.YUV_420_888) {
+                val bitmap = image.toBitmap()
+                try {
+                    check(bitmap.width == crop.width && bitmap.height == crop.height) { "Unexpected panorama crop" }
+                    val packed = java.nio.ByteBuffer.allocateDirect(bitmap.byteCount)
+                    bitmap.copyPixelsToBuffer(packed)
+                    packed.flip()
+                    FileOutputStream(file).channel.use { channel -> while (packed.hasRemaining()) channel.write(packed) }
+                } finally { bitmap.recycle() }
+            } else {
+                require(plane != null && plane.pixelStride == 4) {
+                    "Panorama analysis stream is not RGBA"
+                }
+                val packedRowBytes = crop.width * 4
+                val requiredBufferBytes =
+                    (crop.top + crop.height - 1) * plane.rowStride +
+                        crop.left * plane.pixelStride + packedRowBytes
+                val source = plane.buffer.duplicate().apply { rewind() }
+                require(requiredBufferBytes <= source.limit()) { "Incomplete panorama analysis buffer" }
+                FileOutputStream(file).channel.use { channel ->
+                    if (crop.left == 0 && crop.top == 0 &&
+                        crop.width == image.width && crop.height == image.height &&
+                        plane.rowStride == packedRowBytes
+                    ) {
+                        source.limit(packedRowBytes * crop.height)
+                        while (source.hasRemaining()) channel.write(source)
+                    } else {
+                        for (rowIndex in 0 until crop.height) {
+                            val rowStart = (crop.top + rowIndex) * plane.rowStride +
+                                crop.left * plane.pixelStride
+                            val row = source.duplicate().apply {
+                                position(rowStart)
+                                limit(rowStart + packedRowBytes)
+                            }.slice()
+                            while (row.hasRemaining()) channel.write(row)
+                        }
                     }
                 }
             }
             StoredPanoramaFrame(
                 file = file,
                 sweepRadians = requestedRadians,
-                rawWidth = image.width,
-                rawHeight = image.height,
+                rawWidth = crop.width,
+                rawHeight = crop.height,
                 rotationDegrees = image.imageInfo.rotationDegrees,
                 maximumWidth = PANORAMA_STORED_FRAME_SIZE.width,
                 maximumHeight = PANORAMA_STORED_FRAME_SIZE.height,
                 sensitivityIso = frameIso,
                 exposureTimeNs = frameExposureNs,
                 sharpness = frameSharpness,
+                physicalDisplayRotation = panoramaCaptureDisplayRotation,
             )
         }
         cameraRequestHandler.post {
@@ -5584,18 +6762,25 @@ class CameraRuntimeController(
             stored.onSuccess { frame ->
                 panoramaFrames += frame
                 previewBitmap?.let { preview ->
-                    panoramaPreviewFrames += CapturedPanoramaFrame(preview, requestedRadians)
+                    panoramaPreviewFrames += CapturedPanoramaFrame(
+                        bitmap = preview,
+                        sweepRadians = requestedRadians,
+                        physicalDisplayRotation = panoramaCaptureDisplayRotation,
+                    )
                 }
                 panoramaLastCapturedRadians = requestedRadians
                 PanoramaCaptureState.frameCount.value = panoramaFrames.size
                 PanoramaCaptureState.canStop.value = panoramaFrames.size >= 2
                 if (previewBitmap != null) updatePanoramaLiveThumbnail(generation)
+                if (PanoramaCaptureState.directionLocked.value) queuePanoramaComposition()
                 Log.d(
                     TAG,
                     "Panorama stream frame ${panoramaFrames.size}: " +
                         "${frame.rawWidth}x${frame.rawHeight} raw=${file.length()} " +
                         "sweep=$requestedRadians iso=${frame.sensitivityIso} " +
-                        "expNs=${frame.exposureTimeNs} sharp=${frame.sharpness}",
+                        "expNs=${frame.exposureTimeNs} sharp=${frame.sharpness} " +
+                        "cameraRotation=${frame.rotationDegrees} " +
+                        "physicalRotation=${frame.physicalDisplayRotation}",
                 )
                 when {
                     panoramaFinishPending -> finalizePanoramaFrames()
@@ -5628,33 +6813,58 @@ class CameraRuntimeController(
 
     private fun finishPanoramaCapture() {
         if (!panoramaCaptureActive) return
+        val engine = samsungPanoramaEngine ?: run {
+            failSamsungPanorama("Panorama camera stopped")
+            return
+        }
         panoramaCaptureActive = false
-        PanoramaCaptureState.active.value = false
-        PanoramaCaptureState.finalizing.value = true
-        PanoramaCaptureState.message.value = "Saving panorama…"
-        previewView?.announceForAccessibility("Saving panorama")
+        panoramaReviewPreparing = true
+        deferredPanoramaReviewAction = null
+        panoramaLiveThumbnailGeneration++
         playPanoramaActionSound(MediaActionSound.STOP_VIDEO_RECORDING)
-        PanoramaCaptureState.savingProgress.value = 0
+        setPanoramaCaptureLocks(false)
         cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
-        cameraRequestHandler.postDelayed(
-            panoramaProcessTimeoutRunnable,
-            PANORAMA_PROCESS_TIMEOUT_MS,
-        )
         unregisterPanoramaSensor()
-        val waitForClaimedFrame = synchronized(panoramaFrameRequestLock) {
-            if (panoramaCaptureInFlight && panoramaFrameRequestClaimed) {
-                true
-            } else {
-                panoramaCaptureInFlight = false
-                panoramaFrameRequestClaimed = false
-                false
+        PanoramaCaptureState.movingTooFast.value = false
+        setPanoramaGuidance("")
+        val stoppedAt = SystemClock.elapsedRealtime()
+        samsungPanoramaStopRequestedAtMs = stoppedAt
+        panoramaExecutor.execute {
+            runCatching(engine::stop).onSuccess { hasResult ->
+                if (!hasResult) cameraRequestHandler.post { cancelPanoramaCapture("") }
+            }.onFailure { error ->
+                Log.e(TAG, "Samsung panorama stop failed", error)
+                cameraRequestHandler.post {
+                    failSamsungPanorama("Panorama could not be completed")
+                }
             }
         }
-        if (waitForClaimedFrame) {
-            panoramaFinishPending = true
-        } else {
-            finalizePanoramaFrames()
+        Log.i(TAG, "Samsung panorama stop requested at $stoppedAt")
+    }
+
+    private fun queuePanoramaComposition(): PanoramaWork {
+        val work = panoramaWork
+        val frames = panoramaFrames.map { it.copy(physicalDisplayRotation = panoramaCaptureDisplayRotation) }
+        if (frames.isEmpty()) return work
+        val direction = panoramaBitmapDirection(panoramaDirection, panoramaCaptureDisplayRotation, panoramaGuideDisplayRotation)
+        val fov = Math.toRadians(horizontalFovDegrees()).toFloat()
+        val cross = panoramaTargetCrossPixels(frames.first().rawWidth, frames.first().rawHeight,
+            if (boundLensValue == "0.6x") 1808 else 1728, direction, panoramaCaptureDisplayRotation)
+        val profile = panoramaCaptureProfile
+        panoramaExecutor.execute {
+            if (work.failure == null) runCatching {
+                val stitcher = work.stitcher ?: PanoramaBitmapStitcher.Incremental(direction, fov, cross, profile)
+                    .also { work.stitcher = it }
+                for (index in stitcher.frameCount until frames.size) {
+                    val started = SystemClock.elapsedRealtime()
+                    stitcher.append(frames[index])
+                    // The full-resolution mosaic now owns these pixels; release disk space as we go.
+                    frames[index].file.delete()
+                    Log.i(TAG, "Panorama composed frame=${index + 1} ms=${SystemClock.elapsedRealtime() - started}")
+                }
+            }.onFailure { work.failure = it; Log.e(TAG, "Panorama incremental composition failed", it) }
         }
+        return work
     }
 
     private fun finalizePanoramaFrames() {
@@ -5662,134 +6872,81 @@ class CameraRuntimeController(
         panoramaDirectionPending = false
         panoramaCaptureInFlight = false
         panoramaFrameRequestClaimed = false
+        val work = queuePanoramaComposition()
         val frames = panoramaFrames.toList()
         panoramaFrames.clear()
-        if (frames.isEmpty()) {
-            cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
-            cancelPanoramaCapture("No panorama frames were captured")
-            Toast.makeText(context, "No panorama frames were captured", Toast.LENGTH_LONG).show()
-            return
-        }
-        val generation = panoramaGeneration
-        val direction = panoramaDirection
-        val snapshot = panoramaMetadataSnapshot
+        val previews = panoramaPreviewFrames.toList()
+        panoramaPreviewFrames.clear()
+        // Detach ownership before allowing another capture, a lens change, or camera teardown.
+        val directory = panoramaCaptureDirectory
+        panoramaCaptureDirectory = null
+        val metadata = panoramaMetadataSnapshot
         panoramaMetadataSnapshot = null
-        val dynamicRangeProfile = panoramaCaptureProfile
-        val saveLocation = latestState.recordingSaveLocation
-        val displayName = "DiveControl_Panorama_${System.currentTimeMillis()}.jpg"
-        val horizontalFovRadians = Math.toRadians(horizontalFovDegrees()).toFloat()
-        val targetCrossPixels = if (boundLensValue == "0.6x") 1808 else 1728
-        val stitchStartedAtMs = SystemClock.elapsedRealtime()
-        Log.i(TAG, "Panorama stitch started: frames=${frames.size}")
-        // Every queued live-strip reader must finish before the full-size source frames can be
-        // recycled by the stitcher. The two executors keep both operations off Preview/analysis.
+        val location = latestState.recordingSaveLocation
+        val name = "DiveControl_Panorama_${System.currentTimeMillis()}.jpg"
+        val stoppedAt = SystemClock.elapsedRealtime()
         panoramaPreviewExecutor.execute {
-            panoramaExecutor.execute {
+            panoramaLiveWorkingBitmap?.recycle()
+            panoramaLiveWorkingBitmap = null
+            panoramaLiveWorkingDirection = null
+            panoramaLiveWorkingSweepRadians = null
+            previews.forEach { runCatching { it.bitmap.recycle() } }
+        }
+        panoramaExecutor.execute {
             val result = runCatching {
-                val stitched = PanoramaBitmapStitcher.stitchStored(
-                    frames = frames,
-                    direction = direction,
-                    horizontalFovRadians = horizontalFovRadians,
-                    targetCrossPixels = targetCrossPixels,
-                    dynamicRangeProfile = dynamicRangeProfile,
-                    onProgress = { progress ->
-                        cameraRequestHandler.post {
-                            if (generation == panoramaGeneration && PanoramaCaptureState.finalizing.value) {
-                                PanoramaCaptureState.savingProgress.value = progress
-                            }
-                        }
-                    },
-                )
+                work.failure?.let { throw it }
+                val stitched = checkNotNull(work.stitcher) { "No panorama frames" }.finish()
                 try {
-                    check(generation == panoramaGeneration) { "Panorama save was cancelled" }
-                    stagePanoramaReview(
-                        bitmap = stitched,
-                        displayName = displayName,
-                        saveLocation = saveLocation,
-                        metadata = snapshot,
-                    )
-                } finally {
-                    stitched.recycle()
-                }
+                    stagePanoramaReview(stitched, name, location, metadata)
+                } finally { stitched.recycle() }
             }
-            frames.forEach { frame -> runCatching { frame.file.delete() } }
-            panoramaCaptureDirectory?.let { directory -> runCatching { directory.deleteRecursively() } }
-            panoramaCaptureDirectory = null
-            val previewFrames = panoramaPreviewFrames.toList()
-            panoramaPreviewFrames.clear()
-            panoramaPreviewExecutor.execute {
-                panoramaLiveWorkingBitmap?.recycle()
-                panoramaLiveWorkingBitmap = null
-                panoramaLiveWorkingDirection = null
-                panoramaLiveWorkingSweepRadians = null
-                previewFrames.forEach { frame -> runCatching { frame.bitmap.recycle() } }
-            }
-            ContextCompat.getMainExecutor(context).execute mainThread@{
-                if (generation != panoramaGeneration) return@mainThread
-                cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
+            work.stitcher?.close()
+            frames.forEach { runCatching { it.file.delete() } }
+            directory?.let { runCatching { it.deleteRecursively() } }
+            cameraRequestHandler.post {
+                panoramaReviewPreparing = false
                 result.onSuccess { review ->
-                    val previousReview = pendingPanoramaReview
                     pendingPanoramaReview = review
-                    PanoramaCaptureState.reviewBitmap.value = review.previewBitmap
-                    previousReview?.let { old ->
-                        runCatching { old.file.delete() }
-                        if (old.previewBitmap !== review.previewBitmap) {
-                            cameraRequestHandler.postDelayed(
-                                { runCatching { old.previewBitmap.recycle() } },
-                                500L,
-                            )
+                    val deferredAction = deferredPanoramaReviewAction
+                    deferredPanoramaReviewAction = null
+                    if (deferredAction == null) {
+                        val immediate = PanoramaCaptureState.reviewBitmap.value
+                        PanoramaCaptureState.reviewBitmap.value = review.previewBitmap
+                        if (immediate !== review.previewBitmap) immediate?.let { bitmap ->
+                            cameraRequestHandler.postDelayed({ runCatching { bitmap.recycle() } }, 500L)
+                        }
+                    } else {
+                        when (deferredAction) {
+                            DeferredPanoramaReviewAction.Save -> savePendingPanorama()
+                            DeferredPanoramaReviewAction.Delete -> discardPendingPanoramaReview(deleteFile = true)
                         }
                     }
-                    Log.i(
-                        TAG,
-                        "Panorama ready for review: frames=${frames.size} " +
-                            "processingMs=${SystemClock.elapsedRealtime() - stitchStartedAtMs} " +
-                            "stagedBytes=${review.file.length()}",
-                    )
-                    PanoramaCaptureState.message.value = "Panorama ready"
-                    PanoramaCaptureState.savingProgress.value = 100
-                    previewView?.announceForAccessibility(
-                        "Panorama preview ready. Choose Save or Delete.",
-                    )
-                    onCameraCommand?.invoke(CameraCommand.PanoramaReviewReady)
+                    Log.i(TAG, "Panorama full-resolution review ready: frames=${frames.size} backgroundMs=${SystemClock.elapsedRealtime() - stoppedAt}")
                 }.onFailure { error ->
-                    Log.e(TAG, "Panorama stitch/save failed", error)
-                    PanoramaCaptureState.message.value = "Can't create panorama. Not enough detail in scene."
-                    previewView?.announceForAccessibility("Can't create panorama")
-                    Toast.makeText(
-                        context,
-                        "Panorama failed: ${error.message}",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                }
-                PanoramaCaptureState.finalizing.value = false
-                PanoramaCaptureState.frameCount.value = 0
-                PanoramaCaptureState.progress.value = 0f
-                PanoramaCaptureState.movingTooFast.value = false
-                PanoramaCaptureState.crossAxisRadians.value = 0f
-                val completedLiveThumbnail = PanoramaCaptureState.liveThumbnail.value
-                PanoramaCaptureState.liveThumbnail.value = null
-                completedLiveThumbnail?.let { bitmap ->
-                    cameraRequestHandler.postDelayed({ runCatching { bitmap.recycle() } }, 500L)
-                }
-                setPanoramaCaptureLocks(false)
-                cameraRequestHandler.postDelayed({
-                    if (!PanoramaCaptureState.active.value &&
-                        !PanoramaCaptureState.finalizing.value &&
-                        pendingPanoramaReview == null
-                    ) {
-                        PanoramaCaptureState.message.value = ""
+                    val reviewWasStillVisible = deferredPanoramaReviewAction == null
+                    deferredPanoramaReviewAction = null
+                    if (reviewWasStillVisible) {
+                        clearImmediatePanoramaReview()
+                        onCameraCommand?.invoke(CameraCommand.DeletePanorama)
                     }
-                }, 1_200L)
-            }
+                    Log.e(TAG, "Panorama review failed", error)
+                    Toast.makeText(context, "Panorama could not be prepared: ${error.message}", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }
 
     /** Builds Samsung's continuously accumulated miniature from captured keyframes. */
     private fun updatePanoramaLiveThumbnail(generation: Int) {
+        val horizontalFovRadians = Math.toRadians(horizontalFovDegrees()).toFloat()
         val previewGeneration = ++panoramaLiveThumbnailGeneration
-        val direction = panoramaDirection
+        val direction = panoramaBitmapDirection(
+            guideDirection = panoramaDirection,
+            physicalDisplayRotation = panoramaCaptureDisplayRotation,
+            guideDisplayRotation = panoramaGuideDisplayRotation,
+        )
+        val portraitFrame = panoramaCaptureDisplayRotation == 0 ||
+            panoramaCaptureDisplayRotation == 2
         val frame = panoramaPreviewFrames.lastOrNull() ?: return
         val directionSeedFrames = panoramaPreviewFrames.toList()
         panoramaPreviewExecutor.execute {
@@ -5799,21 +6956,40 @@ class CameraRuntimeController(
                     panoramaLiveWorkingBitmap = PanoramaLiveThumbnailBuilder.build(
                         directionSeedFrames,
                         direction,
+                        portraitFrame,
+                        horizontalFovRadians,
                     )
                     panoramaLiveWorkingSweepRadians = directionSeedFrames.last().sweepRadians
                     panoramaLiveWorkingDirection = direction
+                } else if (
+                    panoramaLiveWorkingSweepRadians != null &&
+                    frame.sweepRadians <= panoramaLiveWorkingSweepRadians!! + 0.001f
+                ) {
+                    // A continuously sampled preview frame may already be newer than this
+                    // asynchronously persisted save keyframe. Never append an older view again.
+                    panoramaLiveWorkingBitmap
                 } else {
                     val next = PanoramaLiveThumbnailBuilder.append(
                         existing = panoramaLiveWorkingBitmap,
                         frame = frame,
                         direction = direction,
                         previousSweepRadians = panoramaLiveWorkingSweepRadians,
+                        portraitFrame = portraitFrame,
+                        horizontalFovRadians = horizontalFovRadians,
                     )
-                    panoramaLiveWorkingBitmap?.recycle()
+                    if (panoramaLiveWorkingBitmap !== next) panoramaLiveWorkingBitmap?.recycle()
                     panoramaLiveWorkingBitmap = next
                     panoramaLiveWorkingSweepRadians = frame.sweepRadians
                 }
-                panoramaLiveWorkingBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                panoramaLiveWorkingBitmap
+                    ?.copy(Bitmap.Config.ARGB_8888, false)
+                    ?.let { physical ->
+                        rotatePanoramaBitmapBetweenDisplays(
+                            source = physical,
+                            sourceDisplayRotation = panoramaCaptureDisplayRotation,
+                            targetDisplayRotation = panoramaGuideDisplayRotation,
+                        )
+                    }
             }.getOrNull()
             cameraRequestHandler.post {
                 if (thumbnail == null ||
@@ -5832,11 +7008,112 @@ class CameraRuntimeController(
         }
     }
 
+    /**
+     * Feeds the on-screen stitch at camera cadence without adding frames to the full-resolution
+     * save set. Samsung's guide updates continuously; limiting this path to ten-degree keyframes
+     * made DiveControl's strip appear static and then jump. The sampled 264 px frame keeps this
+     * work small, and all bitmap composition remains on the dedicated preview executor.
+     */
+    private fun updatePanoramaContinuousThumbnail(
+        generation: Int,
+        bitmap: Bitmap,
+        sweepRadians: Float,
+    ) {
+        val horizontalFovRadians = Math.toRadians(horizontalFovDegrees()).toFloat()
+        val previewGeneration = ++panoramaLiveThumbnailGeneration
+        val direction = panoramaBitmapDirection(
+            guideDirection = panoramaDirection,
+            physicalDisplayRotation = panoramaCaptureDisplayRotation,
+            guideDisplayRotation = panoramaGuideDisplayRotation,
+        )
+        val portraitFrame = panoramaCaptureDisplayRotation == 0 ||
+            panoramaCaptureDisplayRotation == 2
+        val frame = CapturedPanoramaFrame(
+            bitmap = bitmap,
+            sweepRadians = sweepRadians,
+            physicalDisplayRotation = panoramaCaptureDisplayRotation,
+        )
+        panoramaPreviewExecutor.execute {
+            val thumbnail = runCatching {
+                val previous = panoramaLiveWorkingBitmap
+                if (panoramaLiveWorkingDirection == direction &&
+                    panoramaLiveWorkingSweepRadians?.let { sweepRadians <= it } == true
+                ) {
+                    bitmap.recycle()
+                    return@execute
+                }
+                val next = if (panoramaLiveWorkingDirection != direction) {
+                    // The shutter keyframe was collected while direction was still Auto. Reuse
+                    // that miniature as the zero-degree seed, including when the selected guide
+                    // rotates into a vertical lane.
+                    val seedFrames = buildList {
+                        previous?.let {
+                            add(
+                                CapturedPanoramaFrame(
+                                    bitmap = it,
+                                    sweepRadians = 0f,
+                                    physicalDisplayRotation = panoramaCaptureDisplayRotation,
+                                ),
+                            )
+                        }
+                        add(frame)
+                    }
+                    PanoramaLiveThumbnailBuilder.build(seedFrames, direction, portraitFrame, horizontalFovRadians)
+                } else {
+                    PanoramaLiveThumbnailBuilder.append(
+                        existing = previous,
+                        frame = frame,
+                        direction = direction,
+                        previousSweepRadians = panoramaLiveWorkingSweepRadians,
+                        portraitFrame = portraitFrame,
+                        horizontalFovRadians = horizontalFovRadians,
+                    )
+                }
+                if (previous !== next) previous?.recycle()
+                panoramaLiveWorkingBitmap = next
+                panoramaLiveWorkingSweepRadians = sweepRadians
+                panoramaLiveWorkingDirection = direction
+                next?.copy(Bitmap.Config.ARGB_8888, false)?.let { physical ->
+                    rotatePanoramaBitmapBetweenDisplays(
+                        source = physical,
+                        sourceDisplayRotation = panoramaCaptureDisplayRotation,
+                        targetDisplayRotation = panoramaGuideDisplayRotation,
+                    )
+                }
+            }
+                .onFailure { error -> Log.w(TAG, "Could not compose live panorama strip", error) }
+                .getOrNull()
+            bitmap.recycle()
+            cameraRequestHandler.post {
+                if (thumbnail == null ||
+                    generation != panoramaGeneration ||
+                    previewGeneration != panoramaLiveThumbnailGeneration
+                ) {
+                    thumbnail?.recycle()
+                    return@post
+                }
+                val previous = PanoramaCaptureState.liveThumbnail.value
+                PanoramaCaptureState.liveThumbnail.value = thumbnail
+                previous?.takeUnless { it === thumbnail }?.let { old ->
+                    cameraRequestHandler.postDelayed({ runCatching { old.recycle() } }, 500L)
+                }
+            }
+        }
+    }
+
     private fun cancelPanoramaCapture(message: String) {
+        val cancelSamsungCapture = panoramaCaptureActive || panoramaReviewPreparing
+        if (cancelSamsungCapture) {
+            panoramaExecutor.execute { samsungPanoramaEngine?.cancel() }
+        }
+        val cancelledWork = panoramaWork
+        panoramaExecutor.execute { cancelledWork.stitcher?.close() }
         cameraRequestHandler.removeCallbacks(panoramaProcessTimeoutRunnable)
         panoramaGeneration++
         panoramaLiveThumbnailGeneration++
         panoramaCaptureActive = false
+        panoramaReviewPreparing = false
+        deferredPanoramaReviewAction = null
         panoramaCaptureInFlight = false
         panoramaFrameRequestClaimed = false
         panoramaFinishPending = false
@@ -5851,10 +7128,10 @@ class CameraRuntimeController(
         panoramaMetadataSnapshot = null
         panoramaCaptureProfile = PanoramaDynamicRangeProfile.Off
         panoramaCrossAxisRadians = 0f
+        panoramaLastLivePreviewRadians = 0f
         panoramaReverseRadians = 0f
         panoramaBaselineElevationRadians = null
         val oldReferenceFrame = PanoramaCaptureState.referenceFrame.value
-        val oldViewfinderFrame = PanoramaCaptureState.viewfinderFrame.value
         val oldLiveThumbnail = PanoramaCaptureState.liveThumbnail.value
         PanoramaCaptureState.reset()
         oldReferenceFrame?.let { frame ->
@@ -5862,9 +7139,6 @@ class CameraRuntimeController(
         }
         oldLiveThumbnail?.let { frame ->
             cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 500L)
-        }
-        oldViewfinderFrame?.let { frame ->
-            cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 150L)
         }
         panoramaPreviewExecutor.execute {
             panoramaLiveWorkingBitmap?.recycle()
@@ -5923,56 +7197,69 @@ class CameraRuntimeController(
     private fun decodePanoramaAnalysisFrame(image: androidx.camera.core.ImageProxy): Bitmap? {
         val plane = image.planes.firstOrNull() ?: return null
         val buffer = plane.buffer
-        var decoded = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
-        val packedRowBytes = image.width * 4
-        if (plane.pixelStride == 4 && plane.rowStride == packedRowBytes) {
+        val crop = panoramaImageCrop(image)
+        var decoded = Bitmap.createBitmap(crop.width, crop.height, Bitmap.Config.ARGB_8888)
+        val packedRowBytes = crop.width * 4
+        if (crop.left == 0 && crop.top == 0 &&
+            crop.width == image.width && crop.height == image.height &&
+            plane.pixelStride == 4 && plane.rowStride == packedRowBytes
+        ) {
             decoded.copyPixelsFromBuffer(buffer.duplicate().apply { rewind() })
         } else {
-            val pixels = IntArray(image.width * image.height)
-            for (y in 0 until image.height) {
-                val rowOffset = y * plane.rowStride
-                for (x in 0 until image.width) {
-                    val offset = rowOffset + x * plane.pixelStride
+            val pixels = IntArray(crop.width * crop.height)
+            for (y in 0 until crop.height) {
+                val rowOffset = (crop.top + y) * plane.rowStride
+                for (x in 0 until crop.width) {
+                    val offset = rowOffset + (crop.left + x) * plane.pixelStride
+                    if (offset < 0 || offset + 3 >= buffer.limit()) {
+                        decoded.recycle()
+                        return null
+                    }
                     val red = buffer.get(offset).toInt() and 0xff
                     val green = buffer.get(offset + 1).toInt() and 0xff
                     val blue = buffer.get(offset + 2).toInt() and 0xff
                     val alpha = buffer.get(offset + 3).toInt() and 0xff
-                    pixels[y * image.width + x] =
+                    pixels[y * crop.width + x] =
                         (alpha shl 24) or (red shl 16) or (green shl 8) or blue
                 }
             }
-            decoded.setPixels(pixels, 0, image.width, 0, 0, image.width, image.height)
+            decoded.setPixels(pixels, 0, crop.width, 0, 0, crop.width, crop.height)
         }
         return orientPanoramaBitmap(decoded, image.imageInfo.rotationDegrees)
     }
 
-    /** Samples an RGBA analysis frame without ever allocating its full multi-megapixel Bitmap. */
+    /** Samples YUV or RGBA without allocating a full multi-megapixel bitmap. */
     private fun decodePanoramaSampledFrame(
         image: androidx.camera.core.ImageProxy,
         requestedWidth: Int,
         dynamicRangeProfile: PanoramaDynamicRangeProfile,
+        physicalDisplayRotation: Int = previewView?.display?.rotation ?: 1,
     ): Bitmap? {
+        val reader = AnalysisPixelReader(image)
         val plane = image.planes.firstOrNull() ?: return null
-        if (plane.pixelStride < 4) return null
-        val buffer = plane.buffer.duplicate().apply { rewind() }
-        val sampleWidth = requestedWidth.coerceIn(1, image.width)
-        val sampleHeight = (sampleWidth * image.height.toFloat() / image.width)
+        val crop = panoramaImageCrop(image)
+        if (!panoramaBufferGeometryLogged) {
+            panoramaBufferGeometryLogged = true
+            Log.i(
+                TAG,
+                "Panorama source format=${image.format} geometry image=${image.width}x${image.height} " +
+                    "crop=${image.cropRect} resolved=$crop " +
+                    "pixelStride=${plane.pixelStride} rowStride=${plane.rowStride}",
+            )
+        }
+        val sampleWidth = requestedWidth.coerceIn(1, crop.width)
+        val sampleHeight = (sampleWidth * crop.height.toFloat() / crop.width)
             .roundToInt()
             .coerceAtLeast(1)
         val pixels = IntArray(sampleWidth * sampleHeight)
         for (y in 0 until sampleHeight) {
-            val sourceY = (y * image.height / sampleHeight).coerceAtMost(image.height - 1)
-            val rowOffset = sourceY * plane.rowStride
+            val sourceY = crop.top +
+                (y * crop.height / sampleHeight).coerceAtMost(crop.height - 1)
             for (x in 0 until sampleWidth) {
-                val sourceX = (x * image.width / sampleWidth).coerceAtMost(image.width - 1)
-                val offset = rowOffset + sourceX * plane.pixelStride
-                if (offset + 3 >= buffer.limit()) return null
-                val red = buffer.get(offset).toInt() and 0xff
-                val green = buffer.get(offset + 1).toInt() and 0xff
-                val blue = buffer.get(offset + 2).toInt() and 0xff
-                val alpha = buffer.get(offset + 3).toInt() and 0xff
+                val sourceX = crop.left +
+                    (x * crop.width / sampleWidth).coerceAtMost(crop.width - 1)
                 pixels[y * sampleWidth + x] = panoramaProfileArgb(
-                    (alpha shl 24) or (red shl 16) or (green shl 8) or blue,
+                    reader.argb(sourceX, sourceY) ?: return null,
                     dynamicRangeProfile,
                 )
             }
@@ -5983,7 +7270,124 @@ class CameraRuntimeController(
             sampleHeight,
             Bitmap.Config.ARGB_8888,
         )
-        return orientPanoramaBitmap(sampled, image.imageInfo.rotationDegrees)
+        return orientPanoramaBitmap(
+            sampled,
+            image.imageInfo.rotationDegrees,
+            physicalDisplayRotation,
+        )
+    }
+
+    /**
+     * CameraX may expose the RGBA converter's allocation rather than its populated image bounds on
+     * Samsung devices. On the S24 the reported 3648x2736 plane can contain a smaller opaque image
+     * in its top-left followed by transparent zero padding. Treating that padding as camera pixels
+     * is what reduced the guide miniature to a corner and produced black bands in the stitch.
+     */
+    private fun panoramaImageCrop(image: androidx.camera.core.ImageProxy): PanoramaImageCrop {
+        val reported = image.cropRect
+        val left = reported.left.coerceIn(0, (image.width - 1).coerceAtLeast(0))
+        val top = reported.top.coerceIn(0, (image.height - 1).coerceAtLeast(0))
+        val right = reported.right.coerceIn(left + 1, image.width.coerceAtLeast(left + 1))
+        val bottom = reported.bottom.coerceIn(top + 1, image.height.coerceAtLeast(top + 1))
+        val reportedCrop = PanoramaImageCrop(left, top, right - left, bottom - top)
+        if (image.format == android.graphics.ImageFormat.YUV_420_888) return reportedCrop
+        panoramaResolvedImageCrop?.let { cached ->
+            if (cached.left >= left && cached.top >= top &&
+                cached.left + cached.width <= right && cached.top + cached.height <= bottom
+            ) {
+                return cached
+            }
+        }
+
+        val plane = image.planes.firstOrNull()
+        if (plane == null || plane.pixelStride < 4 || plane.rowStride <= 0) {
+            return reportedCrop
+        }
+        val buffer = plane.buffer.duplicate().apply { rewind() }
+        if (buffer.limit() < 4) return reportedCrop
+
+        // Identify the byte which behaves like an opaque alpha channel. CameraX 1.5 exposes RGBA,
+        // but scoring all four channels also tolerates Samsung/CameraX builds which used ARGB.
+        val opaqueCounts = IntArray(4)
+        var populatedSamples = 0
+        val sampleColumns = 24
+        val sampleRows = 18
+        for (sampleY in 0 until sampleRows) {
+            val y = top + sampleY * (bottom - top - 1).coerceAtLeast(0) /
+                (sampleRows - 1).coerceAtLeast(1)
+            val rowOffset = y * plane.rowStride
+            for (sampleX in 0 until sampleColumns) {
+                val x = left + sampleX * (right - left - 1).coerceAtLeast(0) /
+                    (sampleColumns - 1).coerceAtLeast(1)
+                val offset = rowOffset + x * plane.pixelStride
+                if (offset < 0 || offset + 3 >= buffer.limit()) continue
+                var any = false
+                for (channel in 0..3) {
+                    val value = buffer.get(offset + channel).toInt() and 0xff
+                    if (value != 0) any = true
+                    if (value >= 250) opaqueCounts[channel]++
+                }
+                if (any) populatedSamples++
+            }
+        }
+        if (populatedSamples == 0) return reportedCrop
+        val alphaOffset = opaqueCounts.indices.maxByOrNull(opaqueCounts::get) ?: 3
+        val alphaConfidence = opaqueCounts[alphaOffset].toFloat() / populatedSamples
+        if (alphaConfidence < 0.85f) return reportedCrop
+
+        fun populatedAt(x: Int, y: Int): Boolean {
+            val offset = y * plane.rowStride + x * plane.pixelStride + alphaOffset
+            return offset in 0 until buffer.limit() &&
+                (buffer.get(offset).toInt() and 0xff) >= 128
+        }
+
+        fun populatedColumn(x: Int): Boolean {
+            var opaque = 0
+            var sampled = 0
+            val count = 32
+            for (index in 0 until count) {
+                val y = top + index * (bottom - top - 1).coerceAtLeast(0) /
+                    (count - 1).coerceAtLeast(1)
+                if (populatedAt(x, y)) opaque++
+                sampled++
+            }
+            return opaque * 4 >= sampled
+        }
+
+        fun populatedRow(y: Int): Boolean {
+            var opaque = 0
+            var sampled = 0
+            val count = 32
+            for (index in 0 until count) {
+                val x = left + index * (right - left - 1).coerceAtLeast(0) /
+                    (count - 1).coerceAtLeast(1)
+                if (populatedAt(x, y)) opaque++
+                sampled++
+            }
+            return opaque * 4 >= sampled
+        }
+
+        var contentRight = right
+        while (contentRight - 1 > left && !populatedColumn(contentRight - 1)) contentRight--
+        var contentBottom = bottom
+        while (contentBottom - 1 > top && !populatedRow(contentBottom - 1)) contentBottom--
+        val detected = PanoramaImageCrop(
+            left = left,
+            top = top,
+            width = contentRight - left,
+            height = contentBottom - top,
+        )
+        val credible = detected.width >= 640 && detected.height >= 480 &&
+            detected.width * 2 >= reportedCrop.width &&
+            detected.height * 2 >= reportedCrop.height
+        val resolved = if (credible) detected else reportedCrop
+        panoramaResolvedImageCrop = resolved
+        Log.i(
+            TAG,
+            "Panorama populated RGBA bounds reported=$reportedCrop resolved=$resolved " +
+                "alphaByte=$alphaOffset confidence=$alphaConfidence",
+        )
+        return resolved
     }
 
     /**
@@ -6021,7 +7425,11 @@ class CameraRuntimeController(
         return thumbnail
     }
 
-    private fun orientPanoramaBitmap(source: Bitmap, rotation: Int): Bitmap {
+    private fun orientPanoramaBitmap(
+        source: Bitmap,
+        rotation: Int,
+        physicalDisplayRotation: Int = previewView?.display?.rotation ?: 1,
+    ): Bitmap {
         var decoded = source
         if (rotation != 0) {
             val rotated = Bitmap.createBitmap(
@@ -6036,22 +7444,7 @@ class CameraRuntimeController(
             if (rotated !== decoded) decoded.recycle()
             decoded = rotated
         }
-        // The app is landscape-locked; normalize camera sensors which still report portrait JPEG
-        // orientation so every frame's sweep axes agree with the on-screen guide.
-        if (decoded.height > decoded.width) {
-            val landscape = Bitmap.createBitmap(
-                decoded,
-                0,
-                0,
-                decoded.width,
-                decoded.height,
-                Matrix().apply { postRotate(90f) },
-                true,
-            )
-            if (landscape !== decoded) decoded.recycle()
-            decoded = landscape
-        }
-        return decoded
+        return orientPanoramaBitmapForPhysicalRotation(decoded, physicalDisplayRotation)
     }
 
     private fun publishPanoramaThumbnail(thumbnail: Bitmap) {
@@ -6067,22 +7460,6 @@ class CameraRuntimeController(
             PanoramaCaptureState.referenceFrame.value = thumbnail
             previous?.let { frame ->
                 cameraRequestHandler.postDelayed({ runCatching { frame.recycle() } }, 500L)
-            }
-        }
-    }
-
-    /** Publishes the live RGBA analysis feed as Panorama's reliable full-screen viewfinder. */
-    private fun publishPanoramaViewfinder(frame: Bitmap) {
-        cameraRequestHandler.post {
-            if (latestState.activeMode != com.mobiledivecontrol.core.CameraModeId.Panorama) {
-                frame.recycle()
-                return@post
-            }
-            val previous = PanoramaCaptureState.viewfinderFrame.value
-            PanoramaCaptureState.viewfinderFrame.value = frame
-            previous?.takeUnless { it === frame }?.let { bitmap ->
-                // Give Compose two display frames to release the previous ImageBitmap safely.
-                cameraRequestHandler.postDelayed({ runCatching { bitmap.recycle() } }, 100L)
             }
         }
     }
@@ -6128,7 +7505,9 @@ class CameraRuntimeController(
         }
         try {
             FileOutputStream(stagedFile).use { stream ->
-                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
+                // Preserve fine texture from the multi-frame blend; 96 visibly softened foliage
+                // and lettering once the panorama was viewed at 1:1.
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 98, stream)) {
                     "JPEG encoder rejected the panorama"
                 }
             }
@@ -6150,13 +7529,22 @@ class CameraRuntimeController(
     }
 
     /** Copies the already-encoded staged JPEG byte-for-byte; Save never recompresses the stitch. */
-    private fun publishPanorama(review: PendingPanoramaReview): android.net.Uri {
+    private fun publishPanorama(review: PendingPanoramaReview): android.net.Uri =
+        writePanoramaImage(review.displayName, review.saveLocation) { stream ->
+            review.file.inputStream().use { it.copyTo(stream) }
+        }
+
+    private fun writePanoramaImage(
+        displayName: String,
+        saveLocation: com.mobiledivecontrol.core.RecordingSaveLocation,
+        write: (java.io.OutputStream) -> Unit,
+    ): android.net.Uri {
         val resolver = context.contentResolver
         val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, review.displayName)
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, review.saveLocation.relativePath)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, saveLocation.relativePath)
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
         }
@@ -6164,9 +7552,7 @@ class CameraRuntimeController(
             ?: error("MediaStore could not create the panorama")
         try {
             resolver.openOutputStream(uri, "w")?.use { stream ->
-                review.file.inputStream().use { input ->
-                    input.copyTo(stream)
-                }
+                write(stream)
             } ?: error("MediaStore returned no panorama output stream")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 resolver.update(
@@ -6184,6 +7570,11 @@ class CameraRuntimeController(
     }
 
     private fun savePendingPanorama() {
+        if (panoramaReviewPreparing && pendingPanoramaReview == null) {
+            deferredPanoramaReviewAction = DeferredPanoramaReviewAction.Save
+            clearImmediatePanoramaReview()
+            return
+        }
         val review = pendingPanoramaReview ?: run {
             Toast.makeText(context, "Panorama preview is unavailable", Toast.LENGTH_SHORT).show()
             return
@@ -6192,7 +7583,7 @@ class CameraRuntimeController(
         if (PanoramaCaptureState.reviewBitmap.value === review.previewBitmap) {
             PanoramaCaptureState.reviewBitmap.value = null
         }
-        PanoramaCaptureState.message.value = "Saving panorama…"
+        PanoramaCaptureState.message.value = ""
         panoramaExecutor.execute {
             val result = runCatching { publishPanorama(review) }
             result.onSuccess {
@@ -6235,6 +7626,11 @@ class CameraRuntimeController(
     }
 
     private fun discardPendingPanoramaReview(deleteFile: Boolean) {
+        if (deleteFile && panoramaReviewPreparing && pendingPanoramaReview == null) {
+            deferredPanoramaReviewAction = DeferredPanoramaReviewAction.Delete
+            clearImmediatePanoramaReview()
+            return
+        }
         val review = pendingPanoramaReview
         pendingPanoramaReview = null
         val displayed = PanoramaCaptureState.reviewBitmap.value
@@ -6250,6 +7646,284 @@ class CameraRuntimeController(
             cameraRequestHandler.postDelayed({
                 if (pendingPanoramaReview == null) PanoramaCaptureState.message.value = ""
             }, 1_200L)
+        }
+    }
+
+    private fun stageEncodedPanoramaReview(
+        jpeg: ByteArray,
+        displayName: String,
+        saveLocation: com.mobiledivecontrol.core.RecordingSaveLocation,
+        metadata: CaptureMetadataSnapshot?,
+    ): PendingPanoramaReview {
+        require(jpeg.size > 3 && jpeg[0] == 0xff.toByte() && jpeg[1] == 0xd8.toByte()) {
+            "Samsung panorama result is not a JPEG"
+        }
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
+        check(bounds.outWidth > 0 && bounds.outHeight > 0) {
+            "Samsung panorama JPEG could not be decoded"
+        }
+        val targetScale = minOf(
+            1f,
+            2_400f / bounds.outWidth.toFloat(),
+            1_400f / bounds.outHeight.toFloat(),
+        )
+        val targetDecodeWidth = (bounds.outWidth * targetScale).roundToInt().coerceAtLeast(1)
+        val targetDecodeHeight = (bounds.outHeight * targetScale).roundToInt().coerceAtLeast(1)
+        var sampleSize = 1
+        while (bounds.outWidth / (sampleSize * 2) >= targetDecodeWidth &&
+            bounds.outHeight / (sampleSize * 2) >= targetDecodeHeight
+        ) {
+            sampleSize *= 2
+        }
+        val decoded = checkNotNull(
+            BitmapFactory.decodeByteArray(
+                jpeg,
+                0,
+                jpeg.size,
+                BitmapFactory.Options().apply { inSampleSize = sampleSize },
+            ),
+        ) { "Samsung panorama JPEG could not be decoded" }
+        val directory = File(context.noBackupFilesDir, "panorama-review").also { reviewDirectory ->
+            check(reviewDirectory.isDirectory || reviewDirectory.mkdirs()) {
+                "Could not create panorama review workspace"
+            }
+        }
+        val stagedFile = File(directory, displayName)
+        val previewScale = minOf(
+            1f,
+            2_400f / decoded.width.toFloat(),
+            1_400f / decoded.height.toFloat(),
+        )
+        val previewWidth = (decoded.width * previewScale).roundToInt().coerceAtLeast(1)
+        val previewHeight = (decoded.height * previewScale).roundToInt().coerceAtLeast(1)
+        val previewBitmap = if (previewWidth == decoded.width && previewHeight == decoded.height) {
+            decoded
+        } else {
+            Bitmap.createScaledBitmap(decoded, previewWidth, previewHeight, true).also {
+                decoded.recycle()
+            }
+        }
+        try {
+            FileOutputStream(stagedFile).use { stream -> stream.write(jpeg) }
+            check(stagedFile.length() == jpeg.size.toLong()) {
+                "Samsung panorama staging file is incomplete"
+            }
+            return PendingPanoramaReview(
+                file = stagedFile,
+                displayName = displayName,
+                saveLocation = saveLocation,
+                metadata = metadata,
+                previewBitmap = previewBitmap,
+            )
+        } catch (error: Throwable) {
+            runCatching { stagedFile.delete() }
+            previewBitmap.recycle()
+            throw error
+        }
+    }
+
+    private fun prepareSamsungPanoramaEngine() {
+        val horizontalFov = horizontalFovDegrees().toFloat()
+        val signature = "${selectedLensValue(latestState)}:${"%.4f".format(horizontalFov)}"
+        if (samsungPanoramaEngine != null && samsungPanoramaEngineSignature == signature) return
+        if (samsungPanoramaEngineInitializing) return
+        samsungPanoramaEngineInitializing = true
+        panoramaExecutor.execute {
+            val created = runCatching {
+                SamsungPanoramaEngine.create(
+                    context = context,
+                    horizontalViewAngle = horizontalFov,
+                    listener = samsungPanoramaListener,
+                )
+            }
+            cameraRequestHandler.post {
+                samsungPanoramaEngineInitializing = false
+                val stillWanted = latestState.activeMode ==
+                    com.mobiledivecontrol.core.CameraModeId.Panorama &&
+                    "${selectedLensValue(latestState)}:${"%.4f".format(horizontalFovDegrees().toFloat())}" ==
+                    signature
+                created.onSuccess { engine ->
+                    if (stillWanted) {
+                        val previous = samsungPanoramaEngine
+                        samsungPanoramaEngine = engine
+                        samsungPanoramaEngineSignature = signature
+                        if (previous !== engine) panoramaExecutor.execute { previous?.release() }
+                        Log.i(TAG, "Samsung panorama engine ready: $signature from ${engine.sourceApk}")
+                    } else {
+                        panoramaExecutor.execute(engine::release)
+                    }
+                }.onFailure { error ->
+                    samsungPanoramaEngineSignature = null
+                    Log.e(TAG, "Samsung panorama engine initialization failed", error)
+                    if (stillWanted) {
+                        PanoramaCaptureState.message.value = "Samsung panorama engine unavailable"
+                    }
+                }
+            }
+        }
+    }
+
+    private val samsungPanoramaListener = object : SamsungPanoramaEngine.Listener {
+        override fun onUiImage(bitmap: Bitmap, direction: Int) {
+            val generation = panoramaGeneration
+            // This is the complete mosaic returned by Samsung. Its dimensions and content
+            // already contain the native scan rate and alignment; do not stitch it again.
+            cameraRequestHandler.post {
+                if (generation != panoramaGeneration ||
+                    (!panoramaCaptureActive && !panoramaReviewPreparing)
+                ) {
+                    bitmap.recycle()
+                    return@post
+                }
+                val previous = PanoramaCaptureState.liveThumbnail.value
+                PanoramaCaptureState.liveThumbnail.value = bitmap
+                previous?.takeUnless { it === bitmap }?.let { old ->
+                    cameraRequestHandler.postDelayed({ runCatching { old.recycle() } }, 300L)
+                }
+            }
+        }
+
+        override fun onDirectionChanged(direction: Int) {
+            cameraRequestHandler.post {
+                panoramaDirection = samsungPanoramaDirectionName(direction)
+                panoramaDirectionPending = false
+                PanoramaCaptureState.direction.value = panoramaDirection
+                PanoramaCaptureState.directionLocked.value = direction != 0
+                Log.i(TAG, "Samsung panorama direction=$direction ($panoramaDirection)")
+            }
+        }
+
+        override fun onRectChanged(point: android.graphics.Point) {
+            // ArcSoft's rect is the authoritative scan offset. The native UI mosaic already
+            // contain this correction, so this callback is retained for telemetry and guidance.
+            if (kotlin.math.abs(point.y) > 180) {
+                cameraRequestHandler.post {
+                    PanoramaCaptureState.warningLevel.value = PanoramaWarningLevel.Low
+                }
+            }
+        }
+
+        override fun onFrameAccepted() {
+            cameraRequestHandler.post {
+                if (!panoramaCaptureActive) return@post
+                samsungPanoramaAcceptedFrames++
+                PanoramaCaptureState.frameCount.value = samsungPanoramaAcceptedFrames
+                PanoramaCaptureState.canStop.value = samsungPanoramaAcceptedFrames > 0
+            }
+        }
+
+        override fun onStopRequested() {
+            cameraRequestHandler.post {
+                if (panoramaCaptureActive) finishPanoramaCapture()
+            }
+        }
+
+        override fun onWarning(code: Int) {
+            cameraRequestHandler.post {
+                if (!panoramaCaptureActive) return@post
+                PanoramaCaptureState.movingTooFast.value = code == 2
+                setPanoramaGuidance(if (code == 2) "Move slowly" else "")
+            }
+        }
+
+        override fun onError(code: Int) {
+            cameraRequestHandler.post { failSamsungPanorama("Samsung panorama error $code") }
+        }
+
+        override fun onResult(result: SamsungPanoramaEngine.Result) {
+            stageSamsungPanoramaResult(result)
+        }
+    }
+
+    private fun stageSamsungPanoramaResult(result: SamsungPanoramaEngine.Result) {
+        cameraRequestHandler.post resultReceived@{
+            if (!panoramaReviewPreparing) {
+                Log.w(TAG, "Ignoring Samsung panorama result after capture cancellation")
+                return@resultReceived
+            }
+            val generation = panoramaGeneration
+            val metadata = panoramaMetadataSnapshot
+            panoramaMetadataSnapshot = null
+            val saveLocation = latestState.recordingSaveLocation
+            val displayName = "DiveControl_Panorama_${System.currentTimeMillis()}.jpg"
+            panoramaExecutor.execute {
+                val staged = runCatching {
+                    stageEncodedPanoramaReview(
+                        jpeg = result.jpeg,
+                        displayName = displayName,
+                        saveLocation = saveLocation,
+                        metadata = metadata,
+                    )
+                }
+                cameraRequestHandler.post stageCompleted@{
+                    if (generation != panoramaGeneration || !panoramaReviewPreparing) {
+                        staged.getOrNull()?.let { stale ->
+                            runCatching { stale.file.delete() }
+                            stale.previewBitmap.recycle()
+                        }
+                        return@stageCompleted
+                    }
+                    staged.onSuccess { review ->
+                        val oldReference = PanoramaCaptureState.referenceFrame.value
+                        val oldLiveThumbnail = PanoramaCaptureState.liveThumbnail.value
+                        pendingPanoramaReview = review
+                        panoramaReviewPreparing = false
+                        deferredPanoramaReviewAction = null
+                        PanoramaCaptureState.reset()
+                        PanoramaCaptureState.reviewBitmap.value = review.previewBitmap
+                        onCameraCommand?.invoke(CameraCommand.PanoramaReviewReady)
+                        cameraRequestHandler.postDelayed(
+                            { onCameraCommand?.invoke(CameraCommand.ArmPanoramaReviewInput) },
+                            500L,
+                        )
+                        listOfNotNull(oldReference, oldLiveThumbnail)
+                            .distinctBy(System::identityHashCode)
+                            .forEach { old ->
+                                cameraRequestHandler.postDelayed(
+                                    { runCatching { old.recycle() } },
+                                    300L,
+                                )
+                            }
+                        Log.i(
+                            TAG,
+                            "Samsung panorama review ready: jpeg=${result.jpeg.size} " +
+                                "image=${result.imageSize.width}x${result.imageSize.height} " +
+                                "crop=${result.croppedSize.width}x${result.croppedSize.height} " +
+                                "vertical=${result.vertical} orientation=${result.orientation} " +
+                                "stopToReviewMs=${SystemClock.elapsedRealtime() - samsungPanoramaStopRequestedAtMs}",
+                        )
+                    }.onFailure { error ->
+                        Log.e(TAG, "Samsung panorama review staging failed", error)
+                        failSamsungPanorama("Panorama could not be prepared")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun failSamsungPanorama(message: String) {
+        if (!panoramaCaptureActive && !panoramaReviewPreparing) return
+        val reviewScreenWasOpen = latestState.panoramaReviewAvailable
+        cancelPanoramaCapture(message)
+        if (reviewScreenWasOpen) onCameraCommand?.invoke(CameraCommand.DeletePanorama)
+        Log.e(TAG, message)
+        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+    }
+
+    private fun samsungPanoramaDirectionName(direction: Int): String = when (direction) {
+        SamsungPanoramaEngine.DIRECTION_LEFT_TO_RIGHT -> "Right"
+        SamsungPanoramaEngine.DIRECTION_RIGHT_TO_LEFT -> "Left"
+        SamsungPanoramaEngine.DIRECTION_BOTTOM_TO_TOP -> "Up"
+        SamsungPanoramaEngine.DIRECTION_TOP_TO_BOTTOM -> "Down"
+        else -> "Auto"
+    }
+
+    private fun clearImmediatePanoramaReview() {
+        val displayed = PanoramaCaptureState.reviewBitmap.value
+        PanoramaCaptureState.reviewBitmap.value = null
+        displayed?.let { bitmap ->
+            cameraRequestHandler.postDelayed({ runCatching { bitmap.recycle() } }, 500L)
         }
     }
 
@@ -6392,6 +8066,27 @@ class CameraRuntimeController(
         applyAperture: Boolean,
     ) {
         if (expertSequenceKind != null) return
+        val requestedOutput = stillCaptureOutput(currentValue(latestState, ".save_format"))
+        if (prepareDetachedStillCapture(
+                output = requestedOutput,
+                onReady = {
+                    startExpertSequence(
+                        kind,
+                        label,
+                        frameCount,
+                        intervalMillis,
+                        blendMode,
+                        applyAperture,
+                    )
+                },
+                onFailure = {
+                    releaseShutterWhiteBalance()
+                    releaseUnderwaterCaptureFreeze()
+                },
+            )
+        ) {
+            return
+        }
         val capture = imageCapture ?: run {
             releaseShutterWhiteBalance()
             releaseUnderwaterCaptureFreeze()
@@ -6409,7 +8104,7 @@ class CameraRuntimeController(
         expertSequenceKind = kind
         expertCaptureDirectory = directory
         expertCapturedFrames.clear()
-        expertRequestedOutput = stillCaptureOutput(currentValue(latestState, ".save_format"))
+        expertRequestedOutput = requestedOutput
         expertMetadataSnapshot = captureMetadataSnapshot()
         ExpertRawCaptureState.begin("$label 0/$frameCount")
         if (kind == ExpertSequenceKind.AstroPortrait) {
@@ -6451,6 +8146,18 @@ class CameraRuntimeController(
     }
 
     private fun beginManualMultiExposure(frameCount: Int, blendMode: ExpertRawBlendMode) {
+        val requestedOutput = stillCaptureOutput(currentValue(latestState, ".save_format"))
+        if (prepareDetachedStillCapture(
+                output = requestedOutput,
+                onReady = { beginManualMultiExposure(frameCount, blendMode) },
+                onFailure = {
+                    releaseShutterWhiteBalance()
+                    releaseUnderwaterCaptureFreeze()
+                },
+            )
+        ) {
+            return
+        }
         val directory = createExpertCaptureDirectory() ?: run {
             releaseShutterWhiteBalance()
             releaseUnderwaterCaptureFreeze()
@@ -6461,7 +8168,7 @@ class CameraRuntimeController(
         expertSequenceKind = ExpertSequenceKind.MultiManual
         expertCaptureDirectory = directory
         expertCapturedFrames.clear()
-        expertRequestedOutput = stillCaptureOutput(currentValue(latestState, ".save_format"))
+        expertRequestedOutput = requestedOutput
         expertMetadataSnapshot = captureMetadataSnapshot()
         ExpertRawCaptureState.begin("Multi exposure 0/$frameCount")
         captureNextManualMultiExposure(frameCount, blendMode)
@@ -6748,6 +8455,7 @@ class CameraRuntimeController(
         releaseShutterWhiteBalance()
         releaseUnderwaterCaptureFreeze()
         cleanupExpertCaptureFiles()
+        restoreEffectedPreviewAfterStillCapture()
         cameraRequestHandler.postDelayed({
             if (expertSequenceKind == null) ExpertRawCaptureState.reset()
         }, 1_800L)
@@ -6768,6 +8476,7 @@ class CameraRuntimeController(
         expertFrameCaptureInFlight = false
         oceanIntervalMillis = 0L
         cleanupExpertCaptureFiles()
+        restoreEffectedPreviewAfterStillCapture()
         if (announce && message.isNotBlank()) {
             ExpertRawCaptureState.finish(message)
             cameraRequestHandler.postDelayed({
@@ -6797,14 +8506,87 @@ class CameraRuntimeController(
         frame.jpegFile?.delete()
     }
 
+    /**
+     * Install a CameraX-incompatible still surface only for the shutter transaction.
+     *
+     * Returning true means the caller was handed off (or failed) and must return. The recursive
+     * callback re-enters after bind with an ImageCapture whose output contract now matches.
+     */
+    private fun prepareDetachedStillCapture(
+        output: StillCaptureOutput,
+        onReady: () -> Unit,
+        onFailure: () -> Unit,
+    ): Boolean {
+        if (!requiresDetachedStillCapture(output)) return false
+        val expectedFormat = imageCaptureOutputFormat(output)
+        if (imageCapture?.outputFormat == expectedFormat) {
+            return false
+        }
+        if (detachedStillCaptureOutput != null) {
+            reportRuntimeFailure("Another RAW/Ultra HDR capture is still in progress.")
+            onFailure()
+            return true
+        }
+
+        detachedStillCaptureOutput = output
+        pendingStillCapture.begin(expectedFormat, onReady) { message ->
+            cameraRequestHandler.removeCallbacks(pendingStillCaptureTimeout)
+            detachedStillCaptureOutput = null
+            runCatching { bindCamera(force = true) }
+                .onFailure { restoreError ->
+                    CameraPipelineTelemetry.recordRuntimeFailure(
+                        "Effected preview restore failed: ${restoreError.message}",
+                    )
+                }
+            reportRuntimeFailure(
+                "${output.name.replace("RawJpeg", "RAW + JPEG")} capture failed: $message",
+            )
+            onFailure()
+        }
+        cameraRequestHandler.postDelayed(pendingStillCaptureTimeout, 15_000L)
+        runCatching { bindCamera(force = true) }.onFailure { error ->
+            pendingStillCapture.fail(error.message ?: "Camera rejected the still output")
+        }
+        return true
+    }
+
+    /** Restore the continuously effected preview immediately after the still output is final. */
+    private fun restoreEffectedPreviewAfterStillCapture() {
+        if (detachedStillCaptureOutput == null) return
+        detachedStillCaptureOutput = null
+        runCatching { bindCamera(force = true) }
+            .onFailure { error ->
+                reportRuntimeFailure(
+                    "Camera preview could not resume after RAW/Ultra HDR capture: " +
+                        (error.message ?: "camera rejected the effected preview graph"),
+                )
+            }
+    }
+
     private fun capturePhotoNow(onFinished: (Boolean) -> Unit = {}) {
+        val captureOutput = stillCaptureOutput(currentValue(latestState, ".save_format"))
+        if (prepareDetachedStillCapture(
+                output = captureOutput,
+                onReady = { capturePhotoNow(onFinished) },
+                onFailure = {
+                    releaseShutterWhiteBalance()
+                    releaseUnderwaterCaptureFreeze()
+                    onFinished(false)
+                },
+            )
+        ) {
+            return
+        }
         val capture = imageCapture ?: run {
+            reportRuntimeFailure("Photo failed: camera is not ready")
+            restoreEffectedPreviewAfterStillCapture()
             releaseShutterWhiteBalance()
             releaseUnderwaterCaptureFreeze()
             onFinished(false)
             return
         }
         val baseName = "DiveControl_${System.currentTimeMillis()}"
+        val capturedMode = latestState.activeMode
         val jpegName = "$baseName.jpg"
         val rawName = "$baseName.dng"
         val saveLocation = latestState.recordingSaveLocation
@@ -6822,7 +8604,6 @@ class CameraRuntimeController(
         ).build()
         val jpegOutput = output(jpegName, "image/jpeg")
         val rawOutput = output(rawName, "image/x-adobe-dng")
-        val captureOutput = stillCaptureOutput(currentValue(latestState, ".save_format"))
         val expectedResults = if (captureOutput == StillCaptureOutput.RawJpeg) 2 else 1
         val remainingResults = AtomicInteger(expectedResults)
         val terminal = AtomicBoolean(false)
@@ -6835,17 +8616,22 @@ class CameraRuntimeController(
                     writeMetadataSidecar(metadataName, saveLocation, snapshot)
                 }
             }
+            restoreEffectedPreviewAfterStillCapture()
             releaseShutterWhiteBalance()
             releaseUnderwaterCaptureFreeze()
             onFinished(true)
         }
 
         val callback = object : ImageCapture.OnImageSavedCallback {
+            override fun onCaptureStarted() {
+                Log.i(TAG, "Photo exposure started: mode=$capturedMode base=$baseName")
+            }
+
             override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                 val format = outputFileResults.imageFormat
                 Log.i(
                     TAG,
-                    "Photo saved: base=$baseName format=$format " +
+                    "Photo saved: mode=$capturedMode base=$baseName format=$format " +
                         "kind=$captureOutput uri=${outputFileResults.savedUri}",
                 )
                 finishSuccess()
@@ -6854,6 +8640,7 @@ class CameraRuntimeController(
             override fun onError(exception: ImageCaptureException) {
                 if (!terminal.compareAndSet(false, true)) return
                 Log.e(TAG, "Photo capture failed ($captureOutput)", exception)
+                restoreEffectedPreviewAfterStillCapture()
                 releaseShutterWhiteBalance()
                 releaseUnderwaterCaptureFreeze()
                 onFinished(false)
@@ -6884,9 +8671,10 @@ class CameraRuntimeController(
                     callback,
                 )
             }
-        } catch (error: IllegalArgumentException) {
+        } catch (error: Throwable) {
             if (terminal.compareAndSet(false, true)) {
                 Log.e(TAG, "Photo output is not supported by the bound camera", error)
+                restoreEffectedPreviewAfterStillCapture()
                 releaseShutterWhiteBalance()
                 releaseUnderwaterCaptureFreeze()
                 onFinished(false)
@@ -7018,7 +8806,17 @@ class CameraRuntimeController(
         val minZoom = zoomState?.minZoomRatio?.toDouble() ?: 1.0
         val maxZoom = zoomState?.maxZoomRatio?.toDouble() ?: 8.0
         val clamped = requestedZoom.coerceIn(minZoom, maxZoom)
-        boundCamera.cameraControl.setZoomRatio(clamped.toFloat())
+        val ratio = clamped.toFloat()
+        if (lastAppliedZoomRatio?.let { kotlin.math.abs(it - ratio) < 0.001f } == true) return
+        lastAppliedZoomRatio = ratio
+        boundCamera.cameraControl.setZoomRatio(ratio).addListener(
+            {
+                if (lastAppliedZoomRatio == ratio) {
+                    Log.d(TAG, "Logical camera zoom/lens route applied: ${selectedLensValue(cameraState)} ratio=$ratio")
+                }
+            },
+            ContextCompat.getMainExecutor(context),
+        )
     }
 
     private fun sceneModeAvailable(boundCamera: Camera, sceneMode: Int): Boolean = runCatching {
@@ -7097,22 +8895,11 @@ class CameraRuntimeController(
                         CameraMetadata.CONTROL_SCENE_MODE_NIGHT,
                     )
                 }
-                panoramaProcessing && hdrLogMode == "HDR" && panoramaHdrSceneAvailable(boundCamera) -> {
-                    // Camera ID 2 on the S24 exposes public scene mode 18. This lets Samsung's
-                    // sensor-domain HDR run before the RGBA analysis frame reaches our stitcher.
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_MODE,
-                        CameraMetadata.CONTROL_MODE_USE_SCENE_MODE,
-                    )
-                    builder.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_SCENE_MODE,
-                        CameraMetadata.CONTROL_SCENE_MODE_HDR,
-                    )
-                }
                 panoramaProcessing -> {
-                    // Off and LOG both keep the public scene-mode HDR processor out of the
-                    // analysis stream. LOG's lower-processing request controls are applied
-                    // below without replacing ImageAnalysis with a video-only 10-bit surface.
+                    // Panorama keeps one stable RGBA stream for Off/HDR/LOG. The profile is a
+                    // deterministic transform in decodePanoramaSampledFrame and the stitcher;
+                    // changing live Samsung IQ modes here can freeze PreviewView while Camera2
+                    // capture results misleadingly continue.
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                 }
                 hdrLogMode == "HDR" -> {
@@ -7141,19 +8928,19 @@ class CameraRuntimeController(
             val aeRanges = info.getCameraCharacteristic(
                 CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES,
             ) ?: emptyArray()
-            if (hdrLogMode != "LOG" && toneModes.contains(CameraMetadata.TONEMAP_MODE_HIGH_QUALITY)) {
+            if (toneModes.contains(CameraMetadata.TONEMAP_MODE_HIGH_QUALITY)) {
                 builder.setCaptureRequestOption(
                     CaptureRequest.TONEMAP_MODE,
                     CameraMetadata.TONEMAP_MODE_HIGH_QUALITY,
                 )
             }
-            if (hdrLogMode != "LOG" && edgeModes.contains(CameraMetadata.EDGE_MODE_HIGH_QUALITY)) {
+            if (edgeModes.contains(CameraMetadata.EDGE_MODE_HIGH_QUALITY)) {
                 builder.setCaptureRequestOption(
                     CaptureRequest.EDGE_MODE,
                     CameraMetadata.EDGE_MODE_HIGH_QUALITY,
                 )
             }
-            if (hdrLogMode != "LOG" && noiseModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+            if (noiseModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
                 builder.setCaptureRequestOption(
                     CaptureRequest.NOISE_REDUCTION_MODE,
                     CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY,
@@ -7497,6 +9284,18 @@ class CameraRuntimeController(
         return CameraCatalog.currentValue(cameraState, spec)
     }
 
+    private fun captureGraphKey(cameraState: CameraState): String? =
+        detachedStillCaptureOutput?.let { "detached-still:${it.name}" }
+            ?: "ready-still:${readyStillOutput(cameraState).name}:${currentValue(cameraState, ".save_format")}"
+
+    private fun readyStillOutput(cameraState: CameraState): StillCaptureOutput =
+        if (cameraState.activeMode.captureType == CameraCaptureType.Photo) {
+            livePreviewCaptureOutput(
+                stillCaptureOutput(currentValue(cameraState, ".save_format")),
+                previewAssistanceRequired = isFocusAssistEnabled(cameraState) || exposureAssistMode(cameraState) != 0,
+            )
+        } else StillCaptureOutput.Jpeg
+
     private fun oceanModeEnabled(cameraState: CameraState): Boolean =
         currentValue(cameraState, ".ocean_mode") == "On"
 
@@ -7838,21 +9637,50 @@ class CameraRuntimeController(
         if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
             return frontCameraId
         }
-        val lensValue = selectedLensValue(cameraState)
-        // "Auto" mode uses the logical camera — let Samsung's HAL manage lens switching
-        if (lensValue == "Auto") {
-            return backCameraProfile?.logicalCameraId
+        val selectedStillOutput = detachedStillCaptureOutput ?: readyStillOutput(cameraState)
+        if (selectedStillOutput == StillCaptureOutput.Raw ||
+            selectedStillOutput == StillCaptureOutput.RawJpeg
+        ) {
+            // CameraX derives RAW dimensions from the selected CameraInfo. Pinning camera 0's
+            // 4080x3060 RAW stream to ultrawide camera 2 (4000x3000) is rejected by Samsung.
+            // Open the selected public sensor for the still transaction so RAW metadata and
+            // dimensions belong to that sensor. The surface-release gate serializes the switch.
+            selectedLensProfile(cameraState)?.physicalCameraId?.let { physicalId ->
+                val available = cameraProvider?.availableCameraInfos.orEmpty().any {
+                    Camera2CameraInfo.from(it).cameraId == physicalId
+                }
+                if (available && physicalId !in failedDirectPhysicalCameraIds) return physicalId
+            }
         }
-        val physicalCameraId = selectedLensProfile(cameraState)?.physicalCameraId
-        return if (physicalCameraId != null && physicalCameraId !in failedDirectPhysicalCameraIds) {
-            physicalCameraId
-        } else {
-            backCameraProfile?.logicalCameraId
-        }
+        // Keep every rear lens on the same logical multi-camera device. Selecting public camera
+        // 2/5/6 directly makes CameraX open a second Camera2CameraImpl while camera 0 is still
+        // asynchronously closing; on the S24 the replacement then remains PENDING_OPEN forever.
+        // bindCamera() pins Preview/ImageCapture/Analysis to the requested physical camera ID via
+        // Camera2Interop, so this preserves the exact 0.6x/1x/2x/3x sensor and focus routing while
+        // avoiding a cross-device close/open race. A non-logical device falls back to its only
+        // physical/public camera ID.
+        return backCameraProfile?.logicalCameraId
+            ?: selectedLensProfile(cameraState)?.physicalCameraId
     }
 
     private fun selectedLensValue(cameraState: CameraState): String {
         return currentValue(cameraState, ".lens") ?: "Auto"
+    }
+
+    /**
+     * Only a physical stream target changes the CameraX graph. Rear AF lens labels all share the
+     * logical camera and are routed by CONTROL_ZOOM_RATIO without a black configureStreams gap.
+     */
+    private fun physicalStreamGraphKey(cameraState: CameraState): String {
+        val lensValue = selectedLensValue(cameraState)
+        if (lensValue == "front") return "front"
+        val pinned = shouldPinPhysicalCameraStream(
+            mode = cameraState.activeMode,
+            manualFocusRequested = manualFocusRequestFor(cameraState) != null,
+        )
+        if (!pinned) return "rear-logical"
+        val profile = selectedLensProfile(cameraState)
+        return "rear-physical:${profile?.physicalCameraId ?: profile?.logicalCameraId ?: "default"}"
     }
 
     private fun selectedLensProfile(cameraState: CameraState): PhysicalLensProfile? {
@@ -7887,7 +9715,7 @@ class CameraRuntimeController(
         // LENS_FOCUS_DISTANCE and AF commands are routed to the correct sensor.
         // Without this, focus commands go to the 1x wide sensor even when viewing 3x.
         return when (lensValue) {
-            "0.6x" -> 1.0  // ultrawide: fixed focus, CameraX manages routing via physicalCameraId
+            "0.6x" -> 0.6  // logical multi-camera ratio routes to the ultrawide sensor
             "1x" -> 1.0
             "2x" -> 2.0    // digital crop on main sensor
             "3x" -> 3.0    // telephoto: must match so HAL routes focus to telephoto sensor

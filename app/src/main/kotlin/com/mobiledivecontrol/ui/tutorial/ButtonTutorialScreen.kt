@@ -32,6 +32,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextMeasurer
@@ -100,24 +101,23 @@ enum class IntroPhase {
  *
  * The carousel runs itself. Nothing here waits for input: a diver holding a housing they have not
  * learned to use yet should not have to guess which button advances a lesson about which button does
- * what. One press of anything — or one tap — ends the whole intro for the session, and that decision
- * lives in the view model because the packet has to be swallowed before it reaches the control core.
+ * what. Once permission setup is complete, one press of anything — or one tap — ends the intro for
+ * the session. Permission-stage presses remain reserved for the native Android prompt bridge.
  *
  * Opaque black rather than a scrim over the viewfinder: a half-visible camera behind the drawing
  * invites the diver to try to use it, and the housing buttons are not routed to it yet.
  *
  * @param permissionsGranted whether everything the housing link and camera need has been granted.
  * @param bleState the live link state, which drives the whole pre-carousel sequence.
- * @param missingPermissions outstanding permissions, phrased by purpose rather than by Android's
- *   names, shown while [permissionsGranted] is false.
  * @param onDismiss touch fallback. The housing drives this normally, but a diver whose housing
  *   battery dies here must not be locked out of their camera by an intro.
  */
 @Composable
 fun IntroCarouselScreen(
     permissionsGranted: Boolean,
+    missingPermissions: List<String> = emptyList(),
+    permissionDialogVisible: Boolean = false,
     bleState: BleConnectionState,
-    missingPermissions: List<String>,
     modifier: Modifier = Modifier,
     onDismiss: () -> Unit = {},
     onPermissionsSetup: () -> Unit = {},
@@ -303,9 +303,15 @@ fun IntroCarouselScreen(
         // Each overlay is composed only while it has something to say. That is not tidiness: an
         // InfiniteTransition schedules a frame callback for as long as it is in composition, so an
         // invisible banner would keep the display awake at 60 Hz for nothing.
-        if (phase != IntroPhase.Carousel) {
+        if (shouldShowIntroMessage(phase)) {
             IntroMessage(
                 phase = phase,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+
+        if (shouldShowPermissionRecovery(phase, permissionDialogVisible)) {
+            PermissionRecoveryMessage(
                 missingPermissions = missingPermissions,
                 modifier = Modifier.fillMaxSize(),
             )
@@ -339,7 +345,6 @@ fun IntroCarouselScreen(
 @Composable
 private fun IntroMessage(
     phase: IntroPhase,
-    missingPermissions: List<String>,
     modifier: Modifier = Modifier,
 ) {
     val measurer = rememberTextMeasurer()
@@ -358,19 +363,64 @@ private fun IntroMessage(
                 val scale = plateScale(size)
                 val origin = plateOrigin(size, scale)
                 val banner = measurer.layOutBanner(phase, scale, density, fontScale)
-                val permissions = if (phase == IntroPhase.NeedsPermissions) {
-                    measurer.layOutPermissions(missingPermissions, scale, density, fontScale)
-                } else {
-                    null
-                }
 
                 onDrawBehind {
                     translate(left = origin.x, top = origin.y) {
                         banner?.let { drawBanner(it, scale) }
-                        permissions?.let { drawPermissions(it, scale) }
                     }
                 }
             },
+    )
+}
+
+/** Native Android dialogs get the words and actions; this layer supplies only their artwork. */
+internal fun shouldShowIntroMessage(phase: IntroPhase): Boolean =
+    phase != IntroPhase.Carousel && phase != IntroPhase.NeedsPermissions
+
+/** Keep only the housing artwork behind Android's dialog, then reveal recovery when it closes. */
+internal fun shouldShowPermissionRecovery(
+    phase: IntroPhase,
+    permissionDialogVisible: Boolean,
+): Boolean = phase == IntroPhase.NeedsPermissions && !permissionDialogVisible
+
+internal fun permissionRecoveryTapPrompt(): String =
+    "TAP ANYWHERE ON SCREEN TO CONTINUE"
+
+internal fun permissionRecoveryTitle(): String = "ACCESS DENIED"
+
+@Composable
+private fun PermissionRecoveryMessage(
+    missingPermissions: List<String>,
+    modifier: Modifier = Modifier,
+) {
+    val measurer = rememberTextMeasurer()
+    val tapFlash = rememberPulseAlpha(
+        active = true,
+        min = 0f,
+        halfPeriodMs = PERMISSION_TAP_FLASH_HALF_MS,
+        easing = LinearEasing,
+        label = "permission_tap_red_white",
+    )
+    Spacer(
+        modifier = modifier.drawWithCache {
+            val scale = plateScale(size)
+            val origin = plateOrigin(size, scale)
+            val permissions = measurer.layOutPermissions(
+                missing = missingPermissions.ifEmpty { listOf("Required access was denied") },
+                scale = scale,
+                density = density,
+                fontScale = fontScale,
+            )
+            onDrawBehind {
+                translate(left = origin.x, top = origin.y) {
+                    drawPermissions(
+                        block = permissions,
+                        scale = scale,
+                        hintColor = lerp(PermissionTapRed, Color.White, tapFlash.value),
+                    )
+                }
+            }
+        },
     )
 }
 
@@ -729,6 +779,8 @@ private fun TextMeasurer.layOutPermissions(
     density: Float,
     fontScale: Float,
 ): MeasuredPermissions {
+    val popupControlSetup = missing.size == 1 &&
+        missing.first().startsWith("Housing popup control", ignoreCase = true)
     fun line(text: String, sizePlatePx: Float, weight: FontWeight) = fitPlateText(
         text = text,
         style = TextStyle(fontWeight = weight, textAlign = TextAlign.Center),
@@ -742,9 +794,21 @@ private fun TextMeasurer.layOutPermissions(
     )
 
     return MeasuredPermissions(
-        title = line("ALLOW ACCESS TO CONTINUE", PERMISSION_TITLE_PX, FontWeight.Bold),
+        title = line(
+            if (popupControlSetup) "ACCESSIBILITY PERMISSION" else permissionRecoveryTitle(),
+            PERMISSION_TITLE_PX,
+            FontWeight.Bold,
+        ),
         items = missing.map { line(it, PERMISSION_ITEM_PX, FontWeight.Normal) },
-        hint = line("Tap Allow on each prompt", PERMISSION_HINT_PX, FontWeight.Normal),
+        hint = line(
+            if (popupControlSetup) {
+                "Optional • Tap to continue without opening Android Settings"
+            } else {
+                permissionRecoveryTapPrompt()
+            },
+            PERMISSION_HINT_PX,
+            FontWeight.Normal,
+        ),
     )
 }
 
@@ -823,7 +887,11 @@ private fun DrawScope.drawCheckBadge(centre: Offset, radius: Float) {
 }
 
 /** The permission ask, stacked and centred on the port. */
-private fun DrawScope.drawPermissions(block: MeasuredPermissions, scale: Float) {
+private fun DrawScope.drawPermissions(
+    block: MeasuredPermissions,
+    scale: Float,
+    hintColor: Color = DiveColors.TextMuted,
+) {
     val titleGap = PERMISSION_TITLE_GAP * scale
     val itemGap = PERMISSION_ITEM_GAP * scale
     val hintGap = PERMISSION_HINT_GAP * scale
@@ -856,7 +924,7 @@ private fun DrawScope.drawPermissions(block: MeasuredPermissions, scale: Float) 
     y += hintGap
     drawText(
         textLayoutResult = block.hint,
-        color = DiveColors.TextMuted,
+        color = hintColor,
         topLeft = Offset(centreX - block.hint.size.width / 2f, y),
     )
 }
@@ -865,6 +933,8 @@ private fun DrawScope.drawPermissions(block: MeasuredPermissions, scale: Float) 
 
 /** The connected banner gets a beat of its own before the lesson takes the screen. */
 private const val CONNECTED_BANNER_MS = 2500L
+private const val PERMISSION_TAP_FLASH_HALF_MS = 450
+private val PermissionTapRed = Color(0xFFFF2020)
 
 /**
  * The pill's cycle segments — dwell + fade-in + hold + fade-out is one instruction's lifetime,

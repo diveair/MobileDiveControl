@@ -1,15 +1,19 @@
 package com.mobiledivecontrol.viewmodel
 
+import android.Manifest
 import android.app.Application
 import android.app.PendingIntent
+import android.content.pm.PackageManager
 import android.os.Build
-import android.provider.MediaStore
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.mobiledivecontrol.DiveControlApp
 import com.mobiledivecontrol.core.AppState
+import com.mobiledivecontrol.core.AppMode
 import com.mobiledivecontrol.core.BleSignal
 import com.mobiledivecontrol.core.CameraCommand
+import com.mobiledivecontrol.core.CameraState
 import com.mobiledivecontrol.core.ControlCommand
 import com.mobiledivecontrol.core.ControlCore
 import com.mobiledivecontrol.core.GalleryCommand
@@ -25,6 +29,8 @@ import com.mobiledivecontrol.platform.GalleryRepository
 import com.mobiledivecontrol.platform.CompassHeadingMonitor
 import com.mobiledivecontrol.platform.CompassReading
 import com.mobiledivecontrol.platform.HeadingStore
+import com.mobiledivecontrol.FirstRunOnboardingStore
+import com.mobiledivecontrol.shouldShowOnboarding
 import com.mobiledivecontrol.platform.PhoneBatteryMonitor
 import com.mobiledivecontrol.platform.ble.BlePermissions
 import com.mobiledivecontrol.platform.ble.HousingFeatureFlags
@@ -56,11 +62,6 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
     data class GalleryConsentRequest(
         val pendingIntent: PendingIntent,
-        val effect: PlatformEffect,
-        val successMessage: String,
-    )
-
-    data class GalleryMediaManagementRequest(
         val effect: PlatformEffect,
         val successMessage: String,
     )
@@ -101,16 +102,13 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     private val vacuumStore = com.mobiledivecontrol.platform.VacuumStore(application)
     private val compassMonitor = CompassHeadingMonitor(application)
     private val headingStore = HeadingStore(application)
+    private val firstRunOnboardingStore = FirstRunOnboardingStore(application)
 
     val compassReading: StateFlow<CompassReading> = compassMonitor.reading
     private val _targetHeading = MutableStateFlow(headingStore.read())
     val targetHeading: StateFlow<Double?> = _targetHeading.asStateFlow()
 
-    /**
-     * Read once, before [_introVisible] initialises below: a persisted hold that reached its
-     * 3-minute mark is proof this diver has already been through the button lesson with a housing
-     * that works, and the intro must not stand between them and a sealed camera.
-     */
+    /** Read once to restore earned seal confidence; it no longer decides onboarding visibility. */
     private val persistedVacuum = vacuumStore.read()
 
     private val _state = MutableStateFlow(controlCore.state)
@@ -119,12 +117,14 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     private val _effects = MutableStateFlow<List<PlatformEffect>>(emptyList())
     val effects: StateFlow<List<PlatformEffect>> = _effects.asStateFlow()
 
+    private val _runtimePermissionRequest = MutableStateFlow<RuntimePermissionRequest?>(null)
+    val runtimePermissionRequest: StateFlow<RuntimePermissionRequest?> =
+        _runtimePermissionRequest.asStateFlow()
+    private var nextRuntimePermissionRequestId = 1L
+    private var permissionBlockedHousingEffects: List<PlatformEffect> = emptyList()
+
     private val _galleryConsentRequest = MutableStateFlow<GalleryConsentRequest?>(null)
     val galleryConsentRequest: StateFlow<GalleryConsentRequest?> = _galleryConsentRequest.asStateFlow()
-
-    private val _galleryMediaManagementRequest = MutableStateFlow<GalleryMediaManagementRequest?>(null)
-    val galleryMediaManagementRequest: StateFlow<GalleryMediaManagementRequest?> =
-        _galleryMediaManagementRequest.asStateFlow()
 
     private val _depthUnitMetric = MutableStateFlow(true)
     val depthUnitMetric: StateFlow<Boolean> = _depthUnitMetric.asStateFlow()
@@ -132,14 +132,19 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * Whether the intro carousel is on screen.
      *
-     * Scoped to this view model — deliberately not to the process. The foreground housing service
-     * keeps the process alive long after the diver swipes the app away, so a process-lifetime
-     * "seen it" flag meant closing and reopening the app never replayed the intro. The view model
-     * dies with the activity and survives a configuration change, which is exactly the lifetime
-     * the intro wants: replay on every real reopen, no replay on a rotation. While it is true the
-     * housing buttons belong to the intro and nothing else — see [interceptForIntro].
+     * First install always teaches permissions and housing attachment, even if a verified vacuum
+     * was restored. After that first completion, the verified-vacuum record owns the fast path:
+     * keep the walkthrough out of the way while the seal remains trustworthy, and bring it back
+     * when no vacuum exists. While true the housing buttons belong to the intro and nothing else —
+     * see [interceptForIntro].
      */
-    private val _introVisible = MutableStateFlow(persistedVacuum == null)
+    private val firstRunOnboardingRequired = !firstRunOnboardingStore.isComplete()
+    private val _introVisible = MutableStateFlow(
+        shouldShowOnboarding(
+            firstRunComplete = !firstRunOnboardingRequired,
+            hasPersistedVacuum = persistedVacuum != null,
+        ),
+    )
     val introVisible: StateFlow<Boolean> = _introVisible.asStateFlow()
 
     /**
@@ -478,7 +483,8 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     // ---------------------------------------------------------------------------------------
 
     /**
-     * Swallows housing button packets while the intro is up, and lets the first one end it.
+     * Swallows housing button packets while the intro is up, and lets the first one end it after
+     * permission onboarding is complete.
      *
      * The interception lives here rather than in `InputRouter` because the intro is not a control
      * mode: the core's job is to turn a button into a camera or safety action, and adding a
@@ -505,6 +511,21 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         // Same bound the protocol parser applies. A malformed packet must not count as a press.
         if (payload.size != 1) return true
 
+        // A connected housing reaches this branch in the brief beat before the next Android
+        // permission prompt is launched. That press belongs to permission onboarding; treating it
+        // as "skip intro" drops the only explanation and makes the app look bricked. Once the
+        // native prompt owns the screen, PermissionDialogHousingBridge consumes these packets
+        // before they arrive here.
+        // This flow is intentionally runtime-only. Accessibility popup control is not a runtime
+        // grant and must never keep a visible carousel from accepting its promised button press.
+        if (_missingPermissions.value.isNotEmpty()) {
+            android.util.Log.i(
+                "DiveControl",
+                "Intro retained during permission setup for button byte 0x%02X".format(payload[0]),
+            )
+            return true
+        }
+
         android.util.Log.i(
             "DiveControl",
             "Intro dismissed by button byte 0x%02X".format(payload[0]),
@@ -514,15 +535,14 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Ends the intro for the rest of the process.
-     *
-     * The flag lives on the application rather than here so an activity recreation — a rotation, a
-     * theme change, a process-kept restart — does not put the diver back at the start of a carousel
-     * they have already skipped.
+     * Completes the first-install walkthrough. The no-backup marker survives ordinary launches and
+     * app updates but is removed by uninstall/clear-data, which is exactly the definition of first
+     * launch the user sees.
      */
     fun dismissIntro() {
         if (!_introVisible.value) return
         introDismissedAtMs = System.currentTimeMillis()
+        firstRunOnboardingStore.markComplete()
         _introVisible.value = false
         maybeShowCapPrompt()
     }
@@ -607,6 +627,31 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     /** Permissions still outstanding, phrased by purpose rather than by Android's names. */
     fun setMissingPermissions(missing: List<String>) {
         _missingPermissions.value = missing
+    }
+
+    /** Raises a fresh event even if the same capability was denied on the previous attempt. */
+    fun requestRuntimePermissions(needs: Set<RuntimePermissionNeed>) {
+        if (needs.isEmpty()) return
+        val active = _runtimePermissionRequest.value
+        if (active?.needs == needs) return
+        _runtimePermissionRequest.value = RuntimePermissionRequest(
+            id = nextRuntimePermissionRequestId++,
+            needs = needs,
+        )
+    }
+
+    /**
+     * Completes the Activity-owned native prompt and resumes only work that is safe to replay.
+     * Camera shutter/record commands are intentionally not replayed: a permission decision must
+     * never take a photo or start recording without a second deliberate housing press.
+     */
+    fun resolveRuntimePermissionRequest(id: Long, granted: Boolean) {
+        if (_runtimePermissionRequest.value?.id != id) return
+        _runtimePermissionRequest.value = null
+        val housingEffects = permissionBlockedHousingEffects
+        permissionBlockedHousingEffects = emptyList()
+        if (!granted) return
+        if (housingEffects.isNotEmpty()) processHousingEffects(housingEffects)
     }
 
     private val _missingPermissions = MutableStateFlow<List<String>>(emptyList())
@@ -754,6 +799,13 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
     fun simulateButton(event: HousingButtonEvent) {
         android.util.Log.d("DiveControl", "simulateButton: event=$event")
+        // Bench controls must work when the very reason they are open is that no housing is
+        // available. Route through the real wire decoder and InputRouter, but automatically
+        // establish the existing latched bench link instead of requiring an unexplained LINK
+        // press before Up/Down/Left/Right can move a menu.
+        if (!_state.value.housing.inputEnabled && !benchLinkForced) {
+            simulateHousingLink()
+        }
         val wireByte = when (event) {
             HousingButtonEvent.Right -> 0x10
             HousingButtonEvent.Shutter -> 0x20
@@ -769,11 +821,22 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         onButtonPayload(byteArrayOf(wireByte.toByte()))
     }
 
+    /** One emission avoids replaying every mode (and rebuilding every camera graph) after stress. */
+    internal fun restoreCameraStressSnapshot(camera: CameraState, mode: AppMode) {
+        emitOutcome(controlCore.restoreCameraSnapshot(camera, mode))
+    }
+
     private fun emitOutcome(outcome: ProcessingOutcome) {
         // Every dispatch reaches here — up to 500 a second during a focus sweep — and the
         // interpolated string was being built even though nothing reads it in the field.
         if (android.util.Log.isLoggable("DiveControl", android.util.Log.DEBUG)) {
             android.util.Log.d("DiveControl", "emitOutcome: mode=${outcome.state.mode} cameraMode=${outcome.state.camera.activeMode} focusedZone=${outcome.state.camera.focusedZone} settingsEditing=${outcome.state.camera.settingsEditing} sliderEditTarget=${outcome.state.camera.sliderEditTarget} notes=${outcome.notes}")
+        }
+        when {
+            "Camera Permission: Disabled" in outcome.notes ->
+                requestRuntimePermissions(setOf(RuntimePermissionNeed.Camera))
+            "Microphone Permission: Disabled" in outcome.notes ->
+                requestRuntimePermissions(setOf(RuntimePermissionNeed.Microphone))
         }
         _state.value = outcome.state
         // The cap doorway's hardware exits: the cap visibly CAME OFF (a cover transition to open,
@@ -808,9 +871,9 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         // stored reading fresh (throttled — SharedPreferences is not a 5 Hz sink); the moment the
         // hold ends for any reason, forget it. A record that outlives its vacuum would greet the
         // NEXT vacuum with unearned confidence.
-        // A vacuum detected while the intro is still up ends the intro: the housing is sealed
-        // and ready, and a button lesson standing in front of a working camera helps nobody.
-        if (_introVisible.value &&
+        // A verified vacuum may dismiss a repeat walkthrough, but never the first-install lesson:
+        // even a housing restored already sealed must teach its controls once.
+        if (!firstRunOnboardingRequired && _introVisible.value &&
             (sealNow == SealState.LeakMonitoring || sealNow == SealState.Passed)
         ) {
             dismissIntro()
@@ -818,18 +881,12 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
         val safetyNow = outcome.state.safety
 
-        // The mirror case: the intro was SKIPPED on the boot record's promise of a sealed
-        // housing, and the first real reading just refuted that promise. The skip has lost its
-        // justification, so the intro comes back — a diver holding a vented housing wants the
-        // button lesson and the sealing flow, this launch, not the next one. One shot, and only
-        // in the launch window: a housing switched on vented ten minutes into a session must
-        // not push a tutorial over a camera already in use.
-        if (!introReinstated && persistedVacuum != null &&
+        // A restored vacuum can initially justify the fast path. If the first real pressure sample
+        // refutes it, vacuum dependency wins and the walkthrough returns during the launch window.
+        if (!introReinstated && !firstRunOnboardingRequired && persistedVacuum != null &&
             !_introVisible.value && !_capPromptVisible.value &&
             safetyNow.verifiedVacuumKpa == null &&
             sealNow != SealState.LeakMonitoring && sealNow != SealState.Passed &&
-            // A refuted record now renders as SEAL FAILED (TIME); the tutorial must not cover
-            // that verdict. It returns after the diver acknowledges with UP.
             sealNow != SealState.Failed &&
             safetyNow.barometricPressureKpa != null &&
             System.currentTimeMillis() - vmStartedAtMs < INTRO_REINSTATE_WINDOW_MS
@@ -837,6 +894,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             introReinstated = true
             _introVisible.value = true
         }
+
         val holdVerified = (sealNow == SealState.Passed) &&
             safetyNow.sealConfidence >= SealConfidence.Provisional &&
             safetyNow.leakMonitoringStartedAtEpochMs != null
@@ -900,9 +958,25 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * a command that silently does nothing is the failure mode the product forbids.
      */
     private fun processHousingEffects(effects: List<PlatformEffect>) {
-        val link = housingLink ?: return
         val commands = effects.filterIsInstance<PlatformEffect.ExecuteHousing>().map { it.command }
         if (commands.isEmpty()) return
+
+        val application = getApplication<Application>()
+        if (!BlePermissions.allGranted(application)) {
+            permissionBlockedHousingEffects = effects
+            requestRuntimePermissions(setOf(RuntimePermissionNeed.Bluetooth))
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(application, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            // Notification visibility is recoverable independently; never suppress an already-safe
+            // housing write merely because Android hid the foreground-service notification.
+            requestRuntimePermissions(setOf(RuntimePermissionNeed.Notifications))
+        }
+
+        val link = housingLink ?: return
 
         viewModelScope.launch {
             for (command in commands) {
@@ -933,6 +1007,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                 it is PlatformEffect.CreateGalleryFolder
         }
         if (!hasGalleryWork) return
+
         viewModelScope.launch(Dispatchers.IO) {
             for (effect in effects) {
                 when (effect) {
@@ -1015,16 +1090,6 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         if (result.isFailure) {
             val error = result.exceptionOrNull()
             if (allowConsentRequest && error is SecurityException) {
-                if (
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                    !MediaStore.canManageMedia(getApplication())
-                ) {
-                    _galleryMediaManagementRequest.value = GalleryMediaManagementRequest(
-                        effect = effect,
-                        successMessage = successMessage,
-                    )
-                    return
-                }
                 val pendingIntent = runCatching {
                     when (effect) {
                         is PlatformEffect.DeleteGalleryAlbum ->
@@ -1059,35 +1124,6 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.Main) {
             dispatch(GalleryCommand.LoadItems(items))
             dispatch(GalleryCommand.OperationSucceeded(successMessage))
-        }
-    }
-
-    /** Retries the queued mutation after the one-time Android media-management settings screen. */
-    fun resolveGalleryMediaManagement(granted: Boolean) {
-        val request = _galleryMediaManagementRequest.value ?: return
-        _galleryMediaManagementRequest.value = null
-        if (!granted) {
-            dispatch(
-                GalleryCommand.OperationFailed(
-                    "Media management access was not enabled. Delete, move, or rename was cancelled.",
-                ),
-            )
-            return
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            val result = when (val effect = request.effect) {
-                is PlatformEffect.DeleteGalleryItem -> galleryRepository.deleteItem(effect.item)
-                is PlatformEffect.DeleteGalleryAlbum -> galleryRepository.deleteAlbum(effect.album)
-                is PlatformEffect.MoveGalleryItem -> galleryRepository.moveItem(effect.item, effect.targetAlbum)
-                is PlatformEffect.RenameGalleryItem -> galleryRepository.renameItem(effect.item, effect.newName)
-                else -> Result.failure(IllegalArgumentException("Unsupported gallery operation."))
-            }
-            completeGalleryMutation(
-                result = result,
-                successMessage = request.successMessage,
-                effect = request.effect,
-            )
         }
     }
 

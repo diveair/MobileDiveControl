@@ -185,11 +185,17 @@ class CameraSessionStore(context: Context) {
             ?.let { stored -> runCatching { CameraModeId.valueOf(stored) }.getOrNull() }
             ?: CameraModeId.Photo
 
+        val savedSettingValues = restoreStringMap(KEY_SETTING_VALUES)
+        val initialSettingValues = if (preferences.contains(KEY_SETTING_VALUES)) {
+            CameraCatalog.defaultSettingValues
+        } else {
+            CameraCatalog.freshInstallSettingValues
+        }
         val settingValues = removeLegacyPanoramaControls(
             migrateLegacyPanoramaDynamicRange(
                 migrateLegacyAssistDefaults(
                     normalizeRestoredSettingValues(
-                        CameraCatalog.defaultSettingValues + restoreStringMap(KEY_SETTING_VALUES),
+                        initialSettingValues + savedSettingValues,
                     ),
                 ),
             ),
@@ -255,7 +261,9 @@ class CameraSessionStore(context: Context) {
     private fun restoreDetectedLenses(): List<String> {
         val raw = preferences.getString(KEY_DETECTED_LENSES, null)
         if (raw.isNullOrBlank()) return emptyList()
-        return raw.split(",").filter { it.isNotBlank() }
+        // 2x was previously synthesized from the 1x sensor. Never resurrect that digital crop
+        // from an older saved discovery result while the fresh hardware probe is still running.
+        return raw.split(",").filter { it.isNotBlank() && it != "2x" }
     }
 
     /**
@@ -266,6 +274,10 @@ class CameraSessionStore(context: Context) {
      */
     internal fun normalizeRestoredSettingValues(values: Map<String, String>): Map<String, String> {
         val result = values.toMutableMap()
+        // Migrate the removed digital-crop selection without disturbing any other per-mode value.
+        result.entries
+            .filter { (key, value) -> key.endsWith(".lens") && value == "2x" }
+            .forEach { (key, _) -> result[key] = "1x" }
         // Pro Video now spells both columns in one option. Preserve the capture cadence chosen
         // by older builds and make its playback cadence identical until the user changes it.
         result["pro_video.frame_rate"]?.takeIf { '/' !in it }?.let { legacy ->

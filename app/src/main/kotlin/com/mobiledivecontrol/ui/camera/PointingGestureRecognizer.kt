@@ -1,17 +1,18 @@
 package com.mobiledivecontrol.ui.camera
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageProxy
-import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.ByteBufferImageBuilder
+import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizer
 import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizerResult
+import java.nio.ByteBuffer
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.sqrt
@@ -26,7 +27,7 @@ data class PointingGesture(
  * CPU-only, on-device pointing detector for the existing CameraX analysis stream.
  *
  * VIDEO mode is intentional: like LIVE_STREAM it reuses hand tracking between frames, while its
- * synchronous call gives the reusable RGBA bitmap an exact lifetime. CameraX drops stale analysis
+ * synchronous call gives the reusable RGBA buffer an exact lifetime. CameraX drops stale analysis
  * frames if inference is busy, so the 12.5 fps ceiling adds responsiveness without a work queue.
  */
 internal class PointingGestureRecognizer(
@@ -35,8 +36,7 @@ internal class PointingGestureRecognizer(
 ) : AutoCloseable {
     private var recognizer: GestureRecognizer? = null
     private var lastAnalyzedAtMs = 0L
-    private var sourceBitmap: Bitmap? = null
-    private var packedPixels: IntArray? = null
+    private var packedRgbaBuffer: ByteBuffer? = null
     private val processingOptionsByRotation = mutableMapOf<Int, ImageProcessingOptions>()
     private var inferenceWarmupFrames = 0
     private var inferenceSamples = 0
@@ -60,16 +60,21 @@ internal class PointingGestureRecognizer(
         }
 
         val rotation = image.imageInfo.rotationDegrees
-        val source = sourceBitmap(image.width, image.height)
         try {
-            image.use { copyRgba(image, source) }
-            val result = BitmapImageBuilder(source).build().use { mpImage ->
-                val result = engine.recognizeForVideo(
-                    mpImage,
-                    processingOptions(rotation),
-                    now,
-                )
-                result
+            val result = image.use { frame ->
+                val source = rgbaBuffer(frame)
+                ByteBufferImageBuilder(
+                    source,
+                    frame.width,
+                    frame.height,
+                    MPImage.IMAGE_FORMAT_RGBA,
+                ).build().use { mpImage ->
+                    engine.recognizeForVideo(
+                        mpImage,
+                        processingOptions(rotation),
+                        now,
+                    )
+                }
             }
             recordInferenceLatency(SystemClock.uptimeMillis() - now)
             consume(result, now, mirrorHorizontally = frontCamera)
@@ -189,18 +194,6 @@ internal class PointingGestureRecognizer(
         }
     }
 
-    private fun sourceBitmap(width: Int, height: Int): Bitmap {
-        val current = sourceBitmap
-        if (current != null && current.width == width && current.height == height && !current.isRecycled) {
-            return current
-        }
-        current?.recycle()
-        packedPixels = null
-        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
-            sourceBitmap = it
-        }
-    }
-
     private fun processingOptions(rotationDegrees: Int): ImageProcessingOptions {
         val normalized = ((rotationDegrees % 360) + 360) % 360
         return processingOptionsByRotation.getOrPut(normalized) {
@@ -210,40 +203,53 @@ internal class PointingGestureRecognizer(
         }
     }
 
-    /** CameraX may pad RGBA rows; Bitmap.copyPixelsFromBuffer assumes it never does. */
-    private fun copyRgba(image: ImageProxy, bitmap: Bitmap) {
+    /** CameraX may pad RGBA rows; MediaPipe's byte-buffer image must remain tightly packed. */
+    private fun rgbaBuffer(image: ImageProxy): ByteBuffer {
         val plane = image.planes.first()
         val packedRowBytes = image.width * 4
+        val packedByteCount = packedRowBytes * image.height
         if (plane.pixelStride == 4 && plane.rowStride == packedRowBytes) {
-            bitmap.copyPixelsFromBuffer(plane.buffer.duplicate().apply { rewind() })
-            return
+            // The recognizer call is synchronous and runs inside image.use, so this is a safe
+            // zero-copy view of CameraX's plane. MPImage.close does not own/recycle ByteBuffers.
+            return plane.buffer.duplicate().apply {
+                rewind()
+                limit(packedByteCount)
+            }.slice()
         }
 
-        val buffer = plane.buffer
-        val pixelCount = image.width * image.height
-        val pixels = packedPixels?.takeIf { it.size == pixelCount }
-            ?: IntArray(pixelCount).also { packedPixels = it }
-        for (y in 0 until image.height) {
-            val row = y * plane.rowStride
-            for (x in 0 until image.width) {
-                val offset = row + x * plane.pixelStride
-                val r = buffer.get(offset).toInt() and 0xFF
-                val g = buffer.get(offset + 1).toInt() and 0xFF
-                val b = buffer.get(offset + 2).toInt() and 0xFF
-                val a = buffer.get(offset + 3).toInt() and 0xFF
-                pixels[y * image.width + x] =
-                    (a shl 24) or (r shl 16) or (g shl 8) or b
+        val packed = packedRgbaBuffer
+            ?.takeIf { it.capacity() == packedByteCount }
+            ?: ByteBuffer.allocateDirect(packedByteCount).also { packedRgbaBuffer = it }
+        packed.clear()
+        val source = plane.buffer.duplicate()
+        if (plane.pixelStride == 4) {
+            for (y in 0 until image.height) {
+                val rowStart = y * plane.rowStride
+                source.limit(source.capacity())
+                source.position(rowStart)
+                source.limit(rowStart + packedRowBytes)
+                packed.put(source)
+            }
+        } else {
+            for (y in 0 until image.height) {
+                val rowStart = y * plane.rowStride
+                for (x in 0 until image.width) {
+                    val offset = rowStart + x * plane.pixelStride
+                    packed.put(source.get(offset))
+                    packed.put(source.get(offset + 1))
+                    packed.put(source.get(offset + 2))
+                    packed.put(source.get(offset + 3))
+                }
             }
         }
-        bitmap.setPixels(pixels, 0, image.width, 0, 0, image.width, image.height)
+        packed.flip()
+        return packed
     }
 
     override fun close() {
         recognizer?.close()
         recognizer = null
-        sourceBitmap?.recycle()
-        sourceBitmap = null
-        packedPixels = null
+        packedRgbaBuffer = null
         processingOptionsByRotation.clear()
     }
 
@@ -251,9 +257,9 @@ internal class PointingGestureRecognizer(
         const val TAG = "PointingGesture"
         const val MODEL_ASSET = "gesture_recognizer.task"
         const val POINTING_CATEGORY = "Pointing_Up"
-        // Zero means every frame the single CameraX analyzer can actually service. Its
-        // KEEP_ONLY_LATEST policy is the backpressure boundary, so frames never queue.
-        const val ANALYSIS_INTERVAL_MS = 0L
+        // MediaPipe is assistance, not the viewfinder. Cap it at 12.5 fps so its GPU/CPU work
+        // cannot monopolise the analysis thread or contend with CameraX surface restoration.
+        const val ANALYSIS_INTERVAL_MS = 80L
         const val MODEL_CONFIDENCE = 0.55f
         const val INFERENCE_WARMUP_FRAMES = 3
         const val INFERENCE_BENCHMARK_FRAMES = 30

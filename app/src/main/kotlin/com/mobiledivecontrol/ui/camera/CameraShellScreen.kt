@@ -1,10 +1,7 @@
 package com.mobiledivecontrol.ui.camera
 
-import android.content.ContentUris
-import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
-import android.provider.MediaStore
 import android.os.Build
 import android.util.Size
 import androidx.compose.animation.AnimatedVisibility
@@ -12,6 +9,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -72,11 +70,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -84,6 +84,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntOffset
@@ -113,6 +114,7 @@ import com.mobiledivecontrol.core.SliderSensitivity
 import com.mobiledivecontrol.core.selectedSetting
 import com.mobiledivecontrol.core.BottomBarItem
 import com.mobiledivecontrol.theme.DiveColors
+import com.mobiledivecontrol.testing.CameraStressVisualStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -145,6 +147,7 @@ fun CameraShellScreen(
     val settings = CameraCatalog.settingsFor(cameraState.activeMode, cameraState.deviceVariant)
     val settingsVisible = settings.isNotEmpty()
 
+    LatestCaptureProvider(lifecycleOwner) {
     Box(modifier = modifier.fillMaxSize()) {
         // Full-screen camera preview
         if (cameraPermissionGranted && lifecycleOwner != null) {
@@ -223,6 +226,35 @@ fun CameraShellScreen(
             )
         }
 
+        CameraStressVisualStatus.current.value?.let { stress ->
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 10.dp)
+                    .background(DiveColors.DeepBlack.copy(alpha = 0.9f), RoundedCornerShape(10.dp))
+                    .border(1.dp, DiveColors.DiveCyan, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+            ) {
+                Text(
+                    text = "STRESS ${stress.sequence} · ${stress.mode} · ${stress.status}",
+                    color = DiveColors.DiveCyan,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = buildString {
+                        append(stress.setting).append(": ").append(stress.requested)
+                        if (stress.actual.isNotBlank()) append(" → ").append(stress.actual)
+                    },
+                    color = DiveColors.TextPrimary,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+
         // Right side: mode rail (only visible when in ModeRail zone)
         AnimatedVisibility(
             visible = cameraState.focusedZone == CameraUiZone.ModeRail &&
@@ -290,6 +322,7 @@ fun CameraShellScreen(
                 modifier = Modifier.fillMaxSize(),
             )
         }
+    }
     }
 }
 
@@ -609,7 +642,10 @@ private fun ModeGuideOverlay(
             val correction by PanoramaCaptureState.correction
             val referenceFrame by PanoramaCaptureState.referenceFrame
             val liveThumbnail by PanoramaCaptureState.liveThumbnail
-            val savingProgress by PanoramaCaptureState.savingProgress
+            val wideAngle = settings
+                .firstOrNull { it.id == "panorama.lens" }
+                ?.let { CameraCatalog.currentValue(cameraState, it) == "0.6x" }
+                ?: false
             PanoramaGuideOverlay(
                 direction = if (active || finalizing) detectedDirection else "Auto",
                 active = active,
@@ -623,7 +659,7 @@ private fun ModeGuideOverlay(
                 correction = correction,
                 referenceFrame = referenceFrame,
                 liveThumbnail = liveThumbnail,
-                savingProgress = savingProgress,
+                wideAngle = wideAngle,
                 modifier = modifier,
             )
         }
@@ -705,24 +741,6 @@ private fun ExpertRawGuideOverlay(
                     )
                 }
             }
-            Text(
-                text = if (latitude == null || longitude == null) {
-                    // Permission and the phone Location switch are handled by the real system
-                    // surfaces. Never imitate a permission warning inside the viewfinder.
-                    "SKY GUIDE"
-                } else {
-                    "SKY GUIDE  ${azimuth.roundToInt().toString().padStart(3, '0')}°  " +
-                        "${altitude.roundToInt()}° ALT"
-                },
-                color = Color.White,
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 72.dp)
-                    .background(DiveColors.DeepBlack.copy(alpha = 0.72f), RoundedCornerShape(12.dp))
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-            )
         }
         if (active || message.isNotBlank()) {
             Column(
@@ -778,12 +796,28 @@ private fun PanoramaGuideOverlay(
     correction: PanoramaCorrection,
     referenceFrame: Bitmap?,
     liveThumbnail: Bitmap?,
-    savingProgress: Int,
+    wideAngle: Boolean,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier) {
         val resolvedDirection = direction.takeUnless { it == "Auto" } ?: "Right"
         val horizontal = resolvedDirection == "Left" || resolvedDirection == "Right"
+        val awaitingDirection = !directionLocked && !finalizing
+        // The capture rectangle follows the camera frame orientation, not the sweep axis. For a
+        // landscape 1920x1080 stream it remains landscape: horizontal travel exposes a 1080 px
+        // cross-edge, while vertical travel exposes the 1920 px cross-edge. Only the lane rotates.
+        val idlePreviewWidth = 248.dp
+        val idlePreviewHeight = 88.dp
+        val nativeFrameWidthDp by animateDpAsState(
+            targetValue = 132.dp,
+            animationSpec = tween(durationMillis = 220),
+            label = "panorama-frame-width",
+        )
+        val nativeFrameHeightDp by animateDpAsState(
+            targetValue = 88.dp,
+            animationSpec = tween(durationMillis = 220),
+            label = "panorama-frame-height",
+        )
         val arrowTransition = rememberInfiniteTransition(label = "panorama-native-arrow")
         val arrowSwing by arrowTransition.animateFloat(
             initialValue = 0f,
@@ -810,8 +844,8 @@ private fun PanoramaGuideOverlay(
         ) {
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val previewCenter = center
-                val nativeFrameWidth = if (horizontal) 132.dp.toPx() else 88.dp.toPx()
-                val nativeFrameHeight = if (horizontal) 88.dp.toPx() else 132.dp.toPx()
+                val nativeFrameWidth = nativeFrameWidthDp.toPx()
+                val nativeFrameHeight = nativeFrameHeightDp.toPx()
                 val borderWidth = 0.5.dp.toPx()
                 val guideWidth = 4.dp.toPx()
                 val background = Color(0x3D222222)
@@ -819,22 +853,45 @@ private fun PanoramaGuideOverlay(
                 val warning = Color(0xFFFFD90D)
 
                 if (!active && !finalizing) {
-                    val groupWidth = if (horizontal) 248.dp.toPx() else nativeFrameWidth
-                    val groupHeight = if (horizontal) nativeFrameHeight else 248.dp.toPx()
+                    val groupWidth = idlePreviewWidth.toPx()
+                    val groupHeight = idlePreviewHeight.toPx()
                     val left = previewCenter.x - groupWidth / 2f
                     val top = previewCenter.y - groupHeight / 2f
                     drawRect(background, Offset(left, top), androidx.compose.ui.geometry.Size(groupWidth, groupHeight))
                     referenceImage?.let { image ->
-                        drawImage(
-                            image = image,
-                            srcOffset = IntOffset.Zero,
-                            srcSize = IntSize(image.width, image.height),
-                            dstOffset = IntOffset(
-                                (previewCenter.x - nativeFrameWidth / 2f).roundToInt(),
-                                (previewCenter.y - nativeFrameHeight / 2f).roundToInt(),
-                            ),
-                            dstSize = IntSize(nativeFrameWidth.roundToInt(), nativeFrameHeight.roundToInt()),
+                        val frameLeft = previewCenter.x - nativeFrameWidth / 2f
+                        val frameTop = previewCenter.y - nativeFrameHeight / 2f
+                        val crop = centerCropPanoramaPreview(
+                            imageWidth = image.width,
+                            imageHeight = image.height,
+                            boxWidth = nativeFrameWidth,
+                            boxHeight = nativeFrameHeight,
                         )
+                        // Make containment an invariant in addition to supplying a destination
+                        // size: no reference or replacement bitmap can draw outside the exact
+                        // rectangle between the two inner divider lines.
+                        clipRect(
+                            left = frameLeft,
+                            top = frameTop,
+                            right = frameLeft + nativeFrameWidth,
+                            bottom = frameTop + nativeFrameHeight,
+                        ) {
+                            drawImage(
+                                image = image,
+                                // The source bitmap may be a wide stitched thumbnail. Crop its
+                                // centre to the guide's aspect ratio instead of drawing from (0,0).
+                                srcOffset = IntOffset(crop.left, crop.top),
+                                srcSize = IntSize(crop.width, crop.height),
+                                dstOffset = IntOffset(
+                                    frameLeft.roundToInt(),
+                                    frameTop.roundToInt(),
+                                ),
+                                dstSize = IntSize(
+                                    nativeFrameWidth.roundToInt().coerceAtLeast(1),
+                                    nativeFrameHeight.roundToInt().coerceAtLeast(1),
+                                ),
+                            )
+                        }
                     }
                     drawRect(
                         white,
@@ -842,98 +899,144 @@ private fun PanoramaGuideOverlay(
                         androidx.compose.ui.geometry.Size(groupWidth, groupHeight),
                         style = Stroke(borderWidth),
                     )
-                    val sideZone = if (horizontal) {
-                        (groupWidth - nativeFrameWidth) / 2f
-                    } else {
-                        (groupHeight - nativeFrameHeight) / 2f
-                    }
-                    if (horizontal) {
-                        drawLine(white, Offset(left + sideZone, top), Offset(left + sideZone, top + groupHeight), borderWidth)
-                        drawLine(white, Offset(left + groupWidth - sideZone, top), Offset(left + groupWidth - sideZone, top + groupHeight), borderWidth)
-                        drawPanoramaChevron(
-                            Offset(left + sideZone / 2f - arrowSwing.dp.toPx(), previewCenter.y),
-                            PanoramaCorrection.Left,
-                            white,
-                        )
-                        drawPanoramaChevron(
-                            Offset(left + groupWidth - sideZone / 2f + arrowSwing.dp.toPx(), previewCenter.y),
-                            PanoramaCorrection.Right,
-                            white,
-                        )
-                    } else {
-                        drawLine(white, Offset(left, top + sideZone), Offset(left + groupWidth, top + sideZone), borderWidth)
-                        drawLine(white, Offset(left, top + groupHeight - sideZone), Offset(left + groupWidth, top + groupHeight - sideZone), borderWidth)
-                        drawPanoramaChevron(
-                            Offset(previewCenter.x, top + sideZone / 2f - arrowSwing.dp.toPx()),
-                            PanoramaCorrection.Up,
-                            white,
-                        )
-                        drawPanoramaChevron(
-                            Offset(previewCenter.x, top + groupHeight - sideZone / 2f + arrowSwing.dp.toPx()),
-                            PanoramaCorrection.Down,
-                            white,
-                        )
-                    }
+                    val frameLeft = previewCenter.x - nativeFrameWidth / 2f
+                    val frameRight = previewCenter.x + nativeFrameWidth / 2f
+                    drawLine(white, Offset(frameLeft, top), Offset(frameLeft, top + groupHeight), borderWidth)
+                    drawLine(white, Offset(frameRight, top), Offset(frameRight, top + groupHeight), borderWidth)
+                    drawPanoramaChevron(
+                        Offset((left + frameLeft) / 2f - arrowSwing.dp.toPx(), previewCenter.y),
+                        PanoramaCorrection.Left,
+                        white,
+                    )
+                    drawPanoramaChevron(
+                        Offset((frameRight + left + groupWidth) / 2f + arrowSwing.dp.toPx(), previewCenter.y),
+                        PanoramaCorrection.Right,
+                        white,
+                    )
                 } else {
-                    val groupWidth = if (!directionLocked && !finalizing) {
-                        if (horizontal) 248.dp.toPx() else nativeFrameWidth
+                    val groupWidth = if (awaitingDirection) {
+                        248.dp.toPx()
                     } else if (horizontal) {
-                        (size.width - 110.dp.toPx()).coerceAtLeast(248.dp.toPx())
+                        (if (wideAngle) 272.dp else 340.dp).toPx()
+                            .coerceAtMost((size.width - 32.dp.toPx()).coerceAtLeast(248.dp.toPx()))
                     } else {
                         nativeFrameWidth
                     }
-                    val groupHeight = if (!directionLocked && !finalizing) {
-                        if (horizontal) nativeFrameHeight else 248.dp.toPx()
+                    val groupHeight = if (awaitingDirection) {
+                        88.dp.toPx()
                     } else if (horizontal) {
                         nativeFrameHeight
                     } else {
-                        (size.height - 110.dp.toPx()).coerceAtLeast(248.dp.toPx())
+                        (size.height - (if (wideAngle) 146.dp else 110.dp).toPx())
+                            .coerceAtLeast(192.dp.toPx())
                     }
                     val groupLeft = previewCenter.x - groupWidth / 2f
                     val groupTop = previewCenter.y - groupHeight / 2f
                     val crossFraction = panoramaGuideCrossFraction(crossAxisRadians)
-                    val mainSign = if (resolvedDirection == "Left" || resolvedDirection == "Up") -1f else 1f
-                    val mainTravel = if (horizontal) groupWidth - nativeFrameWidth else groupHeight - nativeFrameHeight
-                    val startCenter = previewCenter
-                    val currentCenter = if (!directionLocked) {
-                        startCenter
-                    } else if (horizontal) {
-                        Offset(
-                            startCenter.x + mainSign * progress.coerceIn(0f, 1f) * mainTravel / 2f,
-                            startCenter.y - crossFraction * 44.dp.toPx(),
+                    val liveStrip = if (directionLocked && capturedImage != null) {
+                        panoramaLiveThumbnailRect(
+                            direction = resolvedDirection,
+                            groupLeft = groupLeft,
+                            groupTop = groupTop,
+                            groupWidth = groupWidth,
+                            groupHeight = groupHeight,
+                            bitmapWidth = capturedImage.width,
+                            bitmapHeight = capturedImage.height,
+                            inset = 2.dp.toPx(),
                         )
                     } else {
-                        Offset(
-                            startCenter.x + crossFraction * 44.dp.toPx(),
-                            startCenter.y + mainSign * progress.coerceIn(0f, 1f) * mainTravel / 2f,
+                        null
+                    }
+                    val thumbnailDrivenProgress = liveStrip?.let { strip ->
+                        if (horizontal) {
+                            ((strip.right - strip.left - nativeFrameWidth) /
+                                (groupWidth - nativeFrameWidth).coerceAtLeast(1f))
+                                .coerceIn(0f, 1f)
+                        } else {
+                            ((strip.bottom - strip.top - nativeFrameHeight) /
+                                (groupHeight - nativeFrameHeight).coerceAtLeast(1f))
+                                .coerceIn(0f, 1f)
+                        }
+                    } ?: progress
+                    val track = if (!directionLocked) {
+                        PanoramaGuideTrack(
+                            startX = previewCenter.x,
+                            startY = previewCenter.y,
+                            currentX = previewCenter.x,
+                            currentY = previewCenter.y,
+                        )
+                    } else {
+                        panoramaGuideTrack(
+                            direction = resolvedDirection,
+                            groupLeft = groupLeft,
+                            groupTop = groupTop,
+                            groupWidth = groupWidth,
+                            groupHeight = groupHeight,
+                            frameWidth = nativeFrameWidth,
+                            frameHeight = nativeFrameHeight,
+                            progress = thumbnailDrivenProgress,
+                            crossOffset = crossFraction * 44.dp.toPx(),
                         )
                     }
+                    val startCenter = Offset(track.startX, track.startY)
+                    val currentCenter = Offset(track.currentX, track.currentY)
 
-                    val capturedLeft = if (horizontal) {
-                        minOf(startCenter.x, currentCenter.x) - nativeFrameWidth / 2f
-                    } else groupLeft
-                    val capturedTop = if (horizontal) {
-                        groupTop
-                    } else minOf(startCenter.y, currentCenter.y) - nativeFrameHeight / 2f
-                    val capturedRight = if (horizontal) {
-                        maxOf(startCenter.x, currentCenter.x) + nativeFrameWidth / 2f
-                    } else groupLeft + groupWidth
-                    val capturedBottom = if (horizontal) {
-                        groupTop + groupHeight
-                    } else maxOf(startCenter.y, currentCenter.y) + nativeFrameHeight / 2f
+                    val previewLeft = currentCenter.x - nativeFrameWidth / 2f
+                    val previewTop = currentCenter.y - nativeFrameHeight / 2f
+                    val previewRight = previewLeft + nativeFrameWidth
+                    val previewBottom = previewTop + nativeFrameHeight
 
                     drawRect(background, Offset(groupLeft, groupTop), androidx.compose.ui.geometry.Size(groupWidth, groupHeight))
-                    (capturedImage ?: referenceImage)?.let { image ->
-                        drawImage(
-                            image = image,
-                            srcOffset = IntOffset.Zero,
-                            srcSize = IntSize(image.width, image.height),
-                            dstOffset = IntOffset(capturedLeft.roundToInt(), capturedTop.roundToInt()),
-                            dstSize = IntSize(
-                                (capturedRight - capturedLeft).roundToInt().coerceAtLeast(1),
-                                (capturedBottom - capturedTop).roundToInt().coerceAtLeast(1),
-                            ),
+                    if (directionLocked && capturedImage != null && liveStrip != null) {
+                        // Samsung supplies an already-merged bitmap and preserves its aspect
+                        // ratio. Its long edge grows naturally; it is never stretched to a gyro
+                        // progress rectangle.
+                        clipRect(
+                            left = groupLeft,
+                            top = groupTop,
+                            right = groupLeft + groupWidth,
+                            bottom = groupTop + groupHeight,
+                        ) {
+                            drawImage(
+                                image = capturedImage,
+                                srcOffset = IntOffset.Zero,
+                                srcSize = IntSize(capturedImage.width, capturedImage.height),
+                                dstOffset = IntOffset(liveStrip.left.roundToInt(), liveStrip.top.roundToInt()),
+                                dstSize = IntSize(
+                                    (liveStrip.right - liveStrip.left).roundToInt().coerceAtLeast(1),
+                                    (liveStrip.bottom - liveStrip.top).roundToInt().coerceAtLeast(1),
+                                ),
+                            )
+                        }
+                    } else {
+                        (capturedImage ?: referenceImage)?.let { image ->
+                        val crop = centerCropPanoramaPreview(
+                            imageWidth = image.width,
+                            imageHeight = image.height,
+                            boxWidth = nativeFrameWidth,
+                            boxHeight = nativeFrameHeight,
                         )
+                        clipRect(
+                            left = previewLeft,
+                            top = previewTop,
+                            right = previewRight,
+                            bottom = previewBottom,
+                        ) {
+                            drawImage(
+                                image = image,
+                                srcOffset = IntOffset(crop.left, crop.top),
+                                srcSize = IntSize(crop.width, crop.height),
+                                dstOffset = IntOffset(
+                                    previewLeft.roundToInt(),
+                                    previewTop.roundToInt(),
+                                ),
+                                dstSize = IntSize(
+                                    nativeFrameWidth.roundToInt().coerceAtLeast(1),
+                                    nativeFrameHeight.roundToInt().coerceAtLeast(1),
+                                ),
+                            )
+                        }
+                    }
                     }
                     drawRect(
                         white.copy(alpha = 0.72f),
@@ -964,8 +1067,6 @@ private fun PanoramaGuideOverlay(
                             !directionLocked -> {
                                 drawPanoramaChevron(Offset(startCenter.x - nativeFrameWidth / 2f - 14.dp.toPx(), startCenter.y), PanoramaCorrection.Left, white)
                                 drawPanoramaChevron(Offset(startCenter.x + nativeFrameWidth / 2f + 14.dp.toPx(), startCenter.y), PanoramaCorrection.Right, white)
-                                drawPanoramaChevron(Offset(startCenter.x, startCenter.y - nativeFrameHeight / 2f - 14.dp.toPx()), PanoramaCorrection.Up, white)
-                                drawPanoramaChevron(Offset(startCenter.x, startCenter.y + nativeFrameHeight / 2f + 14.dp.toPx()), PanoramaCorrection.Down, white)
                             }
                         }
                     }
@@ -973,11 +1074,10 @@ private fun PanoramaGuideOverlay(
             }
 
             val guidanceText = when {
-                finalizing -> if (savingProgress > 0) "Saving panorama… $savingProgress%" else "Saving panorama…"
+                finalizing -> ""
                 !active -> "Tap the Camera button, then pan slowly in one direction."
                 message.isNotBlank() -> message
                 movingTooFast -> "Move slowly"
-                !directionLocked -> "Pan slowly in any direction."
                 else -> ""
             }
             if (guidanceText.isNotBlank()) {
@@ -986,9 +1086,17 @@ private fun PanoramaGuideOverlay(
                     color = if (warningLevel == PanoramaWarningLevel.None || !active) DiveColors.TextPrimary else Color(0xFFFFD90D),
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 52.dp)
+                        // The idle instruction belongs to the preview guide, so its outer panel
+                        // uses the guide's exact orientation-aware width rather than intrinsic
+                        // text width.
+                        .then(
+                            if (!active && !finalizing) Modifier.width(idlePreviewWidth)
+                            else Modifier,
+                        )
                         .background(Color(0x33000000), RoundedCornerShape(8.dp))
                         .padding(horizontal = 14.dp, vertical = 6.dp),
                 )
@@ -996,6 +1104,42 @@ private fun PanoramaGuideOverlay(
         }
 
     }
+}
+
+internal data class PanoramaPreviewCrop(
+    val left: Int,
+    val top: Int,
+    val width: Int,
+    val height: Int,
+)
+
+/** Centre-crops a camera frame so it fills exactly the rectangle between the chevrons. */
+internal fun centerCropPanoramaPreview(
+    imageWidth: Int,
+    imageHeight: Int,
+    boxWidth: Float,
+    boxHeight: Float,
+): PanoramaPreviewCrop {
+    if (imageWidth <= 0 || imageHeight <= 0 || boxWidth <= 0f || boxHeight <= 0f) {
+        return PanoramaPreviewCrop(0, 0, 0, 0)
+    }
+    val imageAspect = imageWidth.toFloat() / imageHeight
+    val boxAspect = boxWidth / boxHeight
+    val cropWidth: Int
+    val cropHeight: Int
+    if (imageAspect > boxAspect) {
+        cropHeight = imageHeight
+        cropWidth = (imageHeight * boxAspect).roundToInt().coerceIn(1, imageWidth)
+    } else {
+        cropWidth = imageWidth
+        cropHeight = (imageWidth / boxAspect).roundToInt().coerceIn(1, imageHeight)
+    }
+    return PanoramaPreviewCrop(
+        left = (imageWidth - cropWidth) / 2,
+        top = (imageHeight - cropHeight) / 2,
+        width = cropWidth,
+        height = cropHeight,
+    )
 }
 
 private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawPanoramaChevron(
@@ -1376,6 +1520,7 @@ private fun BottomSettingsTrayLegacy(
     cameraState: CameraState,
     settings: List<CameraSettingSpec>,
     profile: CameraModeProfile,
+    onCommand: (CameraCommand) -> Unit = {},
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -1531,12 +1676,7 @@ private fun BottomSettingsTrayLegacy(
                                 )
                             }
                             is BottomBarItem.GalleryShortcut -> {
-                                Text(
-                                    text = "Gallery",
-                                    color = if (selected) DiveColors.TextPrimary else DiveColors.TextSecondary,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Bold,
-                                )
+                                LatestCaptureThumbnail(selected) { onCommand(CameraCommand.OpenGallery) }
                             }
                             is BottomBarItem.MoreSettings -> {
                                 Text(
@@ -1828,26 +1968,31 @@ private fun ModesBarSide(
     onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val spreadAcrossSide = cameraState.activeMode in compactNativeModeBars
+    val packFromCenter = cameraState.activeMode in centerPackedModeBars
+    val spreadAcrossSide = cameraState.activeMode in compactNativeModeBars && !packFromCenter
     Box(
         contentAlignment = if (alignToEnd) Alignment.CenterEnd else Alignment.CenterStart,
         modifier = modifier,
     ) {
         Row(
-            horizontalArrangement = if (spreadAcrossSide) {
-                Arrangement.SpaceBetween
-            } else {
-                Arrangement.Start
+            horizontalArrangement = when {
+                spreadAcrossSide -> Arrangement.SpaceBetween
+                packFromCenter -> Arrangement.spacedBy(CENTER_PACKED_BAR_GAP)
+                else -> Arrangement.Start
             },
             verticalAlignment = Alignment.CenterVertically,
-            // Compact native-style rails use both halves symmetrically: the first control reaches
-            // the left edge, Gallery remains at the right edge, and every intervening gap is even.
-            modifier = if (spreadAcrossSide || !alignToEnd) Modifier.fillMaxWidth() else Modifier,
+            // These shorter rails grow away from the mode chip at one fixed interval on both
+            // sides. SpaceBetween made unequal item counts look arbitrarily scattered.
+            modifier = if (spreadAcrossSide || (!alignToEnd && !packFromCenter)) {
+                Modifier.fillMaxWidth()
+            } else {
+                Modifier
+            },
         ) {
             items.forEachIndexed { index, item ->
                 if (index > 0) {
-                    if (spreadAcrossSide) {
-                        // Arrangement.SpaceBetween owns every gap on a compact native-style rail.
+                    if (spreadAcrossSide || packFromCenter) {
+                        // The row arrangement owns every gap for these mode-specific rails.
                     } else if (!alignToEnd && item is BottomBarItem.GalleryShortcut) {
                         // The gallery is an edge action, not another variable-width setting.
                         // Consume whatever room remains so it is always visible at bottom-right.
@@ -1861,10 +2006,10 @@ private fun ModesBarSide(
                     cameraState = cameraState,
                     selected = cameraState.settingsCursor == startIndex + index,
                     compact = true,
-                    onClick = if (item is BottomBarItem.MoreSettings) {
-                        { onCommand(CameraCommand.ToggleOptionsMenu) }
-                    } else {
-                        null
+                    onClick = when (item) {
+                        is BottomBarItem.MoreSettings -> { { onCommand(CameraCommand.ToggleOptionsMenu) } }
+                        is BottomBarItem.GalleryShortcut -> { { onCommand(CameraCommand.OpenGallery) } }
+                        else -> null
                     },
                 )
             }
@@ -1930,6 +2075,10 @@ private fun BottomBarChip(
     compact: Boolean = false,
     onClick: (() -> Unit)? = null,
 ) {
+    if (item is BottomBarItem.GalleryShortcut) {
+        LatestCaptureThumbnail(selected, onClick)
+        return
+    }
     val icon = bottomBarIcon(item)
     val label = bottomBarLabel(item)
     val value = bottomBarValue(item, cameraState)
@@ -2028,13 +2177,7 @@ private fun BottomBarChip(
         ) {
             val showLeadingGraphic = !compactDirectExposure && !compactValueOnly
             if (showLeadingGraphic) {
-                if (item is BottomBarItem.GalleryShortcut) {
-                    GalleryChipPreview(
-                        selected = selected,
-                        size = iconSize,
-                        captureCounter = cameraState.captureCounter,
-                    )
-                } else if (compositionGuide != null) {
+                if (compositionGuide != null) {
                     CompositionGuideTypeIcon(
                         guide = compositionGuide,
                         tint = if (selected) DiveColors.DiveCyan else DiveColors.TextMuted,
@@ -2149,6 +2292,15 @@ private val compactNativeModeBars = setOf(
     CameraModeId.Portrait,
     CameraModeId.Photo,
 )
+
+/** These shorter rails stay visually attached to their centre mode instead of touching the edges. */
+private val centerPackedModeBars = setOf(
+    CameraModeId.Food,
+    CameraModeId.Night,
+    CameraModeId.Panorama,
+)
+
+private val CENTER_PACKED_BAR_GAP = 6.dp
 
 private val compactExposureSettingIds = setOf(
     "hyperlapse.exposure",
@@ -2438,84 +2590,6 @@ private fun focusCurveDisplayName(value: String): String = when (value) {
     "SquareRoot" -> "Sq Root"
     "Logarithmic" -> "Log"
     else -> value
-}
-
-@Composable
-private fun GalleryChipPreview(
-    selected: Boolean,
-    size: androidx.compose.ui.unit.Dp,
-    captureCounter: Int = 0,
-) {
-    val thumbnail = rememberLatestGalleryThumbnail(captureCounter)
-
-    if (thumbnail != null) {
-        Image(
-            bitmap = thumbnail,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier
-                .size(size)
-                .clip(CircleShape)
-                .border(
-                    width = 2.dp,
-                    color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder.copy(alpha = 0.6f),
-                    shape = CircleShape,
-                ),
-        )
-    } else {
-        Icon(
-            imageVector = Icons.Rounded.PhotoLibrary,
-            contentDescription = null,
-            tint = if (selected) DiveColors.DiveCyan else DiveColors.TextMuted,
-            modifier = Modifier.size(size),
-        )
-    }
-}
-
-@Composable
-private fun rememberLatestGalleryThumbnail(refreshKey: Int = 0): androidx.compose.ui.graphics.ImageBitmap? {
-    val context = LocalContext.current
-    var thumbnail by remember(context) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-
-    LaunchedEffect(context, refreshKey) {
-        // Small delay after capture to let MediaStore index the new file
-        if (refreshKey > 0) kotlinx.coroutines.delay(500)
-        thumbnail = loadLatestGalleryThumbnail(context)?.asImageBitmap()
-    }
-
-    return thumbnail
-}
-
-private fun loadLatestGalleryThumbnail(context: Context): Bitmap? {
-    return try {
-        val filesUri = MediaStore.Files.getContentUri("external")
-        val projection = arrayOf(
-            MediaStore.Files.FileColumns._ID,
-            MediaStore.Files.FileColumns.MEDIA_TYPE,
-        )
-        val selection = buildString {
-            append("(")
-            append(MediaStore.Files.FileColumns.MEDIA_TYPE)
-            append("=? OR ")
-            append(MediaStore.Files.FileColumns.MEDIA_TYPE)
-            append("=?)")
-        }
-        val selectionArgs = arrayOf(
-            MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
-            MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(),
-        )
-        val sortOrder = "${MediaStore.Files.FileColumns.DATE_ADDED} DESC"
-        context.contentResolver.query(filesUri, projection, selection, selectionArgs, sortOrder)?.use { cursor ->
-            if (!cursor.moveToFirst()) {
-                return null
-            }
-            val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID))
-            val contentUri = ContentUris.withAppendedId(filesUri, id)
-            context.contentResolver.loadThumbnail(contentUri, Size(96, 96), null)
-        }
-    } catch (_: Exception) {
-        null
-    }
 }
 
 @Composable
@@ -2811,7 +2885,11 @@ private fun RecordingPausedChooser(
 ) {
     val selectedAction = cameraState.recordingPausedAction
     val previewVisible = cameraState.recordingPreviewVisible
-    Box(modifier = modifier) {
+    Box(
+        modifier = modifier.alpha(
+            if (previewVisible) RECORDING_PREVIEW_MENU_ALPHA else 1f,
+        ),
+    ) {
         if (cameraState.recordingLocationChooserVisible) {
             if (cameraState.recordingSaveConfirmationVisible) {
                 val destination = cameraState.recordingSaveLocations
@@ -2968,6 +3046,9 @@ private fun RecordingPausedChooser(
     }
 }
 
+/** Keep paused-recording actions locatable without obscuring the video being reviewed. */
+private const val RECORDING_PREVIEW_MENU_ALPHA = 0.20f
+
 @Composable
 private fun RecordingChoiceChip(
     label: String,
@@ -3071,7 +3152,7 @@ private fun RecordingSegmentPreview(modifier: Modifier = Modifier) {
         modifier = modifier.background(DiveColors.DeepBlack),
     ) {
         if (uri != null) {
-            LoopingVideo(uri = uri!!, modifier = Modifier.fillMaxSize())
+            LoopingVideo(uri = uri!!, modifier = Modifier.fillMaxSize(), playbackSpeed = RecordingClock.reviewPlaybackSpeed.value)
         } else {
             Text(
                 text = if (finalizing) "Finalizing preview…" else "Preview unavailable",
@@ -3087,18 +3168,19 @@ internal fun LoopingVideo(
     uri: android.net.Uri,
     modifier: Modifier = Modifier,
     playing: Boolean = true,
+    playbackSpeed: Float = 1f,
     onProgress: ((positionMs: Long, durationMs: Long) -> Unit)? = null,
 ) {
     AndroidView(
         factory = { context ->
             LoopingVideoTextureView(context).apply {
                 setProgressListener(onProgress)
-                play(uri, playing)
+                play(uri, playing, playbackSpeed)
             }
         },
         update = { view ->
             view.setProgressListener(onProgress)
-            view.play(uri, playing)
+            view.play(uri, playing, playbackSpeed)
         },
         modifier = modifier,
     )

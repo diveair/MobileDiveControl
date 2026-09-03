@@ -119,7 +119,10 @@ class ControlReducer(
 
         when (permission) {
             PermissionKind.Accessibility -> {
-                if (!granted) {
+                // During a clean install Compose observes the native permission state before the
+                // accessibility service has bound. That initial false is still onboarding, not a
+                // revocation, and must not replace the default camera screen with Diagnostics.
+                if (wasGranted && !granted) {
                     val note = "Accessibility Permission: Disabled"
                     nextState = nextState.copy(
                         mode = fallbackMode(nextState),
@@ -286,6 +289,7 @@ class ControlReducer(
             state = state.copy(
                 camera = state.camera.copy(
                     panoramaReviewAvailable = true,
+                    panoramaReviewInputArmed = false,
                     panoramaReviewAction = PanoramaReviewAction.Save,
                     focusedZone = CameraUiZone.LiveView,
                     showMoreSettings = false,
@@ -293,15 +297,20 @@ class ControlReducer(
                 ),
             ),
         )
+        CameraCommand.ArmPanoramaReviewInput -> {
+            if (!state.camera.panoramaReviewAvailable) Reduction(state = state)
+            else Reduction(state = state.copy(camera = state.camera.copy(panoramaReviewInputArmed = true)))
+        }
         CameraCommand.SavePanorama,
         CameraCommand.DeletePanorama -> {
-            if (!state.camera.panoramaReviewAvailable) {
+            if (!state.camera.panoramaReviewAvailable || !state.camera.panoramaReviewInputArmed) {
                 Reduction(state = state)
             } else {
                 Reduction(
                     state = state.copy(
                         camera = state.camera.copy(
                             panoramaReviewAvailable = false,
+                            panoramaReviewInputArmed = false,
                             panoramaReviewAction = PanoramaReviewAction.Save,
                             captureCounter = if (command == CameraCommand.SavePanorama) {
                                 state.camera.captureCounter + 1
@@ -316,20 +325,25 @@ class ControlReducer(
         }
         // The router only sends Toggle/Start when nothing is recording, so both mean "begin".
         CameraCommand.ToggleVideoRecording,
-        CameraCommand.StartVideoRecording -> Reduction(
-            state = state.copy(
-                camera = state.camera.copy(
-                    recording = true,
-                    recordingPaused = false,
-                    recordingPausedAction = RecordingPausedAction.Resume,
-                    recordingPreviewVisible = false,
-                    recordingLocationFocused = false,
-                    recordingLocationChooserVisible = false,
-                    recordingSaveConfirmationVisible = false,
+        CameraCommand.StartVideoRecording -> when {
+            !state.permissions.camera -> warning(state, "Camera Permission: Disabled")
+            recordingAudioRequired(state.camera) && !state.permissions.microphone ->
+                warning(state, "Microphone Permission: Disabled")
+            else -> Reduction(
+                state = state.copy(
+                    camera = state.camera.copy(
+                        recording = true,
+                        recordingPaused = false,
+                        recordingPausedAction = RecordingPausedAction.Resume,
+                        recordingPreviewVisible = false,
+                        recordingLocationFocused = false,
+                        recordingLocationChooserVisible = false,
+                        recordingSaveConfirmationVisible = false,
+                    ),
                 ),
-            ),
-            effects = listOf(PlatformEffect.ExecuteCamera(CameraCommand.StartVideoRecording)),
-        )
+                effects = listOf(PlatformEffect.ExecuteCamera(CameraCommand.StartVideoRecording)),
+            )
+        }
         CameraCommand.PauseVideoRecording -> Reduction(
             state = state.copy(
                 camera = state.camera.copy(
@@ -546,10 +560,10 @@ class ControlReducer(
         is CameraCommand.SetCaptureFormat,
         is CameraCommand.SetHdrLogMode,
         is CameraCommand.SetFilter,
-        CameraCommand.OpenGallery,
         CameraCommand.ToggleGrid,
         CameraCommand.ToggleFocusPeaking,
         CameraCommand.RestartCamera -> emitCameraEffect(state, command)
+        CameraCommand.OpenGallery -> openCameraGallery(state)
         is CameraCommand.ReportRuntimeFailure -> warning(state, command.message)
         is CameraCommand.NudgeSetting -> {
             val spec = CameraCatalog.settingsFor(state.camera)
@@ -602,6 +616,26 @@ class ControlReducer(
             Reduction(state = state.copy(camera = nextCamera))
         }
     }
+
+    private fun openCameraGallery(state: AppState): Reduction = Reduction(
+        state = state.copy(
+            mode = AppMode.Gallery,
+            gallery = state.gallery.copy(
+                viewMode = GalleryViewMode.Browser,
+                items = emptyList(),
+                selectedIndex = 0,
+                currentFolder = null,
+                currentFolderName = null,
+                previewExifLines = emptyList(),
+                detailsVisible = false,
+                videoPlaying = false,
+                browserBackFocused = false,
+                browserAction = null,
+                operationMessage = null,
+            ),
+        ),
+        effects = listOf(PlatformEffect.LoadGalleryItems),
+    )
 
     private fun reducePhoneControl(state: AppState, command: PhoneControlCommand): Reduction {
         if (!state.permissions.canUsePhoneControl()) {
@@ -965,12 +999,7 @@ class ControlReducer(
         pausedChooserNavigation(state, verticalStep = -1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
-            CameraUiZone.LiveView -> {
-                val focused = focusModeRail(camera)
-                val size = CameraCatalog.primaryRailEntries.size
-                val nextIndex = (focused.highlightedPrimaryIndex - 1 + size) % size
-                Reduction(state = state.copy(camera = focused.copy(highlightedPrimaryIndex = nextIndex)))
-            }
+            CameraUiZone.LiveView -> cycleModeFromSettingsBar(state, -1)
             CameraUiZone.ModeRail -> {
                 val nextCamera = if (camera.railLevel == CameraRailLevel.Primary) {
                     val size = CameraCatalog.primaryRailEntries.size
@@ -1001,12 +1030,7 @@ class ControlReducer(
         pausedChooserNavigation(state, verticalStep = +1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
-            CameraUiZone.LiveView -> {
-                val focused = focusModeRail(camera)
-                val size = CameraCatalog.primaryRailEntries.size
-                val nextIndex = (focused.highlightedPrimaryIndex + 1) % size
-                Reduction(state = state.copy(camera = focused.copy(highlightedPrimaryIndex = nextIndex)))
-            }
+            CameraUiZone.LiveView -> cycleModeFromSettingsBar(state, +1)
             CameraUiZone.ModeRail -> {
                 val nextCamera = if (camera.railLevel == CameraRailLevel.Primary) {
                     val size = CameraCatalog.primaryRailEntries.size
@@ -1069,9 +1093,7 @@ class ControlReducer(
         pausedChooserNavigation(state, horizontalStep = +1)?.let { return it }
         val camera = state.camera
         return when (camera.focusedZone) {
-            CameraUiZone.LiveView -> Reduction(
-                state = state.copy(camera = focusModeRail(camera).copy(highlightedPrimaryIndex = 0)),
-            )
+            CameraUiZone.LiveView -> openSettingsPanel(state, camera.activeMode)
             CameraUiZone.ModeRail -> enterFromModeRail(state)
             CameraUiZone.SettingsPanel -> {
                 if (camera.showMoreSettings) {
@@ -1087,6 +1109,7 @@ class ControlReducer(
 
     private fun confirmCameraSelection(state: AppState): Reduction {
         if (state.camera.panoramaReviewAvailable) {
+            if (!state.camera.panoramaReviewInputArmed) return Reduction(state = state)
             val command = when (state.camera.panoramaReviewAction) {
                 PanoramaReviewAction.Save -> CameraCommand.SavePanorama
                 PanoramaReviewAction.Delete -> CameraCommand.DeletePanorama
@@ -1220,19 +1243,6 @@ class ControlReducer(
         }
     }
 
-    private fun focusModeRail(camera: CameraState): CameraState {
-        return camera.copy(
-            focusedZone = CameraUiZone.ModeRail,
-            modeRailReturnZone = CameraUiZone.LiveView,
-            railLevel = CameraRailLevel.Primary,
-            // Up/Down from live view means cycle relative to the active capture mode. The
-            // explicit Modes-button/right-entry path overrides this to Track Heading (index 0).
-            highlightedPrimaryIndex = CameraCatalog.primaryIndexForMode(camera.activeMode),
-            settingsEditing = false,
-            sliderEditTarget = SliderEditTarget.Value,
-        )
-    }
-
     private fun modeRailForCurrentMode(
         camera: CameraState,
         returnZone: CameraUiZone = CameraUiZone.LiveView,
@@ -1241,9 +1251,10 @@ class ControlReducer(
             focusedZone = CameraUiZone.ModeRail,
             modeRailReturnZone = returnZone,
             railLevel = CameraRailLevel.Primary,
-            // Reopening the centred Mode menu resumes on the last active/persisted mode instead
-            // of jumping to the first action entry and losing the user's place.
-            highlightedPrimaryIndex = CameraCatalog.primaryIndexForMode(camera.activeMode),
+            // Every deliberate menu opening starts at its first action. The active camera mode is
+            // still remembered and remains unchanged; only the side-menu cursor resets so the
+            // housing always presents Track Heading at the top, regardless of its last position.
+            highlightedPrimaryIndex = 0,
             highlightedSecondaryIndex = CameraCatalog.secondaryIndexForMode(camera.activeMode),
             settingsEditing = false,
             sliderEditTarget = SliderEditTarget.Value,
@@ -1484,25 +1495,7 @@ class ControlReducer(
                     effects = listOf(PlatformEffect.ExecuteCamera(effect))
                 )
             }
-            is BottomBarItem.GalleryShortcut -> Reduction(
-                state = state.copy(
-                    mode = AppMode.Gallery,
-                    gallery = state.gallery.copy(
-                        viewMode = GalleryViewMode.Browser,
-                        items = emptyList(),
-                        selectedIndex = 0,
-                        currentFolder = null,
-                        currentFolderName = null,
-                        previewExifLines = emptyList(),
-                        detailsVisible = false,
-                        videoPlaying = false,
-                        browserBackFocused = false,
-                        browserAction = null,
-                        operationMessage = null,
-                    ),
-                ),
-                effects = listOf(PlatformEffect.LoadGalleryItems),
-            )
+            is BottomBarItem.GalleryShortcut -> openCameraGallery(state)
             is BottomBarItem.MoreSettings -> {
                 toggleOptionsMenu(state)
             }
@@ -1695,8 +1688,13 @@ class ControlReducer(
                 notes = listOf(warning),
             )
         }
-        val manualFocusPreparation = if (spec.id.endsWith(".manual_focus")) {
-            prepareStateForManualFocus(state)
+        val adjustingFocusValue = spec.id.endsWith(".manual_focus") &&
+            (!state.camera.settingsEditing || state.camera.sliderEditTarget == SliderEditTarget.Value)
+        if (adjustingFocusValue && proFocusNeedsMainLens(state.camera) && state.camera.recording) {
+            return warning(state, "Stop recording before switching to 1x for focus control.")
+        }
+        val manualFocusPreparation = if (adjustingFocusValue) {
+            prepareStateForManualFocus(state, adjustingValue = true)
         } else {
             ManualFocusPreparation(state)
         }
@@ -2106,8 +2104,28 @@ class ControlReducer(
         }
     }
 
-    private fun prepareStateForManualFocus(state: AppState): ManualFocusPreparation =
-        ManualFocusPreparation(state)
+    private fun proFocusNeedsMainLens(camera: CameraState): Boolean = when (camera.activeMode) {
+        CameraModeId.Pro -> camera.settingValues["pro.lens"] == "0.6x"
+        CameraModeId.ProVideo -> camera.settingValues["pro_video.lens"] == "0.6x"
+        else -> false
+    }
+
+    private fun prepareStateForManualFocus(
+        state: AppState,
+        adjustingValue: Boolean = false,
+    ): ManualFocusPreparation {
+        if (!adjustingValue || !proFocusNeedsMainLens(state.camera)) return ManualFocusPreparation(state)
+        val lensId = if (state.camera.activeMode == CameraModeId.Pro) "pro.lens" else "pro_video.lens"
+        val camera = applySettingValue(state.camera, lensId, "1x").copy(
+            // The current capability belongs to 0.6x, not the main camera being opened.
+            // Allow this first detent; the runtime probes and applies focus on the new lens.
+            capabilities = state.camera.capabilities?.copy(manualFocusSupported = null),
+        )
+        return ManualFocusPreparation(
+            state.copy(camera = camera),
+            listOf(PlatformEffect.ExecuteCamera(CameraCommand.SwitchLens("1x"))),
+        )
+    }
 
     private fun applySettingValue(camera: CameraState, settingId: String, value: String): CameraState {
         val prefix = settingId.substringBeforeLast('.', "")
@@ -2854,6 +2872,14 @@ class ControlReducer(
      * a manual shutter while the sensor stayed on auto-exposure.
      */
     private fun parseShutterSpeedNs(value: String): Long? = CameraCatalog.shutterOptionNanos(value)
+
+    /** Only an enabled audio control makes microphone permission a recording prerequisite. */
+    private fun recordingAudioRequired(camera: CameraState): Boolean {
+        val audio = CameraCatalog.settingsFor(camera)
+            .firstOrNull { it.id.endsWith(".audio_recording") }
+            ?: return false
+        return CameraCatalog.currentValue(camera, audio) == "On"
+    }
 
     private fun emitCameraEffect(state: AppState, command: CameraCommand): Reduction {
         return if (!state.permissions.camera) {

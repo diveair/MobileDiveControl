@@ -1,6 +1,7 @@
 package com.mobiledivecontrol.ui.camera
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -14,10 +15,28 @@ class ExpertRawCapturePolicyTest {
     }
 
     @Test
+    fun `effected live graph remains JPEG and incompatible outputs use a shutter transaction`() {
+        StillCaptureOutput.entries.forEach { requested ->
+            assertEquals(StillCaptureOutput.Jpeg, livePreviewCaptureOutput(requested, previewAssistanceRequired = true))
+        }
+        assertFalse(requiresDetachedStillCapture(StillCaptureOutput.Jpeg))
+        assertTrue(requiresDetachedStillCapture(StillCaptureOutput.Raw))
+        assertTrue(requiresDetachedStillCapture(StillCaptureOutput.RawJpeg))
+        assertTrue(requiresDetachedStillCapture(StillCaptureOutput.UltraHdrJpeg))
+    }
+
+    @Test
     fun `virtual aperture has a continuous F16 to F1_4 effect range`() {
         assertEquals(0.0, virtualApertureStrength("F16.0"), 1e-9)
         assertTrue(virtualApertureStrength("F8.0") in 0.5..0.6)
         assertEquals(1.0, virtualApertureStrength("F1.4"), 1e-9)
+    }
+
+    @Test
+    fun `ordinary still preview keeps requested output ready before shutter`() {
+        StillCaptureOutput.entries.forEach { requested ->
+            assertEquals(requested, livePreviewCaptureOutput(requested))
+        }
     }
 
     @Test

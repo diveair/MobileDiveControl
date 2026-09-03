@@ -37,6 +37,7 @@ fun HousingLinkBanner(
     bleState: BleConnectionState,
     modifier: Modifier = Modifier,
     bluetoothEnabled: Boolean = true,
+    housingBatteryPercent: Int? = null,
 ) {
     // A radio that is switched off says nothing about the housing, so it must never be reported as
     // a housing fault. It also outranks every link state below it: no scan can succeed until it is
@@ -44,7 +45,7 @@ fun HousingLinkBanner(
     val alert = if (!bluetoothEnabled) {
         info("BLUETOOTH IS OFF", "Turn on Bluetooth to connect the housing")
     } else {
-        alertFor(bleState) ?: return
+        alertFor(bleState, housingBatteryPercent) ?: return
     }
 
     Column(
@@ -94,14 +95,17 @@ fun HousingLinkBanner(
  * @param action what the diver should physically do. Null when there is nothing to do but wait —
  *   inventing an instruction for a state that resolves itself trains people to ignore the banner.
  */
-private data class LinkAlert(
+internal data class LinkAlert(
     val headline: String,
     val action: String?,
     val background: Color,
     val foreground: Color,
 )
 
-private fun alertFor(bleState: BleConnectionState): LinkAlert? = when (bleState) {
+internal fun alertFor(
+    bleState: BleConnectionState,
+    housingBatteryPercent: Int? = null,
+): LinkAlert? = when (bleState) {
     BleConnectionState.Ready -> null
     BleConnectionState.Idle,
     BleConnectionState.Scanning,
@@ -113,9 +117,16 @@ private fun alertFor(bleState: BleConnectionState): LinkAlert? = when (bleState)
     BleConnectionState.Degraded -> caution("HOUSING LINK DEGRADED", "Some sensors unavailable")
     BleConnectionState.Reconnecting ->
         warning("HOUSING DISCONNECTED", "Reconnecting — if the housing is off, hold SHUTTER for 3 seconds")
-    BleConnectionState.Failed ->
+    BleConnectionState.Failed -> if (housingBatteryPercent == 0) {
         warning("HOUSING UNAVAILABLE", "Charge the housing, then hold SHUTTER to turn it on")
+    } else {
+        // A failed scan/connection says nothing about battery charge. Startup commonly passes
+        // through Failed while Bluetooth permission is being established, so do not invent a
+        // dead-battery diagnosis without an actual zero-percent reading from the housing.
+        caution("HOUSING NOT CONNECTED", "Hold SHUTTER to turn on the housing and connect Bluetooth")
+    }
 }
+
 
 /** Blue, not amber or red: this is information and an easy fix, not a fault or a danger. */
 private fun info(headline: String, action: String?) = LinkAlert(

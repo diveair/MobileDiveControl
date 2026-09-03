@@ -47,9 +47,10 @@ class SpecialModeColourTest {
         assertEquals(2.0, hyperlapseFrameIntervalSeconds(60), 1e-9)
         assertEquals(2_000L, hyperlapsePlaybackDurationMs(10_000L, 5))
         assertEquals(0L, hyperlapsePlaybackDurationMs(-1L, 10))
-        assertEquals(5, hyperlapseSpeedFactor("Auto", "Day", 10))
+        assertEquals(15, hyperlapseSpeedFactor("Auto", "Day", 0))
+        assertEquals(15, hyperlapseSpeedFactor("Auto", "Day", 10))
         assertEquals(45, hyperlapseSpeedFactor("Auto", "Day", 100))
-        assertEquals(5, hyperlapseSpeedFactor("Auto", "Day", 98))
+        assertEquals(15, hyperlapseSpeedFactor("Auto", "Day", 98))
         assertEquals(45, hyperlapseSpeedFactor("Auto", "Night", 10))
         assertEquals("00:00:00", hyperlapseClockText(-1L))
         assertEquals("01:01:01", hyperlapseClockText(3_661_999L))
@@ -73,7 +74,8 @@ class SpecialModeColourTest {
         assertEquals(-0.2f, panoramaSweepAxisRate("Down", 1, -0.8f, 0.2f), 1e-6f)
         assertEquals("Right", panoramaDirectionFromGyro(1, -0.8f, 0.1f))
         assertEquals("Left", panoramaDirectionFromGyro(1, 0.8f, 0.1f))
-        assertEquals("Right", panoramaDirectionFromGyro(1, -0.1f, 0.8f))
+        assertEquals("Up", panoramaDirectionFromGyro(1, -0.1f, 0.8f))
+        assertEquals("Down", panoramaDirectionFromGyro(1, -0.1f, -0.8f))
         assertEquals(1f, panoramaProgressFraction(PANORAMA_HORIZONTAL_TARGET_RADIANS), 1e-6f)
         assertEquals(1f, panoramaProgressFraction(PANORAMA_VERTICAL_TARGET_RADIANS, "Up"), 1e-6f)
         assertEquals(
@@ -91,10 +93,191 @@ class SpecialModeColourTest {
 
     @Test
     fun `panorama direction ignores shutter jitter until sustained screen motion`() {
-        assertEquals(null, panoramaDirectionFromAccumulatedMotion(0.008f))
-        assertEquals(null, panoramaDirectionFromAccumulatedMotion(-0.02f))
-        assertEquals("Right", panoramaDirectionFromAccumulatedMotion(0.06f))
-        assertEquals("Left", panoramaDirectionFromAccumulatedMotion(-0.06f))
+        assertEquals(null, panoramaDirectionFromAccumulatedMotion(0.008f, 0.004f))
+        assertEquals(null, panoramaDirectionFromAccumulatedMotion(-0.02f, 0.01f))
+        assertEquals(null, panoramaDirectionFromAccumulatedMotion(0.06f, 0.058f))
+        assertEquals("Right", panoramaDirectionFromAccumulatedMotion(0.06f, 0.01f))
+        assertEquals("Left", panoramaDirectionFromAccumulatedMotion(-0.06f, 0.01f))
+        assertEquals("Up", panoramaDirectionFromAccumulatedMotion(0.01f, 0.06f))
+        assertEquals("Down", panoramaDirectionFromAccumulatedMotion(0.01f, -0.06f))
+    }
+
+    @Test
+    fun `panorama uses gravity orientation when the activity remains landscape locked`() {
+        assertEquals(0, panoramaPhysicalDisplayRotation(0.4f, 9.7f, 1))
+        assertEquals(2, panoramaPhysicalDisplayRotation(0.4f, -9.7f, 1))
+        assertEquals(1, panoramaPhysicalDisplayRotation(9.7f, 0.4f, 1))
+        assertEquals(1, panoramaPhysicalDisplayRotation(-9.7f, 0.4f, 1))
+        assertEquals(1, panoramaPhysicalDisplayRotation(0.1f, 0.1f, 1))
+
+        // The gyro-Y motion that the locked-landscape mapping calls Up is a rightward sweep when
+        // the same phone is physically upright in portrait.
+        assertEquals("Up", panoramaDirectionFromGyro(1, 0.1f, 0.8f))
+        assertEquals("Right", panoramaDirectionFromGyro(0, 0.1f, 0.8f))
+
+        assertEquals("Left", panoramaBitmapDirection("Up", 0, 1))
+        assertEquals("Right", panoramaBitmapDirection("Down", 0, 1))
+        assertEquals("Right", panoramaBitmapDirection("Right", 1, 1))
+        assertEquals("Down", panoramaPreviewDirection("Up", 0))
+        assertEquals("Up", panoramaPreviewDirection("Down", 0))
+        assertEquals("Up", panoramaPreviewDirection("Up", 1))
+
+        // Whatever direction the physical stitch uses must rotate back to the exact direction
+        // drawn by the locked-landscape guide. This is the invariant broken by the portrait bug.
+        for (physicalRotation in 0..3) {
+            for (guideDirection in listOf("Up", "Right", "Down", "Left")) {
+                val physicalDirection = panoramaBitmapDirection(
+                    guideDirection = guideDirection,
+                    physicalDisplayRotation = physicalRotation,
+                    guideDisplayRotation = 1,
+                )
+                assertEquals(
+                    panoramaPreviewDirection(guideDirection, physicalRotation),
+                    panoramaDirectionBetweenDisplays(
+                        direction = physicalDirection,
+                        sourceDisplayRotation = physicalRotation,
+                        targetDisplayRotation = 1,
+                    ),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `panorama cross edge follows frame orientation independently from sweep axis`() {
+        assertEquals(1080, panoramaTargetCrossPixels(1920, 1080, 1080, "Right", 1))
+        assertEquals(1920, panoramaTargetCrossPixels(1920, 1080, 1080, "Up", 1))
+        assertEquals(1920, panoramaTargetCrossPixels(1920, 1080, 1080, "Right", 0))
+        assertEquals(1080, panoramaTargetCrossPixels(1920, 1080, 1080, "Up", 0))
+    }
+
+    @Test
+    fun `panorama live strip contains every frame from start through current guide`() {
+        val right = panoramaLiveStripRect("Right", 100f, 80f, 220f, 82f, 132f, 88f)
+        assertEquals(34f, right.left, 1e-6f)
+        assertEquals(286f, right.right, 1e-6f)
+        assertEquals(38f, right.top, 1e-6f)
+        assertEquals(126f, right.bottom, 1e-6f)
+
+        val up = panoramaLiveStripRect("Up", 100f, 180f, 96f, 60f, 88f, 132f)
+        assertEquals(52f, up.left, 1e-6f)
+        assertEquals(140f, up.right, 1e-6f)
+        assertEquals(-6f, up.top, 1e-6f)
+        assertEquals(246f, up.bottom, 1e-6f)
+    }
+
+    @Test
+    fun `panorama live thumbnail preserves aspect ratio and anchors to sweep origin`() {
+        val right = panoramaLiveThumbnailRect(
+            direction = "Right",
+            groupLeft = 0f,
+            groupTop = 0f,
+            groupWidth = 340f,
+            groupHeight = 88f,
+            bitmapWidth = 396,
+            bitmapHeight = 132,
+            inset = 2f,
+        )
+        assertEquals(2f, right.left, 1e-6f)
+        assertEquals(254f, right.right, 1e-6f)
+        assertEquals(2f, right.top, 1e-6f)
+        assertEquals(86f, right.bottom, 1e-6f)
+
+        val left = panoramaLiveThumbnailRect(
+            direction = "Left",
+            groupLeft = 0f,
+            groupTop = 0f,
+            groupWidth = 340f,
+            groupHeight = 88f,
+            bitmapWidth = 396,
+            bitmapHeight = 132,
+            inset = 2f,
+        )
+        assertEquals(86f, left.left, 1e-6f)
+        assertEquals(338f, left.right, 1e-6f)
+
+        val down = panoramaLiveThumbnailRect(
+            direction = "Down",
+            groupLeft = 10f,
+            groupTop = 20f,
+            groupWidth = 88f,
+            groupHeight = 250f,
+            bitmapWidth = 132,
+            bitmapHeight = 264,
+            inset = 2f,
+        )
+        assertEquals(12f, down.left, 1e-6f)
+        assertEquals(96f, down.right, 1e-6f)
+        assertEquals(22f, down.top, 1e-6f)
+        assertEquals(190f, down.bottom, 1e-6f)
+
+        val up = panoramaLiveThumbnailRect(
+            direction = "Up",
+            groupLeft = 10f,
+            groupTop = 20f,
+            groupWidth = 88f,
+            groupHeight = 250f,
+            bitmapWidth = 132,
+            bitmapHeight = 264,
+            inset = 2f,
+        )
+        assertEquals(100f, up.top, 1e-6f)
+        assertEquals(268f, up.bottom, 1e-6f)
+    }
+
+    @Test
+    fun `panorama locked guide traverses the complete screen lane`() {
+        val rightStart = panoramaGuideTrack(
+            direction = "Right",
+            groupLeft = 20f,
+            groupTop = 100f,
+            groupWidth = 1_000f,
+            groupHeight = 120f,
+            frameWidth = 180f,
+            frameHeight = 120f,
+            progress = 0f,
+        )
+        assertEquals(110f, rightStart.startX, 1e-6f)
+        assertEquals(110f, rightStart.currentX, 1e-6f)
+
+        val rightEnd = panoramaGuideTrack(
+            direction = "Right",
+            groupLeft = 20f,
+            groupTop = 100f,
+            groupWidth = 1_000f,
+            groupHeight = 120f,
+            frameWidth = 180f,
+            frameHeight = 120f,
+            progress = 1f,
+        )
+        assertEquals(930f, rightEnd.currentX, 1e-6f)
+        val fullStrip = panoramaLiveStripRect(
+            direction = "Right",
+            startX = rightEnd.startX,
+            startY = rightEnd.startY,
+            currentX = rightEnd.currentX,
+            currentY = rightEnd.currentY,
+            frameWidth = 180f,
+            frameHeight = 120f,
+        )
+        assertEquals(20f, fullStrip.left, 1e-6f)
+        assertEquals(1_020f, fullStrip.right, 1e-6f)
+
+        val upEnd = panoramaGuideTrack(
+            direction = "Up",
+            groupLeft = 500f,
+            groupTop = 30f,
+            groupWidth = 120f,
+            groupHeight = 900f,
+            frameWidth = 120f,
+            frameHeight = 180f,
+            progress = 1f,
+            crossOffset = 8f,
+        )
+        assertEquals(560f, upEnd.startX, 1e-6f)
+        assertEquals(568f, upEnd.currentX, 1e-6f)
+        assertEquals(840f, upEnd.startY, 1e-6f)
+        assertEquals(120f, upEnd.currentY, 1e-6f)
     }
 
     @Test
@@ -194,6 +377,34 @@ class SpecialModeColourTest {
 
         assertEquals(14, offset.x)
         assertEquals(0, offset.y)
+    }
+
+    @Test
+    fun `panorama registration rejects a stronger distant match from repeated detail`() {
+        val expected = panoramaRegistrationScore(
+            correlation = 0.82,
+            advance = 40,
+            expectedAdvance = 40,
+            crossDrift = 0,
+            maximumCrossDrift = 20,
+        )
+        val repeatedFeature = panoramaRegistrationScore(
+            correlation = 0.90,
+            advance = 22,
+            expectedAdvance = 40,
+            crossDrift = 0,
+            maximumCrossDrift = 20,
+        )
+        val genuineCorrection = panoramaRegistrationScore(
+            correlation = 0.99,
+            advance = 46,
+            expectedAdvance = 40,
+            crossDrift = 2,
+            maximumCrossDrift = 20,
+        )
+
+        assertTrue(expected > repeatedFeature)
+        assertTrue(genuineCorrection > expected)
     }
 
     @Test

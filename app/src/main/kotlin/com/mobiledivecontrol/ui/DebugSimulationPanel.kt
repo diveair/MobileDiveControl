@@ -134,9 +134,11 @@ fun DebugSimulationPanel(
                 exit = fadeOut(),
             ) {
                 Box(
-                    modifier = Modifier
-                        .padding(end = 4.dp)
-                        .then(dragModifier),
+                    // Do not put the parent's drag recognizer over the button cluster. It won
+                    // the pointer-input gesture arena before the children could complete their
+                    // tap, so the controls looked enabled but navigation callbacks never fired.
+                    // The adjacent bug/close handle still moves the complete floating unit.
+                    modifier = Modifier.padding(end = 4.dp),
                 ) {
                     DebugButtonCluster(viewModel = viewModel)
                 }

@@ -38,6 +38,7 @@ desktop.ini
 # Local recovery and analysis scratch data
 .codex-tmp/
 /tmp/
+/artifacts/
 
 # Graphify machine-local caches, intermediates, and conversation memory
 /graphify-out/cache/

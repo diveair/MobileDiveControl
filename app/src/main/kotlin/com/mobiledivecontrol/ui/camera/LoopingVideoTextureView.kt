@@ -25,6 +25,8 @@ internal class LoopingVideoTextureView @JvmOverloads constructor(
     private var source: Uri? = null
     private var player: MediaPlayer? = null
     private var shouldPlay = true
+    private var playbackSpeed = 1f
+    private var appliedPlaybackSpeed: Float? = null
     private var videoWidth = 0
     private var videoHeight = 0
     private val progressHandler = Handler(Looper.getMainLooper())
@@ -43,8 +45,9 @@ internal class LoopingVideoTextureView @JvmOverloads constructor(
         isOpaque = true
     }
 
-    fun play(uri: Uri, playing: Boolean = true) {
+    fun play(uri: Uri, playing: Boolean = true, speed: Float = 1f) {
         shouldPlay = playing
+        playbackSpeed = speed
         if (source == uri && player != null) {
             applyPlaybackState()
             return
@@ -67,6 +70,11 @@ internal class LoopingVideoTextureView @JvmOverloads constructor(
     private fun applyPlaybackState() {
         val activePlayer = player ?: return
         runCatching {
+            if (appliedPlaybackSpeed != playbackSpeed) {
+                activePlayer.playbackParams = android.media.PlaybackParams().setSpeed(playbackSpeed)
+                appliedPlaybackSpeed = playbackSpeed
+                Log.i("RecordingPreview", "Playback speed=$playbackSpeed source=$source")
+            }
             if (shouldPlay) {
                 if (!activePlayer.isPlaying) activePlayer.start()
             } else if (activePlayer.isPlaying) {
@@ -141,6 +149,7 @@ internal class LoopingVideoTextureView @JvmOverloads constructor(
         player?.runCatching { stop() }
         player?.release()
         player = null
+        appliedPlaybackSpeed = null
     }
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {

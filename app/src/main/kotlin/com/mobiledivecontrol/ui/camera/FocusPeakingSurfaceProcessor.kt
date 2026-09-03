@@ -19,7 +19,9 @@ import androidx.camera.core.SurfaceRequest
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
 
 /**
  * GPU-accelerated focus peaking via OpenGL ES 2.0 fragment shader.
@@ -186,6 +188,31 @@ void main() {
     @Volatile var lastDrawSuccessAtMs = 0L
     @Volatile var peakingThreshold = 0.9f
 
+    // CameraX may deliver the previous effect's SurfaceRequest/SurfaceOutput callbacks after a
+    // replacement graph has already been bound. Each CameraEffect receives a generation-scoped
+    // wrapper so those stale callbacks can only release their own resources, never the active
+    // PreviewView surface.
+    private val bindingGenerationLock = Any()
+    @Volatile private var activeBindingGeneration = 0L
+    @Volatile private var released = false
+
+    fun newBinding(cameraBindingGeneration: Long): SurfaceProcessor {
+        val surfaceGeneration = synchronized(bindingGenerationLock) {
+            check(!released) { "Focus peaking processor is released" }
+            ++activeBindingGeneration
+        }
+        lastDrawSuccessAtMs = 0L
+        return object : SurfaceProcessor {
+            override fun onInputSurface(request: SurfaceRequest) {
+                onInputSurface(surfaceGeneration, cameraBindingGeneration, request)
+            }
+
+            override fun onOutputSurface(output: SurfaceOutput) {
+                onOutputSurface(surfaceGeneration, output)
+            }
+        }
+    }
+
     // ── GL thread ─────────────────────────────────────────────────────
     private val glThread = HandlerThread("GL-FocusPeak").apply { start() }
     private val glH = Handler(glThread.looper)
@@ -204,6 +231,7 @@ void main() {
     // ── Output ────────────────────────────────────────────────────────
     private var outEgl: EGLSurface = EGL14.EGL_NO_SURFACE
     private var outSO: SurfaceOutput? = null
+    private var outGeneration = 0L
     private var outW = 0
     private var outH = 0
     private var inW = 0
@@ -223,14 +251,37 @@ void main() {
 
     // ──────────────────────────────────────────────────────────────────
     override fun onInputSurface(request: SurfaceRequest) {
+        val generation = activeBindingGeneration
+        onInputSurface(generation, generation, request)
+    }
+
+    private fun onInputSurface(
+        surfaceGeneration: Long,
+        cameraBindingGeneration: Long,
+        request: SurfaceRequest,
+    ) {
         val sz = request.resolution
         // The single number that sizes every other GPU decision here: StreamSharing may hand
         // this node a surface scaled for the UHD video child rather than for preview, which is
         // 4x the per-frame bandwidth on a pass that runs whether Assist is on or off.
-        Log.i(TAG, "peaking input surface ${sz.width}x${sz.height}")
-        glH.post {
+        Log.i(
+            TAG,
+            "peaking input surface ${sz.width}x${sz.height} " +
+                "surfaceGeneration=$surfaceGeneration cameraGeneration=$cameraBindingGeneration",
+        )
+        val posted = glH.post {
+            if (released || surfaceGeneration != activeBindingGeneration) {
+                request.willNotProvideSurface()
+                return@post
+            }
             try {
                 eglInit()
+                // A previous binding leaves this context current on its PreviewView window.
+                // That window may already be disconnected by the time CameraX delivers the
+                // replacement input callback. Create the new external texture only while the
+                // durable pbuffer is current; otherwise glGenTextures can silently operate
+                // against a destroyed EGLSurface and the new binding swaps black forever.
+                makeTemporarySurfaceCurrent()
                 progInit()
                 bufInit()
                 texInit(sz.width, sz.height)
@@ -254,47 +305,106 @@ void main() {
                         }
                     }
                 }
-                st.setOnFrameAvailableListener({ glH.post { draw() } })
+                st.setOnFrameAvailableListener {
+                    glH.post { draw(surfaceGeneration, cameraBindingGeneration, st) }
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "onInputSurface failed", e)
+                runCatching { request.willNotProvideSurface() }
             }
         }
+        if (!posted) runCatching { request.willNotProvideSurface() }
     }
 
     override fun onOutputSurface(output: SurfaceOutput) {
-        glH.post {
+        onOutputSurface(activeBindingGeneration, output)
+    }
+
+    private fun onOutputSurface(generation: Long, output: SurfaceOutput) {
+        if (released || generation != activeBindingGeneration) {
+            output.close()
+            return
+        }
+        val posted = glH.post {
+            if (released || generation != activeBindingGeneration) {
+                output.close()
+                return@post
+            }
             try {
-                outSO?.close()
+                // SurfaceProcessor does not guarantee callback ordering. Initialising EGL here
+                // as well makes an output-first callback safe instead of relying on input-first.
+                eglInit()
+                // Never destroy a window surface while it is still the context's current draw
+                // target. Qualcomm accepts that sequence but the next external-texture binding
+                // can remain black even though eglSwapBuffers keeps returning true.
+                makeTemporarySurfaceCurrent()
+                progInit()
+                bufInit()
                 if (outEgl != EGL14.EGL_NO_SURFACE) {
                     EGL14.eglDestroySurface(dpy, outEgl)
                     outEgl = EGL14.EGL_NO_SURFACE
                 }
+                // Destroying EGL first disconnects NATIVE_WINDOW_API_EGL before CameraX closes
+                // the old SurfaceOutput and hands the same PreviewView buffer queue back to us.
+                outSO?.close()
                 outSO = output
+                outGeneration = generation
                 outW = output.size.width
                 outH = output.size.height
-                Log.i(TAG, "peaking output surface ${outW}x${outH}")
+                Log.i(TAG, "peaking output surface ${outW}x${outH} generation=$generation")
                 val surf = output.getSurface(cbExecutor) { }
                 outEgl = EGL14.eglCreateWindowSurface(dpy, cfg, surf,
                     intArrayOf(EGL14.EGL_NONE), 0)
+                if (outEgl == EGL14.EGL_NO_SURFACE) {
+                    val error = EGL14.eglGetError()
+                    Log.e(
+                        TAG,
+                        "Could not connect EGL to preview output generation=$generation " +
+                            "error=0x${Integer.toHexString(error)}",
+                    )
+                    output.close()
+                    outSO = null
+                    outGeneration = 0L
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "onOutputSurface failed", e)
+                output.close()
             }
         }
+        if (!posted) output.close()
     }
 
     // ── Draw ──────────────────────────────────────────────────────────
-    private fun draw() {
+    private fun draw(
+        surfaceGeneration: Long,
+        cameraBindingGeneration: Long,
+        requestedInput: SurfaceTexture,
+    ) {
+        if (released || surfaceGeneration != activeBindingGeneration || inST !== requestedInput) return
         val st = inST ?: return
         if (outEgl == EGL14.EGL_NO_SURFACE) return
+        if (outGeneration != surfaceGeneration) return
         outSO ?: return
         try {
+            // SurfaceTexture.updateTexImage() requires the texture's GL context to be current.
+            // After a mode/resolution rebind the old window was deliberately parked above, so
+            // bind the replacement output before consuming its first camera buffer.
+            if (!EGL14.eglMakeCurrent(dpy, outEgl, outEgl, ctx)) {
+                val error = EGL14.eglGetError()
+                Log.w(
+                    TAG,
+                    "eglMakeCurrent failed for surfaceGeneration=$surfaceGeneration error=0x" +
+                        Integer.toHexString(error),
+                )
+                return
+            }
             st.updateTexImage()
+            val sourceFrameTimestampNs = st.timestamp
             st.getTransformMatrix(stm)
             // Ask CameraX what the output surface actually wants: it composes the input
             // transform with whatever rotation/crop this pipeline shape introduces.
             outSO?.updateTransformMatrix(outStm, stm)
 
-            EGL14.eglMakeCurrent(dpy, outEgl, outEgl, ctx)
             GLES20.glViewport(0, 0, outW, outH)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
             GLES20.glUseProgram(prog)
@@ -322,14 +432,20 @@ void main() {
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             if (EGL14.eglSwapBuffers(dpy, outEgl)) {
                 lastDrawSuccessAtMs = SystemClock.elapsedRealtime()
+                CameraPipelineTelemetry.recordDisplayedFrame(
+                    cameraBindingGeneration,
+                    lastDrawSuccessAtMs,
+                    sourceFrameTimestampNs,
+                )
             } else {
                 // Swap failure does NOT throw — without this check a dead output surface
                 // (destroyed while backgrounded) looks like a healthy pipeline upstream.
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastSwapFailLogAtMs > 1000L) {
                     lastSwapFailLogAtMs = now
-                    Log.w(TAG, "eglSwapBuffers failed — output surface dead? err=0x" +
-                        Integer.toHexString(EGL14.eglGetError()))
+                    val error = Integer.toHexString(EGL14.eglGetError())
+                    Log.w(TAG, "eglSwapBuffers failed — output surface dead? err=0x$error")
+                    CameraPipelineTelemetry.recordPreviewSwapFailure("egl=0x$error")
                 }
             }
         } catch (e: Exception) {
@@ -357,7 +473,20 @@ void main() {
             intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
         tmpSurf = EGL14.eglCreatePbufferSurface(dpy, cfg,
             intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
-        EGL14.eglMakeCurrent(dpy, tmpSurf, tmpSurf, ctx)
+        makeTemporarySurfaceCurrent()
+    }
+
+    private fun makeTemporarySurfaceCurrent() {
+        check(dpy != EGL14.EGL_NO_DISPLAY && ctx != EGL14.EGL_NO_CONTEXT) {
+            "EGL context is not initialized"
+        }
+        check(tmpSurf != EGL14.EGL_NO_SURFACE) { "EGL pbuffer surface is not initialized" }
+        if (!EGL14.eglMakeCurrent(dpy, tmpSurf, tmpSurf, ctx)) {
+            val error = EGL14.eglGetError()
+            throw IllegalStateException(
+                "Could not make EGL pbuffer current: 0x${Integer.toHexString(error)}",
+            )
+        }
     }
 
     private fun progInit() {
@@ -415,12 +544,61 @@ void main() {
         if (inTex != 0) { GLES20.glDeleteTextures(1, intArrayOf(inTex), 0); inTex = 0 }
     }
 
+    /**
+     * Disconnect the EGL consumer before CameraX connects PreviewView directly.
+     *
+     * RAW and Ultra HDR cannot coexist with a CameraEffect. Their graph therefore bypasses this
+     * processor, but the previous effect's output callback can otherwise retain the same native
+     * window long enough for the direct preview bind to race it and turn black. Invalidating the
+     * generation first makes late callbacks harmless; the short latch guarantees EGL has let go
+     * before CameraX attempts the replacement connection.
+     */
+    fun suspendForDirectPreview(timeoutMs: Long = 1_000L): Boolean {
+        synchronized(bindingGenerationLock) { activeBindingGeneration++ }
+        lastDrawSuccessAtMs = 0L
+        val parked = CountDownLatch(1)
+        if (!glH.post {
+                try {
+                    if (
+                        dpy != EGL14.EGL_NO_DISPLAY &&
+                        ctx != EGL14.EGL_NO_CONTEXT &&
+                        tmpSurf != EGL14.EGL_NO_SURFACE
+                    ) {
+                        runCatching { makeTemporarySurfaceCurrent() }
+                    }
+                    if (outEgl != EGL14.EGL_NO_SURFACE) {
+                        EGL14.eglDestroySurface(dpy, outEgl)
+                        outEgl = EGL14.EGL_NO_SURFACE
+                    }
+                    outSO?.close()
+                    outSO = null
+                    outGeneration = 0L
+                } finally {
+                    parked.countDown()
+                }
+            }
+        ) {
+            return false
+        }
+        return parked.await(timeoutMs, TimeUnit.MILLISECONDS)
+    }
+
     fun release() {
+        released = true
+        synchronized(bindingGenerationLock) { activeBindingGeneration++ }
         glH.post {
+            if (
+                dpy != EGL14.EGL_NO_DISPLAY &&
+                ctx != EGL14.EGL_NO_CONTEXT &&
+                tmpSurf != EGL14.EGL_NO_SURFACE
+            ) {
+                runCatching { makeTemporarySurfaceCurrent() }
+            }
             releaseIn()
             if (prog != 0) { GLES20.glDeleteProgram(prog); prog = 0 }
-            outSO?.close(); outSO = null
             if (outEgl != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(dpy, outEgl)
+            outEgl = EGL14.EGL_NO_SURFACE
+            outSO?.close(); outSO = null; outGeneration = 0L
             if (tmpSurf != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(dpy, tmpSurf)
             EGL14.eglMakeCurrent(dpy, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
             if (ctx != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(dpy, ctx)

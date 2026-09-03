@@ -105,6 +105,15 @@ object CameraCatalog {
         allModeSettings.associate { it.id to it.defaultValue }
     }
 
+    /** Settings used only when no camera session has ever been saved on this installation. */
+    val freshInstallSettingValues: Map<String, String> by lazy {
+        defaultSettingValues.mapValues { (settingId, value) ->
+            // Each mode owns a distinct prefixed lens key. They all begin at the widest physical
+            // rear camera, then diverge independently as the user changes and persists them.
+            if (settingId.endsWith(".lens")) "0.6x" else value
+        }
+    }
+
     val defaultSliderSensitivities: Map<String, SliderSensitivity> by lazy {
         allModeSettings
             .filter { it.supportsSensitivity }
@@ -134,10 +143,10 @@ object CameraCatalog {
 
     private fun buildProfile(mode: CameraModeId, variant: GalaxyDeviceVariant): CameraModeProfile = when (mode) {
         CameraModeId.Photo -> photoProfile(variant)
-        CameraModeId.Portrait -> portraitProfile()
+        CameraModeId.Portrait -> portraitProfile(variant)
         CameraModeId.ExpertRaw -> expertRawProfile(variant)
         CameraModeId.Pro -> proProfile(variant)
-        CameraModeId.Food -> foodProfile()
+        CameraModeId.Food -> foodProfile(variant)
         CameraModeId.Panorama -> panoramaProfile(variant)
         CameraModeId.Night -> nightProfile(variant)
         CameraModeId.Burst -> burstProfile(variant)
@@ -199,12 +208,12 @@ object CameraCatalog {
         } else {
             baseSettings.map { spec ->
                 if (spec.id.endsWith(".lens")) {
-                    // A mode can expose only a subset of the phone's lenses (Portrait is 1x/2x,
-                    // Panorama is 0.6x/1x, Slow Motion is 0.6x/1x/3x on the reference S24).
-                    // Replacing that subset with every detected lens made the menu disagree with
-                    // Samsung immediately after the capability probe completed.
-                    val supportedForMode = spec.options.filter { it in detectedLenses }
-                    val options = supportedForMode.ifEmpty { spec.options }
+                    // Hardware discovery is authoritative. A mode profile must not hide a
+                    // camera merely because an earlier product assumption copied Samsung's UI
+                    // subset. If the device exposes a rear physical lens or a front camera, the
+                    // mode offers it; an actual session/configuration rejection is the only
+                    // valid reason to withhold it.
+                    val options = detectedLenses.distinct()
                     val default = spec.defaultValue.takeIf { it in options } ?: options.first()
                     spec.copy(options = options, defaultValue = default)
                 } else {
@@ -324,10 +333,11 @@ object CameraCatalog {
             return spec.copy(options = kept, defaultValue = default)
         }
         return when {
-            // Hyperlapse keeps the Pro-style focus tile on its rail across lens changes. The
-            // state-aware value and reducer expose it as Fixed on an actuator-less 0.6x lens,
-            // then restore the same manual ladder when a focus-capable lens is selected.
+            // Keep these focus tiles reachable on fixed-focus lenses. Hyperlapse stays Fixed;
+            // a Pro focus-value adjustment explicitly switches from 0.6x to the main lens.
             spec.id in setOf(
+                "pro.manual_focus",
+                "pro_video.manual_focus",
                 "hyperlapse.manual_focus",
                 "hyperlapse.focus_peaking",
                 "hyperlapse.focus_curve",
@@ -382,6 +392,20 @@ object CameraCatalog {
                 // though that lens exposes both 1920x1080 and 3840x2160 MediaRecorder streams.
                 // Keep the two native Hyperlapse sizes owned by the direct-recorder profile.
                 spec
+            spec.id == "slow_motion.resolution" &&
+                !caps?.availableVideoResolutions.isNullOrEmpty() -> {
+                // A resolution is not a Slow Motion resolution merely because ordinary Video can
+                // encode it. Samsung's public constrained/high-rate map must also expose at least
+                // one cadence from this mode. Leaving UHD visible when it carried only 24/30 fps
+                // let the reducer create the impossible UHD/30 "Slow Motion" graph and the S24 HAL
+                // rejected the stream combination with CAMERA_ERROR / Broken pipe.
+                val slowMotionRates = setOf(48, 60, 120, 240)
+                clip { option ->
+                    if (option !in caps!!.availableVideoResolutions) return@clip false
+                    val rates = caps.videoFrameRatesByResolution[option].orEmpty()
+                    rates.isEmpty() || rates.any { it in slowMotionRates } || 60 in rates
+                }
+            }
             spec.id.endsWith(".resolution") && !caps?.availableVideoResolutions.isNullOrEmpty() ->
                 // Keep every resolution exposed for the selected camera. If the current FPS is
                 // incompatible, the reducer moves it to the closest supported rate as the user
@@ -1267,17 +1291,19 @@ object CameraCatalog {
         )
     }
 
-    private fun portraitProfile(): CameraModeProfile = CameraModeProfile(
+    private fun portraitProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
+        val lenses = photoLenses(variant)
+        return CameraModeProfile(
         mode = CameraModeId.Portrait,
         modeName = CameraModeId.Portrait.label,
         captureType = CameraCaptureType.Photo,
-        availableLenses = listOf("1x", "2x", "3x"),
+        availableLenses = lenses,
         availableResolutions = listOf("Auto"),
         availableExposureControls = listOf("Flash", "Lens", "Exposure Value"),
         availableAssistTools = listOf("Timer", "Beauty", "Lighting", "Background effects", "Grid"),
         settings = listOf(
             choice("portrait.flash", "Flash", "Core", listOf("Off", "On"), "Off"),
-            choice("portrait.lens", "Lens", "Core", listOf("1x", "2x", "3x"), "1x"),
+            choice("portrait.lens", "Lens", "Core", lenses, "1x"),
             choice("portrait.timer", "Timer", "Core", timerOptions(), "Off"),
             choice("portrait.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3"),
             slider("portrait.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
@@ -1321,18 +1347,21 @@ object CameraCatalog {
             ),
             choice("portrait.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
         ),
-    )
+        )
+    }
 
-    private fun foodProfile(): CameraModeProfile = CameraModeProfile(
+    private fun foodProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
+        val lenses = photoLenses(variant)
+        return CameraModeProfile(
         mode = CameraModeId.Food,
         modeName = CameraModeId.Food.label,
         captureType = CameraCaptureType.Photo,
-        availableLenses = listOf("1x", "2x", "3x"),
+        availableLenses = lenses,
         availableResolutions = listOf("Auto"),
         availableExposureControls = listOf("Colour temperature", "Exposure Value"),
         availableAssistTools = listOf("Blur effect", "Grid"),
         settings = listOf(
-            choice("food.lens", "Lens", "Core", listOf("1x", "2x", "3x"), "1x"),
+            choice("food.lens", "Lens", "Core", lenses, "1x"),
             slider(
                 "food.color_temperature",
                 "Colour temperature",
@@ -1355,7 +1384,8 @@ object CameraCatalog {
             choice("food.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3"),
             choice("food.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
         ),
-    )
+        )
+    }
 
     private fun expertRawProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
@@ -1556,16 +1586,18 @@ object CameraCatalog {
         )
     }
 
-    private fun panoramaProfile(_variant: GalaxyDeviceVariant): CameraModeProfile = CameraModeProfile(
+    private fun panoramaProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
+        val lenses = photoLenses(variant)
+        return CameraModeProfile(
         mode = CameraModeId.Panorama,
         modeName = CameraModeId.Panorama.label,
         captureType = CameraCaptureType.Photo,
-        availableLenses = listOf("0.6x", "1x"),
+        availableLenses = lenses,
         availableResolutions = listOf("Auto"),
         availableExposureControls = listOf("Exposure value"),
         availableAssistTools = listOf("Guides", "HDR / LOG"),
         settings = listOf(
-            choice("panorama.lens", "Lens", "Core", listOf("0.6x", "1x"), "1x"),
+            choice("panorama.lens", "Lens", "Core", lenses, "1x"),
             slider("panorama.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
             choice(
                 "panorama.hdr_log",
@@ -1583,7 +1615,8 @@ object CameraCatalog {
                 note = "Optional audible cue when Panorama capture starts and stops.",
             ),
         ),
-    )
+        )
+    }
 
     private fun nightProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
@@ -1821,18 +1854,20 @@ object CameraCatalog {
         )
     }
 
-    private fun portraitVideoProfile(_variant: GalaxyDeviceVariant): CameraModeProfile = CameraModeProfile(
+    private fun portraitVideoProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
+        val lenses = photoLenses(variant)
+        return CameraModeProfile(
         mode = CameraModeId.PortraitVideo,
         modeName = CameraModeId.PortraitVideo.label,
         captureType = CameraCaptureType.Video,
-        availableLenses = listOf("1x", "2x"),
+        availableLenses = lenses,
         availableResolutions = listOf("FHD", "UHD 4K"),
         availableFrameRates = listOf("30fps"),
         availableAudioControls = listOf("Audio recording"),
         availableExposureControls = listOf("Exposure value", "Focus"),
         availableAssistTools = listOf("Portrait Video Effects", "Focus Assist", "HDR", "Grid"),
         settings = listOf(
-            choice("portrait_video.lens", "Lens", "Core", listOf("1x", "2x"), "1x"),
+            choice("portrait_video.lens", "Lens", "Core", lenses, "1x"),
             choice("portrait_video.resolution", "Video size", "Core", listOf("FHD", "UHD 4K"), "FHD"),
             choice("portrait_video.frame_rate", "Frame rate", "Core", listOf("30fps"), "30fps"),
             choice("portrait_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
@@ -1863,13 +1898,16 @@ object CameraCatalog {
             toggle("portrait_video.audio_recording", "Audio recording", "Audio", "On"),
             choice("portrait_video.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
         ),
-    )
+        )
+    }
 
-    private fun slowMotionProfile(_variant: GalaxyDeviceVariant): CameraModeProfile = CameraModeProfile(
+    private fun slowMotionProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
+        val lenses = photoLenses(variant)
+        return CameraModeProfile(
         mode = CameraModeId.SlowMotion,
         modeName = CameraModeId.SlowMotion.label,
         captureType = CameraCaptureType.Video,
-        availableLenses = listOf("0.6x", "1x", "3x"),
+        availableLenses = lenses,
         availableResolutions = listOf("FHD", "UHD 4K"),
         availableFrameRates = listOf("48fps", "60fps", "120fps", "240fps"),
         availableExposureControls = listOf("Exposure value", "Focus"),
@@ -1883,7 +1921,7 @@ object CameraCatalog {
                 listOf("48fps", "60fps", "120fps", "240fps"),
                 "240fps",
             ),
-            choice("slow_motion.lens", "Lens", "Core", listOf("0.6x", "1x", "3x"), "1x"),
+            choice("slow_motion.lens", "Lens", "Core", lenses, "1x"),
             choice("slow_motion.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
             slider("slow_motion.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
                 choice(
@@ -1906,7 +1944,8 @@ object CameraCatalog {
             ),
             choice("slow_motion.grid", "Guides", "Assist", gridOptions(), "Rule of Thirds"),
         ),
-    )
+        )
+    }
 
     private fun dualRecordProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
@@ -1967,8 +2006,8 @@ object CameraCatalog {
 
     private fun photoLenses(variant: GalaxyDeviceVariant): List<String> = when (variant) {
         GalaxyDeviceVariant.S26,
-        GalaxyDeviceVariant.S26Plus -> listOf("Auto", "0.6x", "1x", "2x", "3x", "front")
-        GalaxyDeviceVariant.S26Ultra -> listOf("Auto", "0.6x", "1x", "2x", "3x", "5x", "front")
+        GalaxyDeviceVariant.S26Plus -> listOf("Auto", "0.6x", "1x", "3x", "front")
+        GalaxyDeviceVariant.S26Ultra -> listOf("Auto", "0.6x", "1x", "3x", "5x", "front")
     }
 
     private fun photoMegapixels(variant: GalaxyDeviceVariant): List<String> = when (variant) {
