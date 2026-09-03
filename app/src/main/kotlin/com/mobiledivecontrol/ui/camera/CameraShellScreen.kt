@@ -83,10 +83,13 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.text.ExperimentalTextApi
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -2885,11 +2888,7 @@ private fun RecordingPausedChooser(
 ) {
     val selectedAction = cameraState.recordingPausedAction
     val previewVisible = cameraState.recordingPreviewVisible
-    Box(
-        modifier = modifier.alpha(
-            if (previewVisible) RECORDING_PREVIEW_MENU_ALPHA else 1f,
-        ),
-    ) {
+    Box(modifier = modifier) {
         if (cameraState.recordingLocationChooserVisible) {
             if (cameraState.recordingSaveConfirmationVisible) {
                 val destination = cameraState.recordingSaveLocations
@@ -2965,13 +2964,18 @@ private fun RecordingPausedChooser(
 
         Layout(
             content = {
-                RecordingBadge(visible = true, paused = true)
+                RecordingBadge(
+                    visible = true,
+                    paused = true,
+                    modifier = Modifier.alpha(if (previewVisible) RECORDING_PREVIEW_MENU_ALPHA else 1f),
+                )
 
                 Box(modifier = Modifier.padding(start = 20.dp, top = 10.dp, end = 20.dp)) {
                     RecordingChoiceChip(
                         label = "SAVE TO · ${cameraState.recordingSaveLocation.name}",
                         selected = cameraState.recordingLocationFocused,
                         accent = DiveColors.DiveCyan,
+                        previewPlaying = previewVisible,
                         onClick = { onCommand(CameraCommand.OpenRecordingSaveLocationChooser) },
                     )
                 }
@@ -2986,6 +2990,7 @@ private fun RecordingPausedChooser(
                         label = if (previewVisible) "PAUSE" else "PREVIEW",
                         selected = actionFocused && selectedAction == RecordingPausedAction.Preview,
                         accent = DiveColors.DiveCyan,
+                        previewPlaying = previewVisible,
                         onClick = { onCommand(CameraCommand.PreviewVideoRecording) },
                     )
                     Spacer(modifier = Modifier.width(10.dp))
@@ -2993,6 +2998,7 @@ private fun RecordingPausedChooser(
                         label = "RESUME",
                         selected = actionFocused && selectedAction == RecordingPausedAction.Resume,
                         accent = DiveColors.Success,
+                        previewPlaying = previewVisible,
                         onClick = { onCommand(CameraCommand.ResumeVideoRecording) },
                     )
                     Spacer(modifier = Modifier.width(10.dp))
@@ -3000,6 +3006,7 @@ private fun RecordingPausedChooser(
                         label = "STOP",
                         selected = actionFocused && selectedAction == RecordingPausedAction.Stop,
                         accent = DiveColors.Warning,
+                        previewPlaying = previewVisible,
                         onClick = { onCommand(CameraCommand.StopVideoRecording) },
                     )
                     Spacer(modifier = Modifier.width(10.dp))
@@ -3008,15 +3015,18 @@ private fun RecordingPausedChooser(
                         selected = actionFocused && selectedAction == RecordingPausedAction.Delete,
                         accent = DiveColors.Critical,
                         critical = true,
+                        previewPlaying = previewVisible,
                         onClick = { onCommand(CameraCommand.DeleteVideoRecording) },
                     )
                 }
 
                 Box(
-                    modifier = Modifier.background(
-                        DiveColors.DeepBlack.copy(alpha = 0.88f),
-                        RoundedCornerShape(14.dp),
-                    ),
+                    modifier = Modifier
+                        .recordingPreviewOutline(previewVisible, RoundedCornerShape(14.dp))
+                        .background(
+                            DiveColors.DeepBlack.copy(alpha = 0.88f),
+                            RoundedCornerShape(14.dp),
+                        ),
                 )
             },
             modifier = Modifier.fillMaxSize(),
@@ -3049,33 +3059,56 @@ private fun RecordingPausedChooser(
 /** Keep paused-recording actions locatable without obscuring the video being reviewed. */
 private const val RECORDING_PREVIEW_MENU_ALPHA = 0.20f
 
+/** A one-physical-pixel border, outside the faded content layer so it stays white. */
+private fun Modifier.recordingPreviewOutline(playing: Boolean, shape: RoundedCornerShape): Modifier =
+    if (playing) {
+        border(Dp.Hairline, Color.White, shape).alpha(RECORDING_PREVIEW_MENU_ALPHA)
+    } else {
+        this
+    }
+
+@OptIn(ExperimentalTextApi::class)
 @Composable
 private fun RecordingChoiceChip(
     label: String,
     selected: Boolean,
     accent: Color,
     critical: Boolean = false,
+    previewPlaying: Boolean = false,
     onClick: () -> Unit,
 ) {
-    Box(
-        modifier = Modifier
-            .background(
-                if (selected) accent else DiveColors.SurfaceElevated,
-                RoundedCornerShape(10.dp),
+    Box(contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .recordingPreviewOutline(previewPlaying, RoundedCornerShape(10.dp))
+                .background(
+                    if (selected) accent else DiveColors.SurfaceElevated,
+                    RoundedCornerShape(10.dp),
+                )
+                .clickable(onClick = onClick)
+                .padding(horizontal = 22.dp, vertical = 10.dp),
+        ) {
+            Text(
+                text = label,
+                color = if (selected) {
+                    if (critical) DiveColors.TextPrimary else DiveColors.DeepBlack
+                } else {
+                    DiveColors.TextSecondary
+                },
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
             )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 22.dp, vertical = 10.dp),
-    ) {
-        Text(
-            text = label,
-            color = if (selected) {
-                if (critical) DiveColors.TextPrimary else DiveColors.DeepBlack
-            } else {
-                DiveColors.TextSecondary
-            },
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-        )
+        }
+        if (previewPlaying) {
+            // Antialias a half-pixel lettering stroke outside the faded button layer.
+            Text(
+                text = label,
+                color = Color.White,
+                style = MaterialTheme.typography.titleMedium.copy(drawStyle = Stroke(width = 0.5f)),
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.clearAndSetSemantics { },
+            )
+        }
     }
 }
 
