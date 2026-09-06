@@ -903,6 +903,8 @@ data class CameraCapabilities(
     val rawCaptureSupported: Boolean? = null,
     /** True only when the active camera can deliver DNG and JPEG from the same exposure. */
     val rawJpegCaptureSupported: Boolean? = null,
+    /** Whether the selected camera has a physical continuous light. Used by Slow Motion. */
+    val torchSupported: Boolean? = null,
 )
 
 sealed interface BottomBarItem {

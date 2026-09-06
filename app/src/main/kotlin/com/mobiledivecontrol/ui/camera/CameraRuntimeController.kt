@@ -611,6 +611,8 @@ class CameraRuntimeController(
     private var cachedEightKRates: List<Int>? = null
     private val camera2EightKRecorder = Camera2EightKRecorder(context)
     private val preparedRecorder = PreparedCamera2Recorder(context)
+    private val slowMotionZoom = SlowMotionZoomControl()
+    private var probedSlowMotionRoute: String? = null
     private var preparedRetryAfterMs = 0L
     private val directRecordingClockRunnable = object : Runnable {
         override fun run() {
@@ -753,7 +755,7 @@ class CameraRuntimeController(
     private var onDetectedLenses: ((List<String>) -> Unit)? = null
     private var onPointingGesture: ((PointingGesture) -> Unit)? = null
     private var onGraphReplacementRequired: (((() -> Unit)) -> Unit)? = null
-    private var onDirectPreviewPresented: (() -> Unit)? = null
+    private var onPreviewPresented: (() -> Unit)? = null
     private var pointingRecognizer: PointingGestureRecognizer? = null
     // GPU-accelerated focus peaking via OpenGL shader in the CameraX preview pipeline.
     // Replaces the old CPU bitmap overlay approach which caused jitter and drift.
@@ -1389,7 +1391,7 @@ class CameraRuntimeController(
         onPointingGesture: ((PointingGesture) -> Unit)? = null,
         onCameraCommand: ((CameraCommand) -> Unit)? = null,
         onGraphReplacementRequired: (((() -> Unit)) -> Unit)? = null,
-        onDirectPreviewPresented: (() -> Unit)? = null,
+        onPreviewPresented: (() -> Unit)? = null,
     ) {
         val attachGeneration = ++cameraAttachGeneration
         cameraInitializationComplete = false
@@ -1402,7 +1404,7 @@ class CameraRuntimeController(
         this.onPointingGesture = onPointingGesture
         this.onCameraCommand = onCameraCommand
         this.onGraphReplacementRequired = onGraphReplacementRequired
-        this.onDirectPreviewPresented = onDirectPreviewPresented
+        this.onPreviewPresented = onPreviewPresented
         startFocusMotionMonitor()
         wbCalibration = runCatching { loadWbCalibration() }.getOrNull()
         loadAwbCurve()
@@ -2291,7 +2293,7 @@ class CameraRuntimeController(
         onPointingGesture = null
         onCameraCommand = null
         onGraphReplacementRequired = null
-        onDirectPreviewPresented = null
+        onPreviewPresented = null
         val recognizerToClose = pointingRecognizer
         pointingRecognizer = null
         recognizerToClose?.let { recognizer ->
@@ -3854,9 +3856,34 @@ class CameraRuntimeController(
         Camera2Interop.Extender(analysisBuilder)
             .setSessionCaptureCallback(bindingSessionCaptureCallback)
 
+        var previewRequestGeneration = 0L
         val preview = previewBuilder
             .build()
-            .also { it.setSurfaceProvider(previewSurface.surfaceProvider) }
+            .also { useCase ->
+                useCase.setSurfaceProvider { request ->
+                    if (bindGeneration != cameraBindGeneration || previewView !== previewSurface) {
+                        request.willNotProvideSurface()
+                        return@setSurfaceProvider
+                    }
+                    val requestGeneration = ++previewRequestGeneration
+                    previewSurface.surfaceProvider.onSurfaceRequested(request)
+                    if (previewSurface.implementationMode == PreviewView.ImplementationMode.COMPATIBLE) {
+                        var presented = false
+                        previewSurface.setFrameUpdateListener(ContextCompat.getMainExecutor(context)) {
+                            if (!presented && bindGeneration == cameraBindGeneration &&
+                                requestGeneration == previewRequestGeneration && previewView === previewSurface
+                            ) {
+                                presented = true
+                                previewSurface.setFrameUpdateListener(ContextCompat.getMainExecutor(context), null)
+                                // TextureView has consumed this replacement's actual frame. StreamState
+                                // can remain STREAMING across replacement, so an IDLE edge is not required.
+                                Log.i(TAG, "CameraX preview presented: bind=$bindGeneration request=$requestGeneration")
+                                onPreviewPresented?.invoke()
+                            }
+                        }
+                    }
+                }
+            }
         // Use ResolutionSelector for better resolution support including high-res modes
         val targetSize = if (
             latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Panorama
@@ -4784,12 +4811,23 @@ class CameraRuntimeController(
             ?.replace("+", "")?.toDoubleOrNull()
         val step = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toDouble() ?: 0.0
         val range = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        val slowMotion = latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion
+        val zoomRange = if (slowMotion && Build.VERSION.SDK_INT >= 30)
+            characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            else android.util.Range(1f,
+                characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f)
+        val zoom = if (slowMotion) slowMotionZoom.resolve(selectedLensValue(latestState),
+            requestedZoomRatio(selectedLensValue(latestState)).toFloat())
+            .coerceIn(zoomRange?.lower ?: 1f, zoomRange?.upper ?: 1f)
+            else latestState.zoomFactor.toFloat().coerceAtLeast(1f)
         return PreparedCamera2Recorder.Controls(
             ev = if (ev != null && step > 0.0 && range != null) (ev / step).roundToInt().coerceIn(range.lower, range.upper) else null,
-            zoom = latestState.zoomFactor.toFloat().coerceAtLeast(1f),
+            zoom = zoom,
             torch = currentValue(latestState, ".flash") in setOf("On", "Torch"),
             focus = manualFocusRequestFor(latestState)?.diopters,
-            fixedFocus = selectedFocusCapability(latestState)?.supportsManualFocus == false,
+            fixedFocus = selectedFocusCapability(latestState)?.supportsManualFocus == false &&
+                !(slowMotion && zoom >= 1f &&
+                    (characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f) > 0f),
             singleAf = currentValue(latestState, ".focus_mode") == "Single AF",
         )
     }
@@ -4798,17 +4836,45 @@ class CameraRuntimeController(
         val host = previewView ?: return
         if (preparedRecorder.isBusy || SystemClock.elapsedRealtime() < preparedRetryAfterMs) return
         val highSpeed = isHighSpeedSelection(latestState)
+        val slowMotion = latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion
         val id = selectedCameraIdForBinding(latestState, desiredLensFacing(latestState)) ?: return
+        if (slowMotion) {
+            val route = "$id:${selectedLensValue(latestState)}"
+            if (route != probedSlowMotionRoute) {
+                probedSlowMotionRoute = route
+                reportCameraCapabilities()
+            }
+        } else probedSlowMotionRoute = null
+        val size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: return
+        val captureFps = CameraCatalog.captureFrameRateFps(currentValue(latestState, ".frame_rate"))
+        if (slowMotion && (captureFps ?: 0) >= 120) {
+            val map = context.getSystemService(CameraManager::class.java).getCameraCharacteristics(id)
+                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            // The capability callback may still be updating the reducer after a lens switch.
+            // Wait for its supported rate instead of opening a known-invalid front-camera session.
+            val acceptsRate = runCatching { map?.getHighSpeedVideoFpsRangesFor(size)
+                ?.any { it.lower == captureFps && it.upper == captureFps } == true }.getOrDefault(false)
+            if (!acceptsRate) return
+        }
+        val slowMotionHevc = slowMotion && MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { codec ->
+            codec.isEncoder && MediaFormat.MIMETYPE_VIDEO_HEVC in codec.supportedTypes && runCatching {
+                codec.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC).videoCapabilities
+                    .areSizeAndRateSupported(size.width, size.height,
+                        SlowMotionRecordingPolicy.sourceFrameRate(checkNotNull(captureFps)).toDouble())
+            }.getOrDefault(false)
+        }
         val speed = hyperlapseSpeedFactor(currentValue(latestState, ".speed"), currentValue(latestState, ".day_night"), suggestedHyperlapseMotionSpeedMode)
         val selection = PreparedCamera2Recorder.Config(
             cameraId = id,
-            size = highSpeedResolutionSize(desiredResolutionValue(latestState)) ?: return,
-            highSpeedFps = if (highSpeed) CameraCatalog.captureFrameRateFps(currentValue(latestState, ".frame_rate")) else null,
+            size = size,
+            highSpeedFps = if (highSpeed) captureFps else null,
             captureRate = hyperlapseCaptureRateFps(speed),
             playbackFps = if (highSpeed && latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.ProVideo)
                 proVideoPlaybackFrameRate(currentValue(latestState, ".frame_rate")).roundToInt() else 30,
-            codec = if (highSpeed) TimeLapseVideoCodec.H264 else hyperlapseVideoCodec(currentValue(latestState, ".video_format")),
+            codec = if (slowMotionHevc) TimeLapseVideoCodec.HEVC else if (highSpeed) TimeLapseVideoCodec.H264
+                else hyperlapseVideoCodec(currentValue(latestState, ".video_format")),
             night = !highSpeed && currentValue(latestState, ".day_night") == "Night",
+            slowMotion = slowMotion,
         )
         val controls = runCatching { preparedControls(id) }.getOrElse { error ->
             preparedRetryAfterMs = SystemClock.elapsedRealtime() + 2000L
@@ -4837,7 +4903,7 @@ class CameraRuntimeController(
         pendingCameraBindGraphKey = null
         preparedRecorder.prepare(host, selection, controls,
             onReady = {
-                onDirectPreviewPresented?.invoke()
+                onPreviewPresented?.invoke()
                 pendingCaptureActionAfterGraphBind?.let { action ->
                     pendingCaptureActionAfterGraphBind = null
                     cameraRequestHandler.post(action)
@@ -4856,6 +4922,13 @@ class CameraRuntimeController(
 
     private fun startPreparedSegment(highSpeed: Boolean) {
         val directory = recordingSessionDirectory ?: return
+        if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion && !preparedRecorder.isReady) {
+            val generation = recordingSegmentStartGeneration
+            pendingCaptureActionAfterGraphBind = {
+                if (generation == recordingSegmentStartGeneration && recordingSessionActive) startPreparedSegment(highSpeed)
+            }
+            return
+        }
         val file = File(directory, "segment-${(recordingSegmentFiles.size + 1).toString().padStart(4, '0')}.mp4")
         activeRecordingSegmentFile = file
         val fps = CameraCatalog.captureFrameRateFps(currentValue(latestState, ".frame_rate")) ?: 120
@@ -4893,11 +4966,30 @@ class CameraRuntimeController(
             return
         }
         if (effectiveCaptureFps >= 60) {
+            val slowMotion = latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion
             val retimedFile = File(segmentFile.parentFile, segmentFile.nameWithoutExtension + "-retimed.mp4")
             recordingFinalizeExecutor.execute {
-                val retimed = RecordingSessionMuxer.retimeHighSpeed(segmentFile, retimedFile, playbackFrameRate)
+                val retimed = if (slowMotion) {
+                    SlowMotionMp4Clock.retimeInPlace(segmentFile, playbackFrameRate.roundToInt()) { timing ->
+                        val intervals = timing.runs.groupBy { it.durationTicks }
+                            .mapValues { (_, runs) -> runs.sumOf { it.count } }
+                        val sourceClockRate = if (effectiveCaptureFps >= 120) playbackFrameRate else effectiveCaptureFps.toDouble()
+                        val gaps = timing.runs.filter {
+                            it.durationTicks.toDouble() / timing.timeScale > 1.5 / sourceClockRate
+                        }
+                        Log.i("DiveSlowMotion", "Source clock captureFps=$effectiveCaptureFps clockFps=$sourceClockRate scale=${timing.timeScale} " +
+                            "frames=${timing.runs.sumOf { it.count }} " +
+                            "durationTicks=${timing.runs.sumOf { it.count * it.durationTicks }} " +
+                            "intervals=${intervals.entries.sortedByDescending { it.value }.take(16)} " +
+                            "longIntervalFrames=${gaps.sumOf { it.count }} firstGaps=${gaps.take(12)}")
+                    }
+                        .recoverCatching { error ->
+                            Log.w(TAG, "Slow-motion timing metadata requires full remux", error)
+                            RecordingSessionMuxer.retimeHighSpeed(segmentFile, retimedFile, playbackFrameRate).getOrThrow()
+                        }
+                } else RecordingSessionMuxer.retimeHighSpeed(segmentFile, retimedFile, playbackFrameRate)
                 ContextCompat.getMainExecutor(context).execute {
-                    retimed.onSuccess { segmentFile.delete() }
+                    retimed.onSuccess { if (it != segmentFile) segmentFile.delete() }
                     completeCamera2HighSpeedSegment(retimed.getOrDefault(segmentFile),
                         if (retimed.isSuccess) result else Result.failure(checkNotNull(retimed.exceptionOrNull())))
                 }
@@ -5195,7 +5287,11 @@ class CameraRuntimeController(
                             )
                         }.onFailure { completion.complete(Result.failure(it)) }
                     }
-                    completion.get().getOrThrow()
+                    // A 60 -> 48 selection has alternating source-frame intervals. Give
+                    // retained frames an even 30 fps clock without another encoding pass.
+                    RecordingSessionMuxer.retimeHighSpeed(
+                        completion.get().getOrThrow(), File(directory, "export-48fps-retimed.mp4"), 30.0,
+                    ).getOrThrow()
                 }
             }
             val result = export.fold(
@@ -5229,6 +5325,11 @@ class CameraRuntimeController(
      * has the pipe, because a CameraControl call there would tear that session down.
      */
     private fun applyLiveZoom(ratio: Double) {
+        if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion && preparedRecorder.ownsCamera) {
+            slowMotionZoom.set(selectedLensValue(latestState), ratio.toFloat())
+            preparedRecorder.config?.cameraId?.let { preparedRecorder.update(preparedControls(it)) }
+            return
+        }
         if (nativeFocusActive) return
         try {
             camera?.cameraControl?.setZoomRatio(ratio.toFloat())
@@ -5320,10 +5421,15 @@ class CameraRuntimeController(
                 // The public ceiling stands: the vendor 30 s tail is the stock app's private
                 // still-capture pipeline, not a live-preview range this session can hold.
                 exposureMaxNs = exposureRange?.upper,
-                evMin = evIndexLower?.let { it * evStep },
-                evMax = evIndexUpper?.let { it * evStep },
-                manualFocusSupported = minFocus > 0f,
+                evMin = (if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion)
+                    evRange?.lower else evIndexLower)?.let { it * evStep },
+                evMax = (if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion)
+                    evRange?.upper else evIndexUpper)?.let { it * evStep },
+                manualFocusSupported = if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion)
+                    selectedFocusCapability(latestState)?.supportsManualFocus ?: (minFocus > 0f)
+                    else minFocus > 0f,
                 zoomMaxRatio = zoomMax,
+                torchSupported = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true,
                 availableVideoFrameRates = videoFrameRates,
                 availableVideoResolutions = videoResolutions,
                 videoFrameRatesByResolution = videoCapabilities?.frameRatesByResolution.orEmpty(),
@@ -5591,7 +5697,8 @@ class CameraRuntimeController(
     }
 
     private fun selectedCameraInfoForCapabilities(): androidx.camera.core.CameraInfo? {
-        camera?.cameraInfo?.let { return it }
+        if (latestState.activeMode != com.mobiledivecontrol.core.CameraModeId.SlowMotion)
+            camera?.cameraInfo?.let { return it }
         val provider = cameraProvider ?: return null
         val lensFacing = desiredLensFacing(latestState)
         val selectedId = selectedCameraIdForBinding(latestState, lensFacing)
@@ -9278,7 +9385,9 @@ class CameraRuntimeController(
     }
 
     private fun currentValue(cameraState: CameraState, vararg suffixes: String): String? {
-        val settings = CameraCatalog.settingsFor(cameraState.activeMode, cameraState.deviceVariant)
+        val settings = if (cameraState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion)
+            CameraCatalog.settingsFor(cameraState)
+            else CameraCatalog.settingsFor(cameraState.activeMode, cameraState.deviceVariant)
         val spec = settings.firstOrNull { setting -> suffixes.any { suffix -> setting.id.endsWith(suffix) } }
             ?: return null
         return CameraCatalog.currentValue(cameraState, spec)

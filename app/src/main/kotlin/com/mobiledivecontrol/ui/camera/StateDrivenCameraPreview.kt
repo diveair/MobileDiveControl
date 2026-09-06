@@ -64,8 +64,6 @@ fun StateDrivenCameraPreview(
     var lastStablePreviewFrame by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     var heldTransitionFrame by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     var awaitingReplacementStream by remember { mutableStateOf(false) }
-    var replacementStreamWentIdle by remember { mutableStateOf(false) }
-    var transitionGeneration by remember { mutableStateOf(0L) }
     var previewStreamState by remember {
         mutableStateOf(PreviewView.StreamState.IDLE)
     }
@@ -109,10 +107,7 @@ fun StateDrivenCameraPreview(
                 // The controller invokes this at the exact teardown boundary, after all graph
                 // debounce/coalescing has completed. Capture the still-live TextureView now and
                 // acknowledge only after Compose has submitted the covering bitmap twice.
-                transitionGeneration++
                 awaitingReplacementStream = true
-                replacementStreamWentIdle =
-                    previewStreamState == PreviewView.StreamState.IDLE
                 heldTransitionFrame = previewView.bitmap ?: lastStablePreviewFrame
                 coroutineScope.launch {
                     withFrameNanos { }
@@ -120,15 +115,13 @@ fun StateDrivenCameraPreview(
                     onContinuityFramePresented()
                 }
             },
-            onDirectPreviewPresented = {
+            onPreviewPresented = {
                 cameraReady = true
-                // Hyperlapse replaces CameraX with a direct Camera2 SurfaceView while recording.
-                // PreviewView cannot report STREAMING for that producer, so release any mode
-                // transition cover from the recorder's own first-presented-frame handshake.
-                transitionGeneration++
+                // Both CameraX's TextureView and the direct recorder confirm a real replacement
+                // frame. Waiting for an IDLE -> STREAMING edge could leave this cover up forever
+                // while the panorama mini preview continued updating from ImageAnalysis.
                 heldTransitionFrame = null
                 awaitingReplacementStream = false
-                replacementStreamWentIdle = false
             },
         )
 
@@ -141,35 +134,10 @@ fun StateDrivenCameraPreview(
         val observer = Observer<PreviewView.StreamState> { state ->
             previewStreamState = state
             if (state == PreviewView.StreamState.STREAMING) cameraReady = true
-            if (awaitingReplacementStream && state == PreviewView.StreamState.IDLE) {
-                replacementStreamWentIdle = true
-            }
         }
         previewView.previewStreamState.observe(lifecycleOwner, observer)
         onDispose {
             previewView.previewStreamState.removeObserver(observer)
-        }
-    }
-
-    LaunchedEffect(
-        previewStreamState,
-        awaitingReplacementStream,
-        replacementStreamWentIdle,
-        transitionGeneration,
-    ) {
-        if (awaitingReplacementStream && replacementStreamWentIdle &&
-            previewStreamState == PreviewView.StreamState.STREAMING
-        ) {
-            val completingGeneration = transitionGeneration
-            // STREAMING is posted when PreviewView has consumed the replacement producer. Keep
-            // the held buffer for one display beat so its removal and the new frame cannot land
-            // on opposite sides of a compositor transaction.
-            kotlinx.coroutines.delay(80L)
-            if (transitionGeneration == completingGeneration) {
-                heldTransitionFrame = null
-                awaitingReplacementStream = false
-                replacementStreamWentIdle = false
-            }
         }
     }
 

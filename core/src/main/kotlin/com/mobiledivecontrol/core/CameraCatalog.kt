@@ -310,7 +310,7 @@ object CameraCatalog {
     /** [settingsFor] with every clamp the CameraState itself implies — the one call the reducer and UI share. */
     fun settingsFor(camera: CameraState): List<CameraSettingSpec> {
         val prefix = modeKey(camera.activeMode)
-        return settingsFor(
+        val settings = settingsFor(
             camera.activeMode,
             camera.deviceVariant,
             camera.detectedLenses,
@@ -318,6 +318,19 @@ object CameraCatalog {
             videoShutterCapNs(camera),
             camera.settingValues["$prefix.resolution"] ?: defaultSettingValues["$prefix.resolution"],
         )
+        if (camera.activeMode != CameraModeId.SlowMotion) return settings
+        val fps = captureFrameRateFps(camera.settingValues["slow_motion.frame_rate"]
+            ?: defaultSettingValues["slow_motion.frame_rate"]) ?: 240
+        return settings.map { spec ->
+            if (spec.id == "slow_motion.focus_mode" && camera.capabilities?.manualFocusSupported == false) {
+                spec.copy(options = listOf("Fixed focus"), defaultValue = "Fixed focus",
+                    note = "This lens has fixed focus.")
+            } else if (spec.id == "slow_motion.focus_mode" && fps >= 120) {
+                // Camera2 replaces AF_AUTO with CONTINUOUS_VIDEO in constrained sessions.
+                spec.copy(options = listOf("Continuous AF"), defaultValue = "Continuous AF",
+                    note = "120/240 fps capture uses continuous autofocus required by the camera.")
+            } else spec
+        }
     }
 
     private fun applyCapabilities(
@@ -329,10 +342,13 @@ object CameraCatalog {
         fun clip(keep: (String) -> Boolean): CameraSettingSpec? {
             val kept = spec.options.filter(keep)
             if (kept.isEmpty()) return null
-            val default = if (spec.defaultValue in kept) spec.defaultValue else kept.first()
+            val default = if (spec.defaultValue in kept) spec.defaultValue
+                else if (spec.id == "slow_motion.frame_rate") kept.maxBy { captureFrameRateFps(it) ?: 0 }
+                else kept.first()
             return spec.copy(options = kept, defaultValue = default)
         }
         return when {
+            spec.id == "slow_motion.flash" && caps?.torchSupported == false -> clip { it == "Off" }
             // Keep these focus tiles reachable on fixed-focus lenses. Hyperlapse stays Fixed;
             // a Pro focus-value adjustment explicitly switches from 0.6x to the main lens.
             spec.id in setOf(
@@ -361,7 +377,8 @@ object CameraCatalog {
                     )
                     ns in floor..ceiling
                 }
-            (spec.id.endsWith(".exposure_value") || spec.id.endsWith(".exposure_compensation")) &&
+            (spec.id.endsWith(".exposure_value") || spec.id.endsWith(".exposure_compensation") ||
+                spec.id == "slow_motion.exposure") &&
                 caps?.evMin != null && caps.evMax != null ->
                 clip { option ->
                     val ev = option.replace("+", "").toDoubleOrNull()
@@ -996,6 +1013,8 @@ object CameraCatalog {
             spec.defaultValue
         } else if (spec.id.endsWith(".grid") || spec.id.endsWith(".guides")) {
             canonicalGuideValue(value)
+        } else if (spec.id.startsWith("slow_motion.") && value !in spec.options) {
+            spec.defaultValue
         } else if (spec.id == "pro_video.frame_rate" && '/' !in value) {
             captureFrameRateFps(value)
                 ?.let { captureFps -> proVideoFrameRateOption(captureFps) }
@@ -1074,7 +1093,11 @@ object CameraCatalog {
      */
     fun resnapToClippedLadders(camera: CameraState): CameraState {
         var values = camera.settingValues
-        CameraModeId.entries.forEach { mode ->
+        // Slow Motion probes the active capture camera (including front-camera rate limits).
+        // Those limits must never rewrite saved choices belonging to another mode.
+        val modes = if (camera.activeMode == CameraModeId.SlowMotion) listOf(CameraModeId.SlowMotion)
+            else CameraModeId.entries
+        modes.forEach { mode ->
             val clippedSettings = settingsFor(camera.copy(activeMode = mode))
             clippedSettings
                 .filter { spec -> spec.kind == CameraSettingKind.Slider }
@@ -1086,7 +1109,8 @@ object CameraCatalog {
                             { option -> shutterOptionNanos(option)?.takeIf { it > 0L }?.let { kotlin.math.ln(it.toDouble()) } }
                         spec.id.endsWith(".white_balance") ->
                             { option -> option.removeSuffix("K").toDoubleOrNull() }
-                        spec.id.endsWith(".exposure_value") || spec.id.endsWith(".exposure_compensation") ->
+                        spec.id.endsWith(".exposure_value") || spec.id.endsWith(".exposure_compensation") ||
+                            spec.id == "slow_motion.exposure" ->
                             { option -> option.replace("+", "").toDoubleOrNull() }
                         else -> return@specLoop
                     }
@@ -1931,7 +1955,7 @@ object CameraCatalog {
                 listOf("Continuous AF", "Single AF"),
                 "Continuous AF",
                     CameraFeatureStatus.Confirmed,
-                "Android constrained high-speed capture requires automatic 3A; this selects the supported AF behavior instead of exposing a dead manual-focus dial.",
+                "48/60 fps supports continuous or single autofocus. At 120/240 fps the camera requires continuous autofocus.",
             ),
                 choice(
                     "slow_motion.hdr",

@@ -133,9 +133,18 @@ internal class SamsungPanoramaEngine private constructor(
                         "elapsedMs=${SystemClock.elapsedRealtime() - startedAtMs} " +
                         "stride=$stride elevation=$elevation status=$status")
                 }
+                // Samsung's PanoramaStateCapture handles this before the selected-frame check.
+                // A reversed frame is usually rejected, but it must still end the sweep and
+                // preserve the already stitched image through the normal Save/Delete review.
+                if (status == TRACE_DIRECTION_BACK) {
+                    capturing = false
+                    Log.i(TAG, "Samsung panorama reverse stop: accepted=$selectedFrames " +
+                        "submitted=$submittedFrames direction=$direction")
+                    listener.onStopRequested()
+                    return@synchronized true
+                }
                 listener.onWarning(if (status and 0x8080 == 0x8080) 2 else 0)
-                // Samsung's selector can reject a frame (including reverse/unstable movement)
-                // without ending the capture. Only selected frames enter the stitcher.
+                // Ordinary unselected frames do not end capture or enter the stitcher.
                 if ((selectedField.get(selection) as Number).toLong() == 0L) return@synchronized true
                 direction = when (directionField.getInt(selection)) {
                     1 -> DIRECTION_LEFT_TO_RIGHT
@@ -282,6 +291,7 @@ internal class SamsungPanoramaEngine private constructor(
         private const val TAG = "SamsungPanoEngine"
         private const val INPUT_WIDTH = 4000
         private const val INPUT_HEIGHT = 3000
+        private const val TRACE_DIRECTION_BACK = 0x7011
         private const val SAMSUNG_CAMERA_PACKAGE = "com.sec.android.app.camera"
         private const val SYSTEM_CAMERA_APK = "/system/priv-app/SamsungCamera/SamsungCamera.apk"
         @Volatile private var samsungClassLoader: ClassLoader? = null

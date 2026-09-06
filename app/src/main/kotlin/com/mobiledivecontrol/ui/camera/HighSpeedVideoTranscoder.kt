@@ -2,6 +2,7 @@ package com.mobiledivecontrol.ui.camera
 
 import android.content.Context
 import android.media.MediaExtractor
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.net.Uri
 import android.util.Log
@@ -16,16 +17,14 @@ import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.DefaultEncoderFactory
+import androidx.media3.transformer.VideoEncoderSettings
 import androidx.media3.transformer.Transformer
 import java.io.File
 
 /**
- * Converts the fixed 120/240 fps stream required by Camera2's constrained-high-speed contract
- * into the selected effective capture cadence and playback cadence.
- *
- * Samsung's MediaRecorder accepts setCaptureRate for a Camera2 surface but still writes every
- * constrained-session frame. This explicit hardware-accelerated export is therefore required:
- * it drops frames to the requested output cadence and expands timestamps for slow playback.
+ * Selects real captured frames when the requested cadence is fractional (currently 48 from 60).
+ * This path re-encodes at an explicit quality budget; 60/120/240 selections only remux timestamps.
  */
 @androidx.annotation.OptIn(UnstableApi::class)
 internal class HighSpeedVideoTranscoder(context: Context) {
@@ -117,8 +116,27 @@ internal class HighSpeedVideoTranscoder(context: Context) {
                 onCompleted(Result.failure(exportException))
             }
         }
+        // 48 fps needs frame selection and therefore re-encoding. Keep the same per-frame
+        // quality budget as capture instead of Media3's default low-bitrate AVC export.
+        val format = videoFormat(inputFile)
+        val width = format.getInteger(MediaFormat.KEY_WIDTH)
+        val height = format.getInteger(MediaFormat.KEY_HEIGHT)
+        val hevc = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { codec ->
+            codec.isEncoder && MimeTypes.VIDEO_H265 in codec.supportedTypes && runCatching {
+                codec.getCapabilitiesForType(MimeTypes.VIDEO_H265).videoCapabilities
+                    .areSizeAndRateSupported(width, height, playbackFps)
+            }.getOrDefault(false)
+        }
+        val encoder = DefaultEncoderFactory.Builder(appContext)
+            .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder()
+                .setBitrate(SlowMotionRecordingPolicy.bitrate(width, height, playbackFps, hevc))
+                // The final sample clock and multi-segment muxer require presentation order.
+                .setMaxBFrames(0)
+                .build())
+            .build()
         val transformer = Transformer.Builder(appContext)
-            .setVideoMimeType(MimeTypes.VIDEO_H264)
+            .setVideoMimeType(if (hevc) MimeTypes.VIDEO_H265 else MimeTypes.VIDEO_H264)
+            .setEncoderFactory(encoder)
             .addListener(listener)
             .build()
         activeTransformer = transformer
@@ -129,6 +147,16 @@ internal class HighSpeedVideoTranscoder(context: Context) {
                 "playback=${playbackRate}fps speed=$speed",
         )
         transformer.start(edited, outputFile.absolutePath)
+    }
+
+    private fun videoFormat(file: File): MediaFormat {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(file.absolutePath)
+            return (0 until extractor.trackCount).map(extractor::getTrackFormat).first {
+                it.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
+            }
+        } finally { extractor.release() }
     }
 
     private fun measureFrameRate(file: File): Double? = runCatching {

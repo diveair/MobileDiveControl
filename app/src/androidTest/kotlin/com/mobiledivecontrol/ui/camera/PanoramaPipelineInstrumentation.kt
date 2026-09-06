@@ -19,6 +19,7 @@ class PanoramaPipelineInstrumentation : Instrumentation() {
     private var initializeSamsungNode = false
     private var exerciseSamsungInterface = false
     private var exerciseSamsungPipeline = false
+    private var exerciseSamsungReversal = false
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
         fullResolution = arguments?.getString("fullResolution") == "true"
@@ -26,14 +27,22 @@ class PanoramaPipelineInstrumentation : Instrumentation() {
         initializeSamsungNode = arguments?.getString("initializeSamsungNode") == "true"
         exerciseSamsungInterface = arguments?.getString("exerciseSamsungInterface") == "true"
         exerciseSamsungPipeline = arguments?.getString("exerciseSamsungPipeline") == "true"
+        exerciseSamsungReversal = arguments?.getString("exerciseSamsungReversal") == "true"
         start()
     }
 
     override fun onStart() {
         val results = Bundle()
-        if (exerciseSamsungPipeline) {
+        if (exerciseSamsungPipeline || exerciseSamsungReversal) {
             try {
-                for (vertical in listOf(false, true)) exerciseSamsungCapture(vertical, results)
+                for (vertical in listOf(false, true)) {
+                    if (exerciseSamsungPipeline) exerciseSamsungCapture(vertical, results)
+                    if (exerciseSamsungReversal) {
+                        for (negative in listOf(false, true)) {
+                            exerciseSamsungCapture(vertical, results, reverse = true, negative = negative)
+                        }
+                    }
+                }
                 finish(0, results)
             } catch (error: Throwable) {
                 results.putString("failure", android.util.Log.getStackTraceString(error))
@@ -293,7 +302,12 @@ class PanoramaPipelineInstrumentation : Instrumentation() {
     }
 
     /** Exercises real Image planes, the production adapter and the native stop/JPEG callback. */
-    private fun exerciseSamsungCapture(vertical: Boolean, results: Bundle) {
+    private fun exerciseSamsungCapture(
+        vertical: Boolean,
+        results: Bundle,
+        reverse: Boolean = false,
+        negative: Boolean = false,
+    ) {
         val width = 4000
         val height = 3000
         val worldWidth = if (vertical) width else 6400
@@ -310,13 +324,15 @@ class PanoramaPipelineInstrumentation : Instrumentation() {
         var accepted = 0
         var uiImages = 0
         var stopRequested = false
+        var stopRequests = 0
+        var stoppedAtFrame = -1
         val engine = SamsungPanoramaEngine.create(targetContext, 103.68555f,
             object : SamsungPanoramaEngine.Listener {
                 override fun onUiImage(bitmap: Bitmap, direction: Int) { uiImages++; bitmap.recycle() }
                 override fun onDirectionChanged(direction: Int) = Unit
                 override fun onRectChanged(point: android.graphics.Point) = Unit
                 override fun onFrameAccepted() { accepted++ }
-                override fun onStopRequested() { stopRequested = true }
+                override fun onStopRequested() { stopRequested = true; stopRequests++ }
                 override fun onWarning(code: Int) = Unit
                 override fun onError(code: Int) { errorCode = code; resultReady.countDown() }
                 override fun onResult(value: SamsungPanoramaEngine.Result) {
@@ -331,11 +347,18 @@ class PanoramaPipelineInstrumentation : Instrumentation() {
             engine.start()
             check(!engine.stop()) { "An empty sweep should cancel without requesting a JPEG" }
             engine.start()
-            for (index in 0 until 100) {
+            // Forward travel, a stationary pause, then a return over the same scene. No gyro
+            // injection or fake status: the installed Samsung selector must detect reversal.
+            val shifts = if (reverse) {
+                (0..70).map { it * 20 } + List(10) { 1400 } + (69 downTo 0).map { it * 20 }
+            } else {
+                (0 until 100).map { it * 20 }
+            }
+            for ((index, offset) in shifts.withIndex()) {
                 val input = writer.dequeueInputImage()
                 val yPlane = input.planes[0]
                 val yBuffer = yPlane.buffer
-                val shift = index * 20
+                val shift = if (negative) 2000 - offset else offset
                 for (row in 0 until height) {
                     yBuffer.position(row * yPlane.rowStride)
                     yBuffer.put(world, (row + if (vertical) shift else 0) * worldWidth +
@@ -353,12 +376,24 @@ class PanoramaPipelineInstrumentation : Instrumentation() {
                     SystemClock.sleep(1L)
                     image = reader.acquireLatestImage()
                 }
-                checkNotNull(image).use { check(engine.process(it)) }
+                checkNotNull(image).use {
+                    check(engine.process(it))
+                    if (stopRequested) {
+                        val acceptedAtStop = accepted
+                        check(!engine.process(it)) { "Accepted input after automatic stop" }
+                        check(accepted == acceptedAtStop && stopRequests == 1)
+                    }
+                }
                 check(errorCode == null) { "Native frame error $errorCode" }
-                if (stopRequested) break
+                if (stopRequested) {
+                    stoppedAtFrame = index
+                    check(!reverse || index >= 81) { "Capture stopped before reversal: frame=$index" }
+                    break
+                }
                 SystemClock.sleep(30L)
             }
             check(accepted >= 2 && uiImages > 0) { "No stitched frames: accepted=$accepted ui=$uiImages" }
+            check(!reverse || stopRequested) { "Reversing the sweep did not request Stop" }
             val stopped = SystemClock.elapsedRealtime()
             engine.stop()
             check(resultReady.await(5L, TimeUnit.SECONDS)) { "Native result callback timed out" }
@@ -370,9 +405,12 @@ class PanoramaPipelineInstrumentation : Instrumentation() {
                 completed.jpeg, 0, completed.jpeg.size,
                 android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }))
             decoded.recycle()
-            results.putString(if (vertical) "SamsungVertical" else "SamsungHorizontal",
+            val label = (if (vertical) "SamsungVertical" else "SamsungHorizontal") +
+                (if (reverse) "Reverse${if (negative) "Negative" else "Positive"}" else "")
+            results.putString(label,
                 "accepted=$accepted ui=$uiImages jpeg=${completed.jpeg.size} " +
-                    "size=${completed.imageSize} stopAndDecodeMs=${SystemClock.elapsedRealtime() - stopped}")
+                    "size=${completed.imageSize} stopFrame=$stoppedAtFrame stopRequests=$stopRequests " +
+                    "stopAndDecodeMs=${SystemClock.elapsedRealtime() - stopped}")
         } finally {
             engine.release()
             writer.close()

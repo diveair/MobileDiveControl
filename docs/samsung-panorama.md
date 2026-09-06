@@ -14,6 +14,18 @@ completed JPEG unchanged and opens Save/Delete review. Only Save publishes the i
 gallery. Review input is briefly disarmed so the stop gesture cannot also select Save.
 Stopping before a frame is selected cancels quietly.
 
+Direction reversal uses the installed selector's `0x7011` (trace direction back) result,
+the same condition handled by Samsung's `PanoramaStateCapture`. The adapter checks it before
+discarding unselected frames, stops accepting input, and requests the normal completed-image
+Save/Delete review. Ordinary skipped frames and movement warnings continue capture. This uses
+Samsung's own reversal detection rather than the retired Kotlin gyro thresholds.
+
+The full-screen viewfinder clears its camera-switch still image when the replacement
+`PreviewView` TextureView consumes a frame. The callback is scoped to the camera binding and
+surface request so an old producer cannot reveal an unready replacement. This avoids a stale
+full-screen cover when CameraX's stream state does not deliver an IDLE transition, even though
+the independent ImageAnalysis mini preview continues updating.
+
 ## Callback compatibility
 
 Samsung's higher-level `PanoramaNode` accesses a private `ImageReader` field and cannot process
@@ -46,3 +58,17 @@ Two subsequent physical captures on September 3, 2026 returned native JPEGs 116 
 after stop. The controller opened completed-image review at 213 ms and 181 ms respectively.
 Both review images were deleted through the app, with no crash. These measurements establish
 capture and review behavior for those runs, not exhaustive image-quality or device compatibility.
+
+The reversal regression additionally feeds forward travel, a stationary pause, then reverse
+travel through the production adapter and the installed native selector on both axes and in
+both signs:
+
+```text
+adb shell am instrument -w -e exerciseSamsungPipeline true -e exerciseSamsungReversal true com.mobiledivecontrol.test/com.mobiledivecontrol.ui.camera.PanoramaPipelineInstrumentation
+```
+
+It checks that reversal requests Stop exactly once, later input is ignored, and the completed
+JPEG still decodes. This is a native pipeline test with synthetic image motion, not a physical
+phone-pan or activity review-screen test.
+All four reversal cases and both forward-only controls passed on the connected S24 on
+September 3, 2026; results are retained in `artifacts/panorama-reversal-device-results.txt`.
