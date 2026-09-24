@@ -1,5 +1,32 @@
 package com.mobiledivecontrol
 
+import android.Manifest
+import android.os.Build
+
+/** The actual setup catalog, shared by the Activity and permission-sequence regression tests. */
+internal fun startupRuntimePermissionGroups(
+    sdkInt: Int,
+    bluetoothPermissions: List<String>,
+): List<List<Pair<String, String>>> = buildList {
+    add(bluetoothPermissions.map { it to "Nearby devices  —  to find your housing" })
+    add(listOf(Manifest.permission.CAMERA to "Camera  —  for photos and video"))
+    add(listOf(Manifest.permission.RECORD_AUDIO to "Microphone  —  for video audio"))
+    add(listOf(
+        Manifest.permission.ACCESS_COARSE_LOCATION to "Location/GPS  —  for dive position and Sky Guide",
+        Manifest.permission.ACCESS_FINE_LOCATION to "Precise GPS  —  for accurate dive position and Sky Guide",
+    ))
+    // Android 10+ allows access to media created by this app without a library-wide grant.
+    if (sdkInt <= Build.VERSION_CODES.P) {
+        add(listOf(
+            Manifest.permission.READ_EXTERNAL_STORAGE to "Media  —  to view saved photos and videos",
+            Manifest.permission.WRITE_EXTERNAL_STORAGE to "Save media  —  to save photos and videos",
+        ))
+    }
+    if (sdkInt >= Build.VERSION_CODES.TIRAMISU) {
+        add(listOf(Manifest.permission.POST_NOTIFICATIONS to "Notifications  —  for housing connection status"))
+    }
+}.map { group -> group.distinctBy { it.first } }
+
 internal enum class StartupPermissionGate {
     Request,
     WaitForBluetoothGrant,
@@ -72,18 +99,19 @@ internal fun nextStartupPermissionStep(
 }
 
 /**
- * Activity-result launchers cannot reliably present a system dialog before the Activity reaches
- * STARTED. In particular, recording a request as attempted during onCreate can strand a clean
- * install behind the app UI without Android ever having shown the permission surface.
+ * A subsequent dialog must wait for the previous system window to close and for this Activity
+ * to regain focus. An early launch can strand setup behind an invisible permission surface.
  */
 internal fun canLaunchStartupPermissionDialog(
     step: StartupPermissionStep,
-    lifecycleStarted: Boolean,
+    lifecycleResumed: Boolean,
+    windowFocused: Boolean,
     requestInFlight: Boolean,
     onDemandRequestActive: Boolean,
 ): Boolean = step.gate == StartupPermissionGate.Request &&
     step.permissions.isNotEmpty() &&
-    lifecycleStarted &&
+    lifecycleResumed &&
+    windowFocused &&
     !requestInFlight &&
     !onDemandRequestActive
 

@@ -702,7 +702,7 @@ class SafetyStateMachineTest {
     }
 
     @Test
-    fun `the released banner lets the pump start despite a stale cover byte`() {
+    fun `the released housing inhibits pump start so OK can power it off`() {
         val state = SafetyState(
             sealState = SealState.Unknown,
             vacuumReleasedPrompt = true,
@@ -710,9 +710,9 @@ class SafetyStateMachineTest {
             barometricPressureKpa = 101.0,
         )
         val result = machine.apply(state, SafetySignal.StartVacuumCheckRequested)
-        assertEquals(SealState.Vacuuming, result.state.sealState)
-        assertFalse(result.state.vacuumReleasedPrompt, "Starting the pump answers the banner")
-        assertTrue(motorOn in result.effects)
+        assertEquals(state, result.state)
+        assertTrue(result.state.vacuumReleasedPrompt)
+        assertTrue(result.effects.isEmpty())
     }
 
     @Test

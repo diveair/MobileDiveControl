@@ -17,12 +17,28 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 2. Grant permissions
 
-On first launch the app asks for Camera, media access, and — new — **Nearby devices**.
-Grant all of them. On Android 11 and below it will ask for Location instead of Nearby
-devices; that is a platform requirement for BLE scanning, not something the app uses.
+On first launch, before inserting and sealing the phone, complete the native permission
+requests for **Nearby devices**, **Camera**, **Microphone**, **Location**, and
+**Notifications** (Android 13+). Microphone access is requested during setup, before the
+first audio-enabled recording. Existing installations also request any missing grants
+at startup. Each dialog waits for the previous system window to close and the app to
+regain focus.
 
-If Nearby devices is denied, the app shows `SEARCHING FOR HOUSING` forever and logs the
-blocking reason. Re-grant in Settings → Apps → DiveControl → Permissions.
+Android 11 and below use Location for housing discovery. Android 9 and below also request
+both read and write storage access for viewing and saving media. Android 10+ does not
+require library-wide access to save and view DiveControl's own recordings.
+
+Denied permissions remain listed in setup instead of allowing the first-install
+walkthrough to advance to sealing. Tap the recovery screen to request them again; if
+Android suppresses the dialog after repeated denials, restore access in
+Settings → Apps → DiveControl → Permissions while the phone is still accessible.
+Accessibility control of system dialogs remains optional and is not needed to finish
+setup using the phone's touchscreen.
+
+Platform references: [runtime permissions](https://developer.android.com/training/permissions/requesting),
+[Bluetooth permissions](https://developer.android.com/develop/connectivity/bluetooth/bt-permissions),
+[media access](https://developer.android.com/training/data-storage/shared/media), and
+[notification permission](https://developer.android.com/develop/ui/compose/notifications/notification-permission).
 
 ## 3. Start capturing logs BEFORE powering the housing on
 

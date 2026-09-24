@@ -7,12 +7,12 @@ import org.junit.jupiter.api.Test
 class DepthGaugeColorTest {
     @Test
     fun `surface pressure differences below zero clamp to zero depth`() {
-        assertEquals(0.0, depthMetersFromPressure(101.2, 101.6))
+        assertEquals(0.0, depthMetersFromPressure(101.2))
     }
 
     @Test
-    fun `water pressure converts to depth from captured surface baseline`() {
-        assertEquals(2.0, depthMetersFromPressure(121.22, 101.6)!!, 0.0001)
+    fun `water pressure converts to depth from the DiveIT surface reference`() {
+        assertEquals(2.0, depthMetersFromPressure(120.945)!!, 0.0001)
     }
 
     @Test

@@ -2304,9 +2304,8 @@ class CameraRuntimeController(
     /**
      * @param atmosphericPressureKpa the live in-shell barometric reading. Used for the auto filter
      *   only; it is not a depth reference once a vacuum has been pulled.
-     * @param surfaceAmbientKpa the baseline captured with the suction cover open. Depth is measured
-     *   against this. Defaulted so a caller that has no baseline yet falls back to the standard
-     *   atmosphere rather than silently reverting to the live reading.
+     * @param surfaceAmbientKpa the captured internal atmosphere used for colour-confidence
+     *   weighting only. The depth calculation uses the fixed DiveIT reference.
      */
     fun applyState(
         cameraState: CameraState,
@@ -8817,7 +8816,7 @@ class CameraRuntimeController(
             val values = JSONObject()
             latestWaterPressureKpa?.let { values.put("water_kpa", it) }
             latestAtmosphericPressureKpa?.let { values.put("housing_kpa", it) }
-            latestSurfaceAmbientKpa?.let { values.put("surface_reference_kpa", it) }
+            values.put("surface_reference_kpa", com.mobiledivecontrol.core.STANDARD_SURFACE_PRESSURE_KPA)
             if (values.length() > 0) json.put("pressure", values)
         }
         if (exposure) {
@@ -10342,19 +10341,9 @@ class CameraRuntimeController(
         return RggbChannelVector(redGain, greenGain, greenGain, blueGain)
     }
 
-    /**
-     * Depth from the water-pressure sensor, referenced to the captured surface baseline.
-     *
-     * Deliberately *not* the live barometric reading. That sensor is inside the shell, so once the
-     * vacuum check pulls 20 kPa out of it the reading drops to ~81 kPa and the subtraction reports
-     * about two metres of depth while the housing is still on the boat. That number feeds the
-     * underwater colour correction, which would then start compensating for a dive that has not
-     * happened. `surfaceAmbientKpa` is captured while the suction cover is open, when the shell is
-     * vented and the sensor really is reading atmosphere; with no capture yet, the standard
-     * atmosphere is wrong by altitude and weather but never by the whole vacuum.
-     */
+    /** Same fixed external-pressure reference as the HUD; vacuum cannot shift depth. */
     private fun currentDepthMeters(): Double? {
-        return depthMetersFromPressure(latestWaterPressureKpa, latestSurfaceAmbientKpa)
+        return depthMetersFromPressure(latestWaterPressureKpa)
     }
 
     /** The mode's manual kelvin, or null when white balance sits on Auto (or has no dial). */

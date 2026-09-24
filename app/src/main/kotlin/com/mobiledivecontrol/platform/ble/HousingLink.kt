@@ -14,6 +14,9 @@ import com.mobiledivecontrol.core.HousingIdentityVerifier
 import com.mobiledivecontrol.core.ParseResult
 import com.mobiledivecontrol.core.ProtocolParser
 import com.mobiledivecontrol.core.SensorUpdate
+import com.mobiledivecontrol.core.SensorPacketSource
+import com.mobiledivecontrol.core.HousingSensorMonitor
+import com.mobiledivecontrol.core.pressureMonotonicMs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -22,6 +25,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -50,11 +55,16 @@ sealed interface HousingLinkEvent {
     data class Notification(
         val characteristicShortHex: String,
         val payload: ByteArray,
+        val source: SensorPacketSource = SensorPacketSource.Notification,
+        val receivedAtEpochMs: Long = System.currentTimeMillis(),
+        val receivedAtMonotonicMs: Long = pressureMonotonicMs(),
     ) : HousingLinkEvent {
         override fun equals(other: Any?): Boolean = this === other ||
             (other is Notification &&
                 characteristicShortHex == other.characteristicShortHex &&
-                payload.contentEquals(other.payload))
+                payload.contentEquals(other.payload) &&
+                source == other.source && receivedAtMonotonicMs == other.receivedAtMonotonicMs &&
+                receivedAtEpochMs == other.receivedAtEpochMs)
 
         override fun hashCode(): Int = 31 * characteristicShortHex.hashCode() + payload.contentHashCode()
     }
@@ -91,6 +101,7 @@ class HousingLink(
     private val identityVerifier: HousingIdentityVerifier = HousingIdentityVerifier(),
     private val encoder: HousingCommandEncoder = HousingCommandEncoder(),
     private val parser: ProtocolParser = ProtocolParser(),
+    private val onDiagnosticEvent: (HousingLinkEvent) -> Unit = {},
 ) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -170,8 +181,17 @@ class HousingLink(
     private var coverOpenSeen: Boolean = false
 
     /** True between a successful motor-on write and a successful motor-off write. */
-    @Volatile
-    private var motorBelievedRunning: Boolean = false
+    @Volatile private var motorBelievedRunning: Boolean = false
+    @Volatile private var sensorReadsPaused: Boolean = false
+
+    fun setSensorReadsPaused(paused: Boolean) {
+        sensorReadsPaused = paused
+        refreshSensorReadPolicy()
+    }
+
+    private fun refreshSensorReadPolicy() {
+        session?.sensors?.setReadsEnabled(!sensorReadsPaused && !motorBelievedRunning)
+    }
 
     private var motorWatchdog: Job? = null
 
@@ -250,6 +270,9 @@ class HousingLink(
         val requests = encoder.encode(command)
         if (requests.isEmpty()) return true
 
+        val tracePump = command is HousingCommand.SetVacuumMotor || command is HousingCommand.SetSolenoidValve
+        val writeStartedMs = pressureMonotonicMs()
+        if (tracePump) Log.i("DivePump", "Sending $command")
         val succeeded = runCatching {
             writeLock.withLock { execute(active.transport, requests) }
         }.getOrElse { error ->
@@ -259,6 +282,7 @@ class HousingLink(
             false
         }
 
+        if (tracePump) Log.i("DivePump", "$command success=$succeeded elapsedMs=${pressureMonotonicMs() - writeStartedMs}")
         if (succeeded && command is HousingCommand.SetVacuumMotor) {
             if (command.enabled) armMotorWatchdog() else disarmMotorWatchdog()
         }
@@ -278,6 +302,7 @@ class HousingLink(
      */
     private fun armMotorWatchdog() {
         motorBelievedRunning = true
+        refreshSensorReadPolicy()
         motorWatchdog?.cancel()
         motorWatchdog = scope.launch {
             delay(MOTOR_WATCHDOG_MS)
@@ -289,6 +314,7 @@ class HousingLink(
 
     private fun disarmMotorWatchdog() {
         motorBelievedRunning = false
+        refreshSensorReadPolicy()
         motorWatchdog?.cancel()
         motorWatchdog = null
     }
@@ -312,6 +338,7 @@ class HousingLink(
             Log.e(TAG, "Failed to force pump to rest", error)
         }
         motorBelievedRunning = false
+        refreshSensorReadPolicy()
     }
 
     /**
@@ -415,8 +442,7 @@ class HousingLink(
         try {
             transport.setDisconnectListener { cause -> current.ended.complete(cause) }
             transport.setNotificationListener { characteristic, value ->
-                observeCoverState(characteristic, value)
-                emit(HousingLinkEvent.Notification(characteristic.shortHex, value))
+                current.sensors.receive(characteristic, value, SensorPacketSource.Notification)
             }
 
             emit(HousingLinkEvent.Ble(BleSignal.StartScan))
@@ -461,7 +487,15 @@ class HousingLink(
             emit(HousingLinkEvent.Ble(BleSignal.Ready))
             reconcileMotorAfterReconnect()
 
-            return when (current.ended.await()) {
+            val disconnectCause = coroutineScope {
+                val sensorJob = launch { current.sensors.run(available) }
+                try {
+                    current.ended.await()
+                } finally {
+                    sensorJob.cancelAndJoin()
+                }
+            }
+            return when (disconnectCause) {
                 DisconnectCause.RemoteClosed -> {
                     emit(HousingLinkEvent.Ble(BleSignal.HousingPoweredOff))
                     emit(HousingLinkEvent.Warning("Housing powered off."))
@@ -527,7 +561,7 @@ class HousingLink(
                 transport.readCharacteristic(characteristic)
             }.getOrNull() ?: continue
             if (payload.isNotEmpty()) {
-                emit(HousingLinkEvent.Notification(characteristic.shortHex, payload))
+                session?.sensors?.receive(characteristic, payload, SensorPacketSource.Read)
             }
         }
     }
@@ -632,6 +666,7 @@ class HousingLink(
      * press behind it.
      */
     private fun emit(event: HousingLinkEvent) {
+        onDiagnosticEvent(event)
         when (event) {
             is HousingLinkEvent.Ble -> lastSignal = event.signal
             is HousingLinkEvent.Notification ->
@@ -655,8 +690,16 @@ class HousingLink(
     private fun describe(error: Throwable): String =
         error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
 
-    private class Session(val transport: HousingTransport) {
+    private inner class Session(val transport: HousingTransport) {
         val ended = CompletableDeferred<DisconnectCause>()
+        val sensors = HousingSensorMonitor(
+            read = transport::readCharacteristic,
+            deliver = { characteristic, payload, source ->
+                if (session === this && !ended.isCompleted) {
+                    emit(HousingLinkEvent.Notification(characteristic.shortHex, payload, source))
+                }
+            },
+        ).also { it.setReadsEnabled(!sensorReadsPaused && !motorBelievedRunning) }
     }
 
     private data class SessionResult(

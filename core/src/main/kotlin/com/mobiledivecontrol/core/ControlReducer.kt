@@ -47,6 +47,7 @@ class ControlReducer(
         is HousingCommand -> reduceHousing(state, command)
         is SystemCommand -> reduceSystem(state, command)
         is DiagnosticsCommand -> reduceDiagnostics(state, command)
+        is DiveSettingsCommand -> reduceDiveSettings(state, command)
         is GalleryCommand -> reduceGalleryGrid(state, command)
     }
 
@@ -69,6 +70,18 @@ class ControlReducer(
 
         val effects = mutableListOf<PlatformEffect>()
         val notes = mutableListOf<String>()
+
+        if (state.safety.vacuumReleasedPrompt) {
+            if (state.housing.connected && !connected) {
+                nextState = nextState.copy(safety = nextState.safety.copy(vacuumReleaseDisconnectObserved = true,
+                    vacuumReleaseChoice = VacuumReleaseChoice.ShutDown))
+            } else if (newState == BleConnectionState.Ready && state.safety.vacuumReleaseDisconnectObserved) {
+                nextState = nextState.copy(safety = nextState.safety.copy(
+                    vacuumReleasedPrompt = false, vacuumReleaseDisconnectObserved = false,
+                    vacuumReleaseChoice = VacuumReleaseChoice.ShutDown,
+                    checkDismissed = false, coverOpen = null, sealState = SealState.Unknown))
+            }
+        }
 
         when (newState) {
             BleConnectionState.Reconnecting -> {
@@ -724,6 +737,10 @@ class ControlReducer(
     }
 
     private fun reduceSafety(state: AppState, command: SafetyCommand): Reduction = when (command) {
+        is SafetyCommand.SelectVacuumReleaseChoice -> Reduction(if (state.safety.vacuumReleasedPrompt)
+            state.copy(safety = state.safety.copy(vacuumReleaseChoice = command.choice)) else state)
+        SafetyCommand.ConfirmVacuumReleaseChoice -> if (!state.housing.connected) Reduction(state) else mergeSafetyResult(
+            state, safetyStateMachine.apply(state.safety, SafetySignal.ConfirmVacuumReleaseChoiceRequested))
         SafetyCommand.StartVacuumCheck -> mergeSafetyResult(
             state = state,
             result = safetyStateMachine.apply(
@@ -1002,8 +1019,7 @@ class ControlReducer(
             CameraUiZone.LiveView -> cycleModeFromSettingsBar(state, -1)
             CameraUiZone.ModeRail -> {
                 val nextCamera = if (camera.railLevel == CameraRailLevel.Primary) {
-                    val size = CameraCatalog.primaryRailEntries.size
-                    camera.copy(highlightedPrimaryIndex = (camera.highlightedPrimaryIndex - 1 + size) % size)
+                    camera.copy(highlightedPrimaryIndex = CameraCatalog.movePrimaryRail(camera.highlightedPrimaryIndex, -1, state.diveProfile.stopActive))
                 } else {
                     camera.copy(highlightedSecondaryIndex = (camera.highlightedSecondaryIndex - 1).coerceAtLeast(0))
                 }
@@ -1033,8 +1049,7 @@ class ControlReducer(
             CameraUiZone.LiveView -> cycleModeFromSettingsBar(state, +1)
             CameraUiZone.ModeRail -> {
                 val nextCamera = if (camera.railLevel == CameraRailLevel.Primary) {
-                    val size = CameraCatalog.primaryRailEntries.size
-                    camera.copy(highlightedPrimaryIndex = (camera.highlightedPrimaryIndex + 1) % size)
+                    camera.copy(highlightedPrimaryIndex = CameraCatalog.movePrimaryRail(camera.highlightedPrimaryIndex, 1, state.diveProfile.stopActive))
                 } else {
                     camera.copy(highlightedSecondaryIndex = (camera.highlightedSecondaryIndex + 1).coerceAtMost(CameraCatalog.secondaryModes.lastIndex))
                 }
@@ -1309,6 +1324,11 @@ class ControlReducer(
     private fun activatePrimaryRailEntry(state: AppState): Reduction {
         val camera = state.camera
         val entry = camera.primaryHighlightedEntry
+        if (entry.action == CameraRailAction.SafetyStop) {
+            if (!state.diveProfile.stopActive) return Reduction(state.copy(camera = camera.copy(highlightedPrimaryIndex = 0)))
+            return Reduction(state.copy(camera = exitModeRail(camera), diveProfile = state.diveProfile.copy(
+                stopPresentation = DiveStopPresentation.Expanded)))
+        }
         if (entry.opensSecondaryRail) {
             return Reduction(
                 state = state.copy(
@@ -1338,9 +1358,9 @@ class ControlReducer(
                 effects = listOf(PlatformEffect.TrackCurrentHeading),
             )
         }
-        if (entry.action == CameraRailAction.Diagnostics) {
+        if (entry.action == CameraRailAction.Diagnostics || entry.action == CameraRailAction.DiveSettings) {
             if (camera.recording) {
-                val warning = "Stop recording before opening Diagnostics."
+                val warning = "Stop recording before opening ${entry.label}."
                 return Reduction(
                     state = state.copy(lastWarning = warning),
                     notes = listOf(warning),
@@ -1348,7 +1368,7 @@ class ControlReducer(
             }
             return Reduction(
                 state = state.copy(
-                    mode = AppMode.Diagnostics,
+                    mode = if (entry.action == CameraRailAction.DiveSettings) AppMode.DiveSettings else AppMode.Diagnostics,
                     camera = exitModeRail(camera),
                     diagnosticsAction = DiagnosticsAction.BackToCamera,
                     lastWarning = null,
@@ -1364,7 +1384,8 @@ class ControlReducer(
     }
 
     private fun activateModeRailEntry(state: AppState, index: Int): Reduction {
-        if (index !in CameraCatalog.primaryRailEntries.indices) return Reduction(state = state)
+        if (index !in CameraCatalog.primaryRailEntries.indices &&
+            !(index == CameraCatalog.SAFETY_STOP_RAIL_INDEX && state.diveProfile.stopActive)) return Reduction(state = state)
         val selectedState = state.copy(
             camera = state.camera.copy(
                 focusedZone = CameraUiZone.ModeRail,

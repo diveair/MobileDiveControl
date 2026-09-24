@@ -26,7 +26,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -177,24 +176,12 @@ fun StateDrivenCameraPreview(
         onEffectsConsumed()
     }
 
-    // Front camera preview appears upside down in landscape dive housing
-    val isFrontCamera = cameraState.settingValues.entries
-        .any { it.key.endsWith(".lens") && it.value == "front" }
-
     Box(modifier = modifier.fillMaxSize()) {
         AndroidView(
             factory = { previewView },
-            modifier = Modifier
-                .fillMaxSize()
-                .then(
-                    if (isFrontCamera) {
-                        Modifier.graphicsLayer {
-                            rotationZ = 180f
-                        }
-                    } else {
-                        Modifier
-                    }
-                ),
+            // PreviewView already applies CameraX's sensor/display rotation and front mirroring.
+            // A second 180-degree rotation inverted the image (and leaked across saved lens modes).
+            modifier = Modifier.fillMaxSize(),
         )
 
         heldTransitionFrame?.let { bitmap ->

@@ -111,11 +111,26 @@ class ProtocolParser {
     }
 
     fun decodeWaterPressure(payload: ByteArray): ParseResult<SensorUpdate.WaterPressure> {
-        return decodeUnsignedSensor(
-            payload = payload,
-            label = "water pressure",
-            transform = { raw -> SensorUpdate.WaterPressure(kpa = raw / 100.0) },
-        )
+        if (payload.size !in 3..4) {
+            return ParseResult.Failure(ProtocolError(
+                code = "water_pressure_length_invalid",
+                message = "Expected 3 or 4 bytes for water pressure but received ${payload.size}",
+            ))
+        }
+        // The installed Diveit 3.00 DiveIT decoder uses b0 + b1*256 + b2*65536.
+        // Byte 3 in the documented four-byte packet is not part of its pressure value.
+        val raw = (payload[0].toInt() and 0xFF) or
+            ((payload[1].toInt() and 0xFF) shl 8) or
+            ((payload[2].toInt() and 0xFF) shl 16)
+        val kpa = raw / 100.0
+        return if (validWaterPressure(kpa)) {
+            ParseResult.Success(SensorUpdate.WaterPressure(kpa))
+        } else {
+            ParseResult.Failure(ProtocolError(
+                code = "water_pressure_range_invalid",
+                message = "Out-of-range water pressure value: $raw (raw).",
+            ))
+        }
     }
 
     fun decodeWaterTemperature(payload: ByteArray): ParseResult<SensorUpdate.WaterTemperature> {
@@ -130,6 +145,7 @@ class ProtocolParser {
         return decodeUnsignedSensor(
             payload = payload,
             label = "barometric pressure",
+            validRaw = { validBarometricPressure(it / 1000.0) },
             transform = { raw -> SensorUpdate.BarometricPressure(kpa = raw / 1000.0) },
         )
     }
@@ -185,6 +201,7 @@ class ProtocolParser {
     private fun <T> decodeUnsignedSensor(
         payload: ByteArray,
         label: String,
+        validRaw: (Double) -> Boolean = { true },
         transform: (Double) -> T,
     ): ParseResult<T> {
         val rawValue = decodeUnsignedInt32(payload)
@@ -194,6 +211,14 @@ class ProtocolParser {
                     message = "Expected 4 bytes for $label but received ${payload.size}",
                 ),
             )
+        if (!validRaw(rawValue.toDouble())) {
+            return ParseResult.Failure(
+                ProtocolError(
+                    code = "${label.replace(' ', '_')}_range_invalid",
+                    message = "Out-of-range $label value: $rawValue (raw).",
+                ),
+            )
+        }
         return ParseResult.Success(transform(rawValue.toDouble()))
     }
 

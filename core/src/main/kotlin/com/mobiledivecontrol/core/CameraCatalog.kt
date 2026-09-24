@@ -12,6 +12,8 @@ data class CameraRailEntry(
 
 enum class CameraRailAction {
     TrackHeading,
+    SafetyStop,
+    DiveSettings,
     Diagnostics,
 }
 
@@ -44,6 +46,22 @@ data class CameraModeProfile(
 )
 
 object CameraCatalog {
+    // Stable reserved index: inserting the temporary action must not renumber capture modes.
+    const val SAFETY_STOP_RAIL_INDEX = -1
+    private val safetyStopEntry = CameraRailEntry("safety_stop", "Safety Stop", action = CameraRailAction.SafetyStop)
+
+    fun primaryRailWithStop(active: Boolean): List<IndexedValue<CameraRailEntry>> = buildList {
+        primaryRailEntries.forEachIndexed { index, entry ->
+            add(IndexedValue(index, entry))
+            if (index == 0 && active) add(IndexedValue(SAFETY_STOP_RAIL_INDEX, safetyStopEntry))
+        }
+    }
+
+    fun movePrimaryRail(index: Int, delta: Int, stopActive: Boolean): Int {
+        val visible = primaryRailWithStop(stopActive)
+        val position = visible.indexOfFirst { it.index == index }.coerceAtLeast(0)
+        return visible[Math.floorMod(position + delta, visible.size)].index
+    }
     /**
      * White-balance modes live on the Kelvin ring itself so the housing wheel can reach them
      * from either end without a separate menu. The names are persisted values: keep them stable
@@ -56,8 +74,7 @@ object CameraCatalog {
     val primaryRailEntries: List<CameraRailEntry> = listOf(
         // An overlay action, not a capture mode: it never tears down or rebinds CameraX.
         CameraRailEntry("track_heading", "Track Heading", action = CameraRailAction.TrackHeading),
-        // Capture modes use the same circular order as the centred Mode control. The two action
-        // entries remain outside that capture loop so Diagnostics can still be the final item.
+        // Capture modes stay in their own cycle; screen actions are outside that cycle.
         CameraRailEntry("pro_video", "Pro Video", CameraModeId.ProVideo),
         CameraRailEntry("slow_motion", "Slow Motion", CameraModeId.SlowMotion),
         CameraRailEntry("hyperlapse", "Hyperlapse", CameraModeId.Hyperlapse),
@@ -73,6 +90,8 @@ object CameraCatalog {
         // A state screen rather than a capture profile. Keeping it as an action avoids inventing
         // a camera mode with fake lenses/settings while still placing it last in the Modes menu.
         CameraRailEntry("diagnostics", "Diagnostics", action = CameraRailAction.Diagnostics),
+        // Up wraps from Track Heading to Dive Settings, then Diagnostics.
+        CameraRailEntry("dive_settings", "Dive Settings", action = CameraRailAction.DiveSettings),
     )
 
     /** Circular order used by Up/Down while the centred Mode control is selected. */
@@ -577,6 +596,7 @@ object CameraCatalog {
     }
 
     fun highlightedPrimaryEntry(camera: CameraState): CameraRailEntry {
+        if (camera.highlightedPrimaryIndex == SAFETY_STOP_RAIL_INDEX) return safetyStopEntry
         return primaryRailEntries[camera.highlightedPrimaryIndex.coerceIn(0, primaryRailEntries.lastIndex)]
     }
 

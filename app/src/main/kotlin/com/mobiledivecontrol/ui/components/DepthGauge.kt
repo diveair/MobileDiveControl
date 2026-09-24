@@ -3,6 +3,7 @@ package com.mobiledivecontrol.ui.components
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -11,65 +12,36 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.mobiledivecontrol.core.HeadingMath
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.core.SealState
 import com.mobiledivecontrol.theme.DiveColors
 
 /** ISA standard sea-level pressure. The reference when no surface baseline has been captured. */
-const val STANDARD_ATMOSPHERE_KPA = 101.325
+const val STANDARD_ATMOSPHERE_KPA = com.mobiledivecontrol.core.STANDARD_SURFACE_PRESSURE_KPA
 
-/**
- * Converts absolute water pressure to gauge depth using the captured surface atmosphere.
- * The live internal barometer is intentionally not an input: pulling a housing vacuum changes it
- * without changing depth. The current `9.81 kPa/m` divisor is the freshwater approximation used
- * throughout the app; a salt-water density selector remains a separate calibration task.
- */
-fun depthMetersFromPressure(
-    waterPressureKpa: Double?,
-    surfaceAmbientKpa: Double?,
-): Double? {
-    val water = waterPressureKpa ?: return null
-    val surface = surfaceAmbientKpa ?: STANDARD_ATMOSPHERE_KPA
-    return (water - surface).coerceAtLeast(0.0) / 9.81
-}
+/** DiveIT BLE depth reference, with the requested 9.81 kPa/m conversion. */
+fun depthMetersFromPressure(waterPressureKpa: Double?): Double? =
+    com.mobiledivecontrol.core.pressureDepthMeters(waterPressureKpa)
 
-/**
- * Depth gauge — bottom center of camera UI.
- * No icon. Just clean text: "12.5 m" or "41.0 ft".
- * Color-coded by depth range.
- *
- * [surfaceAmbientKpa] is the barometric reading captured while the suction cover was open, *not*
- * the live one. Once the vacuum check pulls 20 kPa out of the shell the internal sensor reads
- * ~81 kPa, and subtracting that would put the gauge at roughly two metres while the housing is
- * still sitting on the boat. The captured baseline is the only atmospheric reference that survives
- * a pulled vacuum; when it has never been captured this falls back to the standard atmosphere,
- * which is wrong by altitude and weather but never by the whole vacuum.
- *
- * [temperatureCelsius] rides along in the same pill: depth and water temperature are the two
- * numbers a diver reads together every few minutes, and pairing them here freed the top-centre
- * slot for the vacuum cluster, which needs the width.
- *
- * [headingDegrees] occupies the exact middle slot. Equal-width depth and temperature cells keep
- * the compass geometrically centred even as either reading gains digits. When
- * [headingTargetSynchronized] is true it shares the navigation arrow's success colour.
- */
+/** Camera depth uses the same live external pressure and reference as Diagnostics. */
 @Composable
 fun DepthGauge(
     waterPressureKpa: Double?,
-    surfaceAmbientKpa: Double?,
     useMetric: Boolean = true,
     temperatureCelsius: Double? = null,
     headingDegrees: Double? = null,
     headingTargetSynchronized: Boolean = false,
     modifier: Modifier = Modifier,
+    maxDepthMeters: Double? = null,
 ) {
-    val depthMeters = depthMetersFromPressure(waterPressureKpa, surfaceAmbientKpa)
+    val depthMeters = depthMetersFromPressure(waterPressureKpa)
 
     val displayText = when {
-        depthMeters == null -> if (useMetric) "-- m" else "-- ft"
-        useMetric -> "%.1f m".format(depthMeters)
-        else -> "%.1f ft".format(depthMeters * 3.28084)
+        depthMeters == null -> "--"
+        useMetric -> "%.1f".format(depthMeters)
+        else -> "%.1f".format(depthMeters * 3.28084)
     }
 
     val color = when {
@@ -85,15 +57,39 @@ fun DepthGauge(
         modifier = modifier,
     ) {
         Box(
-            modifier = Modifier.width(SIDE_READOUT_WIDTH),
+            modifier = Modifier.widthIn(min = SIDE_READOUT_WIDTH),
             contentAlignment = Alignment.CenterEnd,
         ) {
-            Text(
-                text = displayText,
-                color = color,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-            )
+            // Compact single-line depth pair: current | maximum, sharing the trailing unit.
+            Row {
+                Text(
+                    text = displayText,
+                    color = color,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.alignByBaseline(),
+                    maxLines = 1,
+                )
+                Text(
+                    text = " | ",
+                    color = DiveColors.TextMuted,
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.alignByBaseline(),
+                )
+                Text(
+                    text = maxDepthMeters?.let { maximum ->
+                        if (useMetric) "MAX %.1f m".format(maximum)
+                        else "MAX %.1f ft".format(maximum * 3.28084)
+                    } ?: if (useMetric) "MAX -- m" else "MAX -- ft",
+                    color = if (maxDepthMeters != null) DiveColors.DiveCyan else DiveColors.TextMuted,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontSize = 10.sp,
+                    lineHeight = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.alignByBaseline(),
+                    maxLines = 1,
+                )
+            }
         }
         ReadoutSeparator()
         Text(

@@ -133,6 +133,7 @@ import kotlin.math.sin
 fun CameraShellScreen(
     cameraState: CameraState,
     safetyState: SafetyState,
+    safetyStopActive: Boolean = false,
     cameraPermissionGranted: Boolean = false,
     locationPrerequisitesReady: Boolean = false,
     lifecycleOwner: androidx.lifecycle.LifecycleOwner? = null,
@@ -270,6 +271,7 @@ fun CameraShellScreen(
         ) {
             RightModeRail(
                 cameraState = cameraState,
+                safetyStopActive = safetyStopActive,
                 onCommand = onCameraCommand,
             )
         }
@@ -1449,15 +1451,16 @@ private fun SaveLocationAlbumCover(
 @Composable
 private fun RightModeRail(
     cameraState: CameraState,
+    safetyStopActive: Boolean,
     onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val items = CameraCatalog.primaryRailEntries
-    val highlightedIndex = cameraState.highlightedPrimaryIndex
+    val items = CameraCatalog.primaryRailWithStop(safetyStopActive)
+    val highlightedIndex = items.indexOfFirst { it.index == cameraState.highlightedPrimaryIndex }.coerceAtLeast(0)
     val listState = rememberLazyListState()
 
     // Auto-scroll to keep highlighted item visible
-    LaunchedEffect(highlightedIndex) {
+    LaunchedEffect(highlightedIndex, safetyStopActive) {
         listState.animateScrollToItem(
             index = highlightedIndex.coerceIn(0, items.lastIndex),
         )
@@ -1484,7 +1487,8 @@ private fun RightModeRail(
             verticalArrangement = Arrangement.spacedBy(4.dp),
             modifier = Modifier.weight(1f),
         ) {
-            itemsIndexed(items) { index, entry ->
+            itemsIndexed(items, key = { _, entry -> entry.value.key }) { index, indexed ->
+                val entry = indexed.value
                 val selected = index == highlightedIndex
                 Box(
                     modifier = Modifier
@@ -1499,7 +1503,7 @@ private fun RightModeRail(
                             color = if (selected) DiveColors.DiveCyan else DiveColors.SurfaceBorder,
                             shape = RoundedCornerShape(14.dp),
                         )
-                        .clickable { onCommand(CameraCommand.ActivateModeRailEntry(index)) }
+                        .clickable { onCommand(CameraCommand.ActivateModeRailEntry(indexed.index)) }
                         .padding(horizontal = 10.dp, vertical = if (selected) 10.dp else 8.dp),
                 ) {
                     Text(

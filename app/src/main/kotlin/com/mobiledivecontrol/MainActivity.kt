@@ -89,13 +89,15 @@ class MainActivity : ComponentActivity() {
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        runtimePermissionRequestInFlight = false
         refreshPermissionState()
         // Let Android remove the current permission window before presenting the next one. This
         // keeps every group a distinct, housing-navigable surface instead of allowing controllers
         // to coalesce or visually overlap consecutive launches.
         window.decorView.postDelayed(
-            { checkAndRequestPermissions() },
+            {
+                runtimePermissionRequestInFlight = false
+                checkAndRequestPermissions()
+            },
             STARTUP_PERMISSION_DIALOG_SETTLE_MS,
         )
     }
@@ -165,6 +167,16 @@ class MainActivity : ComponentActivity() {
             val cameraStressRequested =
                 (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 &&
                 intent.getBooleanExtra(CameraStressTestRunner.EXTRA_ENABLED, false)
+            androidx.compose.runtime.LaunchedEffect(cameraPermissionGranted) {
+                if (cameraPermissionGranted && (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 &&
+                    intent.getBooleanExtra("divecontrol.safety_stop_motion", false)) {
+                    intent.removeExtra("divecontrol.safety_stop_motion")
+                    viewModel.dismissIntro()
+                    viewModel.dismissCapPrompt()
+                    viewModel.dispatch(com.mobiledivecontrol.core.SafetyCommand.DismissSealCheck)
+                    viewModel.runSafetyStopMotion()
+                }
+            }
             androidx.compose.runtime.LaunchedEffect(
                 cameraStressRequested,
                 cameraPermissionGranted,
@@ -261,8 +273,7 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
-            // Microphone is requested after startup. Its grant can change without any of the
-            // startup permission keys changing, so it needs its own observable synchronization.
+            // Keep the microphone grant synchronized for setup and any later permission change.
             androidx.compose.runtime.LaunchedEffect(microphonePermissionGranted) {
                 viewModel.updatePermission(
                     com.mobiledivecontrol.core.PermissionKind.Microphone,
@@ -353,6 +364,8 @@ class MainActivity : ComponentActivity() {
                         onCameraCommand = { command -> viewModel.dispatch(command) },
                         onGalleryCommand = { command -> viewModel.dispatch(command) },
                         onDiagnosticsCommand = { command -> viewModel.dispatch(command) },
+                        onDiveSettingsCommand = { command -> viewModel.dispatch(command) },
+                        onSafetyCommand = { command -> viewModel.dispatch(command) },
                         introVisible = introVisible,
                         onIntroDismiss = {
                             viewModel.dismissIntro()
@@ -381,6 +394,7 @@ class MainActivity : ComponentActivity() {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
             hideSystemBars()
+            window.decorView.post { checkAndRequestPermissions() }
         }
     }
 
@@ -412,40 +426,8 @@ class MainActivity : ComponentActivity() {
         bluetoothStateRefresh?.invoke()
     }
 
-    private fun startupRuntimePermissionGroups(): List<List<Pair<String, String>>> = buildList {
-            // Bootstrap first: these share Android's Nearby Devices dialog and must stay together.
-            add(
-                BlePermissions.required().map { permission ->
-                    permission to "Nearby devices  —  to find your housing"
-                },
-            )
-            add(listOf(Manifest.permission.CAMERA to "Camera  —  so the app can see"))
-            add(
-                listOf(
-                    Manifest.permission.ACCESS_COARSE_LOCATION to
-                        "Location/GPS  —  for dive position and Sky Guide",
-                    Manifest.permission.ACCESS_FINE_LOCATION to
-                        "Precise GPS  —  for accurate dive position and Sky Guide",
-                ),
-            )
-            // Microphone is feature-scoped, not an application-start prerequisite. Request it
-            // when the diver first starts an audio-enabled recording; putting it in this chain
-            // left a secure GrantPermissionsActivity over the intro after camera acceptance and
-            // made the still-running app look frozen.
-            // Android 10+ lets an app read and modify media it created without a storage grant.
-            // Requesting READ_MEDIA_* would let Android offer partial access and launch its
-            // selected-media management picker, so modern startup deliberately has no media step.
-            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                add(
-                    listOf(
-                        Manifest.permission.READ_EXTERNAL_STORAGE to
-                            "Media  —  DiveControl gallery access",
-                    ),
-                )
-            }
-            // Notification visibility is also optional and is requested by the housing-link
-            // feature itself. It must never prevent the camera UI from opening.
-        }.map { group -> group.distinctBy { it.first } }
+    private fun startupRuntimePermissionGroups(): List<List<Pair<String, String>>> =
+        startupRuntimePermissionGroups(Build.VERSION.SDK_INT, BlePermissions.required())
 
     private fun requiredRuntimePermissions(): List<Pair<String, String>> =
         startupRuntimePermissionGroups().flatten().distinctBy { it.first }
@@ -495,9 +477,10 @@ class MainActivity : ComponentActivity() {
 
         if (canLaunchStartupPermissionDialog(
                 step = step,
-                lifecycleStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
+                lifecycleResumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
+                windowFocused = window.decorView.hasWindowFocus(),
                 requestInFlight = runtimePermissionRequestInFlight,
-                onDemandRequestActive = activeOnDemandPermissionRequest != null,
+                onDemandRequestActive = activeOnDemandPermissionRequest != null || skyGuidePermissionRequestInFlight,
             )
         ) {
             startupPermissionsAttempted += step.permissions
@@ -505,7 +488,8 @@ class MainActivity : ComponentActivity() {
             runtimePermissionRequestInFlight = true
             permissionsLauncher.launch(step.permissions.toTypedArray())
         } else if (step.gate == StartupPermissionGate.Complete) {
-            launchQueuedOnDemandPermissionRequest()
+            if (queuedOnDemandPermissionRequest != null) launchQueuedOnDemandPermissionRequest()
+            else if (skyGuideLocationWanted && locationPermissionGranted) requestSkyGuideLocationPrerequisites()
         }
     }
 
@@ -560,7 +544,7 @@ class MainActivity : ComponentActivity() {
         resolve: (Long, Boolean) -> Unit,
     ) {
         val pending = PendingOnDemandPermissionRequest(request, resolve)
-        if (runtimePermissionRequestInFlight || activeOnDemandPermissionRequest != null) {
+        if (runtimePermissionRequestInFlight || activeOnDemandPermissionRequest != null || skyGuidePermissionRequestInFlight) {
             queuedOnDemandPermissionRequest = pending
             return
         }
@@ -607,7 +591,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchQueuedOnDemandPermissionRequest() {
-        if (runtimePermissionRequestInFlight || activeOnDemandPermissionRequest != null) return
+        if (runtimePermissionRequestInFlight || activeOnDemandPermissionRequest != null || skyGuidePermissionRequestInFlight) return
         val queued = queuedOnDemandPermissionRequest ?: return
         queuedOnDemandPermissionRequest = null
         window.decorView.post {
@@ -627,7 +611,8 @@ class MainActivity : ComponentActivity() {
     }.distinct()
 
     /**
-     * Location is requested at the moment Sky Guide is selected, not during unrelated startup.
+     * Startup requests location before housing setup; this handles a later revocation or a
+     * disabled phone Location switch when Sky Guide is selected.
      * Android permits a second ordinary request after a rejection; once the OS marks the grant as
      * permanently denied, only the app-permission settings page can legally restore it.
      */
@@ -645,6 +630,10 @@ class MainActivity : ComponentActivity() {
     private fun requestSkyGuideLocationPrerequisites(forcePermissionDialog: Boolean = false) {
         refreshPermissionState()
         if (!skyGuideLocationWanted) return
+        if (startupPermissionSequenceActive || runtimePermissionRequestInFlight ||
+            activeOnDemandPermissionRequest != null || skyGuidePermissionRequestInFlight ||
+            !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || !window.decorView.hasWindowFocus()
+        ) return
         if (locationPermissionGranted) {
             val locationManager = getSystemService(LocationManager::class.java)
             val locationEnabled = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {

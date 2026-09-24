@@ -125,16 +125,53 @@ This document is the app-developer-facing reference for the BLE protocol used by
 
 ## 4. Sensor Data Encoding
 
-All multi-byte sensor values use **little-endian** byte order, **4 bytes**, unsigned 32-bit integers.
+The vendor documents four-byte unsigned little-endian sensor payloads. For external water pressure, DiveControl matches the installed Diveit 3.00-google decoder: it reads the first three bytes unsigned little-endian and ignores the fourth byte. Both three- and four-byte water packets are accepted; temperature and internal pressure remain four-byte values.
 
 > **Source:** Vendor spec `tpyrced_Bluetooth-and-APP-protocol-description-A4.0-20241224.docx`
 
 | Sensor | Characteristic | Bytes | Raw Unit | Conversion to App Unit | Range |
 |---|---|---|---|---|---|
-| Water Pressure | `0x1625` | 4, LE, unsigned | 0.1 mbar | `raw / 100.0` → kPa | 0–1400 kPa (resolution 50 kPa) |
+| Water Pressure | `0x1625` | first 3 of 3/4, LE, unsigned | 0.1 mbar | `raw / 100.0` → kPa | HP5834-10BA: 0–1000 kPa, 0.01 kPa resolution |
 | Water Temperature | `0x1626` | 4, LE, unsigned | 0.01 °C | `raw / 100.0` → °C | — |
-| Barometric Pressure | `0x1627` | 4, LE, unsigned | 1 Pa | `raw / 1000.0` → kPa | 30–120 kPa (resolution 5 kPa) |
+| Barometric Pressure | `0x1627` | 4, LE, unsigned | 1 Pa | `raw / 1000.0` → kPa | HP203N: 30–120 kPa, 0.001 kPa resolution |
 | Air Extraction Cover | `0x1628` | 1 byte | — | `0x00 = OPEN`, `0x01 = CLOSED` | — |
+
+### Live pressure and depth
+
+- External water pressure (`0x1625`, HP5834-10BA) alone drives depth. Internal air pressure
+  (`0x1627`, HP203N) drives vacuum monitoring. Live internal air pressure is never substituted
+  for external pressure or subtracted from it to compute depth.
+- Depth is `((external kPa - 101.325) / 9.81).coerceIn(0, 300)`. The reference matches
+  Diveit's default environment in its DiveIT Bluetooth path; 9.81 kPa/m is the user's requested
+  conversion. Captured internal pressure is used only for vacuum monitoring. Weather, altitude,
+  water density and sensor offsets affect physical accuracy. Connecting underwater never auto-zeros it.
+- Camera and Diagnostics share the same live calculation and display tenths of a metre. The
+  camera retains the maximum accepted fresh depth for the current app session, in small text beside
+  the live depth (`current | MAX m`) inside the same readout. Screen changes and Bluetooth reconnection do not reset the maximum;
+  a new app session starts without a maximum until the first valid reading.
+- Notifications apply immediately, without averaging, a change threshold or a delayed UI refresh.
+  Once notifications go quiet, the connected session reads external pressure every 500 ms,
+  internal air pressure every 1000 ms, suction-cap state every 2000 ms, and temperature every
+  5000 ms. Healthy notification
+  streams suppress those reads. Reads use the existing serialized GATT queue. Fallback polling pauses during the pump
+  workflow and until motor-off completes; notifications remain live throughout.
+- Absent characteristics are skipped. Failed or invalid reads back off at 1, 2, 4 and 8 seconds.
+  Cancellation on disconnect stops polling. An older read cannot overwrite a newer notification.
+- Packet length (3/4 bytes external, 4 internal) and pressure range validation precede state updates. Zero external pressure,
+  values outside the HP5834/HP203N measurement ranges and malformed packets do not refresh
+  liveness. After 3 seconds without a valid packet, existing pressure/depth fields display their
+  unavailable placeholder. No new UI controls or panels are added.
+- `pressure-sensors.json` and `raw-packets.jsonl` in the existing diagnostic export record packet
+  bytes, receipt time, source and sample count. Fresh identical packets confirm BLE receipt,
+  not a new ADC conversion: if the bytes stay fixed during immersion even with successful reads,
+  investigate housing firmware, the sensor and its pressure port.
+
+The supplied **HP5834-10BA Datasheet V1.0, p.3** specifies 0.01 kPa resolution and absolute
+accuracy of ±2.5 kPa at 0–40°C (±5 kPa over -20–60°C). **HP203N Datasheet V2.2, p.2** specifies
+0.01 mbar resolution. These conflict with the coarse resolution entries in the WFH07 A4.0
+hardware overview (PDF p.6). The BLE scaling follows **WFH07 §5.4, PDF pp.11–12**, whose examples
+agree with the finer sensor resolution. The sensor datasheets describe MCU-side I²C commands;
+the phone reads the housing's already converted BLE values and must not send I²C opcodes to GATT.
 
 ### Vendor Encoding Examples
 

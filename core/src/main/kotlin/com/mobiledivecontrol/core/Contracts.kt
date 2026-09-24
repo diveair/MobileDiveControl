@@ -8,6 +8,7 @@ enum class AppMode {
     PhoneCursor,
     PhoneTarget,
     Safety,
+    DiveSettings,
     Diagnostics,
     Gallery,
 }
@@ -452,13 +453,16 @@ data class SafetyState(
      */
     val adoptedHold: Boolean = false,
     /**
-     * True after a deliberate vacuum release at the surface, until the diver answers it. Drives
-     * the "VACUUM RELEASED" banner — cap already off, re-pump or open the housing — instead of
-     * the remove-the-cap doorway, which would be asking them to do what they just did.
+     * Choice after a deliberate surface vent. Power-off is selected by default; restarting
+     * requires an explicit right selection and confirmation through the seal-check workflow.
      */
     val vacuumReleasedPrompt: Boolean = false,
+    val vacuumReleaseDisconnectObserved: Boolean = false,
+    val vacuumReleaseChoice: VacuumReleaseChoice = VacuumReleaseChoice.ShutDown,
     val warning: String? = null,
 )
+
+enum class VacuumReleaseChoice { ShutDown, RestartPump }
 
 enum class GalleryTab {
     Photos,
@@ -611,6 +615,11 @@ data class AppState(
     val camera: CameraState = CameraState(),
     val phoneControl: PhoneControlState = PhoneControlState(),
     val safety: SafetyState = SafetyState(),
+    val diveProfile: DiveProfileState = DiveProfileState(),
+    val waterPressureTelemetry: PressureTelemetry? = null,
+    /** Highest valid external-pressure depth this app session; retained across screens and reconnects. */
+    val maxDepthMeters: Double? = null,
+    val barometricPressureTelemetry: PressureTelemetry? = null,
     val gallery: GalleryState = GalleryState(),
     /** Focused action in the bottom diagnostics navigation row. */
     val diagnosticsAction: DiagnosticsAction = DiagnosticsAction.BackToCamera,
@@ -719,6 +728,8 @@ sealed interface PhoneControlCommand : ControlCommand {
 }
 
 sealed interface SafetyCommand : ControlCommand {
+    data class SelectVacuumReleaseChoice(val choice: VacuumReleaseChoice) : SafetyCommand
+    data object ConfirmVacuumReleaseChoice : SafetyCommand
     data object StartVacuumCheck : SafetyCommand
     data object CancelVacuumCheck : SafetyCommand
     /** Silences the pre-dive prompt without disabling the feature; cleared when the cover opens. */

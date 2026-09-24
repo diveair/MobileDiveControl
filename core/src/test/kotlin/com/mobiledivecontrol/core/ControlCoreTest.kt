@@ -345,13 +345,15 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `diagnostics is the final mode entry and back returns to camera`() {
+    fun `up from track heading opens dive settings then diagnostics and back returns to camera`() {
         val core = ControlCore()
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
         val originalCameraMode = core.state.camera.activeMode
 
         core.dispatch(CameraCommand.OpenModeRail)
+        val diveEntry = core.dispatch(CameraCommand.NavigateUp)
+        assertEquals("Dive Settings", diveEntry.state.camera.primaryHighlightedEntry.label)
         val lastEntry = core.dispatch(CameraCommand.NavigateUp)
         assertEquals("Diagnostics", lastEntry.state.camera.primaryHighlightedEntry.label)
         assertEquals(CameraRailAction.Diagnostics, lastEntry.state.camera.primaryHighlightedEntry.action)
@@ -372,7 +374,7 @@ class ControlCoreTest {
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
         core.dispatch(
-            CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryRailEntries.lastIndex),
+            CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryRailEntries.indexOfFirst { it.action == CameraRailAction.Diagnostics }),
         )
         assertEquals(DiagnosticsAction.BackToCamera, core.state.diagnosticsAction)
 
@@ -391,7 +393,7 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `touch command opens the mode rail and activates its final diagnostics row`() {
+    fun `touch command opens the mode rail and activates diagnostics row`() {
         val core = ControlCore()
         core.updatePermission(PermissionKind.Camera, true)
 
@@ -399,7 +401,7 @@ class ControlCoreTest {
         assertEquals(CameraUiZone.ModeRail, rail.state.camera.focusedZone)
 
         val opened = core.dispatch(
-            CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryRailEntries.lastIndex),
+            CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryRailEntries.indexOfFirst { it.action == CameraRailAction.Diagnostics }),
         )
         assertEquals(AppMode.Diagnostics, opened.state.mode)
     }

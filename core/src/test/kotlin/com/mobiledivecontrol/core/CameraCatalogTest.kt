@@ -26,6 +26,7 @@ class CameraCatalogTest {
                 "Pro",
                 "Panorama",
                 "Diagnostics",
+                "Dive Settings",
             ),
             labels,
         )

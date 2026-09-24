@@ -156,6 +156,7 @@ const val VACUUM_NOT_BUILDING_WARNING = "Pump stopped — vacuum not building; a
 const val SLOW_LEAK_WARNING_PREFIX = "Vacuum decayed"
 
 sealed interface SafetySignal {
+    data object ConfirmVacuumReleaseChoiceRequested : SafetySignal
     data object StartVacuumCheckRequested : SafetySignal
     data object CancelVacuumCheckRequested : SafetySignal
 
@@ -196,6 +197,7 @@ class SafetyStateMachine(
     private val thresholds: SafetyThresholds = SafetyThresholds(),
 ) {
     fun apply(state: SafetyState, signal: SafetySignal): SafetyMachineResult = when (signal) {
+        SafetySignal.ConfirmVacuumReleaseChoiceRequested -> confirmVacuumReleaseChoice(state)
         SafetySignal.StartVacuumCheckRequested -> startVacuumCheck(state)
         SafetySignal.CancelVacuumCheckRequested -> cancelVacuumCheck(state)
         SafetySignal.DismissSealCheckRequested -> dismissSealCheck(state)
@@ -207,12 +209,22 @@ class SafetyStateMachine(
 
     // --- Step 1: Confirm cover is open, then open solenoid + start motor ---
 
+    private fun confirmVacuumReleaseChoice(state: SafetyState): SafetyMachineResult {
+        if (!state.vacuumReleasedPrompt || state.vacuumReleaseChoice != VacuumReleaseChoice.RestartPump)
+            return SafetyMachineResult(state)
+        if (state.coverOpen != true) return SafetyMachineResult(state,
+            note = "Remove the blue cap before restarting the pump.")
+        if (pressureDepthMeters(state.waterPressureKpa)?.let { it > thresholds.surfaceMaxDepthM } == true)
+            return SafetyMachineResult(state, note = "Return to the surface before restarting the pump.")
+        return startVacuumCheck(state.copy(vacuumReleasedPrompt = false,
+            vacuumReleaseDisconnectObserved = false, vacuumReleaseChoice = VacuumReleaseChoice.ShutDown,
+            checkDismissed = false))
+    }
+
     private fun startVacuumCheck(state: SafetyState): SafetyMachineResult {
-        // A live released-prompt is its own cover-open proof: the shell just equalised to
-        // ambient, and air can only have come in through the open port. The cover byte may
-        // well be stale at this moment — it usually is — and must not block the re-pump the
-        // banner explicitly offered.
-        if (state.coverOpen != true && !state.vacuumReleasedPrompt) {
+        if (state.vacuumReleasedPrompt) return SafetyMachineResult(state,
+            note = "Select Restart Pump and press OK to begin another seal check.")
+        if (state.coverOpen != true) {
             return SafetyMachineResult(
                 state = state.copy(
                     sealState = SealState.Warning,
@@ -333,6 +345,7 @@ class SafetyStateMachine(
         timestampMs: Long,
     ): SafetyMachineResult? {
         if (state.sealState !in ESTABLISHED_VACUUM_ADOPTABLE_STATES) return null
+        if (state.vacuumReleasedPrompt) return null
 
         // Reference preference: a captured baseline, then the dry water-pressure sensor (true
         // local atmosphere, right even at altitude, but a different physical sensor so it gets a
@@ -684,6 +697,12 @@ class SafetyStateMachine(
     }
 
     private fun handleCoverChange(state: SafetyState, open: Boolean): SafetyMachineResult {
+        if (state.vacuumReleasedPrompt) return SafetyMachineResult(state.copy(coverOpen = open))
+        val completedHoldAtSurface = open &&
+            state.sealState in setOf(SealState.Passed, SealState.LeakMonitoring) &&
+            (state.adoptedHold || state.sealConfidence >= SealConfidence.ManufacturerMinimum ||
+                state.leakMonitoringElapsedMs >= thresholds.manufacturerMinimumMs) &&
+            pressureDepthMeters(state.waterPressureKpa)?.let { it <= thresholds.surfaceMaxDepthM } == true
         return when {
             // Cover opened. Only a real closed -> open transition means anything; the cover
             // is legitimately open for the whole pumping phase, and a repeat notification
@@ -703,6 +722,9 @@ class SafetyStateMachine(
                     leakMonitoringStartedAtEpochMs = null,
                     leakMonitoringElapsedMs = 0L,
                     checkDismissed = false,
+                    vacuumReleasedPrompt = completedHoldAtSurface,
+                    vacuumReleaseDisconnectObserved = false,
+                    vacuumReleaseChoice = VacuumReleaseChoice.ShutDown,
                     warning = null,
                 ),
             )
@@ -869,9 +891,7 @@ class SafetyStateMachine(
         } else {
             thresholds.leakDecaySlowFailKpa
         }
-        val depthM = state.waterPressureKpa?.let { water ->
-            (water - (state.surfaceAmbientKpa ?: STANDARD_ATMOSPHERE_KPA)).coerceAtLeast(0.0) / 9.81
-        }
+        val depthM = pressureDepthMeters(state.waterPressureKpa)
         val submerged = depthM != null && depthM > thresholds.surfaceMaxDepthM
         if (!submerged && decayKpa >= decayLimit) {
             return sealFailed(
@@ -976,7 +996,7 @@ class SafetyStateMachine(
                 leakMonitoringElapsedMs = 0L,
                 checkDismissed = false,
                 adoptedHold = false,
-                vacuumReleasedPrompt = false,
+                vacuumReleasedPrompt = state.vacuumReleasedPrompt,
                 restartFailAgoMinutes = null,
                 warning = null,
             ),
@@ -1022,10 +1042,7 @@ class SafetyStateMachine(
         // screen must not ask them to remove it. Underwater (or at unknown depth from a live
         // water reading) the deliberate classification stands but the released banner does not:
         // "you may open the housing" is not a sentence this app will ever say below the surface.
-        val depthM = state.waterPressureKpa?.let { water ->
-            val surface = state.surfaceAmbientKpa ?: STANDARD_ATMOSPHERE_KPA
-            (water - surface).coerceAtLeast(0.0) / 9.81
-        }
+        val depthM = pressureDepthMeters(state.waterPressureKpa)
         val atSurface = depthM == null || depthM <= thresholds.surfaceMaxDepthM
         return SafetyMachineResult(
             state = state.copy(
@@ -1037,6 +1054,8 @@ class SafetyStateMachine(
                 leakMonitoringElapsedMs = 0L,
                 checkDismissed = false,
                 vacuumReleasedPrompt = atSurface,
+                vacuumReleaseDisconnectObserved = false,
+                vacuumReleaseChoice = VacuumReleaseChoice.ShutDown,
                 warning = null,
             ),
             effects = safeHardwareState(),

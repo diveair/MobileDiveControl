@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,6 +34,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.mobiledivecontrol.core.AppMode
 import com.mobiledivecontrol.core.AppState
@@ -62,12 +64,14 @@ import kotlinx.coroutines.delay
 @Composable
 fun CameraHudOverlay(
     state: AppState,
+    liveWaterPressureKpa: Double? = state.safety.waterPressureKpa,
     useMetric: Boolean = true,
     modifier: Modifier = Modifier,
     bluetoothEnabled: Boolean = true,
     compassReading: CompassReading = CompassReading(),
     targetHeading: Double? = null,
     hudVisible: Boolean = true,
+    onSafetyCommand: (com.mobiledivecontrol.core.SafetyCommand) -> Unit = {},
     content: @Composable () -> Unit,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
@@ -197,13 +201,20 @@ fun CameraHudOverlay(
                 }
                 OverlayPill(compact = bottomControlMenuOpen) {
                     DepthGauge(
-                        waterPressureKpa = state.safety.waterPressureKpa,
-                        surfaceAmbientKpa = state.safety.surfaceAmbientKpa,
+                        // Optical centring: shift the glyph row within the pill, not the pill itself.
+                        modifier = Modifier.offset(y = 2.dp),
+                        waterPressureKpa = liveWaterPressureKpa,
+                        maxDepthMeters = state.maxDepthMeters,
                         useMetric = useMetric,
                         temperatureCelsius = state.safety.waterTemperatureC,
                         headingDegrees = compassReading.headingDegrees,
                         headingTargetSynchronized = headingTargetSynchronized,
                     )
+                }
+                if (state.diveProfile.decompression.history != com.mobiledivecontrol.core.DecoHistory.Uninitialized) {
+                    OverlayPill(compact = true) {
+                        com.mobiledivecontrol.ui.dive.DecompressionReadout(state.diveProfile.decompression, useMetric, compact = true)
+                    }
                 }
             }
         }
@@ -217,7 +228,10 @@ fun CameraHudOverlay(
         SealCheckIndicator(
             safety = state.safety,
             housingConnected = state.housing.connected,
+            onCommand = onSafetyCommand,
             topPadding = sealTop,
+            coveredBackdrop = if (state.diveProfile.stopExpanded)
+                com.mobiledivecontrol.ui.dive.safetyStopAccent(state.diveProfile) else null,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(start = 16.dp, end = 16.dp),

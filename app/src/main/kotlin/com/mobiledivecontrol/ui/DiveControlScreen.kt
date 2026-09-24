@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.PhoneAndroid
@@ -66,6 +67,8 @@ fun DiveControlScreen(
     onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit = {},
     onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit = {},
     onDiagnosticsCommand: (DiagnosticsCommand) -> Unit = {},
+    onDiveSettingsCommand: (com.mobiledivecontrol.core.DiveSettingsCommand) -> Unit = {},
+    onSafetyCommand: (com.mobiledivecontrol.core.SafetyCommand) -> Unit = {},
     introVisible: Boolean = false,
     onIntroDismiss: () -> Unit = {},
     permissionsGranted: Boolean = false,
@@ -95,6 +98,8 @@ fun DiveControlScreen(
             onCameraCommand = onCameraCommand,
             onGalleryCommand = onGalleryCommand,
             onDiagnosticsCommand = onDiagnosticsCommand,
+            onDiveSettingsCommand = onDiveSettingsCommand,
+            onSafetyCommand = onSafetyCommand,
             bluetoothEnabled = bluetoothEnabled,
         )
 
@@ -119,6 +124,16 @@ fun DiveControlScreen(
                 modifier = Modifier.fillMaxSize(),
             )
         }
+        // One banner, with its compact presentation anchored at the top while the timer continues.
+        val stopMinimized = state.diveProfile.stopPresentation == com.mobiledivecontrol.core.DiveStopPresentation.Minimized &&
+            !state.diveProfile.decompressionHold
+        com.mobiledivecontrol.ui.dive.DiveStopBanner(
+            profile = state.diveProfile,
+            useMetric = useMetric,
+            onCommand = onDiveSettingsCommand,
+            modifier = Modifier.align(if (stopMinimized) Alignment.TopCenter else Alignment.Center)
+                .padding(top = if (stopMinimized) 8.dp else 0.dp),
+        )
     }
 }
 
@@ -148,15 +163,22 @@ private fun DiveControlContent(
     onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit,
     onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit,
     onDiagnosticsCommand: (DiagnosticsCommand) -> Unit,
+    onDiveSettingsCommand: (com.mobiledivecontrol.core.DiveSettingsCommand) -> Unit,
+    onSafetyCommand: (com.mobiledivecontrol.core.SafetyCommand) -> Unit,
     bluetoothEnabled: Boolean = true,
 ) {
+    val liveWaterPressure = com.mobiledivecontrol.ui.components.rememberLivePressure(
+        state.safety.waterPressureKpa, state.waterPressureTelemetry, state.housing.connected,
+    )
     CameraHudOverlay(
         state = state,
+        liveWaterPressureKpa = liveWaterPressure,
         useMetric = useMetric,
         bluetoothEnabled = bluetoothEnabled,
         compassReading = compassReading,
         targetHeading = targetHeading,
-        hudVisible = state.mode != AppMode.Diagnostics,
+        hudVisible = state.mode != AppMode.Diagnostics && state.mode != AppMode.DiveSettings,
+        onSafetyCommand = onSafetyCommand,
     ) {
         AnimatedContent(
             // CameraLive <-> CameraAdjust used to create two CameraShellScreen instances during
@@ -171,8 +193,9 @@ private fun DiveControlContent(
         ) { mode ->
             when (mode) {
                 AppMode.CameraLive, AppMode.CameraAdjust -> CameraShellScreen(
+                    safetyStopActive = state.diveProfile.stopActive,
                     cameraState = state.camera,
-                    safetyState = state.safety,
+                    safetyState = state.safety.copy(waterPressureKpa = liveWaterPressure),
                     cameraPermissionGranted = cameraPermissionGranted,
                     locationPrerequisitesReady = locationPrerequisitesReady,
                     lifecycleOwner = lifecycleOwner,
@@ -192,6 +215,11 @@ private fun DiveControlContent(
                     onCommand = onDiagnosticsCommand,
                 )
                 AppMode.PhoneCursor, AppMode.PhoneTarget -> PhoneControlPlaceholder(mode = mode)
+                AppMode.DiveSettings -> com.mobiledivecontrol.ui.dive.DiveSettingsScreen(
+                    profile = state.diveProfile,
+                    useMetric = useMetric,
+                    onCommand = onDiveSettingsCommand,
+                )
                 AppMode.Gallery -> com.mobiledivecontrol.ui.gallery.GalleryScreen(
                     galleryState = state.gallery,
                     onCommand = onGalleryCommand,

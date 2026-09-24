@@ -25,6 +25,7 @@ fun ModeIndicator(
         AppMode.PhoneCursor -> "📱 Cursor" to DiveColors.DeepBlue
         AppMode.PhoneTarget -> "🎯 Target" to DiveColors.DeepBlue
         AppMode.Safety -> "🛡 Safety" to DiveColors.Warning
+        AppMode.DiveSettings -> "Dive Settings" to DiveColors.DiveCyan
         AppMode.Diagnostics -> "🔧 Diagnostics" to DiveColors.TextSecondary
         AppMode.Gallery -> "🖼 Gallery" to DiveColors.DiveCyan
     }

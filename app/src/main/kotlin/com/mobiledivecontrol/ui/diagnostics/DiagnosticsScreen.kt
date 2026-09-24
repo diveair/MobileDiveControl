@@ -38,12 +38,17 @@ fun DiagnosticsScreen(
     onCommand: (DiagnosticsCommand) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    val depthMeters = depthMetersFromPressure(
-        waterPressureKpa = state.safety.waterPressureKpa,
-        surfaceAmbientKpa = state.safety.surfaceAmbientKpa,
+    val waterPressure = com.mobiledivecontrol.ui.components.rememberLivePressure(
+        state.safety.waterPressureKpa, state.waterPressureTelemetry, state.housing.connected,
     )
-    val depthBaselineKpa = state.safety.surfaceAmbientKpa ?: STANDARD_ATMOSPHERE_KPA
-    val pressureDeltaKpa = state.safety.waterPressureKpa?.let { water ->
+    val barometricPressure = com.mobiledivecontrol.ui.components.rememberLivePressure(
+        state.safety.barometricPressureKpa, state.barometricPressureTelemetry, state.housing.connected,
+    )
+    val depthMeters = depthMetersFromPressure(
+        waterPressureKpa = waterPressure,
+    )
+    val depthBaselineKpa = STANDARD_ATMOSPHERE_KPA
+    val pressureDeltaKpa = waterPressure?.let { water ->
         water - depthBaselineKpa
     }
     val vacuum = vacuumReadout(state.safety)
@@ -84,19 +89,15 @@ fun DiagnosticsScreen(
             Column(modifier = Modifier.weight(1f)) {
                 SectionHeader("Sensors")
                 InfoCard {
-                    InfoRow("Water Pressure", state.safety.waterPressureKpa?.let { "%.1f kPa".format(it) } ?: "—")
+                    InfoRow("Water Pressure", waterPressure?.let { "%.2f kPa".format(it) } ?: "—")
                     InfoRow(
                         "Surface Baseline",
-                        if (state.safety.surfaceAmbientKpa != null) {
-                            "%.1f kPa captured".format(depthBaselineKpa)
-                        } else {
-                            "%.1f kPa standard".format(depthBaselineKpa)
-                        },
+                        "%.1f kPa standard".format(depthBaselineKpa),
                     )
-                    InfoRow("Depth ΔP", pressureDeltaKpa?.let { "%.1f kPa".format(it) } ?: "—")
+                    InfoRow("Depth ΔP", pressureDeltaKpa?.let { "%.2f kPa".format(it) } ?: "—")
                     InfoRow("Calculated Depth", depthMeters?.let { "%.1f m".format(it) } ?: "—")
                     InfoRow("Water Temp", state.safety.waterTemperatureC?.let { "%.1f°C".format(it) } ?: "—")
-                    InfoRow("Barometric", state.safety.barometricPressureKpa?.let { "%.1f kPa".format(it) } ?: "—")
+                    InfoRow("Barometric", barometricPressure?.let { "%.3f kPa".format(it) } ?: "—")
                     InfoRow("Vacuum", vacuum?.let { "−%.1f kPa".format(it.kpa) } ?: "—")
                     InfoRow("Cover", when (state.safety.coverOpen) {
                         true -> "Open"

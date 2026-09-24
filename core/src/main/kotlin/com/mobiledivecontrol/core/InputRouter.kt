@@ -20,6 +20,10 @@ class InputRouter {
             return RouteDecision(note = "Unknown button ${event.rawValue.toHexString()} ignored.")
         }
 
+        // The foreground stop owns OK until minimized/dismissed. Hidden prompts cannot act on it.
+        if (event == HousingButtonEvent.Ok && state.diveProfile.stopExpanded) {
+            return RouteDecision(commands = listOf(DiveSettingsCommand.AcknowledgeStop))
+        }
         sealCheckInterception(state, event)?.let { return it }
 
         return when (state.mode) {
@@ -29,6 +33,7 @@ class InputRouter {
             AppMode.PhoneTarget -> routePhoneTarget(event)
             AppMode.Safety -> routeSafety(event)
             AppMode.Diagnostics -> routeDiagnostics(event)
+            AppMode.DiveSettings -> routeDiveSettings(event)
             AppMode.Gallery -> routeGallery(event)
         }
     }
@@ -59,10 +64,18 @@ class InputRouter {
      */
     private fun sealCheckInterception(state: AppState, event: HousingButtonEvent): RouteDecision? {
         val safety = state.safety
-        // The released-vacuum banner is a start prompt too, and it must not depend on the cover
-        // byte: the vent that raised it is itself proof the port is open, while the byte is
-        // routinely stale at exactly this moment.
-        val promptVisible = (safety.coverOpen == true || safety.vacuumReleasedPrompt) &&
+        if (safety.vacuumReleasedPrompt) {
+            when (event) {
+                HousingButtonEvent.Left, HousingButtonEvent.BackOrSafety -> return RouteDecision(
+                    commands = listOf(SafetyCommand.SelectVacuumReleaseChoice(VacuumReleaseChoice.ShutDown)))
+                HousingButtonEvent.Right -> return RouteDecision(
+                    commands = listOf(SafetyCommand.SelectVacuumReleaseChoice(VacuumReleaseChoice.RestartPump)))
+                // Shutdown consumes short/repeated OK; firmware handles the physical long press.
+                HousingButtonEvent.Ok -> return RouteDecision(commands = listOf(SafetyCommand.ConfirmVacuumReleaseChoice))
+                else -> Unit
+            }
+        }
+        val promptVisible = safety.coverOpen == true && !safety.vacuumReleasedPrompt &&
             safety.sealState in SEAL_START_STATES &&
             !safety.checkDismissed &&
             // A primed boot record still awaiting its first pressure sample means the housing may
@@ -168,6 +181,16 @@ class InputRouter {
         HousingButtonEvent.BackOrSafety -> RouteDecision(commands = listOf(SafetyCommand.CancelVacuumCheck))
         else -> RouteDecision(note = "Safety mode ignores $event.")
     }
+
+    private fun routeDiveSettings(event: HousingButtonEvent): RouteDecision = RouteDecision(commands = when (event) {
+        HousingButtonEvent.Up -> listOf(DiveSettingsCommand.Navigate(-1))
+        HousingButtonEvent.Down -> listOf(DiveSettingsCommand.Navigate(1))
+        HousingButtonEvent.Left, HousingButtonEvent.ZoomOut -> listOf(DiveSettingsCommand.Adjust(-1))
+        HousingButtonEvent.Right, HousingButtonEvent.ZoomIn -> listOf(DiveSettingsCommand.Adjust(1))
+        HousingButtonEvent.Ok, HousingButtonEvent.Shutter -> listOf(DiveSettingsCommand.Confirm)
+        HousingButtonEvent.BackOrSafety -> listOf(DiveSettingsCommand.Back)
+        else -> emptyList()
+    })
 
     private fun routeDiagnostics(event: HousingButtonEvent): RouteDecision = when (event) {
         HousingButtonEvent.Up, HousingButtonEvent.Left ->

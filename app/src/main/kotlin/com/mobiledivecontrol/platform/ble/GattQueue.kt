@@ -154,6 +154,7 @@ internal class GattQueue(
         }
         if (operation.uuid.isNotEmpty() && !operation.uuid.equals(uuid, ignoreCase = true)) {
             onDiagnostic("GATT $kind callback UUID $uuid does not match ${operation.label}")
+            return
         }
         operation.result.complete(GattOutcome(status, value, null))
     }
@@ -177,7 +178,7 @@ internal class GattQueue(
         pending.close()
     }
 
-    private suspend fun submit(
+    internal suspend fun submit(
         kind: Kind,
         uuid: String,
         label: String,

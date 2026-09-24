@@ -94,7 +94,25 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      */
     private val ramps = mutableMapOf<String, Ramp>()
 
-    private val controlCore = ControlCore(initialState = sessionStore.restoreAppState())
+    private val diveProfileStore = com.mobiledivecontrol.platform.DiveProfileStore(application)
+    private val _diveLogWarning = MutableStateFlow<String?>(null)
+    val diveLogWarning: StateFlow<String?> = _diveLogWarning.asStateFlow()
+    private val restoredDiveProfile = runCatching { diveProfileStore.read() }.getOrElse {
+        _diveLogWarning.value = "Saved dive log could not be read. New monitoring starts without prior history."
+        com.mobiledivecontrol.core.DiveProfileState()
+    }
+    private val pendingDiveSave = MutableStateFlow<com.mobiledivecontrol.core.DiveProfileState?>(null)
+    private val diveStopNotifier = com.mobiledivecontrol.platform.DiveStopNotifier(application)
+    private val housingShutdownPrefs = application.getSharedPreferences("housing_shutdown", android.content.Context.MODE_PRIVATE)
+    private var safetyStopMotionRunning = false
+    private var safetyStopMotionBaseline: com.mobiledivecontrol.core.DiveProfileState? = null
+    private val controlCore = ControlCore(
+        initialState = sessionStore.restoreAppState().let { restored -> restored.copy(diveProfile = restoredDiveProfile,
+            safety = restored.safety.copy(
+                vacuumReleasedPrompt = housingShutdownPrefs.getBoolean("pending", false),
+                vacuumReleaseDisconnectObserved = housingShutdownPrefs.getBoolean("disconnected", false))) },
+        triggerSafetyStopAtSurface = false,
+    )
     private val galleryRepository = GalleryRepository(application)
     private val diveApp: DiveControlApp? = application as? DiveControlApp
     private val housingLink: HousingLink? = diveApp?.housingLink
@@ -143,7 +161,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         shouldShowOnboarding(
             firstRunComplete = !firstRunOnboardingRequired,
             hasPersistedVacuum = persistedVacuum != null,
-        ),
+        ) && !housingShutdownPrefs.getBoolean("pending", false),
     )
     val introVisible: StateFlow<Boolean> = _introVisible.asStateFlow()
 
@@ -194,11 +212,15 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         }
         collectHousingLink()
         collectPhoneBattery()
+        housingLink?.setSensorReadsPaused(controlCore.state.safety.sealState == SealState.Vacuuming)
+        diveApp?.setPressureCapture(controlCore.state.mode == AppMode.Diagnostics, com.mobiledivecontrol.core.STANDARD_SURFACE_PRESSURE_KPA)
         collectPendingSaves()
+        collectDiveProfile()
         compassMonitor.start()
     }
 
     override fun onCleared() {
+        diveApp?.setPressureCapture(false)
         if (bluetoothReceiverRegistered) {
             runCatching {
                 getApplication<android.app.Application>().unregisterReceiver(bluetoothStateReceiver)
@@ -207,9 +229,32 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         // Whatever the rate limiter has not written yet goes to disk now, synchronously, so
         // teardown can never lose a setting the diver changed.
         pendingSave.value?.let { state -> runCatching { sessionStore.save(state) } }
+        runCatching { diveProfileStore.save(safetyStopMotionBaseline ?: controlCore.state.diveProfile) }
+        diveStopNotifier.close()
         phoneBatteryMonitor.stop()
         compassMonitor.stop()
         super.onCleared()
+    }
+
+    private fun collectDiveProfile() {
+        viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(500)
+                val previousProfile = controlCore.state.diveProfile
+                val outcome = controlCore.tickDiveProfile()
+                if (outcome.state.diveProfile != previousProfile) emitOutcome(outcome)
+            }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            pendingDiveSave.collect { profile ->
+                if (profile == null) return@collect
+                runCatching { diveProfileStore.save(profile) }
+                    .onSuccess { _diveLogWarning.value = null }
+                    .onFailure { _diveLogWarning.value = "Dive log could not be saved on this phone." }
+                pendingDiveSave.compareAndSet(profile, null)
+                kotlinx.coroutines.delay(5_000)
+            }
+        }
     }
 
     private fun collectPendingSaves() {
@@ -335,7 +380,10 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         when (event) {
             is HousingLinkEvent.Ble -> advanceBle(event.signal)
             is HousingLinkEvent.Notification ->
-                onNotification(event.characteristicShortHex, event.payload)
+                onNotification(
+                    event.characteristicShortHex, event.payload, event.source,
+                    event.receivedAtEpochMs, event.receivedAtMonotonicMs,
+                )
             is HousingLinkEvent.Warning -> surfaceWarning(event.message)
             is HousingLinkEvent.Identity -> android.util.Log.i(
                 "DiveControl",
@@ -457,13 +505,23 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         emitOutcome(outcome)
     }
 
-    fun onNotification(characteristic: String, payload: ByteArray) {
+    fun onNotification(
+        characteristic: String,
+        payload: ByteArray,
+        source: com.mobiledivecontrol.core.SensorPacketSource = com.mobiledivecontrol.core.SensorPacketSource.Notification,
+        receivedAtEpochMs: Long = System.currentTimeMillis(),
+        receivedAtMonotonicMs: Long = com.mobiledivecontrol.core.pressureMonotonicMs(),
+    ) {
+        if (safetyStopMotionRunning && HousingCharacteristic.from(characteristic) == HousingCharacteristic.WaterPressure) return
         if (HousingCharacteristic.from(characteristic) == HousingCharacteristic.ButtonEvents &&
             PermissionDialogHousingBridge.handleButtonPayload(payload)
         ) return
         if (interceptForIntro(characteristic, payload)) return
         if (interceptForCapPrompt(characteristic, payload)) return
-        val outcome = controlCore.handleNotificationPayload(characteristic, payload)
+        val outcome = controlCore.handleNotificationPayload(
+            characteristic, payload, java.time.Instant.ofEpochMilli(receivedAtEpochMs),
+            source, receivedAtMonotonicMs,
+        )
         emitOutcome(outcome)
     }
 
@@ -501,6 +559,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * @return true when the packet was consumed and must not reach [ControlCore].
      */
     private fun interceptForIntro(characteristic: String, payload: ByteArray): Boolean {
+        if (foregroundStopOwnsOk(characteristic, payload)) return false
         if (HousingCharacteristic.from(characteristic) != HousingCharacteristic.ButtonEvents) {
             return false
         }
@@ -563,7 +622,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         // dies the instant telemetry arrives. The only reliable skip is a seal already engaged —
         // pumping, holding or passed — which the pressure-based detection establishes honestly.
         lastCoverOpen = _state.value.safety.coverOpen
-        val show = _state.value.safety.sealState !in SEAL_ENGAGED_STATES
+        val show = !_state.value.safety.vacuumReleasedPrompt && _state.value.safety.sealState !in SEAL_ENGAGED_STATES
         if (show) capPromptRaisedAtMs = System.currentTimeMillis()
         android.util.Log.i(
             "DiveControl",
@@ -606,6 +665,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * are the doorway's other two exits and they arrive through [onNotification].
      */
     private fun interceptForCapPrompt(characteristic: String, payload: ByteArray): Boolean {
+        if (foregroundStopOwnsOk(characteristic, payload)) return false
         if (HousingCharacteristic.from(characteristic) != HousingCharacteristic.ButtonEvents) {
             return false
         }
@@ -662,6 +722,46 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         emitOutcome(outcome)
     }
 
+    private fun foregroundStopOwnsOk(characteristic: String, payload: ByteArray): Boolean =
+        _state.value.diveProfile.stopExpanded && HousingCharacteristic.from(characteristic) == HousingCharacteristic.ButtonEvents &&
+            payload.size == 1 && payload[0] == 0x50.toByte()
+
+    /** One explicit, finite hardware-UI exercise through the normal required-stop path. */
+    fun runSafetyStopMotion() {
+        val app = getApplication<Application>()
+        if (app.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0 || safetyStopMotionRunning) return
+        val baseline = controlCore.state
+        if (baseline.diveProfile.active != null) return
+        safetyStopMotionBaseline = baseline.diveProfile
+        safetyStopMotionRunning = true
+        pendingDiveSave.value = baseline.diveProfile
+        emitOutcome(controlCore.restoreDiveMonitoring(com.mobiledivecontrol.core.DiveProfileState(
+            settings = baseline.diveProfile.settings,
+            logs = baseline.diveProfile.logs, alertSequence = baseline.diveProfile.alertSequence), 0.0, null))
+        viewModelScope.launch {
+            try {
+                val target = controlCore.state.diveProfile.settings.stopDepthMeters.toDouble()
+                // A 30 m profile requires the stop. Cross its real configured depth on ascent,
+                // show red, recover through yellow to green, then end at the surface once.
+                val depths = listOf(0.0, 2.0, 30.0, target + 1.0, target) + List(24) { target } +
+                    List(48) { target - (it + 1) * 0.025 } + List(16) { target - 1.2 } +
+                    List(48) { target - 1.2 + (it + 1) * 0.025 } + List(32) { target } + 0.0
+                for (depth in depths) {
+                    updateSensor(SensorUpdate.WaterPressure(com.mobiledivecontrol.core.STANDARD_SURFACE_PRESSURE_KPA +
+                        depth * com.mobiledivecontrol.core.FRESHWATER_KPA_PER_METER))
+                    kotlinx.coroutines.delay(250L)
+                }
+            } finally {
+                val restored = baseline.diveProfile.copy(alertSequence = controlCore.state.diveProfile.alertSequence,
+                    lastAlert = null)
+                val outcome = controlCore.restoreDiveMonitoring(restored, baseline.maxDepthMeters,
+                    baseline.safety.waterPressureKpa)
+                safetyStopMotionRunning = false
+                emitOutcome(outcome)
+                safetyStopMotionBaseline = null
+            }
+        }
+    }
     fun updateBattery(level: Int) {
         val outcome = controlCore.updateBatteryLevel(level)
         emitOutcome(outcome)
@@ -827,6 +927,11 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun emitOutcome(outcome: ProcessingOutcome) {
+        if (outcome.state.safety.vacuumReleasedPrompt != _state.value.safety.vacuumReleasedPrompt ||
+            outcome.state.safety.vacuumReleaseDisconnectObserved != _state.value.safety.vacuumReleaseDisconnectObserved) {
+            housingShutdownPrefs.edit().putBoolean("pending", outcome.state.safety.vacuumReleasedPrompt)
+                .putBoolean("disconnected", outcome.state.safety.vacuumReleaseDisconnectObserved).apply()
+        }
         // Every dispatch reaches here — up to 500 a second during a focus sweep — and the
         // interpolated string was being built even though nothing reads it in the field.
         if (android.util.Log.isLoggable("DiveControl", android.util.Log.DEBUG)) {
@@ -837,6 +942,22 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                 requestRuntimePermissions(setOf(RuntimePermissionNeed.Camera))
             "Microphone Permission: Disabled" in outcome.notes ->
                 requestRuntimePermissions(setOf(RuntimePermissionNeed.Microphone))
+        }
+        // Yield the shared GATT queue before submitting valve/motor writes. Restore fallback
+        // polling only after the workflow leaves Vacuuming and the motor-off write completes.
+        housingLink?.setSensorReadsPaused(outcome.state.safety.sealState == SealState.Vacuuming)
+        if (_state.value.safety.sealState != outcome.state.safety.sealState ||
+            _state.value.safety.warning != outcome.state.safety.warning) {
+            android.util.Log.i("DivePump", "state=${outcome.state.safety.sealState} pressureKpa=${outcome.state.safety.barometricPressureKpa} baselineKpa=${outcome.state.safety.baselinePressureKpa} warning=${outcome.state.safety.warning} notes=${outcome.notes}")
+        }
+        diveApp?.setPressureCapture(outcome.state.mode == AppMode.Diagnostics, com.mobiledivecontrol.core.STANDARD_SURFACE_PRESSURE_KPA)
+        val previousProfile = _state.value.diveProfile
+        val nextProfile = outcome.state.diveProfile
+        if (previousProfile != nextProfile) {
+            if (!safetyStopMotionRunning) pendingDiveSave.value = nextProfile
+            if (previousProfile.alertSequence != nextProfile.alertSequence) {
+                nextProfile.lastAlert?.let(diveStopNotifier::notify)
+            }
         }
         _state.value = outcome.state
         // The cap doorway's hardware exits: the cap visibly CAME OFF (a cover transition to open,

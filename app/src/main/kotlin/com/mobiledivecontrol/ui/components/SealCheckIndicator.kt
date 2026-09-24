@@ -1,6 +1,8 @@
 package com.mobiledivecontrol.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -25,6 +27,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -38,6 +41,8 @@ import com.mobiledivecontrol.core.NO_SUCTION_WARNING
 import com.mobiledivecontrol.core.SLOW_LEAK_WARNING_PREFIX
 import com.mobiledivecontrol.core.VACUUM_NOT_BUILDING_WARNING
 import com.mobiledivecontrol.core.SafetyState
+import com.mobiledivecontrol.core.SafetyCommand
+import com.mobiledivecontrol.core.VacuumReleaseChoice
 import com.mobiledivecontrol.core.SealConfidence
 import com.mobiledivecontrol.core.SealState
 import com.mobiledivecontrol.theme.DiveColors
@@ -72,6 +77,9 @@ fun SealCheckIndicator(
     topPadding: Dp = 0.dp,
     /** Actual top-chip/banner height, so neighbouring HUD elements never guess its footprint. */
     onTopContentHeightChanged: (Int) -> Unit = {},
+    /** Only the background edges remain visible while the full safety-stop card covers this banner. */
+    coveredBackdrop: Color? = null,
+    onCommand: (SafetyCommand) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     // A result is an event, not a condition. It announces itself, then leaves — and announces
@@ -97,12 +105,17 @@ fun SealCheckIndicator(
 
     Box(modifier = modifier) {
         when {
+            safety.vacuumReleasedPrompt -> VacuumReleaseBanner(
+                safety = safety,
+                onCommand = onCommand,
+                modifier = Modifier.align(Alignment.Center).fillMaxWidth(CENTERED_BANNER_WIDTH),
+            )
             // The two ask-the-diver moments take the centre of the screen: they are the only seal
             // stages that exist purely to be answered, and centre is where an instruction that
             // owns the next button press belongs. Everything that merely *reports* stays at the
             // top edge where it cannot sit on the subject.
             visibleStage.centered -> CenteredSealBanner(
-                stage = visibleStage,
+                stage = if (coveredBackdrop != null) visibleStage.copy(background = coveredBackdrop) else visibleStage,
                 modifier = Modifier
                     .align(Alignment.Center)
                     .fillMaxWidth(CENTERED_BANNER_WIDTH),
@@ -125,6 +138,48 @@ fun SealCheckIndicator(
                     .onSizeChanged { onTopContentHeightChanged(it.height) },
             )
         }
+    }
+}
+
+@Composable
+private fun VacuumReleaseBanner(safety: SafetyState, onCommand: (SafetyCommand) -> Unit, modifier: Modifier = Modifier) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = modifier.background(DiveColors.DeepBlack.copy(alpha = 0.96f), RoundedCornerShape(14.dp))
+            .border(1.dp, DiveColors.DiveCyan.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
+            .padding(16.dp),
+    ) {
+        Text("VACUUM RELEASED", color = DiveColors.TextPrimary,
+            style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(14.dp))
+        Row(modifier = Modifier.fillMaxWidth()) {
+            VacuumReleaseChoice.entries.forEachIndexed { index, choice ->
+                if (index > 0) Spacer(Modifier.width(12.dp))
+                val selected = safety.vacuumReleaseChoice == choice
+                val foreground = if (selected) DiveColors.DeepBlack else DiveColors.TextPrimary
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.weight(1f)
+                        .background(if (selected) DiveColors.DiveCyan else Color.Transparent, RoundedCornerShape(10.dp))
+                        .border(if (selected) 3.dp else 1.dp,
+                            if (selected) DiveColors.DiveCyan else DiveColors.TextPrimary.copy(alpha = 0.4f), RoundedCornerShape(10.dp))
+                        .selectable(selected = selected, role = Role.RadioButton,
+                            onClick = { onCommand(SafetyCommand.SelectVacuumReleaseChoice(choice)) })
+                        .padding(horizontal = 12.dp, vertical = 18.dp),
+                ) {
+                    AutoShrinkText(if (choice == VacuumReleaseChoice.ShutDown) "SHUT DOWN" else "RESTART PUMP",
+                        color = foreground, maxLines = 1, modifier = Modifier.fillMaxWidth(),
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold, textAlign = TextAlign.Center))
+                    Spacer(Modifier.height(6.dp))
+                    Text(if (choice == VacuumReleaseChoice.ShutDown) "HOLD OK" else "PRESS OK",
+                        color = foreground, style = MaterialTheme.typography.titleMedium)
+                }
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(if (safety.vacuumReleaseChoice == VacuumReleaseChoice.RestartPump && safety.coverOpen != true)
+            "REMOVE THE BLUE CAP TO RESTART" else "LEFT / RIGHT TO SELECT",
+            color = DiveColors.TextPrimary, style = MaterialTheme.typography.labelLarge)
     }
 }
 
@@ -493,6 +548,11 @@ private data class SealStage(
  * Order matters: a failure outranks everything, and a running motor outranks a prompt.
  */
 private fun sealStage(safety: SafetyState): SealStage? {
+    if (safety.vacuumReleasedPrompt) return SealStage(
+        headline = "VACUUM RELEASED",
+        centered = true,
+        background = DiveColors.DiveCyan,
+    )
     // The adopted-vacuum reminder outranks the state branches for both monitoring AND passed:
     // adoption starts a clock that keeps promoting the seal on its own, and a diver who leaves
     // the intro up for three minutes must not have the cap question silently outrun by their own
@@ -663,24 +723,6 @@ private fun sealStageFor(safety: SafetyState): SealStage? = when (safety.sealSta
 
     SealState.Unknown -> when {
         safety.checkDismissed -> null
-        // A deliberate release at the surface: the cap is already off, so the doorway that asks
-        // the diver to remove it never shows. Instead this banner names the two legitimate next
-        // moves — pump again, or open up and take the phone out. OK re-pumps (the router treats
-        // this banner as a live start prompt); DOWN dismisses like every other centred banner.
-        safety.vacuumReleasedPrompt -> SealStage(
-            headline = "VACUUM RELEASED",
-            columns = listOf(
-                "BLUE CAP IS OFF",
-                "Press Menu/OK to",
-                "re-establish vacuum",
-            ) to listOf(
-                "YOU MAY OPEN",
-                "the housing to",
-                "remove your phone",
-            ),
-            background = DiveColors.DiveCyan,
-            centered = true,
-        )
         safety.coverOpen == true -> startPrompt(safety)
         // Cover state unknown means the housing has not told us anything yet; claiming the seal is
         // unchecked would be guessing, and the product does not guess about seal state.
@@ -704,7 +746,8 @@ private fun startPrompt(safety: SafetyState): SealStage? {
     // about to yank away.
     if (safety.verifiedVacuumKpa != null) return null
     return SealStage(
-        headline = "PRESS MENU/OK TO START VACUUM PUMP",
+        headline = "INSERT PHONE INTO HOUSING THEN",
+        detail = "PRESS MENU/OK TO START VACUUM PUMP",
         hint = "DOWN dismisses",
         background = DiveColors.Warning,
         centered = true,

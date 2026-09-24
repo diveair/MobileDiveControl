@@ -12,8 +12,11 @@ class ControlCore(
     private val reducer: ControlReducer = ControlReducer(),
     private val bleConnectionMachine: BleConnectionMachine = BleConnectionMachine(),
     private val diagnostics: DiagnosticsStore = DiagnosticsStore(),
+    private val monotonicMs: () -> Long = ::pressureMonotonicMs,
+    val triggerSafetyStopAtSurface: Boolean = false,
 ) {
-    var state: AppState = initialState
+    var state: AppState = if (triggerSafetyStopAtSurface) initialState else initialState.copy(
+        diveProfile = DiveProfileTracker.forLiveDiving(initialState.diveProfile))
         private set
 
     private var reconnectAttempt: Int = 0
@@ -30,6 +33,8 @@ class ControlCore(
         characteristic: String,
         payload: ByteArray,
         receivedAt: Instant = clock.instant(),
+        source: SensorPacketSource = SensorPacketSource.Notification,
+        receivedAtMonotonicMs: Long = monotonicMs(),
     ): ProcessingOutcome {
         val startedNanos = System.nanoTime()
         val previousState = state
@@ -39,8 +44,11 @@ class ControlCore(
         return when (val result = protocolParser.decodeNotification(characteristic, payload)) {
             is ParseResult.Failure -> {
                 diagnostics.recordError(receivedAt, result.error.code, result.error.message)
+                if (HousingCharacteristic.from(characteristic) == HousingCharacteristic.WaterPressure) {
+                    state = state.copy(diveProfile = DiveProfileTracker.unavailable(state.diveProfile))
+                }
                 completeWithoutStateChange(
-                    previousState = previousState,
+                    previousState = state,
                     notes = listOf(result.error.message),
                     path = "notification_packet",
                     receivedAt = receivedAt,
@@ -66,7 +74,11 @@ class ControlCore(
                     )
                 }
                 is DecodedNotification.Sensor -> {
-                    val reduction = reducer.updateSensor(state, notification.update)
+                    val sensorReduction = reducer.updateSensor(state, notification.update)
+                    val reduction = sensorReduction.copy(state = withPressureTelemetry(
+                        sensorReduction.state, notification.update, payload.toSpacedHexString(),
+                        receivedAt, receivedAtMonotonicMs, source,
+                    ))
                     commitReduction(
                         previousState = previousState,
                         reduction = reduction,
@@ -202,12 +214,21 @@ class ControlCore(
             reconnectAttempt = 0
         }
 
-        val reduction = reducer.updateBleState(
+        val bleReduction = reducer.updateBleState(
             state = state,
             newState = transition.state,
             reconnectAttempt = reconnectAttempt,
             reconnectDelay = transition.reconnectDelay,
         )
+
+        // A reconnect must receive its own sensor packets; a previous session cannot appear live.
+        val reduction = if (!bleReduction.state.housing.connected) {
+            bleReduction.copy(state = bleReduction.state.copy(
+                waterPressureTelemetry = null,
+                barometricPressureTelemetry = null,
+                diveProfile = DiveProfileTracker.unavailable(bleReduction.state.diveProfile),
+            ))
+        } else bleReduction
 
         return commitReduction(
             previousState = previousState,
@@ -314,10 +335,27 @@ class ControlCore(
     fun updateSensor(
         sensorUpdate: SensorUpdate,
         receivedAt: Instant = clock.instant(),
+    ): ProcessingOutcome = updateSensorReading(sensorUpdate, receivedAt)
+
+    /** Signed depth for the explicitly requested surface motion exercise, never a BLE reading. */
+    fun updateSurfaceMotionDepth(depthMeters: Double, receivedAt: Instant = clock.instant()): ProcessingOutcome {
+        require(triggerSafetyStopAtSurface && depthMeters.isFinite() && depthMeters in -1.5..3.0)
+        return updateSensorReading(SensorUpdate.WaterPressure(STANDARD_SURFACE_PRESSURE_KPA +
+            depthMeters * FRESHWATER_KPA_PER_METER), receivedAt, depthMeters)
+    }
+
+    private fun updateSensorReading(
+        sensorUpdate: SensorUpdate,
+        receivedAt: Instant,
+        surfaceMotionDepthMeters: Double? = null,
     ): ProcessingOutcome {
         val startedNanos = System.nanoTime()
         val previousState = state
-        val reduction = reducer.updateSensor(state, sensorUpdate)
+        val sensorReduction = reducer.updateSensor(state, sensorUpdate)
+        val reduction = sensorReduction.copy(state = withPressureTelemetry(
+            sensorReduction.state, sensorUpdate, null, receivedAt, monotonicMs(),
+            SensorPacketSource.Simulation, surfaceMotionDepthMeters,
+        ))
         return commitReduction(
             previousState = previousState,
             reduction = reduction,
@@ -326,6 +364,69 @@ class ControlCore(
             receivedAt = receivedAt,
             startedNanos = startedNanos,
         )
+    }
+
+    private fun withPressureTelemetry(
+        next: AppState,
+        update: SensorUpdate,
+        rawHex: String?,
+        receivedAt: Instant,
+        receivedAtMonotonicMs: Long,
+        source: SensorPacketSource,
+        surfaceMotionDepthMeters: Double? = null,
+    ): AppState {
+        val previous = when (update) {
+            is SensorUpdate.WaterPressure -> next.waterPressureTelemetry
+            is SensorUpdate.BarometricPressure -> next.barometricPressureTelemetry
+            else -> return next
+        }
+        val telemetry = PressureTelemetry(
+            rawHex = rawHex,
+            receivedAtEpochMs = receivedAt.toEpochMilli(),
+            receivedAtMonotonicMs = receivedAtMonotonicMs,
+            packetCount = (previous?.packetCount ?: 0L) + 1L,
+            source = source,
+        )
+        return when (update) {
+            is SensorUpdate.WaterPressure -> {
+                val depth = pressureDepthMeters(update.kpa)
+                    ?.takeIf { telemetry.isFresh(monotonicMs()) }
+                next.copy(
+                    waterPressureTelemetry = telemetry,
+                    diveProfile = depth?.let {
+                        val motionExercise = triggerSafetyStopAtSurface && source == SensorPacketSource.Simulation &&
+                            surfaceMotionDepthMeters != null
+                        val decompression = if (motionExercise) DecompressionTracker.unavailable(next.diveProfile.decompression)
+                        else DecompressionTracker.sample(next.diveProfile.decompression,
+                            it, update.kpa / 100.0, receivedAtMonotonicMs, receivedAt.toEpochMilli(),
+                            next.diveProfile.active?.settings?.gas ?: next.diveProfile.settings.gas)
+                        DiveProfileTracker.sample(next.diveProfile.copy(decompression = decompression),
+                            if (motionExercise) surfaceMotionDepthMeters!! else it,
+                            receivedAtMonotonicMs, receivedAt.toEpochMilli(),
+                            triggerAtSurface = triggerSafetyStopAtSurface, surfaceMotionExercise = motionExercise)
+                    } ?: DiveProfileTracker.unavailable(next.diveProfile),
+                    maxDepthMeters = depth?.let { maxOf(next.maxDepthMeters ?: 0.0, it) }
+                        ?: next.maxDepthMeters,
+                )
+            }
+            is SensorUpdate.BarometricPressure -> next.copy(barometricPressureTelemetry = telemetry)
+            else -> next
+        }
+    }
+
+    /** Expiry only; a wall-clock tick must NEVER earn stop time without a pressure sample. */
+    fun tickDiveProfile(nowMs: Long = monotonicMs()): ProcessingOutcome {
+        val available = state.housing.connected || state.waterPressureTelemetry?.source == SensorPacketSource.Simulation
+        val dive = DiveProfileTracker.tick(state.diveProfile, nowMs, available)
+        if (dive != state.diveProfile) state = state.copy(diveProfile = dive)
+        return ProcessingOutcome(state)
+    }
+
+    /** Used only by the finite, explicit engineering run to retain real logs and exposure history. */
+    fun restoreDiveMonitoring(profile: DiveProfileState, maximumDepth: Double?, waterPressure: Double?): ProcessingOutcome {
+        state = state.copy(diveProfile = DiveProfileTracker.unavailable(profile), maxDepthMeters = maximumDepth,
+            waterPressureTelemetry = null, safety = state.safety.copy(waterPressureKpa = waterPressure))
+        return ProcessingOutcome(state)
     }
 
     fun forceMode(
