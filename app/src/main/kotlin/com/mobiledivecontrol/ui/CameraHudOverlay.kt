@@ -211,11 +211,6 @@ fun CameraHudOverlay(
                         headingTargetSynchronized = headingTargetSynchronized,
                     )
                 }
-                if (state.diveProfile.decompression.history != com.mobiledivecontrol.core.DecoHistory.Uninitialized) {
-                    OverlayPill(compact = true) {
-                        com.mobiledivecontrol.ui.dive.DecompressionReadout(state.diveProfile.decompression, useMetric, compact = true)
-                    }
-                }
             }
         }
 

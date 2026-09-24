@@ -1,14 +1,19 @@
 package com.mobiledivecontrol.ui.components
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -17,6 +22,7 @@ import com.mobiledivecontrol.core.HeadingMath
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.core.SealState
 import com.mobiledivecontrol.theme.DiveColors
+import java.util.Locale
 
 /** ISA standard sea-level pressure. The reference when no surface baseline has been captured. */
 const val STANDARD_ATMOSPHERE_KPA = com.mobiledivecontrol.core.STANDARD_SURFACE_PRESSURE_KPA
@@ -38,12 +44,6 @@ fun DepthGauge(
 ) {
     val depthMeters = depthMetersFromPressure(waterPressureKpa)
 
-    val displayText = when {
-        depthMeters == null -> "--"
-        useMetric -> "%.1f".format(depthMeters)
-        else -> "%.1f".format(depthMeters * 3.28084)
-    }
-
     val color = when {
         depthMeters == null -> DiveColors.TextMuted
         depthMeters < 0.5 -> DiveColors.DiveCyan
@@ -56,41 +56,11 @@ fun DepthGauge(
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier,
     ) {
-        Box(
-            modifier = Modifier.widthIn(min = SIDE_READOUT_WIDTH),
-            contentAlignment = Alignment.CenterEnd,
-        ) {
-            // Compact single-line depth pair: current | maximum, sharing the trailing unit.
-            Row {
-                Text(
-                    text = displayText,
-                    color = color,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.alignByBaseline(),
-                    maxLines = 1,
-                )
-                Text(
-                    text = " | ",
-                    color = DiveColors.TextMuted,
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.alignByBaseline(),
-                )
-                Text(
-                    text = maxDepthMeters?.let { maximum ->
-                        if (useMetric) "MAX %.1f m".format(maximum)
-                        else "MAX %.1f ft".format(maximum * 3.28084)
-                    } ?: if (useMetric) "MAX -- m" else "MAX -- ft",
-                    color = if (maxDepthMeters != null) DiveColors.DiveCyan else DiveColors.TextMuted,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontSize = 10.sp,
-                    lineHeight = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    modifier = Modifier.alignByBaseline(),
-                    maxLines = 1,
-                )
-            }
-        }
+        DepthReadout(depthMeters, useMetric, "now", color)
+        Box(Modifier.padding(horizontal = 4.dp).width(1.dp).height(24.dp)
+            .background(DiveColors.TextMuted))
+        DepthReadout(maxDepthMeters, useMetric, "max",
+            if (maxDepthMeters != null) DiveColors.DiveCyan else DiveColors.TextMuted)
         ReadoutSeparator()
         Text(
             text = headingDegrees?.let(::formatHeading) ?: "---° --",
@@ -120,6 +90,24 @@ fun DepthGauge(
                 fontWeight = FontWeight.Bold,
             )
         }
+    }
+}
+
+/** Units stay with each number; small labels underneath keep the pair narrow and unambiguous. */
+@Composable
+private fun DepthReadout(meters: Double?, metric: Boolean, label: String, color: Color) {
+    val value = meters?.let { String.format(Locale.US, "%.1f", if (metric) it else it * 3.28084) } ?: "--"
+    Column(
+        // Align the smaller depth numerals with the heading/temperature glyph bottoms.
+        modifier = Modifier.offset(y = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(text = value + if (metric) "m" else "ft", color = color,
+            fontSize = 14.sp, lineHeight = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+        Text(text = label, color = color.copy(alpha = 0.8f),
+            // Halve the visible gap left by the two text lines' font metrics.
+            modifier = Modifier.offset(y = (-4).dp),
+            fontSize = 8.sp, lineHeight = 9.sp, fontWeight = FontWeight.Medium, maxLines = 1)
     }
 }
 

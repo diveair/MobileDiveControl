@@ -28,20 +28,24 @@ class DiveLogNdlTest {
         assertEquals(300, state.active!!.minimumNdlSeconds)
     }
 
-    @Test fun `version three logs migrate without inventing past NDL`() {
+    @Test fun `version three and four logs migrate without inventing past exposure`() {
+        for (version in 3..4) {
         val bytes = ByteArrayOutputStream().also { buffer -> DataOutputStream(buffer).use { out ->
             fun settings() { out.writeInt(21); out.writeInt(0); out.writeInt(5); out.writeInt(180); out.writeBoolean(false) }
-            out.writeInt(0x44495645); out.writeInt(3); settings(); out.writeBoolean(false); out.writeInt(1)
+            out.writeInt(0x44495645); out.writeInt(version); settings(); out.writeBoolean(false); out.writeInt(1)
             out.writeLong(1000); settings(); out.writeLong(60000); out.writeDouble(10.0)
             out.writeInt(DiveStopPhase.Armed.ordinal); out.writeLong(0); out.writeBoolean(false)
             out.writeBoolean(false); out.writeInt(DiveLogOutcome.IncompleteStop.ordinal); out.writeInt(0)
             out.writeBoolean(false); out.writeDouble(-1000.0)
+            if (version >= 4) out.writeInt(900)
             out.writeInt(DecoHistory.Uninitialized.ordinal); out.writeInt(0); out.writeDouble(0.0); out.writeBoolean(false)
             out.writeDouble(0.0); out.writeLong(0); out.writeLong(-1); out.writeDouble(-1.0); out.writeInt(0)
             out.writeInt(DiveStopPresentation.Dismissed.ordinal)
         } }.toByteArray()
         val migrated = DiveProfileCodec.decode(bytes)
         assertEquals(10.0, migrated.logs.single().maxDepthMeters)
-        assertNull(migrated.logs.single().minimumNdlSeconds)
+        assertEquals(if (version >= 4) 900 else null, migrated.logs.single().minimumNdlSeconds)
+        assertNull(migrated.logs.single().exposure)
+        }
     }
 }

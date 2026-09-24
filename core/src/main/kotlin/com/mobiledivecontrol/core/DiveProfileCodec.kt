@@ -14,7 +14,7 @@ object DiveProfileCodec {
         require(state.logs.size <= DiveProfileTracker.MAX_LOGS)
         DataOutputStream(bytes).use { out ->
             out.writeInt(0x44495645)
-            out.writeInt(4)
+            out.writeInt(5)
             out.settings(state.settings)
             out.writeBoolean(state.active != null)
             state.active?.let { out.session(it) }
@@ -29,7 +29,7 @@ object DiveProfileCodec {
         require(bytes.size <= MAX_ENCODED_BYTES)
         return DataInputStream(ByteArrayInputStream(bytes)).use { input ->
             require(input.readInt() == 0x44495645)
-            val version = input.readInt().also { require(it in 1..4) }
+            val version = input.readInt().also { require(it in 1..5) }
             val settings = input.settings()
             val active = if (input.readBoolean()) input.session(version) else null
             val count = input.readInt().also { require(it in 0..DiveProfileTracker.MAX_LOGS) }
@@ -101,6 +101,12 @@ object DiveProfileCodec {
         writeBoolean(s.limitReached)
         writeDouble(s.shallowestAfterStopMeters ?: -1000.0)
         writeInt(s.minimumNdlSeconds ?: -1)
+        writeBoolean(s.exposure != null)
+        s.exposure?.let { exposure ->
+            writeDouble(exposure.maxCeilingMeters); writeDouble(exposure.maxCnsPercent)
+            writeBoolean(exposure.cnsOutsideTable); writeDouble(exposure.maxOtu24Hours)
+            writeDouble(exposure.maxPpO2Ata ?: -1.0)
+        }
     }
 
     private fun DataInputStream.session(version: Int): DiveSession {
@@ -127,7 +133,12 @@ object DiveProfileCodec {
             require(it.isFinite() && (it == -1000.0 || it in (if (settings.stopDepthMeters == 0) -1.5 else 0.0)..100.0))
         }.takeUnless { it == -1000.0 } else samples.lastOrNull()?.depthMeters.takeIf { phase == DiveStopPhase.Complete }
         val minimumNdl = if (version >= 4) readInt().also { require(it in -1..Buhlmann.NDL_CAP_SECONDS) }.takeIf { it >= 0 } else null
+        val exposure = if (version >= 5 && readBoolean()) DiveExposureSummary(
+            boundedDouble(200.0), boundedDouble(1_000_000.0), readBoolean(), boundedDouble(1_441_000_000.0),
+            readDouble().also { require(it.isFinite() && (it == -1.0 || it in 0.0..10.0)) }.takeIf { it >= 0 },
+        ) else null
         return DiveSession(start, settings, elapsed, max, samples, phase, progress, started, incomplete, result,
-            limitReached = limitReached, shallowestAfterStopMeters = shallowest, minimumNdlSeconds = minimumNdl)
+            limitReached = limitReached, shallowestAfterStopMeters = shallowest, minimumNdlSeconds = minimumNdl,
+            exposure = exposure)
     }
 }

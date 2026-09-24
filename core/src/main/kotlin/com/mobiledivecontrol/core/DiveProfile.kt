@@ -36,6 +36,15 @@ enum class DiveLogOutcome { CompletedStop, IncompleteStop, NoStopRecorded }
 
 data class DiveSample(val elapsedMs: Long, val depthMeters: Double, val gapBefore: Boolean = false)
 
+/** Observed maxima for this dive; absent on logs written before exposure summaries were recorded. */
+data class DiveExposureSummary(
+    val maxCeilingMeters: Double,
+    val maxCnsPercent: Double,
+    val cnsOutsideTable: Boolean,
+    val maxOtu24Hours: Double,
+    val maxPpO2Ata: Double?,
+)
+
 data class DiveSession(
     val startedAtEpochMs: Long,
     val settings: DiveSettings,
@@ -55,6 +64,7 @@ data class DiveSession(
     val shallowestAfterStopMeters: Double? = null,
     /** Lowest valid NDL observed during this dive; absent on legacy or uninitialized profiles. */
     val minimumNdlSeconds: Int? = null,
+    val exposure: DiveExposureSummary? = null,
 ) {
     /** Recommend a stop on ascent from every dive that went deeper than its target. */
     val stopRecommended: Boolean get() = maxDepthMeters > settings.stopDepthMeters + 1e-9
@@ -170,9 +180,21 @@ object DiveProfileTracker {
         val maxDepth = maxOf(dive.maxDepthMeters, depthMeters)
         val limitReached = dive.limitReached || (state.decompression.history == DecoHistory.Tracking &&
             state.decompression.readings?.ndlSeconds == 0)
-        val ndl = state.decompression.readings?.ndlSeconds.takeIf { state.decompression.history == DecoHistory.Tracking }
+        val readings = state.decompression.readings.takeIf { state.decompression.history == DecoHistory.Tracking }
+        val ndl = readings?.ndlSeconds
+        val exposure = readings?.let { reading ->
+            val previous = dive.exposure
+            DiveExposureSummary(
+                maxOf(previous?.maxCeilingMeters ?: reading.ceilingMeters, reading.ceilingMeters),
+                maxOf(previous?.maxCnsPercent ?: reading.cnsPercent, reading.cnsPercent),
+                previous?.cnsOutsideTable == true || reading.cnsOutsideTable,
+                maxOf(previous?.maxOtu24Hours ?: reading.otu24Hours, reading.otu24Hours),
+                listOfNotNull(previous?.maxPpO2Ata, state.decompression.ppO2Ata).maxOrNull(),
+            )
+        } ?: dive.exposure
         dive = dive.copy(maxDepthMeters = maxDepth, limitReached = limitReached,
-            minimumNdlSeconds = ndl?.let { minOf(dive.minimumNdlSeconds ?: it, it) } ?: dive.minimumNdlSeconds)
+            minimumNdlSeconds = ndl?.let { minOf(dive.minimumNdlSeconds ?: it, it) } ?: dive.minimumNdlSeconds,
+            exposure = exposure)
         val config = dive.settings
         val inBand = depthMeters in config.bandMin..config.bandMax
         var phase = dive.phase

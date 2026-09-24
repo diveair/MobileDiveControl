@@ -6,7 +6,8 @@ class DiveLogCapacityTest {
     @Test fun `a thousand full profiles plus an active dive round trip without losing graph points`() {
         val samples = List(DiveProfileTracker.MAX_SAMPLES) { DiveSample(it * 5000L, 18.0) }
         val template = DiveSession(1, DiveSettings(), elapsedMs = samples.last().elapsedMs,
-            maxDepthMeters = 18.0, samples = samples, outcome = DiveLogOutcome.CompletedStop, minimumNdlSeconds = 240)
+            maxDepthMeters = 18.0, samples = samples, outcome = DiveLogOutcome.CompletedStop, minimumNdlSeconds = 240,
+            exposure = DiveExposureSummary(0.0, 12.5, false, 35.0, 1.4))
         val logs = List(1000) { template.copy(startedAtEpochMs = (1000 - it).toLong()) }
         val profile = DiveProfileState(logs = logs, active = template.copy(startedAtEpochMs = 2000, outcome = null))
         val bytes = DiveProfileCodec.encode(profile)
@@ -20,6 +21,7 @@ class DiveLogCapacityTest {
             assertEquals(samples.first(), log.samples.first())
             assertEquals(samples.last(), log.samples.last())
             assertEquals(240, log.minimumNdlSeconds)
+            assertEquals(template.exposure, log.exposure)
         }
         assertEquals(samples, restored.active!!.samples)
     }

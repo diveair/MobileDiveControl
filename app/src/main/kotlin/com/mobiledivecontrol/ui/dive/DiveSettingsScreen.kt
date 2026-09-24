@@ -148,6 +148,7 @@ fun DiveSettingsScreen(
                             null -> "Monitoring"
                         }, color = if (selected.outcome == DiveLogOutcome.IncompleteStop) DiveColors.Warning else DiveColors.TextSecondary, fontSize = 12.sp)
                     }
+                    DiveLogExposureReadout(profile, selected, useMetric)
                 }
             }
             SettingsList(profile, useMetric, sessions.size, onCommand, Modifier.width(126.dp))
