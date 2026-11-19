@@ -16,10 +16,9 @@ data class SamsungLogAcquisitionCalibration(
 /**
  * Samsung Log's published transfer function plus DiveControl's measured S24 acquisition policy.
  *
- * Samsung Log is not available to third-party Camera2 clients. DiveControl therefore records an
- * untouched 10-bit BT.2020 HLG master, protects the extra highlight latitude at capture, then uses
- * [hlgToSamsungLog] as an editor input transform. The original HLG file remains standards-compliant
- * and is never falsely tagged as Samsung Log.
+ * [hlgToSamsungLog] and the acquisition offsets describe legacy HLG recordings. Native Samsung
+ * LOG uses the camera's own transfer function and must never receive that conversion or offset.
+ * Native access is device/firmware dependent; the Android recorder owns its capability checks.
  */
 object SamsungLogProfile {
     // Samsung Log White Paper, revision available 2026-08-24.
@@ -116,10 +115,11 @@ object SamsungLogProfile {
     }
 
     /** Official Samsung Log signal to scene-linear inverse transfer function. */
-    fun decode(signal: Double): Double = if (signal >= SIGNAL_TOE_CROSSOVER) {
-        10.0.pow((signal - G1) / A1) - B1
-    } else {
-        -10.0.pow((signal - G2) / A2) + B2
+    fun decode(signal: Double): Double = when {
+        // Samsung's inverse clamps below-black encoded values to the scene-domain floor.
+        signal < 0.0 -> SCENE_BLACK
+        signal >= SIGNAL_TOE_CROSSOVER -> 10.0.pow((signal - G1) / A1) - B1
+        else -> -10.0.pow((signal - G2) / A2) + B2
     }
 
     /** Analytic editor input transform used by the bundled DCTL. */

@@ -383,6 +383,9 @@ internal fun shouldShowPermissionRecovery(
     permissionDialogVisible: Boolean,
 ): Boolean = phase == IntroPhase.NeedsPermissions && !permissionDialogVisible
 
+/** The orange first-connection banner, shown once permissions are settled. */
+internal const val TURN_ON_HOUSING_PROMPT = "HOLD SHUTTER TO POWER ON & CONNECT BLUETOOTH"
+
 internal fun permissionRecoveryTapPrompt(): String =
     "TAP ANYWHERE ON SCREEN TO CONTINUE"
 
@@ -735,8 +738,8 @@ private fun TextMeasurer.layOutBanner(
         IntroPhase.TurnOnHousing -> MeasuredBanner(
             fill = DiveColors.Warning,
             ink = Color.Black,
-            primary = primary("HOLD SHUTTER TO TURN ON HOUSING", BANNER_TEXT_BOX),
-            secondary = secondary("WHICH WILL CONNECT BLUETOOTH"),
+            primary = primary(TURN_ON_HOUSING_PROMPT, BANNER_TEXT_BOX),
+            secondary = null,
             badge = false,
         )
 

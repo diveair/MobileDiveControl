@@ -7,9 +7,9 @@ import org.junit.jupiter.api.Test
 
 class VideoDynamicRangePolicyTest {
     @Test
-    fun `legacy LOG selection chooses public ten bit HLG when supported`() {
+    fun `LOG never substitutes public HLG even when supported`() {
         assertEquals(
-            DynamicRange.HLG_10_BIT,
+            DynamicRange.SDR,
             VideoDynamicRangePolicy.select(
                 requestedMode = "LOG",
                 supported = setOf(DynamicRange.SDR, DynamicRange.HLG_10_BIT),
@@ -37,9 +37,9 @@ class VideoDynamicRangePolicyTest {
     }
 
     @Test
-    fun `LOG contract never accepts an SDR fallback`() {
+    fun `LOG contract rejects both HLG and SDR CameraX fallbacks`() {
         assertEquals(
-            true,
+            false,
             VideoDynamicRangePolicy.isCaptureContractSatisfied("LOG", DynamicRange.HLG_10_BIT),
         )
         assertEquals(

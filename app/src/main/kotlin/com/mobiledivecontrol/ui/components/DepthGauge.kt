@@ -1,5 +1,7 @@
 package com.mobiledivecontrol.ui.components
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,18 +13,31 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mobiledivecontrol.core.HeadingMath
+import com.mobiledivecontrol.core.Buhlmann
+import com.mobiledivecontrol.core.DecoHistory
+import com.mobiledivecontrol.core.DiveProfileState
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.core.SealState
 import com.mobiledivecontrol.theme.DiveColors
 import java.util.Locale
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 /** ISA standard sea-level pressure. The reference when no surface baseline has been captured. */
 const val STANDARD_ATMOSPHERE_KPA = com.mobiledivecontrol.core.STANDARD_SURFACE_PRESSURE_KPA
@@ -41,6 +56,7 @@ fun DepthGauge(
     headingTargetSynchronized: Boolean = false,
     modifier: Modifier = Modifier,
     maxDepthMeters: Double? = null,
+    ndlSeconds: Int? = null,
 ) {
     val depthMeters = depthMetersFromPressure(waterPressureKpa)
 
@@ -59,8 +75,7 @@ fun DepthGauge(
         DepthReadout(depthMeters, useMetric, "now", color)
         Box(Modifier.padding(horizontal = 4.dp).width(1.dp).height(24.dp)
             .background(DiveColors.TextMuted))
-        DepthReadout(maxDepthMeters, useMetric, "max",
-            if (maxDepthMeters != null) DiveColors.DiveCyan else DiveColors.TextMuted)
+        MaxDepthNdlReadout(maxDepthMeters, useMetric, ndlSeconds, depthMeters)
         ReadoutSeparator()
         Text(
             text = headingDegrees?.let(::formatHeading) ?: "---° --",
@@ -97,12 +112,81 @@ fun DepthGauge(
 @Composable
 private fun DepthReadout(meters: Double?, metric: Boolean, label: String, color: Color) {
     val value = meters?.let { String.format(Locale.US, "%.1f", if (metric) it else it * 3.28084) } ?: "--"
+    HudValueReadout(value + if (metric) "m" else "ft", label, color)
+}
+
+/** Both presentations are measured together, so pulsing cannot move adjacent HUD readings. */
+@Composable
+private fun MaxDepthNdlReadout(
+    maxDepthMeters: Double?, metric: Boolean, ndlSeconds: Int?, depthMeters: Double?,
+) {
+    // Removing the animated branch also cancels its pulse and discards the current phase.
+    // At one metre or shallower, or with unavailable data, max depth stays at full opacity.
+    if (!shouldPulseHudNdl(depthMeters, ndlSeconds)) {
+        DepthReadout(maxDepthMeters, metric, "max",
+            if (maxDepthMeters != null) DiveColors.MaxDepthBlue else DiveColors.TextMuted)
+        return
+    }
+    var showNdl by remember { mutableStateOf(false) }
+    val pulse = remember { Animatable(1f) }
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            delay(3_000L)
+            pulse.animateTo(0f, tween(800))
+            showNdl = !showNdl
+            pulse.animateTo(1f, tween(800))
+        }
+    }
+    Box(contentAlignment = Alignment.Center) {
+        Box(
+            Modifier
+                .then(if (showNdl) Modifier.clearAndSetSemantics { } else Modifier)
+                .graphicsLayer {
+                    // The lowered labels extend past the measured box; fading must not clip them.
+                    compositingStrategy = CompositingStrategy.ModulateAlpha
+                    alpha = if (showNdl) 0f else pulse.value
+                },
+        ) {
+            DepthReadout(maxDepthMeters, metric, "max",
+                if (maxDepthMeters != null) DiveColors.MaxDepthBlue else DiveColors.TextMuted)
+        }
+        Box(
+            Modifier
+                .then(if (!showNdl) Modifier.clearAndSetSemantics { } else Modifier)
+                .graphicsLayer {
+                    compositingStrategy = CompositingStrategy.ModulateAlpha
+                    alpha = if (showNdl) pulse.value else 0f
+                },
+        ) {
+            HudValueReadout(hudNdlTime(ndlSeconds), "NDL", DiveColors.MaxDepthBlue)
+        }
+    }
+}
+
+internal fun liveHudNdlSeconds(profile: DiveProfileState): Int? =
+    profile.decompression.readings?.ndlSeconds?.takeIf {
+        it >= 0 && profile.sensorAvailable && profile.decompression.history == DecoHistory.Tracking
+    }
+
+internal fun shouldPulseHudNdl(depthMeters: Double?, ndlSeconds: Int?): Boolean =
+    depthMeters != null && depthMeters.isFinite() && depthMeters > 1.0 &&
+        ndlSeconds != null && ndlSeconds >= 0
+
+internal fun hudNdlTime(seconds: Int?): String = when {
+    seconds == null || seconds < 0 -> "—"
+    seconds >= Buhlmann.NDL_CAP_SECONDS -> "∞min"
+    seconds < 60 -> "${seconds}s"
+    else -> "${seconds / 60}min"
+}
+
+@Composable
+private fun HudValueReadout(value: String, label: String, color: Color) {
     Column(
         // Align the smaller depth numerals with the heading/temperature glyph bottoms.
         modifier = Modifier.offset(y = 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(text = value + if (metric) "m" else "ft", color = color,
+        Text(text = value, color = color,
             fontSize = 14.sp, lineHeight = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1)
         Text(text = label, color = color.copy(alpha = 0.8f),
             // Halve the visible gap left by the two text lines' font metrics.

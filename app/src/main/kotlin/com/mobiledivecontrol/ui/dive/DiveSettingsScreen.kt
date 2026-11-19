@@ -114,7 +114,7 @@ fun DiveSettingsScreen(
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text("DIVE SETTINGS", color = DiveColors.DiveCyan, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
-            if (profile.active != null) Text("DIVE ACTIVE · SETTINGS LOCKED",
+            if (profile.active != null) Text("DIVE ACTIVE · GAS / STOP LOCKED",
                 color = DiveColors.Warning, style = MaterialTheme.typography.labelMedium)
         }
         Spacer(Modifier.height(10.dp))
@@ -164,15 +164,16 @@ private fun SettingsList(profile: DiveProfileState, metric: Boolean, sessionCoun
     onCommand: (DiveSettingsCommand) -> Unit, modifier: Modifier) {
     val settings = profile.active?.settings ?: profile.settings
     // Share the available screen height so every option stays visible during housing navigation.
-    Column(modifier.fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    Column(modifier.fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(3.dp)) {
         DiveSettingsField.entries.forEach { field ->
             val focused = profile.selectedField == field
-            val enabled = profile.active == null || field in setOf(DiveSettingsField.Log, DiveSettingsField.Back)
+            val enabled = profile.active == null || field in setOf(DiveSettingsField.Log, DiveSettingsField.Alerts, DiveSettingsField.Back)
             val label = when (field) {
                 DiveSettingsField.Gas -> "Breathing gas"
-                DiveSettingsField.StopDepth -> "Stop depth"
-                DiveSettingsField.StopDuration -> "Stop duration"
+                DiveSettingsField.StopDepth -> "Safety Stop Depth"
+                DiveSettingsField.StopDuration -> "Safety Stop Time"
                 DiveSettingsField.Log -> "Dive Logs"
+                DiveSettingsField.Alerts -> "Dive Alerts"
                 DiveSettingsField.Back -> "Back to camera"
             }
             val value = when (field) {
@@ -180,9 +181,10 @@ private fun SettingsList(profile: DiveProfileState, metric: Boolean, sessionCoun
                 DiveSettingsField.StopDepth -> diveDepth(settings.stopDepthMeters.toDouble(), metric)
                 DiveSettingsField.StopDuration -> "${settings.stopDurationSeconds / 60} min"
                 DiveSettingsField.Log -> if (sessionCount == 0) "No dives" else "${profile.logIndex + 1} / $sessionCount"
+                DiveSettingsField.Alerts -> "CONFIGURE"
                 DiveSettingsField.Back -> "BACK"
             }
-            val adjustable = enabled && field !in setOf(DiveSettingsField.Gas, DiveSettingsField.Back) &&
+            val adjustable = enabled && field !in setOf(DiveSettingsField.Gas, DiveSettingsField.Alerts, DiveSettingsField.Back) &&
                 (field != DiveSettingsField.Log || sessionCount > 0)
             Column(Modifier.fillMaxWidth().weight(1f)
                 .background(if (focused) DiveColors.SurfaceElevated else DiveColors.SurfaceCard, RoundedCornerShape(8.dp))
@@ -191,17 +193,17 @@ private fun SettingsList(profile: DiveProfileState, metric: Boolean, sessionCoun
                     onCommand(DiveSettingsCommand.Select(field))
                     if (field == DiveSettingsField.Back) onCommand(DiveSettingsCommand.Back)
                     if (field == DiveSettingsField.Gas && enabled) onCommand(DiveSettingsCommand.Confirm)
-                    if (field == DiveSettingsField.Log) onCommand(DiveSettingsCommand.Confirm)
+                    if (field == DiveSettingsField.Log || field == DiveSettingsField.Alerts) onCommand(DiveSettingsCommand.Confirm)
                 }
-                .padding(horizontal = 6.dp, vertical = 3.dp)) {
-                Text(label, color = DiveColors.TextSecondary, fontSize = 11.sp, lineHeight = 13.sp, maxLines = 1,
+                .padding(horizontal = 5.dp, vertical = 2.dp)) {
+                Text(label, color = DiveColors.TextSecondary, fontSize = 10.sp, lineHeight = 11.sp, maxLines = 1,
                     textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
                 Row(Modifier.fillMaxWidth().weight(1f), verticalAlignment = Alignment.CenterVertically) {
                     if (adjustable) SettingsChevron(label, -1, field, onCommand)
                     // Balance the submenu chevron so the gas value shares the card's centerline.
                     if (enabled && field == DiveSettingsField.Gas) Spacer(Modifier.width(14.dp))
                     AutoShrinkText(value, color = if (enabled) DiveColors.TextPrimary else DiveColors.TextSecondary,
-                        style = TextStyle(fontWeight = FontWeight.Bold, fontSize = 15.sp, lineHeight = 17.sp,
+                        style = TextStyle(fontWeight = FontWeight.Bold, fontSize = 13.sp, lineHeight = 14.sp,
                             textAlign = TextAlign.Center),
                         modifier = Modifier.weight(1f), maxLines = 1)
                     if (adjustable) SettingsChevron(label, 1, field, onCommand)
@@ -230,10 +232,12 @@ private fun SettingsChevron(label: String, delta: Int, field: DiveSettingsField,
 
 @Composable
 fun DiveStopBanner(profile: DiveProfileState, useMetric: Boolean, modifier: Modifier = Modifier,
-    onCommand: (DiveSettingsCommand) -> Unit = {}) {
+    onCommand: (DiveSettingsCommand) -> Unit = {}, forceCompact: Boolean = false, recording: Boolean = false) {
     val dive = profile.active ?: return
     val decompressionCeiling = profile.requiredDecompressionCeilingMeters
     val decompressionRequired = profile.decompressionHold
+    if (profile.atSurface && !decompressionRequired) return
+    if (!dive.stopRecommended && !dive.stopStarted && !decompressionRequired) return
     if (profile.stopPresentation == DiveStopPresentation.Dismissed && !decompressionRequired) return
     val approaching = dive.phase == DiveStopPhase.Armed && profile.depthMeters?.let {
         it <= dive.settings.bandMax + 2 && dive.maxDepthMeters - it >= 0.5
@@ -247,30 +251,32 @@ fun DiveStopBanner(profile: DiveProfileState, useMetric: Boolean, modifier: Modi
     val accent = safetyStopAccent(profile)
     val motion = profile.verticalMetersPerMinute?.takeIf { !missing && !complete && abs(it) >= 0.6 }
     val stopHeading = "${diveDepth(target, useMetric).replace(" ", "")} SAFETY STOP"
-    if (profile.stopPresentation == DiveStopPresentation.Minimized && !complete && !decompressionRequired) {
-        Column(modifier.widthIn(max = 290.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        if (motion != null && motion < 0) StopMotionTriangle(motion, useMetric, compact = true,
-            warningColor = accent)
-        Column(Modifier.fillMaxWidth().background(Color.Black, RoundedCornerShape(10.dp))
-            .background(accent.copy(alpha = 0.16f), RoundedCornerShape(10.dp))
-            .border(2.dp, accent, RoundedCornerShape(10.dp))
-            .clickable { onCommand(DiveSettingsCommand.ExpandStop) }.padding(horizontal = 12.dp, vertical = 6.dp),
-            horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("$stopHeading  ${diveTime(dive.remainingSeconds.toLong())}", color = accent,
-                fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-            Text(if (missing) "DEPTH LOST · PAUSED" else "DEPTH ${diveDepth(profile.depthMeters!!, useMetric)}",
+    if (forceCompact || (profile.stopPresentation == DiveStopPresentation.Minimized && !decompressionRequired)) {
+        Column(modifier.widthIn(max = 430.dp).fillMaxWidth()
+            .background(Color.Black.copy(alpha = if (recording) 0f else 0.9f), RoundedCornerShape(10.dp))
+            .border(1.dp, accent, RoundedCornerShape(10.dp))
+            .clickable(enabled = !forceCompact && !decompressionRequired) { onCommand(DiveSettingsCommand.ExpandStop) }
+            .padding(horizontal = 12.dp, vertical = 5.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            val title = when {
+                decompressionCeiling != null -> "DECOMPRESSION · CEILING ${diveDepth(ceil(decompressionCeiling * 10) / 10, useMetric)}"
+                decompressionRequired -> "DECOMPRESSION STATUS UNKNOWN"
+                complete -> "SAFETY STOP COMPLETE"
+                else -> "$stopHeading  ${diveTime(dive.remainingSeconds.toLong())}"
+            }
+            Text(title, color = accent, fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+            Text(if (missing) "DEPTH LOST · TIMER PAUSED" else
+                "DEPTH ${diveDepth(profile.depthMeters!!, useMetric)}" +
+                    if (decompressionRequired) " · SAFETY TIMER PAUSED" else "",
                 color = accent, fontSize = 12.sp)
-        }
-        if (motion != null && motion > 0) StopMotionTriangle(motion, useMetric, compact = true, warningColor = accent)
         }
         return
     }
     Column(modifier.widthIn(max = 430.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-    if (motion != null && motion < 0) StopMotionTriangle(motion, useMetric,
+    if (!recording && motion != null && motion < 0) StopMotionTriangle(motion, useMetric,
         warningColor = accent)
     Column(Modifier.fillMaxWidth()
-        .background(Color.Black, RoundedCornerShape(14.dp))
-        .background(accent.copy(alpha = 0.16f), RoundedCornerShape(14.dp))
+        .background(Color.Black.copy(alpha = if (recording) 0f else 1f), RoundedCornerShape(14.dp))
+        .background(accent.copy(alpha = if (recording) 0f else 0.16f), RoundedCornerShape(14.dp))
         .border(2.dp, accent, RoundedCornerShape(14.dp))
         .clickable(enabled = dive.stopStarted) { onCommand(DiveSettingsCommand.AcknowledgeStop) }
         .padding(horizontal = 18.dp, vertical = 12.dp),
@@ -309,8 +315,15 @@ fun DiveStopBanner(profile: DiveProfileState, useMetric: Boolean, modifier: Modi
             else -> ""
         }
         if (instruction.isNotEmpty()) Text(instruction, color = accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        if (!decompressionRequired && dive.stopStarted) {
+            Text(if (complete) "OK  DISMISS" else "OK  MINIMIZE", color = accent, fontSize = 14.sp,
+                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp)
+                    .border(1.dp, accent, RoundedCornerShape(8.dp))
+                    .clickable { onCommand(DiveSettingsCommand.AcknowledgeStop) }
+                    .padding(horizontal = 20.dp, vertical = 8.dp))
+        }
     }
-    if (motion != null && motion > 0) StopMotionTriangle(motion, useMetric, warningColor = accent)
+    if (!recording && motion != null && motion > 0) StopMotionTriangle(motion, useMetric, warningColor = accent)
     }
 }
 

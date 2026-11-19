@@ -172,11 +172,12 @@ object HeadingMath {
             )
         }
 
-        // Preserve the perspective aspect ratio but keep every orientation inside the compact HUD
-        // viewport. A common scale for both faces retains the extrusion and foreshortening.
+        // Centre the projected bounds, not the vertex average: the dart's three rear vertices
+        // otherwise push a top-down arrow off-centre and leave much of its viewport unused.
+        // One common scale for both faces preserves perspective and the physical extrusion.
         val all = lowerRaw + upperRaw
-        val centreX = all.sumOf { it.x } / all.size
-        val centreY = all.sumOf { it.y } / all.size
+        val centreX = (all.minOf { it.x } + all.maxOf { it.x }) / 2.0
+        val centreY = (all.minOf { it.y } + all.maxOf { it.y }) / 2.0
         val extent = all.maxOf { max(abs(it.x - centreX), abs(it.y - centreY)) }
             .coerceAtLeast(MIN_NORMALIZATION_EXTENT)
         val scale = ARROW_VIEWPORT_EXTENT / extent
@@ -297,14 +298,16 @@ object HeadingMath {
     // face give the complete silhouette depth.
     private val ARROW_OUTLINE = listOf(
         ArrowVertex(along = 0.95, across = 0.0),
-        ArrowVertex(along = -0.78, across = 0.52),
+        ArrowVertex(along = -0.78, across = 0.78),
         ArrowVertex(along = -0.26, across = 0.0),
-        ArrowVertex(along = -0.78, across = -0.52),
+        ArrowVertex(along = -0.78, across = -0.78),
     )
 
     private const val ARROW_DISTANCE = 5.0
-    private const val ARROW_PLANE_DROP = 2.4
-    private const val ARROW_THICKNESS = 0.16
+    // The broader world-space dart and plane drop retain the readable overhead/forward shape.
+    private const val ARROW_PLANE_DROP = 3.6
+    // 15% more physical extrusion makes the side walls clearer as the phone tilts and rolls.
+    private const val ARROW_THICKNESS = 0.276
     private const val ARROW_VIEWPORT_EXTENT = 0.92
     private const val MIN_PROJECTION_DEPTH = 0.25
     private const val MIN_NORMALIZATION_EXTENT = 1e-6

@@ -29,6 +29,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mobiledivecontrol.platform.ble.BlePermissions
 import com.mobiledivecontrol.accessibility.PermissionDialogHousingBridge
@@ -84,6 +85,16 @@ class MainActivity : ComponentActivity() {
     )
 
     private var activeOnDemandPermissionRequest: PendingOnDemandPermissionRequest? = null
+
+    /**
+     * The same instance Compose's viewModel() returns (same owner, same default key), held here so
+     * permission sequencing can read the welcome card synchronously from onResume/focus callbacks.
+     */
+    private lateinit var diveViewModel: DiveViewModel
+
+    /** The welcome card (every launch) comes before every Android system prompt. */
+    private fun welcomeHoldsSystemPrompts(): Boolean =
+        ::diveViewModel.isInitialized && diveViewModel.welcomeVisible.value
     private var queuedOnDemandPermissionRequest: PendingOnDemandPermissionRequest? = null
 
     private val permissionsLauncher = registerForActivityResult(
@@ -142,8 +153,21 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
+        diveViewModel = ViewModelProvider(this)[DiveViewModel::class.java]
+        if ((applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 &&
+            intent.getBooleanExtra(EXTRA_PREVIEW_WELCOME, false)
+        ) {
+            intent.removeExtra(EXTRA_PREVIEW_WELCOME)
+            diveViewModel.previewWelcome()
+        }
+
         setContent {
             val viewModel: DiveViewModel = viewModel()
+            val welcomeVisible by viewModel.welcomeVisible.collectAsState()
+            // The welcome card held every system prompt back; start them the moment it ends.
+            androidx.compose.runtime.LaunchedEffect(welcomeVisible) {
+                if (!welcomeVisible) checkAndRequestPermissions()
+            }
             // onResume runs outside the composition; keep a handle so a Bluetooth toggle made
             // from quick settings is picked up the moment the diver returns to the app.
             bluetoothStateRefresh = viewModel::refreshBluetoothState
@@ -238,10 +262,10 @@ class MainActivity : ComponentActivity() {
                 viewModel.refreshBluetoothState()
             }
 
-            androidx.compose.runtime.LaunchedEffect(bluetoothEnabled, blePermissionsGranted) {
+            androidx.compose.runtime.LaunchedEffect(bluetoothEnabled, blePermissionsGranted, welcomeVisible) {
                 if (bluetoothEnabled) {
                     bluetoothEnableRequestedWhileOff = false
-                } else if (blePermissionsGranted && !bluetoothEnableRequestedWhileOff) {
+                } else if (blePermissionsGranted && !bluetoothEnableRequestedWhileOff && !welcomeVisible) {
                     val request = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
                     if (request.resolveActivity(packageManager) != null) {
                         bluetoothEnableRequestedWhileOff = true
@@ -381,6 +405,8 @@ class MainActivity : ComponentActivity() {
                         onPermissionsSetup = ::openPermissionSetup,
                         capPromptVisible = capPromptVisible,
                         onCapPromptDismiss = viewModel::dismissCapPrompt,
+                        welcomeVisible = welcomeVisible,
+                        onWelcomeFinished = viewModel::finishWelcome,
                     )
 
                     // Debug simulation panel (tap 🐛 on the right edge)
@@ -474,6 +500,8 @@ class MainActivity : ComponentActivity() {
                 "popupConnected=$popupControlReady",
         )
         startupPermissionSequenceActive = step.gate != StartupPermissionGate.Complete
+        // Re-entered from LaunchedEffect(welcomeVisible) the moment the card finishes.
+        if (welcomeHoldsSystemPrompts()) return
 
         if (canLaunchStartupPermissionDialog(
                 step = step,
@@ -544,7 +572,9 @@ class MainActivity : ComponentActivity() {
         resolve: (Long, Boolean) -> Unit,
     ) {
         val pending = PendingOnDemandPermissionRequest(request, resolve)
-        if (runtimePermissionRequestInFlight || activeOnDemandPermissionRequest != null || skyGuidePermissionRequestInFlight) {
+        if (welcomeHoldsSystemPrompts() || runtimePermissionRequestInFlight ||
+            activeOnDemandPermissionRequest != null || skyGuidePermissionRequestInFlight
+        ) {
             queuedOnDemandPermissionRequest = pending
             return
         }
@@ -630,7 +660,7 @@ class MainActivity : ComponentActivity() {
     private fun requestSkyGuideLocationPrerequisites(forcePermissionDialog: Boolean = false) {
         refreshPermissionState()
         if (!skyGuideLocationWanted) return
-        if (startupPermissionSequenceActive || runtimePermissionRequestInFlight ||
+        if (welcomeHoldsSystemPrompts() || startupPermissionSequenceActive || runtimePermissionRequestInFlight ||
             activeOnDemandPermissionRequest != null || skyGuidePermissionRequestInFlight ||
             !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || !window.decorView.hasWindowFocus()
         ) return
@@ -728,6 +758,8 @@ class MainActivity : ComponentActivity() {
         const val STARTUP_PERMISSION_LOG_TAG = "StartupPermissions"
         const val SKY_GUIDE_PERMISSION_RETRY_LIMIT = 1
         const val SKY_GUIDE_PERMISSION_RETRY_DELAY_MS = 900L
+        /** Debug builds only: `adb shell am start -n com.mobiledivecontrol/.MainActivity --ez divecontrol.preview_welcome true` */
+        const val EXTRA_PREVIEW_WELCOME = "divecontrol.preview_welcome"
     }
 
 }

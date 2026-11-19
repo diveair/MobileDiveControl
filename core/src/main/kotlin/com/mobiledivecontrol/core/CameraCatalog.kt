@@ -1853,13 +1853,13 @@ object CameraCatalog {
             availableLenses = lenses,
             availableResolutions = listOf("FHD", "UHD 4K", "8K"),
             availableFrameRates = frameRates,
-            availableFormatOptions = listOf("Standard", "HDR", "10-bit HLG"),
+            availableFormatOptions = listOf("Standard", "HDR", "Samsung LOG (experimental)"),
             availableExposureControls = listOf(
                 "White balance", "ISO", "Focus", "Shutter", "Exposure value",
                 "Frame rate / playback",
             ),
             availableAudioControls = listOf("Microphone audio"),
-            availableAssistTools = listOf("Zebra", "False colour", "Guides", "HDR", "10-bit HLG / Log grade"),
+            availableAssistTools = listOf("Zebra", "False colour", "Guides", "HDR", "Samsung LOG (experimental)"),
             settings = listOf(
                 slider("pro_video.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
                 slider("pro_video.iso", "ISO", "Manual", isoOptions, "Auto"),
@@ -1890,7 +1890,7 @@ object CameraCatalog {
                 choice("pro_video.exposure_display", "Exposure display", "Assist", exposureDisplayOptions(), "Off"),
                 // Both default OFF: wide-dynamic-range capture is a deliberate grading workflow.
                 choice("pro_video.hdr", "HDR video", "Dynamic range", listOf("Off", "On"), "Off"),
-                choice("pro_video.log", "10-bit HLG / Log grade", "Dynamic range", listOf("Off", "On"), "Off"),
+                choice("pro_video.log", "Samsung LOG (experimental)", "Dynamic range", listOf("Off", "On"), "Off"),
                 choice("pro_video.video_stabilization", "Video stabilization", "Stabilization", listOf("Off", "Standard"), "Off"),
                 toggle("pro_video.audio_recording", "Microphone audio", "Audio", "On"),
                 *metadataSettings("pro_video").toTypedArray(),

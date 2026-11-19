@@ -114,6 +114,42 @@ class HeadingMathTest {
         assertTrue(mesh.upperFace.maxOf { it.x } - mesh.upperFace.minOf { it.x } > 0.25)
         assertTrue(mesh.lowerFace != mesh.upperFace, "the arrow must retain visible 3D extrusion")
         assertEquals(0.0, mesh.yawErrorDegrees!!, 0.0001)
+        // Keep the forward width and perspective with the slightly thicker extrusion.
+        assertEquals(1.84, mesh.upperFace.maxOf { it.x } - mesh.upperFace.minOf { it.x }, 0.0001)
+        assertEquals(1.139944, mesh.upperFace.maxOf { it.y } - mesh.upperFace.minOf { it.y }, 0.0001)
+    }
+
+    @Test
+    fun `straight down arrow stays broad and uses the full viewport`() {
+        val down = downwardBasis(90.0)
+        val mesh = HeadingMath.navigationArrowMesh(down, 0.0)
+        val width = mesh.upperFace.maxOf { it.x } - mesh.upperFace.minOf { it.x }
+        val height = mesh.upperFace.maxOf { it.y } - mesh.upperFace.minOf { it.y }
+        assertTrue(width / height >= 0.85, "the overhead arrow must not become a skinny needle")
+        assertTrue(height >= 1.8, "the overhead arrow must use its available HUD space")
+        assertTrue(mesh.upperFace[0].y < mesh.upperFace[2].y, "north remains toward image-top")
+    }
+
+    @Test
+    fun `arrow stays centred bounded and continuous through downward pitch and turns`() {
+        for (heading in 0..350 step 10) {
+            var previous: NavigationArrowMesh? = null
+            for (pitch in 0..100) {
+                val mesh = HeadingMath.navigationArrowMesh(downwardBasis(pitch.toDouble()), heading.toDouble())
+                val points = mesh.lowerFace + mesh.upperFace
+                assertTrue(points.all { it.x.isFinite() && it.y.isFinite() })
+                assertTrue(points.all { kotlin.math.abs(it.x) <= 0.920001 && kotlin.math.abs(it.y) <= 0.920001 })
+                assertEquals(0.0, points.maxOf { it.x } + points.minOf { it.x }, 0.000001)
+                assertEquals(0.0, points.maxOf { it.y } + points.minOf { it.y }, 0.000001)
+                assertEquals(HeadingMath.shortestDelta(0.0, heading.toDouble()), mesh.yawErrorDegrees!!, 0.0001)
+                previous?.let { prior ->
+                    (prior.lowerFace + prior.upperFace).zip(points).forEach { (before, after) ->
+                        assertTrue(distance(before, after) < 0.06, "projection jumped at pitch=$pitch heading=$heading")
+                    }
+                }
+                previous = mesh
+            }
+        }
     }
 
     @Test
@@ -262,6 +298,16 @@ class HeadingMathTest {
         forwardNorth = 1.0,
         forwardUp = 0.0,
     )
+
+    private fun downwardBasis(degrees: Double): CameraBasis {
+        val pitch = Math.toRadians(degrees)
+        return levelNorthBasis().copy(
+            screenUpNorth = kotlin.math.sin(pitch),
+            screenUpUp = kotlin.math.cos(pitch),
+            forwardNorth = kotlin.math.cos(pitch),
+            forwardUp = -kotlin.math.sin(pitch),
+        )
+    }
 
     private fun midpoint(a: ProjectedArrowPoint, b: ProjectedArrowPoint) = ProjectedArrowPoint(
         x = (a.x + b.x) / 2.0,

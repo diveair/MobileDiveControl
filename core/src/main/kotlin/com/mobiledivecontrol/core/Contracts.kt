@@ -616,6 +616,7 @@ data class AppState(
     val phoneControl: PhoneControlState = PhoneControlState(),
     val safety: SafetyState = SafetyState(),
     val diveProfile: DiveProfileState = DiveProfileState(),
+    val airAlerts: AirAlertState = AirAlertState(),
     val waterPressureTelemetry: PressureTelemetry? = null,
     /** Highest valid external-pressure depth this app session; retained across screens and reconnects. */
     val maxDepthMeters: Double? = null,

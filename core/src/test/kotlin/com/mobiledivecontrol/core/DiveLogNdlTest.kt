@@ -14,6 +14,7 @@ class DiveLogNdlTest {
             state = DiveProfileTracker.sample(state, depth, time, time)
         }
         sample(2.0, 5940); sample(20.0, 1234); sample(20.0, 900); sample(5.0, 1600); sample(0.0, 5940)
+        repeat(180) { sample(0.3, 5940) }
         assertEquals(900, state.logs.single().minimumNdlSeconds)
         state = state.copy(decompression = DecompressionState())
         assertEquals(900, DiveProfileCodec.decode(DiveProfileCodec.encode(state)).logs.single().minimumNdlSeconds)

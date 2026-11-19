@@ -30,9 +30,3 @@ class FirstRunOnboardingStore internal constructor(
         const val COMPLETION_MARKER = "first-run-onboarding-v1-complete"
     }
 }
-
-/** First install always wins; after it, a verified vacuum is what permits the fast camera path. */
-internal fun shouldShowOnboarding(
-    firstRunComplete: Boolean,
-    hasPersistedVacuum: Boolean,
-): Boolean = !firstRunComplete || !hasPersistedVacuum

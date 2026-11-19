@@ -115,6 +115,11 @@ class HousingLink(
     /** Hot stream of link activity. Drops oldest under back pressure rather than blocking GATT. */
     val events: SharedFlow<HousingLinkEvent> = _events.asSharedFlow()
 
+    private val startupTracker = HousingStartupTracker.create(context)
+
+    /** A power-on after more than one hour away may show startup once, even for a late subscriber. */
+    fun consumeStartupRequest(): Boolean = startupTracker.consumeStartupRequest()
+
     /**
      * Last connection signal and last value of each telemetry characteristic.
      *
@@ -668,8 +673,12 @@ class HousingLink(
     private fun emit(event: HousingLinkEvent) {
         onDiagnosticEvent(event)
         when (event) {
-            is HousingLinkEvent.Ble -> lastSignal = event.signal
-            is HousingLinkEvent.Notification ->
+            is HousingLinkEvent.Ble -> {
+                startupTracker.onSignal(event.signal)
+                lastSignal = event.signal
+            }
+            is HousingLinkEvent.Notification -> {
+                startupTracker.onLivePacket()
                 if (event.characteristicShortHex != BUTTON_SHORT_HEX) {
                     telemetry[event.characteristicShortHex] = event.payload
                     // Arm the motor interlock here rather than in the notification listener: the
@@ -680,6 +689,7 @@ class HousingLink(
                         observeCoverState(it, event.payload)
                     }
                 }
+            }
             else -> Unit
         }
         if (!_events.tryEmit(event)) {

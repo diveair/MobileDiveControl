@@ -30,7 +30,6 @@ import com.mobiledivecontrol.platform.CompassHeadingMonitor
 import com.mobiledivecontrol.platform.CompassReading
 import com.mobiledivecontrol.platform.HeadingStore
 import com.mobiledivecontrol.FirstRunOnboardingStore
-import com.mobiledivecontrol.shouldShowOnboarding
 import com.mobiledivecontrol.platform.PhoneBatteryMonitor
 import com.mobiledivecontrol.platform.ble.BlePermissions
 import com.mobiledivecontrol.platform.ble.HousingFeatureFlags
@@ -94,6 +93,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      */
     private val ramps = mutableMapOf<String, Ramp>()
 
+    private val airAlertStore = com.mobiledivecontrol.platform.AirAlertStore(application)
     private val diveProfileStore = com.mobiledivecontrol.platform.DiveProfileStore(application)
     private val _diveLogWarning = MutableStateFlow<String?>(null)
     val diveLogWarning: StateFlow<String?> = _diveLogWarning.asStateFlow()
@@ -108,6 +108,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     private var safetyStopMotionBaseline: com.mobiledivecontrol.core.DiveProfileState? = null
     private val controlCore = ControlCore(
         initialState = sessionStore.restoreAppState().let { restored -> restored.copy(diveProfile = restoredDiveProfile,
+            airAlerts = com.mobiledivecontrol.core.AirAlertState(settings = airAlertStore.read()),
             safety = restored.safety.copy(
                 vacuumReleasedPrompt = housingShutdownPrefs.getBoolean("pending", false),
                 vacuumReleaseDisconnectObserved = housingShutdownPrefs.getBoolean("disconnected", false))) },
@@ -150,20 +151,34 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * Whether the intro carousel is on screen.
      *
-     * First install always teaches permissions and housing attachment, even if a verified vacuum
-     * was restored. After that first completion, the verified-vacuum record owns the fast path:
-     * keep the walkthrough out of the way while the seal remains trustworthy, and bring it back
-     * when no vacuum exists. While true the housing buttons belong to the intro and nothing else —
-     * see [interceptForIntro].
+     * First install teaches permissions and housing attachment. Later starts are requested by
+     * the housing link only after more than an hour disconnected. Seal state never starts or
+     * dismisses the animation. While visible it owns housing input — see [interceptForIntro].
      */
-    private val firstRunOnboardingRequired = !firstRunOnboardingStore.isComplete()
     private val _introVisible = MutableStateFlow(
-        shouldShowOnboarding(
-            firstRunComplete = !firstRunOnboardingRequired,
-            hasPersistedVacuum = persistedVacuum != null,
-        ) && !housingShutdownPrefs.getBoolean("pending", false),
+        !firstRunOnboardingStore.isComplete() && !housingShutdownPrefs.getBoolean("pending", false),
     )
     val introVisible: StateFlow<Boolean> = _introVisible.asStateFlow()
+
+    /**
+     * Whether the NAUTICASE welcome card is on screen.
+     *
+     * Raised on every app launch (each new app process; a rotation or other Activity recreation
+     * keeps this ViewModel and does not replay it), and it always comes first: Android's
+     * permission prompts are held back until it finishes, so a first launch reads
+     * welcome -> permissions -> "hold shutter" banner. Lowered by [finishWelcome].
+     */
+    private val _welcomeVisible = MutableStateFlow(true)
+    val welcomeVisible: StateFlow<Boolean> = _welcomeVisible.asStateFlow()
+
+    fun finishWelcome() {
+        _welcomeVisible.value = false
+    }
+
+    /** Debug-build preview hook: replays the welcome card without clearing app data. */
+    fun previewWelcome() {
+        _welcomeVisible.value = true
+    }
 
     /**
      * Whether the remove-the-blue-cap doorway is on screen.
@@ -194,6 +209,10 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      */
     private var introDismissedAtMs: Long = 0L
 
+    private val airReceiver = com.mobiledivecontrol.platform.ble.AirPressureReceiver(application,
+        housingAddress = { diveApp?.housingStore?.lastAddress },
+        emit = { command -> viewModelScope.launch { dispatch(com.mobiledivecontrol.core.DiveSettingsCommand.Alerts(command)) } })
+
     init {
         // Before any telemetry can arrive: the persisted verified reading has to be in the
         // safety state before the first barometric sample makes the adoption decision.
@@ -216,10 +235,16 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         diveApp?.setPressureCapture(controlCore.state.mode == AppMode.Diagnostics, com.mobiledivecontrol.core.STANDARD_SURFACE_PRESSURE_KPA)
         collectPendingSaves()
         collectDiveProfile()
+        val airSettings = controlCore.state.airAlerts.settings
+        if (airSettings.source == com.mobiledivecontrol.core.AirSource.Receiver && airSettings.mapping.verified) {
+            airReceiver.execute(com.mobiledivecontrol.core.AirReceiverRequest(0, com.mobiledivecontrol.core.AirReceiverAction.Connect), airSettings)
+        }
         compassMonitor.start()
     }
 
     override fun onCleared() {
+        airReceiver.close()
+        airAlertStore.save(controlCore.state.airAlerts.settings)
         diveApp?.setPressureCapture(false)
         if (bluetoothReceiverRegistered) {
             runCatching {
@@ -241,8 +266,9 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             while (true) {
                 kotlinx.coroutines.delay(500)
                 val previousProfile = controlCore.state.diveProfile
+                val previousAir = controlCore.state.airAlerts
                 val outcome = controlCore.tickDiveProfile()
-                if (outcome.state.diveProfile != previousProfile) emitOutcome(outcome)
+                if (outcome.state.diveProfile != previousProfile || outcome.state.airAlerts != previousAir) emitOutcome(outcome)
             }
         }
         viewModelScope.launch(Dispatchers.IO) {
@@ -378,7 +404,15 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun applyLinkEvent(event: HousingLinkEvent) {
         when (event) {
-            is HousingLinkEvent.Ble -> advanceBle(event.signal)
+            is HousingLinkEvent.Ble -> {
+                advanceBle(event.signal)
+                if (!benchLinkForced && event.signal == BleSignal.Ready &&
+                    housingLink?.consumeStartupRequest() == true
+                ) {
+                    _capPromptVisible.value = false
+                    _introVisible.value = true
+                }
+            }
             is HousingLinkEvent.Notification ->
                 onNotification(
                     event.characteristicShortHex, event.payload, event.source,
@@ -563,6 +597,9 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         if (HousingCharacteristic.from(characteristic) != HousingCharacteristic.ButtonEvents) {
             return false
         }
+        // The welcome card is not interactive; a press while it is up must neither skip the
+        // intro nor reach the camera underneath.
+        if (_welcomeVisible.value) return true
         if (!_introVisible.value) {
             val sinceDismiss = System.currentTimeMillis() - introDismissedAtMs
             return sinceDismiss in 0 until INTRO_DISMISS_GUARD_MS
@@ -646,12 +683,6 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * previous session must be clearable too, or it outlives its vacuum.
      */
     private var recordInStore: Boolean = persistedVacuum != null
-
-    /** One-shot: the intro may be reinstated at most once, when the boot record is refuted. */
-    private var introReinstated: Boolean = false
-
-    /** When this view model came up, for the intro-reinstatement window. */
-    private val vmStartedAtMs: Long = System.currentTimeMillis()
 
     private var lastPersistedTier: SealConfidence? = null
 
@@ -959,7 +990,22 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                 nextProfile.lastAlert?.let(diveStopNotifier::notify)
             }
         }
+        val oldAir = _state.value.airAlerts
+        val newAir = outcome.state.airAlerts
+        val audibleAir = newAir.simulation?.air ?: newAir
+        val gasWarning = audibleAir.gasWarning?.takeIf {
+            it.visible && !com.mobiledivecontrol.core.airAlertPresentationBlocked(outcome.state)
+        }
+        diveStopNotifier.updateAirWarning(gasWarning?.level,
+            "${audibleAir.sessionId}:${audibleAir.tankNumber}:${audibleAir.gasWarningSequence}:${newAir.simulation != null}")
+        if (oldAir.settings != newAir.settings) {
+            airAlertStore.save(newAir.settings)
+            airReceiver.configure(newAir.settings)
+        }
         _state.value = outcome.state
+        if (newAir.receiverRequest != oldAir.receiverRequest) newAir.receiverRequest?.let {
+            airReceiver.execute(it, newAir.settings)
+        }
         // The cap doorway's hardware exits: the cap visibly CAME OFF (a cover transition to open,
         // never the level — this housing latches stale "open" for whole sessions), or the shell
         // turned out to be holding vacuum all along. Either way the screen's ask is moot.
@@ -992,29 +1038,10 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         // stored reading fresh (throttled — SharedPreferences is not a 5 Hz sink); the moment the
         // hold ends for any reason, forget it. A record that outlives its vacuum would greet the
         // NEXT vacuum with unearned confidence.
-        // A verified vacuum may dismiss a repeat walkthrough, but never the first-install lesson:
-        // even a housing restored already sealed must teach its controls once.
-        if (!firstRunOnboardingRequired && _introVisible.value &&
-            (sealNow == SealState.LeakMonitoring || sealNow == SealState.Passed)
-        ) {
-            dismissIntro()
-        }
-
         val safetyNow = outcome.state.safety
 
-        // A restored vacuum can initially justify the fast path. If the first real pressure sample
-        // refutes it, vacuum dependency wins and the walkthrough returns during the launch window.
-        if (!introReinstated && !firstRunOnboardingRequired && persistedVacuum != null &&
-            !_introVisible.value && !_capPromptVisible.value &&
-            safetyNow.verifiedVacuumKpa == null &&
-            sealNow != SealState.LeakMonitoring && sealNow != SealState.Passed &&
-            sealNow != SealState.Failed &&
-            safetyNow.barometricPressureKpa != null &&
-            System.currentTimeMillis() - vmStartedAtMs < INTRO_REINSTATE_WINDOW_MS
-        ) {
-            introReinstated = true
-            _introVisible.value = true
-        }
+        // Seal revalidation is handled by the seal UI. Telemetry must never replay
+        // the startup animation over an already-running camera session.
 
         val holdVerified = (sealNow == SealState.Passed) &&
             safetyNow.sealConfidence >= SealConfidence.Provisional &&
@@ -1330,7 +1357,6 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         const val PERSIST_DELTA_KPA = 0.3
 
         /** How long after launch a refuted boot record may still bring the intro back. */
-        const val INTRO_REINSTATE_WINDOW_MS = 120_000L
 
 
 

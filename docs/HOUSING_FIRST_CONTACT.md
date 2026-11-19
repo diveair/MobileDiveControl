@@ -66,6 +66,17 @@ The whole sequence should take a few seconds. There is deliberately no pairing s
 no device picker: the app connects to the strongest nearby `DIVE IT`, remembers it, and
 reconnects to it automatically from then on.
 
+After first-install onboarding, the startup animation is requested when the housing connects
+after more than one hour disconnected. Short power cycles, ordinary reconnects, activity
+recreation, and seal telemetry do not replay it. The animation remains dismissible with a
+housing button; an already verified vacuum does not cut it short.
+
+The process-wide link persists the disconnect time and checkpoints live contact at most once
+per minute. If the app was not running when the housing switched off, the next connection uses
+the last recorded contact as its fallback. The housing protocol exposes no uptime counter, so
+the app cannot distinguish an unobserved power-off from being out of Bluetooth range. A fresh
+installation uses its existing walkthrough; the first connection establishes the timing baseline.
+
 ## 5. What to send back
 
 ### 5a. The discovery dump — the important one

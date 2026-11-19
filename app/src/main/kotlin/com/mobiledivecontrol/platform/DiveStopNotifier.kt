@@ -16,6 +16,8 @@ import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import java.util.Locale
 import com.mobiledivecontrol.core.DiveStopAlert
+import com.mobiledivecontrol.core.AirGasLevel
+import com.mobiledivecontrol.core.airGasSpeech
 import kotlin.math.PI
 import kotlin.math.min
 import kotlin.math.sin
@@ -30,7 +32,16 @@ class DiveStopNotifier(context: Context) {
     private var track: AudioTrack? = null
     private var previousVolume: Int? = null
     private var raisedVolume: Int? = null
-    private val finish = Runnable { releaseAlert() }
+    private var gasLevel: AirGasLevel? = null
+    private var gasKey: String? = null
+    private var playingGas = false
+    private val repeatGas = Runnable {
+        gasLevel?.takeIf { it.critical }?.let { playAlert(false, airGasSpeech(it), true) }
+    }
+    private val finish = Runnable {
+        releaseAlert()
+        if (!closed && gasLevel?.critical == true) handler.postDelayed(repeatGas, 750L)
+    }
     private var speech: TextToSpeech? = null
     private var speechReady = false
     private var speechFailed = false
@@ -44,14 +55,17 @@ class DiveStopNotifier(context: Context) {
             val text = phrase ?: return
             if (!speechReady) {
                 if (!speechFailed) handler.postDelayed(this, 100L)
+                else if (gasLevel?.critical == true) finishSpeech(utterance)
                 return
             }
             val parameters = Bundle().apply {
                 putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1f)
                 putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_ALARM)
             }
-            if (speech?.speak(text, TextToSpeech.QUEUE_FLUSH, parameters, utterance) == TextToSpeech.ERROR)
+            if (speech?.speak(text, TextToSpeech.QUEUE_FLUSH, parameters, utterance) == TextToSpeech.ERROR) {
                 Log.e("DiveStopVoice", "Speech playback failed")
+                finishSpeech(utterance)
+            }
         }
     }
 
@@ -95,11 +109,34 @@ class DiveStopNotifier(context: Context) {
     } }
 
     fun notify(alert: DiveStopAlert) {
-        handler.removeCallbacks(finish)
-        releaseAlert()
+        if (gasLevel?.critical == true) return
         val completed = alert == DiveStopAlert.Completed
-        utterance = "${alert.name}-${++alertNumber}"
-        phrase = if (completed) "SAFETY STOP FINISHED" else "BEGIN SAFETY STOP"
+        playAlert(completed, if (completed) "SAFETY STOP FINISHED" else "BEGIN SAFETY STOP", false)
+    }
+
+    /** One-shot reserve cues; a critical cue repeats until the owning state explicitly clears it. */
+    fun updateAirWarning(level: AirGasLevel?, key: String) {
+        if (closed) return
+        if (level == null) {
+            gasLevel = null
+            gasKey = null
+            handler.removeCallbacks(repeatGas)
+            if (playingGas) { handler.removeCallbacks(finish); releaseAlert() }
+            return
+        }
+        val changed = gasLevel != level || gasKey != key
+        gasLevel = level
+        gasKey = key
+        if (changed) playAlert(false, airGasSpeech(level), true)
+    }
+
+    private fun playAlert(completed: Boolean, text: String, gas: Boolean) {
+        handler.removeCallbacks(finish)
+        handler.removeCallbacks(repeatGas)
+        releaseAlert()
+        playingGas = gas
+        utterance = "dive-alert-" + (++alertNumber)
+        phrase = text
         earliestFinishMs = SystemClock.uptimeMillis() + if (completed) 4_300L else 2_000L
         runCatching {
             // Start: 1.5 × the original pattern. Completion: 2 ×, with a long final pulse.
@@ -140,6 +177,7 @@ class DiveStopNotifier(context: Context) {
         runCatching { track?.stop() }
         runCatching { track?.release() }
         track = null
+        playingGas = false
         runCatching { vibrator?.cancel() }
         runCatching {
             // Preserve a volume change the user made during the alert.
@@ -154,6 +192,8 @@ class DiveStopNotifier(context: Context) {
 
     fun close() {
         closed = true
+        gasLevel = null
+        handler.removeCallbacks(repeatGas)
         handler.removeCallbacks(finish)
         releaseAlert()
         runCatching { speech?.shutdown() }

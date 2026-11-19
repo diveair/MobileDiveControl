@@ -1,7 +1,26 @@
 # DiveControl Samsung Log grading workflow
 
-DiveControl cannot request Samsung's privileged native Log pipeline. Pro Video therefore records a
-standards-compliant 10-bit HEVC BT.2020 HLG master and never labels that file as Samsung Log.
+## Native LOG path (2026-10-11)
+
+Pro Video's **Samsung LOG (experimental)** now uses Samsung's camera parameter, vendor request,
+native stream configuration and HEVC Main10 recorder, rather than CameraX HLG. It is restricted
+to the tested SM-S921W firmware S921WVLS6DZH3, rear camera, FHD/UHD30. Unsupported configurations
+fail explicitly. See `SAMSUNG_LOG_REA.md` for exact evidence and remaining verification.
+
+Do **not** apply the legacy HLG-to-Log DCTL or -1.5 EV acquisition compensation to these new files.
+The firmware now emits the same HEVC Main10,10-bit BT.2020 limited-range and unspecified transfer
+tag as Samsung Camera's native LOG. Use the same Samsung LOG input interpretation in the editor;
+the unspecified tag is intentional and must not be treated as HLG or ordinary BT.2020 SDR.
+The original framing mismatch is fixed through native/public stabilization controls. Select
+**Standard stabilization in both apps** to match stabilized framing; Off retains the wider view.
+A fresh comparison after the phone moved measured0.69% residual scale difference and1.68ten-bit
+luma codes of direct error without registration. Native Kelvin WB and FAST/FAST processing are
+now used. See `SAMSUNG_LOG_REA.md` for the device qualification and recording regression evidence.
+The scene test does not replace full-range chart/clipping/color or editor-transform qualification.
+
+## Legacy HLG files
+
+The workflow below applies only to recordings made by the previous HLG implementation.
 
 Enable **10-bit HLG / Log grade**. On the measured SM-S921 1x path, with ISO and shutter on Auto,
 the app applies a −1.5 EV command: the analytic −1.443 EV target rounded outward to the S24's

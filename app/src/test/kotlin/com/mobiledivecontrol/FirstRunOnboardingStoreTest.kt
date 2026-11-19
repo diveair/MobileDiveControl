@@ -23,29 +23,4 @@ class FirstRunOnboardingStoreTest {
         }
     }
 
-    @Test
-    fun `first launch shows onboarding even with a persisted vacuum`() {
-        assertTrue(
-            shouldShowOnboarding(
-                firstRunComplete = false,
-                hasPersistedVacuum = true,
-            ),
-        )
-    }
-
-    @Test
-    fun `later launch is vacuum dependent`() {
-        assertFalse(
-            shouldShowOnboarding(
-                firstRunComplete = true,
-                hasPersistedVacuum = true,
-            ),
-        )
-        assertTrue(
-            shouldShowOnboarding(
-                firstRunComplete = true,
-                hasPersistedVacuum = false,
-            ),
-        )
-    }
 }

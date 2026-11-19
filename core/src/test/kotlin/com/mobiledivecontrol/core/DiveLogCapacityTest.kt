@@ -29,7 +29,7 @@ class DiveLogCapacityTest {
     @Test fun `archiving a new dive at capacity retains the newest thousand including the new dive`() {
         val logs = List(1000) { DiveSession((1000 - it).toLong(), DiveSettings(), maxDepthMeters = 2.0,
             outcome = DiveLogOutcome.NoStopRecorded) }
-        val active = DiveSession(2000, DiveSettings(), maxDepthMeters = 2.0)
+        val active = DiveSession(2000, DiveSettings(), maxDepthMeters = 2.0, elapsedMs = 180_000, surfaceElapsedMs = 179_000)
         val state = DiveProfileState(logs = logs, active = active, depthMeters = 0.2,
             sensorAvailable = true, lastSampleMs = 1000)
         val surfaced = DiveProfileTracker.sample(state, 0.0, 2000, 3000)

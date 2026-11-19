@@ -226,6 +226,7 @@ class ControlCore(
             bleReduction.copy(state = bleReduction.state.copy(
                 waterPressureTelemetry = null,
                 barometricPressureTelemetry = null,
+                safety = bleReduction.state.safety.copy(waterPressureKpa = null, barometricPressureKpa = null),
                 diveProfile = DiveProfileTracker.unavailable(bleReduction.state.diveProfile),
             ))
         } else bleReduction
@@ -418,7 +419,8 @@ class ControlCore(
     fun tickDiveProfile(nowMs: Long = monotonicMs()): ProcessingOutcome {
         val available = state.housing.connected || state.waterPressureTelemetry?.source == SensorPacketSource.Simulation
         val dive = DiveProfileTracker.tick(state.diveProfile, nowMs, available)
-        if (dive != state.diveProfile) state = state.copy(diveProfile = dive)
+        val air = AirAlertEngine.tick(state.airAlerts, dive, nowMs, airAlertPresentationBlocked(state.copy(diveProfile = dive)))
+        if (dive != state.diveProfile || air != state.airAlerts) state = state.copy(diveProfile = dive, airAlerts = air)
         return ProcessingOutcome(state)
     }
 

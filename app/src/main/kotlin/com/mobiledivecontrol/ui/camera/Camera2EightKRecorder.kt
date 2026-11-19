@@ -9,8 +9,10 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -79,6 +81,11 @@ internal class Camera2EightKRecorder(
         val focusDiopters: Float?,
         /** LOG in this app is the honest public 10-bit BT.2020 HLG acquisition contract. */
         val hdrLogMode: String,
+        /**
+         * The mode's explicit white point (manual kelvin, underwater filter or Auto Underwater),
+         * or null for the HAL's AWB. Without it a Pro Video 8K take silently fell back to auto.
+         */
+        val whitePoint: Pair<RggbChannelVector, ColorSpaceTransform?>? = null,
     )
 
     private val handler = Handler(Looper.getMainLooper())
@@ -303,7 +310,16 @@ internal class Camera2EightKRecorder(
             }
             set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(request.fps, request.fps))
             set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
-            set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+            val whitePoint = request.whitePoint
+            if (whitePoint != null) {
+                set(CaptureRequest.CONTROL_AWB_LOCK, false)
+                set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+                set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+                set(CaptureRequest.COLOR_CORRECTION_GAINS, whitePoint.first)
+                whitePoint.second?.let { set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
+            } else {
+                set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+            }
             if (request.focusDiopters != null) {
                 set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
                 set(CaptureRequest.LENS_FOCUS_DISTANCE, request.focusDiopters)
@@ -321,7 +337,8 @@ internal class Camera2EightKRecorder(
                 if (request.torchEnabled) CameraMetadata.FLASH_MODE_TORCH
                 else CameraMetadata.FLASH_MODE_OFF,
             )
-            if (request.hdrLogMode == "HDR") {
+            // USE_SCENE_MODE makes Camera2 ignore CONTROL_AWB_MODE; an explicit white point wins.
+            if (request.hdrLogMode == "HDR" && request.whitePoint == null) {
                 set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
                 set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
             } else {

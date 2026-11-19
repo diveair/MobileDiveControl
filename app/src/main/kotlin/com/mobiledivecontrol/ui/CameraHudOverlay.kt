@@ -29,6 +29,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
@@ -48,6 +49,7 @@ import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.ui.camera.ExpertRawCaptureState
 import com.mobiledivecontrol.ui.components.ConnectionStatus
 import com.mobiledivecontrol.ui.components.DepthGauge
+import com.mobiledivecontrol.ui.components.liveHudNdlSeconds
 import com.mobiledivecontrol.ui.components.DualBatteryIndicator
 import com.mobiledivecontrol.ui.components.HousingLinkBanner
 import com.mobiledivecontrol.ui.components.SealCheckIndicator
@@ -205,6 +207,7 @@ fun CameraHudOverlay(
                         modifier = Modifier.offset(y = 2.dp),
                         waterPressureKpa = liveWaterPressureKpa,
                         maxDepthMeters = state.maxDepthMeters,
+                        ndlSeconds = liveHudNdlSeconds(state.diveProfile),
                         useMetric = useMetric,
                         temperatureCelsius = state.safety.waterTemperatureC,
                         headingDegrees = compassReading.headingDegrees,
@@ -212,6 +215,14 @@ fun CameraHudOverlay(
                     )
                 }
             }
+            // Float in the gap above the mode button. Its height must never move the depth
+            // pill or navigation arrow, including when pressure/time values alternate.
+            com.mobiledivecontrol.ui.dive.AirPressureHud(
+                state.airAlerts.simulation?.air ?: state.airAlerts,
+                state.airAlerts.simulation?.profile ?: state.diveProfile,
+                modifier = Modifier.align(Alignment.BottomCenter)
+                    .padding(bottom = (bottomPadding - 11.dp).coerceAtLeast(0.dp)),
+            )
         }
 
         // Anchor the seal chip to the vacuum cluster's real bottom edge, not a guess: the cluster
@@ -235,7 +246,10 @@ fun CameraHudOverlay(
         // Every housing-link state owns the same dead-centre anchor. Keeping the placement here,
         // outside the individual message variants, prevents reconnecting, Bluetooth-off and
         // failure states from drifting back to the old top-of-viewfinder slot.
-        HousingLinkBanner(
+        val alertAir = state.airAlerts.simulation?.air ?: state.airAlerts
+        val airMessageVisible = !com.mobiledivecontrol.core.airAlertPresentationBlocked(state) &&
+            (alertAir.prompt != null || alertAir.entry != null || alertAir.gasWarning?.visible == true)
+        if (!airMessageVisible) HousingLinkBanner(
             bleState = state.bleConnectionState,
             bluetoothEnabled = bluetoothEnabled,
             housingBatteryPercent = state.housing.batteryPercent,
@@ -275,7 +289,7 @@ private fun TargetHeadingArrow(
         turn > 0.0 -> "turn right ${abs(turn).roundToInt()} degrees"
         else -> "turn left ${abs(turn).roundToInt()} degrees"
     }
-    val arrowColor = if (onHeading) DiveColors.Success else DiveColors.DiveCyan
+    val arrowColor = if (onHeading) DiveColors.Success else DiveColors.HeadingViolet
 
     Canvas(
         modifier = modifier
@@ -308,7 +322,7 @@ private fun TargetHeadingArrow(
             (mesh.lowerFace[index].y + mesh.lowerFace[next].y +
                 mesh.upperFace[index].y + mesh.upperFace[next].y) / 4.0
         }
-        wallIndices.forEachIndexed { order, index ->
+        wallIndices.forEach { index ->
             val next = (index + 1) % mesh.lowerFace.size
             val wall = face(
                 listOf(
@@ -320,7 +334,9 @@ private fun TargetHeadingArrow(
             )
             drawPath(
                 wall,
-                arrowColor.copy(alpha = if (order % 2 == 0) 0.42f else 0.28f),
+                // Solid shaded faces keep their contrast over the live camera image. Tie the
+                // shade to the physical face so depth-sort changes cannot make it flicker.
+                lerp(DiveColors.DeepBlack, arrowColor, if (index % 2 == 0) 0.48f else 0.32f),
             )
         }
 
@@ -328,14 +344,14 @@ private fun TargetHeadingArrow(
         drawPath(
             path = top,
             brush = Brush.linearGradient(
-                colors = listOf(arrowColor.copy(alpha = 0.74f), arrowColor),
+                colors = listOf(lerp(arrowColor, DiveColors.DeepBlack, 0.15f), arrowColor),
                 start = Offset(size.width * 0.18f, size.height * 0.92f),
                 end = Offset(size.width * 0.78f, size.height * 0.06f),
             ),
         )
         drawPath(
             path = top,
-            color = DiveColors.TextPrimary.copy(alpha = 0.76f),
+            color = DiveColors.TextPrimary.copy(alpha = 0.84f),
             style = Stroke(width = 0.8.dp.toPx()),
         )
     }

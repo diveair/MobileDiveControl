@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    NAUTICASE logo — PLACEHOLDER artwork.
+
+    To replace it, overwrite THIS file with the final vector (keep the name nauticase_logo.xml),
+    or delete it and drop in res/drawable-nodpi/nauticase_logo.png. Nothing else needs to change:
+    the welcome screen reads the logo only through NauticaseBranding.LOGO.
+
+    Concept: a landscape phone housing (cyan body, orange shutter) whose centre is a bolted
+    porthole looking into water — the phone sealed in a case, at sea.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="240dp"
+    android:height="240dp"
+    android:viewportWidth="240"
+    android:viewportHeight="240">
+
+    <!-- Shutter button on the housing's top edge -->
+    <path
+        android:fillColor="#FFB300"
+        android:pathData="M160,26 H192 A6,6 0 0 1 198,32 V40 H154 V32 A6,6 0 0 1 160,26 Z" />
+
+    <!-- Housing body, held landscape -->
+    <path
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="10"
+        android:strokeLineJoin="round"
+        android:pathData="M56,40 H184 A36,36 0 0 1 220,76 V164 A36,36 0 0 1 184,200 H56 A36,36 0 0 1 20,164 V76 A36,36 0 0 1 56,40 Z" />
+
+    <!-- Porthole glass: deep water -->
+    <path
+        android:fillColor="#0A2A4A"
+        android:pathData="M88,120 A32,32 0 1 0 152,120 A32,32 0 1 0 88,120 Z" />
+
+    <!-- Light and waves, clipped to the glass -->
+    <group>
+        <clip-path android:pathData="M88,120 A32,32 0 1 0 152,120 A32,32 0 1 0 88,120 Z" />
+        <path
+            android:fillColor="#CCFFFFFF"
+            android:pathData="M104,104 a4,4 0 1 0 8,0 a4,4 0 1 0 -8,0 Z" />
+        <path
+            android:strokeColor="#00E5FF"
+            android:strokeWidth="5"
+            android:strokeLineCap="round"
+            android:pathData="M84,122 Q90,116 96,122 T108,122 T120,122 T132,122 T144,122 T156,122" />
+        <path
+            android:strokeColor="#00BFA5"
+            android:strokeWidth="5"
+            android:strokeLineCap="round"
+            android:pathData="M84,136 Q90,130 96,136 T108,136 T120,136 T132,136 T144,136 T156,136" />
+    </group>
+
+    <!-- Porthole ring -->
+    <path
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="10"
+        android:pathData="M72,120 A48,48 0 1 0 168,120 A48,48 0 1 0 72,120 Z" />
+
+    <!-- Eight porthole bolts -->
+    <path
+        android:fillColor="#00BFA5"
+        android:pathData="M178.5,120 a4.5,4.5 0 1 0 9,0 a4.5,4.5 0 1 0 -9,0 Z M160.05,164.55 a4.5,4.5 0 1 0 9,0 a4.5,4.5 0 1 0 -9,0 Z M115.5,183 a4.5,4.5 0 1 0 9,0 a4.5,4.5 0 1 0 -9,0 Z M70.95,164.55 a4.5,4.5 0 1 0 9,0 a4.5,4.5 0 1 0 -9,0 Z M52.5,120 a4.5,4.5 0 1 0 9,0 a4.5,4.5 0 1 0 -9,0 Z M70.95,75.45 a4.5,4.5 0 1 0 9,0 a4.5,4.5 0 1 0 -9,0 Z M115.5,57 a4.5,4.5 0 1 0 9,0 a4.5,4.5 0 1 0 -9,0 Z M160.05,75.45 a4.5,4.5 0 1 0 9,0 a4.5,4.5 0 1 0 -9,0 Z" />
+</vector>

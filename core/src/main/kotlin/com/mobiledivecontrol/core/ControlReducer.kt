@@ -71,6 +71,23 @@ class ControlReducer(
         val effects = mutableListOf<PlatformEffect>()
         val notes = mutableListOf<String>()
 
+        if (state.housing.connected && !connected && (state.diveProfile.atSurface || state.diveProfile.surfaceConfirmedBeforeLoss) &&
+            state.safety.sealState in setOf(SealState.Passed, SealState.LeakMonitoring)) {
+            val seal = state.safety
+            // The next connection is a new observation period. Keep earned trust as a
+            // candidate to verify, never compare its first packet with a stale leak window.
+            nextState = nextState.copy(safety = seal.copy(
+                sealState = SealState.Unknown, coverOpen = null,
+                verifiedVacuumKpa = seal.barometricPressureKpa.takeIf { seal.sealConfidence >= SealConfidence.Provisional },
+                verifiedVacuumConfidence = seal.sealConfidence,
+                verifiedVacuumStartedAtEpochMs = seal.leakMonitoringStartedAtEpochMs,
+                verifiedVacuumRecordedAtEpochMs = System.currentTimeMillis(),
+                baselinePressureKpa = null, stabilizationSamples = emptyList(),
+                pendingOutlierKpa = null, pendingAdoptionKpa = null,
+                leakMonitoringStartedAtEpochMs = null, leakMonitoringElapsedMs = 0,
+                capCloseReminder = false, adoptedHold = false, warning = null))
+        }
+
         if (state.safety.vacuumReleasedPrompt) {
             if (state.housing.connected && !connected) {
                 nextState = nextState.copy(safety = nextState.safety.copy(vacuumReleaseDisconnectObserved = true,

@@ -2,7 +2,9 @@ package com.mobiledivecontrol.ui.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.hardware.camera2.*
+import android.hardware.camera2.params.SessionConfiguration
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
@@ -33,6 +35,9 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         val codec: TimeLapseVideoCodec = TimeLapseVideoCodec.H264,
         val night: Boolean = false,
         val slowMotion: Boolean = false,
+        val nativeLog: Boolean = false,
+        val recordAudio: Boolean = true,
+        val nativeStabilization: Boolean = true,
     )
     data class Controls(
         val ev: Int? = null,
@@ -54,6 +59,9 @@ internal class PreparedCamera2Recorder(private val context: Context) {
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var recorder: MediaRecorder? = null
+    private var nativePendingTracks = 0
+    private var nativeTracksStartedAt = 0L
+    private var repeatingSerial = 0
     private var recorderPreparing = false
     private var preparedFile: File? = null
     private var destination: File? = null
@@ -72,6 +80,9 @@ internal class PreparedCamera2Recorder(private val context: Context) {
     private var deferredStop: Runnable? = null
     private var singleAfTriggered = false
     private var lastSlowMotionTelemetryAt = 0L
+    private var nativeReadyTimeout: Runnable? = null
+    var configureNativeLogRequest: ((CaptureRequest.Builder) -> Unit)? = null
+    var onNativeLogCapture: ((TotalCaptureResult) -> Unit)? = null
     val ownsCamera: Boolean get() = config != null
     val isReady: Boolean get() = ready && recorder != null && !recorderPreparing && !stopping
     val isBusy: Boolean get() = destination != null || stopping
@@ -84,6 +95,15 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         this.onReady = onReady
         this.onError = onError
         val token = ++generation
+        if (selection.nativeLog) {
+            try {
+                SamsungNativeLogPipeline.requireSupported(selection.cameraId, selection.size, selection.playbackFps)
+                check(!selection.slowMotion && !selection.night && selection.highSpeedFps == null) {
+                    "Native LOG cannot be combined with slow motion or night capture."
+                }
+            } catch (error: Throwable) { fail(error); return }
+            armNativeReadyTimeout(token)
+        }
         val surfaceView = SurfaceView(context).apply {
             setZOrderMediaOverlay(true)
             holder.setFixedSize(selection.size.width, selection.size.height)
@@ -136,13 +156,20 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             // Keep an advertised preview-only fallback while the old recorder drains. Stable
             // Samsung high-speed preview uses both targets once a suspended recorder is ready.
             if (selection.slowMotion && selection.highSpeedFps!! < 120) previewRange = sourceRange
+            if (selection.nativeLog) {
+                sourceRange = Range(selection.playbackFps, selection.playbackFps)
+                previewRange = sourceRange
+            }
             input = MediaCodec.createPersistentInputSurface()
             prepareNextRecorder()
             val deviceCallback = object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (token != generation) { camera.close(); return }
                     device = camera
-                    createSession(camera, holder, token)
+                    try {
+                        if (selection.nativeLog) SamsungNativeLogPipeline.configureCamera(camera, selection.nativeStabilization)
+                        createSession(camera, holder, token)
+                    } catch (error: Throwable) { fail(error) }
                 }
                 override fun onDisconnected(camera: CameraDevice) {
                     camera.close()
@@ -173,25 +200,58 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         val file = File(context.noBackupFilesDir, "prepared-recordings/${System.nanoTime()}.mp4")
         file.parentFile?.mkdirs()
         preparedFile = file
-        recorder = createRecorder(selection, file, checkNotNull(input), sourceRange?.upper ?: selection.playbackFps)
+        recorder = createRecorder(selection, file, input, sourceRange?.upper ?: selection.playbackFps)
     }
 
     @Suppress("DEPRECATION")
-    private fun createRecorder(selection: Config, file: File, surface: Surface, cadence: Int): MediaRecorder {
+    private fun createRecorder(selection: Config, file: File, surface: Surface?, cadence: Int): MediaRecorder {
         val next = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(context) else MediaRecorder()
         try {
+            if (selection.nativeLog) SamsungNativeLogPipeline.initializeRecorder(next)
+            val audio = selection.nativeLog && selection.recordAudio && context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            if (selection.nativeLog) {
+                nativePendingTracks = if (audio) 2 else 1
+                nativeTracksStartedAt = 0L
+                next.setOnInfoListener { source, what, extra ->
+                    if (source === recorder && what == 905 && nativePendingTracks > 0) {
+                        // Samsung SEM_MEDIA_RECORDER_TRACK_INFO_STARTED, once per configured track.
+                        nativePendingTracks--
+                        if (nativePendingTracks == 0) nativeTracksStartedAt = SystemClock.elapsedRealtime()
+                        Log.i("DivePrepared", "Native track started: $extra, pending=$nativePendingTracks")
+                    }
+                }
+            }
+            if (audio) next.setAudioSource(MediaRecorder.AudioSource.MIC)
             next.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             next.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            next.setVideoEncoder(if (selection.codec == TimeLapseVideoCodec.HEVC) MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264)
+            next.setVideoEncoder(if (selection.nativeLog || selection.codec == TimeLapseVideoCodec.HEVC) MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264)
+            if (audio) {
+                next.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                next.setAudioSamplingRate(48_000)
+                next.setAudioEncodingBitRate(192_000)
+            }
+            if (selection.nativeLog) SamsungNativeLogPipeline.configureRecorder(next)
             next.setVideoSize(selection.size.width, selection.size.height)
-            if (selection.highSpeedFps == null) next.setCaptureRate(selection.captureRate)
+            if (selection.nativeLog) {
+                val sensorOrientation = context.getSystemService(CameraManager::class.java)
+                    .getCameraCharacteristics(selection.cameraId).get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                val rotation = runCatching { context.display?.rotation }.getOrNull() ?: Surface.ROTATION_0
+                val displayDegrees = when (rotation) {
+                    Surface.ROTATION_90 -> 90
+                    Surface.ROTATION_180 -> 180
+                    Surface.ROTATION_270 -> 270
+                    else -> 0
+                }
+                next.setOrientationHint((sensorOrientation - displayDegrees + 360) % 360)
+            }
+            if (selection.highSpeedFps == null && !selection.nativeLog) next.setCaptureRate(selection.captureRate)
             val recorderSlowMotion = selection.slowMotion && (selection.highSpeedFps ?: 0) >= 120
             // Like Samsung's native recorder, declare both the sensor and playback rates.
             // Stagefright uses capture rate for encoder operating-rate/temporal layers as well
             // as timestamps. Declaring only 30 fps can lose whole high-speed batches under load.
             if (recorderSlowMotion) next.setCaptureRate(cadence.toDouble())
             next.setVideoFrameRate(selection.playbackFps)
-            val bitrate = if (selection.slowMotion) {
+            val bitrate = if (selection.nativeLog) SamsungNativeLogPipeline.BITRATE else if (selection.slowMotion) {
                 val mime = if (selection.codec == TimeLapseVideoCodec.HEVC) MediaFormat.MIMETYPE_VIDEO_HEVC
                     else MediaFormat.MIMETYPE_VIDEO_AVC
                 val encoderRange = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
@@ -207,7 +267,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             } else (selection.size.width.toLong() * selection.size.height * cadence / 8)
                 .coerceIn(20_000_000L, 100_000_000L).toInt()
             next.setVideoEncodingBitRate(bitrate)
-            next.setInputSurface(surface)
+            next.setInputSurface(checkNotNull(surface))
             next.setOutputFile(file.absolutePath)
             next.prepare()
             return next
@@ -256,18 +316,30 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                 } catch (error: Throwable) { fail(error) }
             }
             override fun onConfigureFailed(failed: CameraCaptureSession) {
-                if (token == generation) fail(IllegalStateException("Prepared camera session rejected"))
+                if (token == generation) fail(IllegalStateException(if (config?.nativeLog == true)
+                    "Samsung native LOG output configuration was rejected; no fallback recording was started."
+                    else "Prepared camera session rejected"))
             }
         }
         try {
             val surfaces = listOf(holder.surface, checkNotNull(input))
-            if ((config?.highSpeedFps ?: 0) >= 120) camera.createConstrainedHighSpeedCaptureSession(surfaces, callback, main)
+            if (config?.nativeLog == true) {
+                val outputs = listOf(SamsungNativeLogPipeline.output(holder.surface, false),
+                    SamsungNativeLogPipeline.output(checkNotNull(input), true))
+                val configuration = SessionConfiguration(SessionConfiguration.SESSION_REGULAR,
+                    outputs, { command -> main.post(command); Unit }, callback)
+                val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                configureNativeLogRequest?.invoke(request)
+                SamsungNativeLogPipeline.configureRequest(request, checkNotNull(config).nativeStabilization)
+                configuration.setSessionParameters(request.build())
+                camera.createCaptureSession(configuration)
+            } else if ((config?.highSpeedFps ?: 0) >= 120) camera.createConstrainedHighSpeedCaptureSession(surfaces, callback, main)
             else camera.createCaptureSession(surfaces, callback, main)
         } catch (error: Throwable) { fail(error) }
     }
 
     fun update(values: Controls) {
-        if (values == controls) return
+        if (values == controls && config?.nativeLog != true) return
         if (values.singleAf != controls.singleAf) singleAfTriggered = false
         controls = values
         if (session != null && !stopping) {
@@ -275,7 +347,8 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         }
     }
 
-    private fun repeat(recording: Boolean) {
+    private fun repeat(recording: Boolean, stopNativeRecording: Boolean = false) {
+        val serial = ++repeatingSerial
         val selection = checkNotNull(config)
         val currentSession = checkNotNull(session)
         val builder = checkNotNull(device).createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
@@ -285,7 +358,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         // Remove the encoder target while its old recorder drains, then restore it after prepare.
         val preparedPreview = !recording && preparedPreviewRange != null && recorder != null && !stopping
         builder.addTarget(checkNotNull(view).holder.surface)
-        if (recording || preparedPreview) builder.addTarget(checkNotNull(input))
+        if (recording || preparedPreview || (selection.nativeLog && recorder != null && !stopping)) builder.addTarget(checkNotNull(input))
         builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
         (if (recording) sourceRange else if (preparedPreview) preparedPreviewRange else previewRange)
@@ -335,10 +408,27 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                     builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)
             }
         }
+        if (selection.nativeLog) {
+            configureNativeLogRequest?.invoke(builder)
+            SamsungNativeLogPipeline.configureRequest(builder, selection.nativeStabilization)
+            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(selection.playbackFps, selection.playbackFps))
+        }
         val token = generation
         val callback = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                 if (token != generation) return
+                if (selection.nativeLog) {
+                    // A persistent session can deliver a previous take's queued results after
+                    // rearm. Only the current request may mark the next recorder ready.
+                    if (s !== session || serial != repeatingSerial) return
+                    try {
+                        onNativeLogCapture?.invoke(result)
+                        if (!stopping && !SamsungNativeLogPipeline.isNativeResult(result)) {
+                            if (ready) fail(IllegalStateException("Samsung native LOG mode was lost: result mode=${SamsungNativeLogPipeline.captureMode(result)}."))
+                            return
+                        }
+                    } catch (error: Throwable) { fail(error); return }
+                }
                 observedFocus = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
                 val now = SystemClock.elapsedRealtime()
                 if (selection.slowMotion && recording && now - lastSlowMotionTelemetryAt >= 1000) {
@@ -360,6 +450,8 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                 // High-speed callbacks expose the wrapped regular session, not the public
                 // CameraConstrainedHighSpeedCaptureSession object. Generation owns identity.
                 if (!ready) {
+                    nativeReadyTimeout?.let(main::removeCallbacks)
+                    nativeReadyTimeout = null
                     ready = true
                     Log.i("DivePrepared", "Preview ready $config; camera session prepared before shutter")
                     onReady?.invoke()
@@ -374,6 +466,11 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             singleAfTriggered = true
         }
         builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+        if (stopNativeRecording) {
+            SamsungNativeLogPipeline.setRecordingStopTrigger(builder, true)
+            currentSession.capture(builder.build(), null, main)
+            SamsungNativeLogPipeline.setRecordingStopTrigger(builder, false)
+        }
         if (currentSession is CameraConstrainedHighSpeedCaptureSession)
             currentSession.setRepeatingBurst(currentSession.createHighSpeedRequestList(builder.build()), callback, main)
         else currentSession.setRepeatingRequest(builder.build(), callback, main)
@@ -384,7 +481,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         destination = output
         this.onFinalized = onFinalized
         try {
-            if (config?.highSpeedFps == null && controls.focus == null) {
+            if (config?.highSpeedFps == null && config?.nativeLog != true && controls.focus == null) {
                 controls = controls.copy(focus = observedFocus)
             }
             checkNotNull(recorder).start()
@@ -397,6 +494,16 @@ internal class PreparedCamera2Recorder(private val context: Context) {
 
     fun stop() {
         if (!isBusy || stopping) return
+        if (config?.nativeLog == true &&
+            (nativePendingTracks > 0 || SystemClock.elapsedRealtime() - nativeTracksStartedAt < 150L)) {
+            if (elapsedDurationMs >= SamsungNativeLogPipeline.READY_TIMEOUT_MS) {
+                fail(IllegalStateException("Native LOG encoder did not start every recording track."))
+                return
+            }
+            deferredStop?.let(main::removeCallbacks)
+            deferredStop = Runnable { deferredStop = null; stop() }.also { main.postDelayed(it, 100L) }
+            return
+        }
         if (!releaseAfterStop) {
             val minimumMs = if (config?.highSpeedFps == null)
                 kotlin.math.ceil(2_000.0 / checkNotNull(config).captureRate).toLong() + 250L else 150L
@@ -415,31 +522,47 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         val token = generation
         val completedRecorder = checkNotNull(recorder)
         val slowMotion = config?.slowMotion == true
+        val nativeLog = config?.nativeLog == true
         val completedFile = checkNotNull(preparedFile)
         val output = checkNotNull(destination)
         val callback = onFinalized
-        // Keep preview repeating while the encoder finishes its MP4 on a worker thread.
-        try { repeat(recording = false) } catch (error: Throwable) { fail(error); return }
+        // Samsung stops the recorder BEFORE removing its camera target. Stabilized frames arrive
+        // late; removing the target here truncates video while audio continues (~670 ms on S24).
+        // Its persistent input surface survives stop/rearm, matching Samsung's session lifecycle.
+        if (!nativeLog) try { repeat(recording = false) } catch (error: Throwable) { fail(error); return }
         recorder = null
         preparedFile = null
         finalizer.execute {
             val result = runCatching {
                 try { completedRecorder.stop() } finally { completedRecorder.release() }
                 check(completedFile.length() > 0L) { "Recorder produced no frames" }
+                val encodedDuration = if (nativeLog) SamsungNativeLogPipeline.validateOutput(completedFile) else duration
                 output.parentFile?.mkdirs()
                 check(completedFile.renameTo(output)) { "Could not retain recording segment" }
-                duration
+                encodedDuration
             }
             completedFile.delete()
             main.post {
                 if (token != generation) { output.delete(); return@post }
+                if (nativeLog && !releaseAfterStop) {
+                    try { repeat(recording = false, stopNativeRecording = true) } catch (error: Throwable) { fail(error); return@post }
+                }
                 destination = null
                 startedAt = 0L
                 stopping = false
                 onFinalized = null
                 val rearmSlowMotion = slowMotion && !releaseAfterStop
                 if (releaseAfterStop) release()
-                else if (!rearmSlowMotion) try { prepareNextRecorder() } catch (error: Throwable) { fail(error) }
+                else if (!rearmSlowMotion) try {
+                    if (nativeLog) {
+                        ready = false
+                    }
+                    prepareNextRecorder()
+                    if (nativeLog) {
+                        armNativeReadyTimeout(token)
+                        repeat(recording = false)
+                    }
+                } catch (error: Throwable) { fail(error) }
                 Log.i("DivePrepared", "Pause finalized in ${SystemClock.elapsedRealtime() - pauseAt}ms; preview session retained=$ownsCamera")
                 callback?.invoke(result)
                 if (rearmSlowMotion && token == generation) prepareSlowMotionAfterStop(token)
@@ -462,8 +585,18 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         if (callback != null) callback(Result.failure(error)) else report?.invoke(error)
     }
 
+    private fun armNativeReadyTimeout(token: Int) {
+        nativeReadyTimeout?.let(main::removeCallbacks)
+        nativeReadyTimeout = Runnable {
+            if (token == generation && !ready) fail(IllegalStateException(
+                "Samsung native LOG did not confirm capture mode 6 within 8 seconds. Recording is unavailable."))
+        }.also { main.postDelayed(it, SamsungNativeLogPipeline.READY_TIMEOUT_MS) }
+    }
+
     fun release() {
         generation++
+        nativeReadyTimeout?.let(main::removeCallbacks)
+        nativeReadyTimeout = null
         availability?.let { context.getSystemService(CameraManager::class.java).unregisterAvailabilityCallback(it) }
         availability = null
         deferredStop?.let(main::removeCallbacks)

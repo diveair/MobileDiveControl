@@ -50,4 +50,9 @@ class IntroPermissionBackdropPolicyTest {
         assertTrue(shouldShowIntroMessage(IntroPhase.LinkLost))
         assertFalse(shouldShowIntroMessage(IntroPhase.Carousel))
     }
+
+    @Test
+    fun `turn on housing banner uses the single combined instruction`() {
+        assertEquals("HOLD SHUTTER TO POWER ON & CONNECT BLUETOOTH", TURN_ON_HOUSING_PROMPT)
+    }
 }

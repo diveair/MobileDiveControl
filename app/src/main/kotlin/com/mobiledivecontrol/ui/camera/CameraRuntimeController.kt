@@ -624,7 +624,8 @@ class CameraRuntimeController(
             }
             RecordingClock.durationMs.value =
                 completedRecordingDurationMs + currentRecordingSegmentDurationMs
-            RecordingClock.playbackDurationMs.value = if (preparedRecorder.config?.highSpeedFps == null && preparedRecorder.isBusy) {
+            RecordingClock.playbackDurationMs.value = if (preparedRecorder.config?.highSpeedFps == null &&
+                preparedRecorder.config?.nativeLog != true && preparedRecorder.isBusy) {
                 hyperlapsePlaybackDurationMs(
                     RecordingClock.durationMs.value,
                     RecordingClock.timeLapseSpeedFactor.value,
@@ -708,6 +709,7 @@ class CameraRuntimeController(
     @Volatile private var shutterAwbLockActive = false
     private var shutterAwbLockInFlight = false
     private var shutterAwbLockGeneration = 0
+    private var nativeLogAwbAction: (() -> Unit)? = null
     @Volatile private var latestWaterPressureKpa: Double? = null
     @Volatile private var latestAtmosphericPressureKpa: Double? = null
     @Volatile private var latestWaterTemperatureC: Double? = null
@@ -4271,7 +4273,7 @@ class CameraRuntimeController(
         if (!boundLogCaptureContractSatisfied) {
             Log.e(
                 TAG,
-                "The bound camera has no public 10-bit HLG encoder surface; Log recording is blocked.",
+                "Native LOG requires the supported Samsung rear-camera recorder configuration.",
             )
         }
         imageCapture = capture.takeIf { photoMode && !maximumInformationLog && !panoramaMode }
@@ -4363,11 +4365,12 @@ class CameraRuntimeController(
                 return
             }
         } else if (prepareDeferredCaptureGraph { startVideoRecording() }) return
-        if (resolvedHdrLogMode(latestState) == "LOG" && !boundLogCaptureContractSatisfied) {
-            Log.e(TAG, "Refusing Log recording because the bound stream is not public HLG10")
+        if (resolvedHdrLogMode(latestState) == "LOG" &&
+            !(preparedRecorder.config?.nativeLog == true && preparedRecorder.isReady)) {
+            Log.e(TAG, "Refusing LOG recording without the native Samsung session")
             Toast.makeText(
                 context,
-                "Log recording unavailable: this camera path is not 10-bit HLG",
+                "Native LOG is unavailable for this camera configuration",
                 Toast.LENGTH_LONG,
             ).show()
             return
@@ -4459,6 +4462,10 @@ class CameraRuntimeController(
 
     private fun startRecordingSegmentNow() {
         if (activeRecording != null || directCamera2RecorderBusy()) return
+        if (usesNativeLogRecorder(latestState)) {
+            startPreparedSegment(highSpeed = false)
+            return
+        }
         if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse) {
             startCamera2TimeLapseSegment()
             return
@@ -4716,6 +4723,7 @@ class CameraRuntimeController(
                     torchEnabled = currentValue(latestState, ".flash") in setOf("On", "Torch"),
                     focusDiopters = manualFocusRequestFor(latestState)?.diopters,
                     hdrLogMode = hdrLogMode,
+                    whitePoint = explicitWhitePointColour(latestState),
                 ),
                 onStarted = {
                     currentRecordingSegmentDurationMs = 0L
@@ -4801,8 +4809,12 @@ class CameraRuntimeController(
         }
     }
 
+    private fun usesNativeLogRecorder(state: CameraState): Boolean =
+        state.activeMode in setOf(com.mobiledivecontrol.core.CameraModeId.Video,
+            com.mobiledivecontrol.core.CameraModeId.ProVideo) && resolvedHdrLogMode(state) == "LOG"
+
     private fun usesPreparedRecorder(state: CameraState): Boolean =
-        state.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse || isHighSpeedSelection(state)
+        usesNativeLogRecorder(state) || state.activeMode == com.mobiledivecontrol.core.CameraModeId.Hyperlapse || isHighSpeedSelection(state)
 
     private fun preparedControls(cameraId: String): PreparedCamera2Recorder.Controls {
         val characteristics = context.getSystemService(CameraManager::class.java).getCameraCharacteristics(cameraId)
@@ -4831,10 +4843,58 @@ class CameraRuntimeController(
         )
     }
 
+    /** The direct LOG recorder has no CameraX Camera object; preserve the same live controls. */
+    private fun populateNativeLogLook(builder: CaptureRequest.Builder, cameraId: String) {
+        val state = latestState
+        val chars = context.getSystemService(CameraManager::class.java).getCameraCharacteristics(cameraId)
+        builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+        val iso = currentValue(state, ".iso")?.toIntOrNull()
+        val shutter = currentValue(state, ".shutter_speed")?.let(::parseShutterNs)
+        if (iso != null || shutter != null) {
+            val isoRange = checkNotNull(chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE))
+            val exposureRange = checkNotNull(chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE))
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+            builder.set(CaptureRequest.SENSOR_SENSITIVITY,
+                (iso ?: lastAeSensitivity ?: 100).coerceIn(isoRange.lower, isoRange.upper))
+            builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME,
+                (shutter ?: lastAeExposureNs ?: 16_666_666L)
+                    .coerceIn(exposureRange.lower, minOf(exposureRange.upper, 33_333_333L)))
+            builder.set(CaptureRequest.SENSOR_FRAME_DURATION, 33_333_333L)
+        }
+        // Native LOG owns its exposure allocation; never apply the old HLG -1.5 EV offset.
+        val autoUnderwater = underwaterModeEnabled(state)
+        val filter = if (autoUnderwater) null else underwaterFilterProfile(
+            currentValue(state, ".filters"), currentDepthMeters())
+        val kelvin = resolvedWhiteBalanceValue(state)?.removeSuffix("K")?.toIntOrNull()
+        val colour = when {
+            autoUnderwater && underwaterCommandSolution != null -> underwaterWhiteBalanceColour(state)
+            filter != null -> filter to lastAutoColorTransform
+            else -> null
+        }
+        builder.set(CaptureRequest.CONTROL_AWB_LOCK,
+            colour == null && shutterAwbLockActive && CameraCatalog.isWhiteBalanceAutoShutter(resolvedWhiteBalanceValue(state)))
+        if (colour != null) {
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, colour.first)
+            colour.second?.let { builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
+        } else {
+            SamsungNativeLogPipeline.configureWhiteBalance(builder, if (autoUnderwater) null else kelvin)
+        }
+        // SamsungNativeLogPipeline applies the native LOG ISP settings after the live controls.
+    }
+
     private fun bindPreparedRecorder() {
         val host = previewView ?: return
-        if (preparedRecorder.isBusy || SystemClock.elapsedRealtime() < preparedRetryAfterMs) return
+        if (preparedRecorder.isBusy) {
+            if (preparedRecorder.config?.nativeLog == true && usesNativeLogRecorder(latestState)) {
+                preparedRecorder.config?.cameraId?.let { preparedRecorder.update(preparedControls(it)) }
+            }
+            return
+        }
+        if (SystemClock.elapsedRealtime() < preparedRetryAfterMs) return
         val highSpeed = isHighSpeedSelection(latestState)
+        val nativeLog = usesNativeLogRecorder(latestState)
         val slowMotion = latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion
         val id = selectedCameraIdForBinding(latestState, desiredLensFacing(latestState)) ?: return
         if (slowMotion) {
@@ -4866,15 +4926,26 @@ class CameraRuntimeController(
         val selection = PreparedCamera2Recorder.Config(
             cameraId = id,
             size = size,
-            highSpeedFps = if (highSpeed) captureFps else null,
-            captureRate = hyperlapseCaptureRateFps(speed),
+            highSpeedFps = if (highSpeed && !nativeLog) captureFps else null,
+            captureRate = if (nativeLog) 30.0 else hyperlapseCaptureRateFps(speed),
             playbackFps = if (highSpeed && latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.ProVideo)
                 proVideoPlaybackFrameRate(currentValue(latestState, ".frame_rate")).roundToInt() else 30,
-            codec = if (slowMotionHevc) TimeLapseVideoCodec.HEVC else if (highSpeed) TimeLapseVideoCodec.H264
+            codec = if (nativeLog || slowMotionHevc) TimeLapseVideoCodec.HEVC else if (highSpeed) TimeLapseVideoCodec.H264
                 else hyperlapseVideoCodec(currentValue(latestState, ".video_format")),
             night = !highSpeed && currentValue(latestState, ".day_night") == "Night",
             slowMotion = slowMotion,
+            nativeLog = nativeLog,
+            recordAudio = currentValue(latestState, ".audio_recording") != "Off",
+            nativeStabilization = currentValue(latestState, ".video_stabilization") == "Standard",
         )
+        if (nativeLog && (captureFps != 30 || size.width > 3840 || size.height > 2160 || id != "0")) {
+            preparedRecorder.release()
+            pendingCaptureActionAfterGraphBind = null
+            reportRuntimeFailure("Native LOG currently requires the rear camera at FHD/UHD 30 fps")
+            return
+        }
+        preparedRecorder.configureNativeLogRequest = if (nativeLog) ({ builder -> populateNativeLogLook(builder, id) }) else null
+        preparedRecorder.onNativeLogCapture = if (nativeLog) ::observeNativeLogCapture else null
         val controls = runCatching { preparedControls(id) }.getOrElse { error ->
             preparedRetryAfterMs = SystemClock.elapsedRealtime() + 2000L
             Log.w(TAG, "Recording camera temporarily unavailable", error)
@@ -4916,12 +4987,44 @@ class CameraRuntimeController(
         )
     }
 
+    private fun observeNativeLogCapture(result: TotalCaptureResult) {
+        lastAeSensitivity = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: lastAeSensitivity
+        lastAeExposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: lastAeExposureNs
+        lastAeFpsRange = result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE) ?: lastAeFpsRange
+        lastObservedFocusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: lastObservedFocusDiopters
+        val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+        lastObservedColorGains = gains ?: lastObservedColorGains
+        if (wbIsAuto(latestState)) {
+            lastAutoColorTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM) ?: lastAutoColorTransform
+            lastAutoColorGains = gains ?: lastAutoColorGains
+        }
+        if (result.get(CaptureResult.CONTROL_AWB_LOCK) == true) nativeLogAwbAction?.invoke()
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastFocusResultLogAtMs < 500L) return
+        lastFocusResultLogAtMs = now
+        if (!vendorResultKeysProbed) {
+            vendorResultKeysProbed = true
+            vendorColorTempResultKey = makeVendorResultKey("samsung.android.control.colorTemperature")
+            vendorEvMeterResultKey = makeVendorResultKey("samsung.android.control.evCompensationValue")
+        }
+        val kelvin = readVendorResult(result, vendorColorTempResultKey) { vendorColorTempResultKey = null }
+        val ev = readVendorResult(result, vendorEvMeterResultKey) { vendorEvMeterResultKey = null }
+        onMeteredExposure?.invoke(com.mobiledivecontrol.core.MeteredExposure(
+            iso = lastAeSensitivity, shutterNs = lastAeExposureNs, wbKelvin = kelvin, evTenths = ev))
+        if (!wbIsAuto(latestState)) wbManualSeenAtMs = now
+        else if (now - wbManualSeenAtMs > WB_AUTO_SETTLE_MS && kelvin != null && gains != null) {
+            lastAutoWbAnchor = WbAnchor(kelvin, gains, lastAutoColorTransform, now)
+            harvestAwbCurvePoint(kelvin, gains, lastAutoColorTransform, now)
+        }
+    }
+
     private fun startCamera2TimeLapseSegment() = startPreparedSegment(highSpeed = false)
     private fun startCamera2HighSpeedSegment() = startPreparedSegment(highSpeed = true)
 
     private fun startPreparedSegment(highSpeed: Boolean) {
         val directory = recordingSessionDirectory ?: return
-        if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion && !preparedRecorder.isReady) {
+        val nativeLog = preparedRecorder.config?.nativeLog == true
+        if (!preparedRecorder.isReady) {
             val generation = recordingSegmentStartGeneration
             pendingCaptureActionAfterGraphBind = {
                 if (generation == recordingSegmentStartGeneration && recordingSessionActive) startPreparedSegment(highSpeed)
@@ -4942,12 +5045,14 @@ class CameraRuntimeController(
                     cameraRequestHandler.post(directRecordingClockRunnable)
                 },
                 onFinalized = { result ->
-                    if (highSpeed) finalizeCamera2HighSpeedSegment(file, result, fps, playback)
+                    if (nativeLog) completeCamera2HighSpeedSegment(file, result, "Native LOG")
+                    else if (highSpeed) finalizeCamera2HighSpeedSegment(file, result, fps, playback)
                     else finalizeCamera2VariableRateSegment(file, result, "Hyperlapse")
                 },
             )
         } catch (error: Throwable) {
-            if (highSpeed) completeCamera2HighSpeedSegment(file, Result.failure(error))
+            if (nativeLog || highSpeed) completeCamera2HighSpeedSegment(file, Result.failure(error),
+                if (nativeLog) "Native LOG" else "High-speed")
             else finalizeCamera2VariableRateSegment(file, Result.failure(error), "Hyperlapse")
         }
     }
@@ -5003,7 +5108,7 @@ class CameraRuntimeController(
         completeCamera2HighSpeedSegment(segmentFile, result)
     }
 
-    private fun completeCamera2HighSpeedSegment(segmentFile: File, result: Result<Long>) {
+    private fun completeCamera2HighSpeedSegment(segmentFile: File, result: Result<Long>, label: String = "High-speed") {
         val reviewBoundary = recordingSegmentFinalizingForReview
         result.onSuccess { durationMs ->
             currentRecordingSegmentDurationMs = durationMs
@@ -5011,12 +5116,12 @@ class CameraRuntimeController(
             RecordingClock.durationMs.value = completedRecordingDurationMs
             RecordingClock.playbackDurationMs.value = completedRecordingDurationMs
             if (segmentFile.isFile && segmentFile.length() > 0L) recordingSegmentFiles += segmentFile
-            Log.i(TAG, "Direct high-speed segment finalized: $segmentFile durationMs=$durationMs")
+            Log.i(TAG, "$label segment finalized: $segmentFile durationMs=$durationMs")
         }.onFailure { error ->
-            Log.e(TAG, "Direct high-speed segment finalize failed", error)
+            Log.e(TAG, "$label segment finalize failed", error)
             segmentFile.delete()
             RecordingClock.reviewUri.value = null
-            reportRuntimeFailure("High-speed recording failed: ${error.message ?: "invalid output"}")
+            reportRuntimeFailure("$label recording failed: ${error.message ?: "invalid output"}")
         }
         currentRecordingSegmentDurationMs = 0L
         releaseShutterWhiteBalance()
@@ -5324,6 +5429,10 @@ class CameraRuntimeController(
      * has the pipe, because a CameraControl call there would tear that session down.
      */
     private fun applyLiveZoom(ratio: Double) {
+        if (preparedRecorder.config?.nativeLog == true) {
+            preparedRecorder.config?.cameraId?.let { preparedRecorder.update(preparedControls(it).copy(zoom = ratio.toFloat())) }
+            return
+        }
         if (latestState.activeMode == com.mobiledivecontrol.core.CameraModeId.SlowMotion && preparedRecorder.ownsCamera) {
             slowMotionZoom.set(selectedLensValue(latestState), ratio.toFloat())
             preparedRecorder.config?.cameraId?.let { preparedRecorder.update(preparedControls(it)) }
@@ -6075,14 +6184,16 @@ class CameraRuntimeController(
     ) {
         // ── HDR / public 10-bit wide-dynamic-range video ──
         when (resolvedHdrLogMode(cameraState)) {
-            "HDR" -> {
+            // Scene-mode HDR only while the HAL owns colour: USE_SCENE_MODE makes Camera2 ignore
+            // CONTROL_AWB_MODE, which silently discarded every explicit white point below.
+            "HDR" -> if (sceneHdrAllowed(cameraState)) {
                 builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
                 builder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
+            } else {
+                builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             }
             "LOG" -> {
-                // Samsung Log is not exposed to third-party Camera2 clients. The LOG control
-                // therefore uses the public 10-bit HLG stream selected at bind time and never
-                // installs a fabricated SDR tonemap curve.
+                // Native video LOG is handled by PreparedCamera2Recorder before this CameraX path.
                 builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             }
             else -> builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
@@ -6316,7 +6427,7 @@ class CameraRuntimeController(
     }
 
     private fun stabilizationGraphKey(cameraState: CameraState): String = when {
-        resolvedHdrLogMode(cameraState) == "LOG" -> "Off"
+        resolvedHdrLogMode(cameraState) == "LOG" && !usesNativeLogRecorder(cameraState) -> "Off"
         currentValue(cameraState, ".video_stabilization") == "Standard" -> "On"
         currentValue(cameraState, ".super_steady") == "On" -> "On"
         else -> "Off"
@@ -6527,6 +6638,28 @@ class CameraRuntimeController(
             action()
             return
         }
+        if (preparedRecorder.config?.nativeLog == true) {
+            if (shutterAwbLockInFlight) return
+            val id = checkNotNull(preparedRecorder.config).cameraId
+            val available = context.getSystemService(CameraManager::class.java)
+                .getCameraCharacteristics(id).get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true
+            if (!available) { action(); return }
+            val generation = ++shutterAwbLockGeneration
+            shutterAwbLockInFlight = true
+            shutterAwbLockActive = true
+            nativeLogAwbAction = {
+                nativeLogAwbAction = null
+                if (generation == shutterAwbLockGeneration && shutterAwbLockInFlight) {
+                    shutterAwbLockInFlight = false
+                    action()
+                }
+            }
+            preparedRecorder.update(preparedControls(id))
+            cameraRequestHandler.postDelayed({
+                if (generation == shutterAwbLockGeneration) nativeLogAwbAction?.invoke()
+            }, WB_SHUTTER_LOCK_TIMEOUT_MS)
+            return
+        }
         val boundCamera = camera
         if (boundCamera == null) {
             action()
@@ -6595,6 +6728,11 @@ class CameraRuntimeController(
         shutterAwbLockGeneration++
         shutterAwbLockInFlight = false
         shutterAwbLockActive = false
+        nativeLogAwbAction = null
+        if (preparedRecorder.config?.nativeLog == true) {
+            preparedRecorder.config?.cameraId?.let { preparedRecorder.update(preparedControls(it)) }
+            return
+        }
         val boundCamera = camera ?: return
         try {
             val options = CaptureRequestOptions.Builder()
@@ -9008,7 +9146,11 @@ class CameraRuntimeController(
                     // capture results misleadingly continue.
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                 }
-                hdrLogMode == "HDR" -> {
+                // Same rule as populateSessionLook. Pro photo defaults "HDR photo" to On, and the
+                // scene mode made the HAL ignore AWB_MODE_OFF + COLOR_CORRECTION_GAINS: the
+                // white-balance dial moved in Pro Video (HDR video defaults Off) but never
+                // reached a Pro photo frame.
+                hdrLogMode == "HDR" && sceneHdrAllowed(cameraState) -> {
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
                     builder.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
                 }
@@ -9376,7 +9518,7 @@ class CameraRuntimeController(
         SamsungLogProfile.acquisitionCalibration(
             deviceModel = Build.MODEL.orEmpty(),
             lensValue = currentValue(cameraState, ".lens"),
-        ).takeIf { resolvedHdrLogMode(cameraState) == "LOG" }
+        ).takeIf { resolvedHdrLogMode(cameraState) == "LOG" && !usesNativeLogRecorder(cameraState) }
 
     private fun playPanoramaActionSound(sound: Int) {
         if (currentValue(latestState, ".shutter_sound") != "On") return
@@ -9411,6 +9553,41 @@ class CameraRuntimeController(
         oceanModeEnabled(cameraState) || CameraCatalog.isWhiteBalanceAutoUnderwater(
             currentValue(cameraState, ".white_balance"),
         )
+
+    /**
+     * The explicit white point this frame must carry, or null while the HAL's own AWB owns colour.
+     *
+     * Mirrors [populateSessionLook]'s precedence exactly — Auto Underwater / Ocean Mode, then an
+     * underwater filter, then a manual kelvin (or Food's tone) — so every request writer that
+     * cannot share that function (the direct 8K recorder) renders the same white point.
+     */
+    private fun explicitWhitePointColour(
+        cameraState: CameraState,
+    ): Pair<RggbChannelVector, android.hardware.camera2.params.ColorSpaceTransform?>? {
+        if (underwaterModeEnabled(cameraState)) {
+            return if (underwaterCommandSolution != null) underwaterWhiteBalanceColour(cameraState) else null
+        }
+        underwaterFilterProfile(currentValue(cameraState, ".filters"), currentDepthMeters())
+            ?.let { return it to lastAutoColorTransform }
+        val kelvin = resolvedWhiteBalanceValue(cameraState)?.removeSuffix("K")?.toIntOrNull() ?: return null
+        return manualWbColour(kelvin)
+    }
+
+    /**
+     * Whether HDR may be requested as CONTROL_SCENE_MODE_HDR on this frame.
+     *
+     * Camera2 contract: while CONTROL_MODE is USE_SCENE_MODE the device IGNORES CONTROL_AWB_MODE
+     * (HDR is not FACE_PRIORITY), so AWB_MODE_OFF + COLOR_CORRECTION_GAINS never reach the image.
+     * Any explicit white point — a manual kelvin, Food's tone, Auto Underwater / Ocean Mode
+     * (including its AWB bootstrap, so the hand-over never flips CONTROL_MODE mid-stream), or an
+     * underwater filter — therefore keeps CONTROL_MODE_AUTO. Pro photo defaults "HDR photo" to
+     * On, which is exactly why white balance adjusted in Pro Video but did nothing in Pro photo.
+     * Video HDR keeps its 10-bit session; only the redundant scene request is dropped.
+     */
+    private fun sceneHdrAllowed(cameraState: CameraState): Boolean =
+        !underwaterModeEnabled(cameraState) &&
+            underwaterFilterProfile(currentValue(cameraState, ".filters"), currentDepthMeters()) == null &&
+            resolvedWhiteBalanceValue(cameraState)?.removeSuffix("K")?.toIntOrNull() == null
 
     /** Food has a relative tone control instead of a Kelvin dial; both use one renderer. */
     private fun resolvedWhiteBalanceValue(cameraState: CameraState): String? =

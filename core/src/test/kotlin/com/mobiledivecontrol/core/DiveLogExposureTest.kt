@@ -16,6 +16,7 @@ class DiveLogExposureTest {
         sample(30.0, DecoReadings(0, 3.3, 80.2, true, 140.5), 1.7)
         sample(5.0, DecoReadings(1800, 0.0, 75.0, true, 135.0), .4)
         sample(0.0, DecoReadings(5940, 0.0, 70.0, true, 130.0), .21)
+        repeat(180) { sample(0.3, DecoReadings(5940, 0.0, 70.0, true, 130.0), .21) }
         val expected = DiveExposureSummary(3.3, 80.2, true, 140.5, 1.7)
         assertEquals(expected, state.logs.single().exposure)
         val restored = DiveProfileCodec.decode(DiveProfileCodec.encode(state.copy(decompression = DecompressionState())))

@@ -153,13 +153,13 @@ class DiveProfileTest {
         assertEquals(3, d.state.alertSequence)
     }
 
-    @Test fun `a fresh zero depth ends dive and next dive has its own maximum`() {
+    @Test fun `sustained surface readings end a dive without an exact zero`() {
         val d = Dive(); d.ascend(); d.at(0.4)
         d.at(0.4, 60000)
         assertNotNull(d.state.active)
         repeat(60) { d.at(0.4) }
         assertNotNull(d.state.active)
-        d.at(0.0)
+        repeat(121) { d.at(0.4) }
         assertNull(d.state.active)
         assertEquals(DiveLogOutcome.IncompleteStop, d.state.logs.single().outcome)
         assertEquals(30.0, d.state.logs.single().maxDepthMeters)
@@ -187,7 +187,7 @@ class DiveProfileTest {
         assertEquals(180000, restored.active!!.stopElapsedMs)
         assertEquals(DiveStopPhase.Complete, restored.active!!.phase)
         assertTrue(restored.active!!.profileIncomplete)
-        repeat(61) { d.at(0.0) }
+        repeat(181) { d.at(0.0) }
         assertEquals(d.state.logs, DiveProfileCodec.decode(DiveProfileCodec.encode(d.state)).logs)
     }
 

@@ -27,6 +27,7 @@ object DiveColors {
     val DeepBlue = Color(0xFF2979FF)
     val OceanBlue = Color(0xFF0D47A1)
     val CoolBlue = Color(0xFF448AFF)
+    val MaxDepthBlue = Color(0xFF78A5BE)
 
     // Navigation — deliberately distinct from depth cyan and temperature/status colours.
     val HeadingViolet = Color(0xFFB388FF)

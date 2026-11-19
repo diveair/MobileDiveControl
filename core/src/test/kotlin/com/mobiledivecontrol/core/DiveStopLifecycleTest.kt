@@ -18,7 +18,7 @@ class DiveStopLifecycleTest {
         assertTrue(profile.stopActive)
         assertFalse(profile.active!!.requiredByKnownProfile)
         assertEquals(1, profile.alertSequence)
-        at(0.0)
+        at(0.0); repeat(180) { at(0.0) }
         assertEquals(DiveLogOutcome.IncompleteStop, profile.logs.single().outcome)
         repeat(100) { at(0.0) }
         assertNull(profile.active)
@@ -27,20 +27,21 @@ class DiveStopLifecycleTest {
 
     @Test fun `dive that never went deeper than the target does not trigger on descent or ascent`() {
         listOf(0.0, 2.0, 4.0, 5.0, 4.0, 2.0, 0.0).forEach(::at)
+        repeat(180) { at(0.0) }
         assertNull(profile.active)
         assertEquals(0, profile.alertSequence)
         assertEquals(DiveLogOutcome.NoStopRecorded, profile.logs.single().outcome)
     }
 
-    @Test fun `ascent from just beyond a custom target triggers once at the target`() {
+    @Test fun `ascent from just beyond a custom target does not qualify for a stop`() {
         profile = DiveProfileState(settings = DiveSettings(stopDepthMeters = 4))
         listOf(2.0, 4.0, 4.1).forEach(::at)
         assertFalse(profile.stopActive)
         at(4.0)
-        assertTrue(profile.stopActive)
-        assertEquals(1, profile.alertSequence)
+        assertFalse(profile.stopActive)
+        assertEquals(0, profile.alertSequence)
         repeat(10) { at(4.0) }
-        assertEquals(1, profile.alertSequence)
+        assertEquals(0, profile.alertSequence)
     }
 
     @Test fun `required stop waits for an observed ascent to the configured trigger depth`() {
@@ -75,11 +76,11 @@ class DiveStopLifecycleTest {
     }
 
     @Test fun `surfacing clears completion and next dive does not inherit its requirement`() {
-        requiredStop(); repeat(180) { at(5.0) }; at(0.0)
+        requiredStop(); repeat(180) { at(5.0) }; at(0.0); repeat(180) { at(0.0) }
         assertNull(profile.active)
         assertFalse(profile.stopActive)
         assertEquals(DiveLogOutcome.CompletedStop, profile.logs.single().outcome)
-        at(2.0); at(8.0); at(5.0)
+        at(2.0); at(12.0); at(5.0)
         assertTrue(profile.stopActive)
         assertFalse(profile.active!!.requiredByKnownProfile)
         assertEquals(180, profile.active!!.remainingSeconds)

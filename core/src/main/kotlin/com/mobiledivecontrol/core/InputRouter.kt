@@ -20,11 +20,23 @@ class InputRouter {
             return RouteDecision(note = "Unknown button ${event.rawValue.toHexString()} ignored.")
         }
 
+        // Record stays a camera action even while pressure entry or a warning is on screen.
+        // OK alone reports pressure; starting a clip must never save an unconfirmed estimate.
+        if (event == HousingButtonEvent.Shutter && state.mode in setOf(AppMode.CameraLive, AppMode.CameraAdjust)) {
+            return routeCameraLive(state, event)
+        }
+
+        // The critical gas card is drawn over the stop UI, so its visible action owns OK.
+        val air = state.airAlerts.simulation?.air ?: state.airAlerts
+        if (air.gasWarning?.level?.critical == true || air.buddyConfirmation ||
+            air.entry?.purpose == AirEntryPurpose.NextTank) routeAirAlerts(state, event)?.let { return it }
+
         // The foreground stop owns OK until minimized/dismissed. Hidden prompts cannot act on it.
-        if (event == HousingButtonEvent.Ok && state.diveProfile.stopExpanded) {
+        if (event == HousingButtonEvent.Ok && state.diveProfile.stopExpanded && !airAlertVisible(state)) {
             return RouteDecision(commands = listOf(DiveSettingsCommand.AcknowledgeStop))
         }
         sealCheckInterception(state, event)?.let { return it }
+        routeAirAlerts(state, event)?.let { return it }
 
         return when (state.mode) {
             AppMode.CameraLive -> routeCameraLive(state, event)

@@ -1,6 +1,8 @@
 package com.mobiledivecontrol.ui
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -36,6 +38,7 @@ import com.mobiledivecontrol.ui.diagnostics.DiagnosticsScreen
 import com.mobiledivecontrol.ui.safety.SafetyScreen
 import com.mobiledivecontrol.ui.tutorial.IntroCarouselScreen
 import com.mobiledivecontrol.ui.tutorial.SealCapPromptScreen
+import com.mobiledivecontrol.ui.welcome.WelcomeSplashScreen
 
 /**
  * Root composable — routes to the active mode's screen
@@ -77,6 +80,8 @@ fun DiveControlScreen(
     onPermissionsSetup: () -> Unit = {},
     capPromptVisible: Boolean = false,
     onCapPromptDismiss: () -> Unit = {},
+    welcomeVisible: Boolean = false,
+    onWelcomeFinished: () -> Unit = {},
     bluetoothEnabled: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
@@ -124,20 +129,29 @@ fun DiveControlScreen(
                 modifier = Modifier.fillMaxSize(),
             )
         }
-        // One banner, with its compact presentation anchored at the top while the timer continues.
-        val stopMinimized = state.diveProfile.stopPresentation == com.mobiledivecontrol.core.DiveStopPresentation.Minimized &&
-            !state.diveProfile.decompressionHold
-        com.mobiledivecontrol.ui.dive.DiveStopBanner(
-            profile = state.diveProfile,
-            useMetric = useMetric,
-            onCommand = onDiveSettingsCommand,
-            modifier = Modifier.align(if (stopMinimized) Alignment.TopCenter else Alignment.Center)
-                .padding(top = if (stopMinimized) 8.dp else 0.dp),
-        )
+        if (!introVisible && !capPromptVisible) com.mobiledivecontrol.ui.dive.DiveAlertLayer(
+            state, useMetric, onDiveSettingsCommand)
+
+        // Welcome card, shown first on every launch, above everything. It fades out onto what is
+        // already composed underneath: the intro's housing artwork on a first launch (ready for the
+        // permission prompts that follow), the live camera otherwise.
+        AnimatedVisibility(
+            visible = welcomeVisible,
+            enter = EnterTransition.None,
+            exit = fadeOut(tween(WELCOME_FADE_OUT_MS)),
+        ) {
+            WelcomeSplashScreen(
+                onFinished = onWelcomeFinished,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+
     }
 }
 
 internal fun shouldShowIntroLayer(introVisible: Boolean): Boolean = introVisible
+
+private const val WELCOME_FADE_OUT_MS = 300
 
 /** Camera adjustment is an overlay state, not a different screen or preview lifetime. */
 internal fun animatedContentMode(mode: AppMode): AppMode = when (mode) {
@@ -170,14 +184,17 @@ private fun DiveControlContent(
     val liveWaterPressure = com.mobiledivecontrol.ui.components.rememberLivePressure(
         state.safety.waterPressureKpa, state.waterPressureTelemetry, state.housing.connected,
     )
+    // Show test alerts over the real camera without changing the active mode or real dive/safety state.
+    val displayMode = if (state.mode == AppMode.DiveSettings && state.airAlerts.simulation != null)
+        AppMode.CameraLive else state.mode
     CameraHudOverlay(
-        state = state,
+        state = state.copy(mode = displayMode),
         liveWaterPressureKpa = liveWaterPressure,
         useMetric = useMetric,
         bluetoothEnabled = bluetoothEnabled,
         compassReading = compassReading,
         targetHeading = targetHeading,
-        hudVisible = state.mode != AppMode.Diagnostics && state.mode != AppMode.DiveSettings,
+        hudVisible = displayMode != AppMode.Diagnostics && displayMode != AppMode.DiveSettings,
         onSafetyCommand = onSafetyCommand,
     ) {
         AnimatedContent(
@@ -185,7 +202,7 @@ private fun DiveControlContent(
             // mode selection. The outgoing shell detached CameraX while the incoming shell built
             // a new controller, so even the last-frame hold was disposed and the crossfade showed
             // black. Both states are the same visual/camera destination; keep one identity.
-            targetState = animatedContentMode(state.mode),
+            targetState = animatedContentMode(displayMode),
             transitionSpec = {
                 fadeIn(tween(300)) togetherWith fadeOut(tween(200))
             },
@@ -215,7 +232,9 @@ private fun DiveControlContent(
                     onCommand = onDiagnosticsCommand,
                 )
                 AppMode.PhoneCursor, AppMode.PhoneTarget -> PhoneControlPlaceholder(mode = mode)
-                AppMode.DiveSettings -> com.mobiledivecontrol.ui.dive.DiveSettingsScreen(
+                AppMode.DiveSettings -> if (state.airAlerts.menuOpen) {
+                    com.mobiledivecontrol.ui.dive.DiveAlertsScreen(state, onDiveSettingsCommand)
+                } else com.mobiledivecontrol.ui.dive.DiveSettingsScreen(
                     profile = state.diveProfile,
                     useMetric = useMetric,
                     onCommand = onDiveSettingsCommand,

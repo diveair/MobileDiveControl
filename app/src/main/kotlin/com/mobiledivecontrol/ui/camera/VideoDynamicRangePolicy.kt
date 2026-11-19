@@ -4,26 +4,23 @@ import android.hardware.camera2.CameraMetadata
 import androidx.camera.core.DynamicRange
 
 /**
- * Maps the legacy UI's `LOG` selection to the strongest public 10-bit profile the S24 exposes.
- * Samsung Log itself is a privileged Samsung Camera pipeline, not a CameraX dynamic range.
+ * CameraX does not represent Samsung Log. LOG uses the separate native recorder;
+ * a CameraX stream can never satisfy that capture contract, including HLG10.
  */
 internal object VideoDynamicRangePolicy {
     /** Native Samsung Log measured 98.9 Mbit/s at UHD30; request the nearest round target. */
     const val LOG_TARGET_VIDEO_BITRATE_BPS = 100_000_000
 
-    fun select(requestedMode: String, supported: Set<DynamicRange>): DynamicRange =
-        if (requestedMode == "LOG" && DynamicRange.HLG_10_BIT in supported) {
-            DynamicRange.HLG_10_BIT
-        } else {
-            DynamicRange.SDR
-        }
+    @Suppress("UNUSED_PARAMETER")
+    fun select(requestedMode: String, supported: Set<DynamicRange>): DynamicRange = DynamicRange.SDR
 
     fun targetVideoBitrate(requestedMode: String): Int? =
         LOG_TARGET_VIDEO_BITRATE_BPS.takeIf { requestedMode == "LOG" }
 
     /** Log is an acquisition contract, not permission to silently record an 8-bit substitute. */
+    @Suppress("UNUSED_PARAMETER")
     fun isCaptureContractSatisfied(requestedMode: String, selected: DynamicRange): Boolean =
-        requestedMode != "LOG" || selected == DynamicRange.HLG_10_BIT
+        requestedMode != "LOG"
 
     /**
      * Log drops still capture and 8-bit RGBA analysis surfaces from the bound session. Live

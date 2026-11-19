@@ -1006,44 +1006,18 @@ class SafetyStateMachine(
         )
     }
 
-    /**
-     * Routes a lost vacuum by *when* it was lost, because the same pressure event means two
-     * different things on two sides of the five-minute hard verify:
-     *
-     *  - Inside the hard verify the seal was still on trial, so depressurisation goes to Failed
-     *    — the UI words it as a definite leak or as "vacuum inactive", depending on whether the
-     *    diver ever claimed the cap was back on.
-     *  - Past the hard verify the seal had already proven itself. A shell that loses pressure
-     *    after that was opened by its owner — the cap unscrewed, the housing cracked for a
-     *    battery swap — and greeting a deliberate act with a leak alarm teaches the diver that
-     *    the alarm cries wolf. The machine steps quietly back to the start: seal Unknown,
-     *    prompts re-armed, no alert, and at the surface the VACUUM RELEASED banner.
-     */
+    /** A confirmed full vent at a known surface can retire an established seal quietly.
+     * Partial loss, unknown depth and underwater loss remain failures at every confidence tier. */
     private fun sealLost(
         state: SafetyState,
         elapsedMs: Long,
         vent: Boolean,
         message: String,
     ): SafetyMachineResult {
-        // The quiet released path opens only past the 5-minute hard verify: by then the seal has
-        // proven itself, a leak is unlikely, and a diver adjusting their phone between dives is
-        // the story that fits the evidence. Any depressurisation before that — clean vent or
-        // gradual fall — goes to Failed, where the UI splits the message on whether the diver
-        // ever claimed the cap was on. The one exception is a full vent of an ADOPTED hold
-        // ([SafetyState.adoptedHold]): the housing proved that seal before this app's clock
-        // existed, so the clock has no standing to call its release early. A hold this app
-        // pumped itself never gets that pass, whatever cap banner happened to be raised.
-        val deliberate = elapsedMs >= thresholds.manufacturerMinimumMs ||
-            (vent && state.adoptedHold)
-        if (!deliberate) {
-            return sealFailed(state, message)
-        }
-        // At the surface a deliberate release means the diver just pulled the cap — the next
-        // screen must not ask them to remove it. Underwater (or at unknown depth from a live
-        // water reading) the deliberate classification stands but the released banner does not:
-        // "you may open the housing" is not a sentence this app will ever say below the surface.
         val depthM = pressureDepthMeters(state.waterPressureKpa)
-        val atSurface = depthM == null || depthM <= thresholds.surfaceMaxDepthM
+        val atSurface = depthM != null && depthM <= thresholds.surfaceMaxDepthM
+        val deliberate = vent && atSurface && (elapsedMs >= thresholds.manufacturerMinimumMs || state.adoptedHold)
+        if (!deliberate) return sealFailed(state, message)
         return SafetyMachineResult(
             state = state.copy(
                 sealState = SealState.Unknown,
@@ -1069,6 +1043,26 @@ class SafetyStateMachine(
      * that trust was earned, because "failed" without "since when" is not actionable.
      */
     private fun restartSealFailed(state: SafetyState, timestampMs: Long): SafetyMachineResult {
+        val water = state.waterPressureKpa
+        val internal = state.barometricPressureKpa
+        if (water == null) {
+            // Sensor subscriptions can arrive in either order. Await current external
+            // pressure before calling a vented, dry housing a failed seal.
+            return SafetyMachineResult(state)
+        }
+        if (pressureDepthMeters(water)?.let { it <= thresholds.surfaceMaxDepthM } == true &&
+            internal != null && kotlin.math.abs(internal - water) <= thresholds.establishedVacuumCrossSensorMinKpa) {
+            return SafetyMachineResult(state.copy(
+                sealState = if (state.coverOpen == true) SealState.CoverOpen else SealState.Unknown,
+                sealConfidence = SealConfidence.Monitoring,
+                verifiedVacuumKpa = null, verifiedVacuumConfidence = null,
+                verifiedVacuumStartedAtEpochMs = null, verifiedVacuumRecordedAtEpochMs = null,
+                pendingAdoptionKpa = null, pendingOutlierKpa = null, baselinePressureKpa = null,
+                stabilizationSamples = emptyList(), leakMonitoringStartedAtEpochMs = null,
+                leakMonitoringElapsedMs = 0, restartFailAgoMinutes = null,
+                checkDismissed = false, capCloseReminder = false, adoptedHold = false, warning = null),
+                note = "Housing is at ambient pressure on reconnect. A new seal check is needed.")
+        }
         val lastGoodMs = state.verifiedVacuumRecordedAtEpochMs
             ?: state.verifiedVacuumStartedAtEpochMs
         val agoMinutes = lastGoodMs

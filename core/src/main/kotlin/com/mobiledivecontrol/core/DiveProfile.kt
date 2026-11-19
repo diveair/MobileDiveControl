@@ -66,8 +66,8 @@ data class DiveSession(
     val minimumNdlSeconds: Int? = null,
     val exposure: DiveExposureSummary? = null,
 ) {
-    /** Recommend a stop on ascent from every dive that went deeper than its target. */
-    val stopRecommended: Boolean get() = maxDepthMeters > settings.stopDepthMeters + 1e-9
+    /** Eligibility is independent of the hold target. Never suppress a known NDL obligation. */
+    val stopRecommended: Boolean get() = maxDepthMeters > DiveProfileTracker.STOP_QUALIFYING_DEPTH_METERS || limitReached
     val requiredByKnownProfile: Boolean get() = maxDepthMeters >= 30.0 || limitReached
     val remainingSeconds: Int get() = ((settings.stopDurationSeconds * 1000L - stopElapsedMs + 999) / 1000)
         .coerceAtLeast(0).toInt()
@@ -82,6 +82,8 @@ data class DiveProfileState(
     val verticalMetersPerMinute: Double? = null,
     val lastSampleMs: Long? = null,
     val sensorAvailable: Boolean = false,
+    /** A BLE disconnect may arrive seconds after the last pressure packet has already expired. */
+    val surfaceConfirmedBeforeLoss: Boolean = false,
     val rateWindow: List<DiveSample> = emptyList(),
     val alertSequence: Long = 0,
     val lastAlert: DiveStopAlert? = null,
@@ -109,6 +111,7 @@ data class DiveProfileState(
         (stopDecompressionPaused && decompression.history != DecoHistory.Tracking)
     val selectedSavedLog: DiveSession? get() = logs.getOrNull(logIndex - if (active != null) 1 else 0)
     val stopActive: Boolean get() = active?.let { it.stopStarted && it.phase != DiveStopPhase.Complete } == true
+    val atSurface: Boolean get() = sensorAvailable && depthMeters?.let { it <= DiveProfileTracker.SURFACE_END_METERS } == true
     val stopExpanded: Boolean get() = active != null && (decompressionHold ||
         (active.stopStarted && stopPresentation == DiveStopPresentation.Expanded))
 }
@@ -121,8 +124,11 @@ data class DiveProfileState(
 object DiveProfileTracker {
     const val MAX_SAMPLES = 3_600
     const val MAX_LOGS = 1_000
-    const val SURFACE_CONFIRM_MS = 60_000L
-    const val SURFACE_END_METERS = 0.05
+    const val STOP_QUALIFYING_DEPTH_METERS = 11.0
+    /** Brief surface swims belong to the same dive; do not split on a single zero reading. */
+    const val SURFACE_CONFIRM_MS = 180_000L
+    const val SURFACE_SHUTDOWN_CONFIRM_MS = 10_000L
+    const val SURFACE_END_METERS = 0.8
 
     /** Retire the previously requested 0 m bench checkpoint before enabling normal diving. */
     fun forLiveDiving(state: DiveProfileState): DiveProfileState {
@@ -135,12 +141,36 @@ object DiveProfileTracker {
             stopPresentation = if (surfaceRun != null) DiveStopPresentation.Dismissed else state.stopPresentation)
     }
 
-    fun unavailable(state: DiveProfileState): DiveProfileState = state.copy(
-        sensorAvailable = false, depthMeters = null, verticalMetersPerMinute = null,
-        rateWindow = emptyList(),
-        decompression = DecompressionTracker.unavailable(state.decompression),
-        active = state.active?.copy(profileIncomplete = true, surfaceElapsedMs = 0),
-    )
+    fun unavailable(state: DiveProfileState): DiveProfileState {
+        // Only fresh surface evidence can close a dive when the housing is switched off.
+        // A link loss at depth remains an incomplete, active dive.
+        val surfaced = if (state.atSurface && (state.active?.surfaceElapsedMs ?: 0) >= SURFACE_SHUTDOWN_CONFIRM_MS)
+            finishAtSurface(state) else state
+        return surfaced.copy(
+            sensorAvailable = false, depthMeters = null, verticalMetersPerMinute = null,
+            surfaceConfirmedBeforeLoss = state.surfaceConfirmedBeforeLoss || (state.atSurface &&
+                (state.active == null || state.active.surfaceElapsedMs >= SURFACE_SHUTDOWN_CONFIRM_MS)),
+            rateWindow = emptyList(),
+            decompression = DecompressionTracker.unavailable(state.decompression),
+            active = surfaced.active?.copy(profileIncomplete = true, surfaceElapsedMs = 0),
+        )
+    }
+
+    private fun finishAtSurface(state: DiveProfileState): DiveProfileState {
+        val dive = state.active ?: return state
+        // Exclude the final surface waiting period from dive duration, but retain surface
+        // intervals followed by another descent as part of the same recorded profile.
+        val end = (dive.elapsedMs - dive.surfaceElapsedMs).coerceAtLeast(0)
+        val outcome = when {
+            dive.phase == DiveStopPhase.Complete -> DiveLogOutcome.CompletedStop
+            dive.stopRecommended || dive.requiredByKnownProfile -> DiveLogOutcome.IncompleteStop
+            else -> DiveLogOutcome.NoStopRecorded
+        }
+        val log = dive.copy(elapsedMs = end, samples = dive.samples.filter { it.elapsedMs <= end },
+            outcome = outcome, surfaceElapsedMs = 0)
+        return state.copy(active = null, logs = (listOf(log) + state.logs).take(MAX_LOGS),
+            logIndex = 0, stopPresentation = DiveStopPresentation.Dismissed, lastAlert = null)
+    }
 
     fun tick(state: DiveProfileState, nowMs: Long, connected: Boolean): DiveProfileState {
         if (!state.sensorAvailable) return state
@@ -156,6 +186,15 @@ object DiveProfileTracker {
         if (state.lastSampleMs != null && nowMs <= state.lastSampleMs) return state
         val delta = state.lastSampleMs?.let { nowMs - it }
         val continuous = state.sensorAvailable && delta != null && delta < PRESSURE_STALE_MS
+        val interrupted = state.active
+        if (!triggerAtSurface && !continuous && interrupted != null && depthMeters <= SURFACE_END_METERS &&
+            interrupted.samples.lastOrNull()?.depthMeters?.let { it <= SURFACE_END_METERS } == true &&
+            epochMs - interrupted.startedAtEpochMs - interrupted.elapsedMs >= SURFACE_CONFIRM_MS) {
+            // Surface observed on both sides of a power cycle. Preserve the unobserved gap as
+            // incomplete; do not append hours on land to the underwater profile.
+            return sample(finishAtSurface(state.copy(active = interrupted.copy(profileIncomplete = true))),
+                depthMeters, nowMs, epochMs)
+        }
         val dt = if (continuous) delta!! else 0L
         val rateWindow = ((if (continuous) state.rateWindow else emptyList()) + DiveSample(nowMs, depthMeters))
             .filter { nowMs - it.elapsedMs <= 5_000L }.takeLast(100)
@@ -164,7 +203,7 @@ object DiveProfileTracker {
             (depthMeters - first.depthMeters) * 60_000.0 / (nowMs - first.elapsedMs)
         } else null
         val decompressionRequired = state.decompressionHold
-        var next = state.copy(depthMeters = depthMeters, sensorAvailable = true, lastSampleMs = nowMs,
+        var next = state.copy(depthMeters = depthMeters, sensorAvailable = true, surfaceConfirmedBeforeLoss = false, lastSampleMs = nowMs,
             verticalMetersPerMinute = rate, rateWindow = rateWindow, stopDecompressionPaused = decompressionRequired)
         var dive = state.active ?: if (depthMeters >= 1.5 || triggerAtSurface) {
             DiveSession(epochMs, if (triggerAtSurface) state.settings.copy(stopDepthMeters = 0) else state.settings,
@@ -176,7 +215,8 @@ object DiveProfileTracker {
             dive = dive.copy(settings = dive.settings.copy(stopDepthMeters = 0), phase = DiveStopPhase.Armed,
                 stopElapsedMs = 0, stopStarted = false)
         }
-        val elapsed = dive.elapsedMs + if (state.active != null) (delta ?: 0L).coerceAtLeast(0L) else 0L
+        val elapsed = dive.elapsedMs + if (state.active != null)
+            (delta ?: (epochMs - dive.startedAtEpochMs - dive.elapsedMs)).coerceAtLeast(0L) else 0L
         val maxDepth = maxOf(dive.maxDepthMeters, depthMeters)
         val limitReached = dive.limitReached || (state.decompression.history == DecoHistory.Tracking &&
             state.decompression.readings?.ndlSeconds == 0)
@@ -241,12 +281,14 @@ object DiveProfileTracker {
                 shallowestAfterStop = depthMeters
             }
         }
-        val surfaceMs = if (depthMeters <= 0.8) {
-            dive.surfaceElapsedMs + if (state.depthMeters?.let { it <= 0.8 } == true) dt else 0L
+        val surfaceMs = if (surfaced) {
+            (if (continuous) dive.surfaceElapsedMs else 0L) +
+                if (state.atSurface) dt else 0L
         } else 0L
         var samples = dive.samples
         // At most one regular log point each 5 s; always retain gaps, stop transitions and the final surface reading.
-        if (samples.isEmpty() || elapsed - samples.last().elapsedMs >= 5_000 || !continuous || phase != dive.phase || surfaced) {
+        if (samples.isEmpty() || elapsed - samples.last().elapsedMs >= 5_000 || !continuous || phase != dive.phase ||
+            (surfaced && !state.atSurface)) {
             if (samples.size >= MAX_SAMPLES) samples = listOf(samples.first()) + samples.drop(1).chunked(2).map { pair ->
                 pair.last().copy(gapBefore = pair.any { it.gapBefore })
             }
@@ -258,21 +300,13 @@ object DiveProfileTracker {
             profileIncomplete = dive.profileIncomplete || (state.active != null && !continuous))
         if (alert != null) next = next.copy(alertSequence = next.alertSequence + 1, lastAlert = alert,
             stopPresentation = DiveStopPresentation.Expanded)
-        // A fresh 0.0 m reading ends this dive. Surface noise cannot start another dive until 1.5 m.
-        return if (surfaced) {
-            val outcome = when {
-                phase == DiveStopPhase.Complete -> DiveLogOutcome.CompletedStop
-                dive.stopRecommended || dive.requiredByKnownProfile -> DiveLogOutcome.IncompleteStop
-                else -> DiveLogOutcome.NoStopRecorded
-            }
-            next.copy(active = null, logs = (listOf(dive.copy(outcome = outcome, surfaceElapsedMs = 0)) + state.logs).take(MAX_LOGS),
-                logIndex = 0, stopPresentation = DiveStopPresentation.Dismissed, lastAlert = null)
-        } else next.copy(active = dive)
+        next = next.copy(active = dive)
+        return if (surfaced && surfaceMs >= SURFACE_CONFIRM_MS) finishAtSurface(next) else next
     }
 
     /** Never credit unobserved time. A previously completed stop stays completed across restarts. */
     fun restored(state: DiveProfileState): DiveProfileState = state.copy(
-        sensorAvailable = false, depthMeters = null, verticalMetersPerMinute = null, lastSampleMs = null,
+        sensorAvailable = false, surfaceConfirmedBeforeLoss = false, depthMeters = null, verticalMetersPerMinute = null, lastSampleMs = null,
         rateWindow = emptyList(), lastAlert = null,
         decompression = DecompressionTracker.restored(state.decompression),
         stopDecompressionPaused = state.stopDecompressionPaused || (state.active != null &&
@@ -291,7 +325,7 @@ object DiveProfileTracker {
     }
 }
 
-enum class DiveSettingsField { Log, Gas, StopDepth, StopDuration, Back }
+enum class DiveSettingsField { Log, Gas, StopDuration, StopDepth, Alerts, Back }
 enum class GasMenuField { Type, Oxygen, Helium, Done }
 
 fun gasMenuFields(gas: DiveGas): List<GasMenuField> = when {
@@ -310,6 +344,7 @@ fun stopDepthZone(depthMeters: Double?, targetMeters: Double): StopDepthZone = w
 }
 
 sealed interface DiveSettingsCommand : ControlCommand {
+    data class Alerts(val command: AirAlertCommand) : DiveSettingsCommand
     data object AcknowledgeStop : DiveSettingsCommand
     data object ExpandStop : DiveSettingsCommand
     /** Explicit declarations, never inferred from elapsed time or a missing checkpoint. */
@@ -331,6 +366,7 @@ sealed interface DiveSettingsCommand : ControlCommand {
 }
 
 fun reduceDiveSettings(state: AppState, command: DiveSettingsCommand): Reduction {
+    if (command is DiveSettingsCommand.Alerts) return reduceAirAlerts(state, command.command)
     val dive = state.diveProfile
     val gas = dive.active?.settings?.gas ?: dive.settings.gas
     if (command == DiveSettingsCommand.RequestHistoryConfirmation) return Reduction(
@@ -404,6 +440,8 @@ fun reduceDiveSettings(state: AppState, command: DiveSettingsCommand): Reduction
     if (command is DiveSettingsCommand.Select) return Reduction(state.copy(diveProfile = dive.copy(selectedField = command.field)))
     if (command is DiveSettingsCommand.Navigate) return Reduction(state.copy(diveProfile = dive.copy(
         selectedField = fields[Math.floorMod(dive.selectedField.ordinal + command.delta, fields.size)])))
+    if (dive.selectedField == DiveSettingsField.Alerts) return Reduction(
+        if (command == DiveSettingsCommand.Confirm) state.copy(airAlerts = state.airAlerts.copy(menuOpen = true, page = AirPage.Home, selectedRow = 0, backStack = emptyList())) else state)
     if (dive.selectedField == DiveSettingsField.Gas) return Reduction(
         if (command == DiveSettingsCommand.Confirm && dive.active == null)
             state.copy(diveProfile = dive.copy(gasMenuOpen = true, gasMenuField = GasMenuField.Type)) else state)

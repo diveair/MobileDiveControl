@@ -23,6 +23,15 @@ class SamsungLogProfileTest {
     }
 
     @Test
+    fun `below black signal decodes to published scene floor`() {
+        // White paper page 5: y < 0 decodes to x0 = -0.05, not an extrapolated toe.
+        listOf(-Double.MIN_VALUE, -0.001, -0.1, -1.0).forEach { signal ->
+            assertEquals(-0.05, SamsungLogProfile.decode(signal))
+        }
+        assertClose(-0.05, SamsungLogProfile.decode(0.0), 0.00001)
+    }
+
+    @Test
     fun `HLG editor transform maps full scene domain to published anchors`() {
         listOf(0.0, 0.01, 0.18, 0.9, 1.0, 6.0, 12.0).forEach { scene ->
             val hlg = SamsungLogProfile.sceneLinearToHlg(scene / SamsungLogProfile.MAX_SCENE_LINEAR)

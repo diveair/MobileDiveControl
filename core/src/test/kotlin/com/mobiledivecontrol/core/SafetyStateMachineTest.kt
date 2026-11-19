@@ -634,6 +634,7 @@ class SafetyStateMachineTest {
             sealState = SealState.Passed,
             sealConfidence = SealConfidence.ManufacturerMinimum,
             surfaceAmbientKpa = 101.0,
+            waterPressureKpa = 101.0,
             leakMonitoringStartedAtEpochMs = 0L,
             stabilizationSamples = listOf(81.0),
         )
@@ -678,7 +679,7 @@ class SafetyStateMachineTest {
     }
 
     @Test
-    fun `a deliberate release below the surface never offers to open the housing`() {
+    fun `confirmed vacuum loss below the surface fails even after a long verified hold`() {
         val monitoring = SafetyState(
             sealState = SealState.Passed,
             sealConfidence = SealConfidence.ManufacturerMinimum,
@@ -697,7 +698,8 @@ class SafetyStateMachineTest {
             quarantined,
             SafetySignal.BarometricPressureSample(kpa = 100.9, timestampMs = 360_500L),
         )
-        assertEquals(SealState.Unknown, result.state.sealState)
+        assertEquals(SealState.Failed, result.state.sealState)
+        assertTrue(result.effects.any { it is PlatformEffect.EmitAlert })
         assertFalse(result.state.vacuumReleasedPrompt)
     }
 
@@ -894,7 +896,7 @@ class SafetyStateMachineTest {
     }
 
     @Test
-    fun `a boot record refuted at ambient is a restart seal failure, confirmed by two readings`() {
+    fun `a boot record refuted at surface ambient requests a new check without a failure alarm`() {
         var state = SafetyState(
             sealState = SealState.Unknown,
             waterPressureKpa = 101.0,
@@ -915,8 +917,9 @@ class SafetyStateMachineTest {
             state,
             SafetySignal.BarometricPressureSample(kpa = 100.9, timestampMs = 3_601_500L),
         )
-        assertEquals(SealState.Failed, result.state.sealState)
-        assertEquals(60L, result.state.restartFailAgoMinutes, "an hour since the seal was last good")
+        assertEquals(SealState.Unknown, result.state.sealState)
+        assertNull(result.state.restartFailAgoMinutes)
+        assertTrue(result.effects.isEmpty())
         assertEquals(null, result.state.verifiedVacuumKpa)
         assertEquals(null, result.state.verifiedVacuumConfidence)
     }
