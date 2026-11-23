@@ -77,7 +77,8 @@ fun CameraHudOverlay(
     content: @Composable () -> Unit,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
-        content()
+        val menuBounds = remember { CameraMenuBounds() }
+        androidx.compose.runtime.CompositionLocalProvider(LocalCameraMenuBounds provides menuBounds) { content() }
 
         // Full-screen menus such as Diagnostics already render these values in their own
         // layout. Keeping the camera HUD there would cover headings, formulae, and navigation.
@@ -166,7 +167,12 @@ fun CameraHudOverlay(
 
         val bottomControlMenuOpen = state.mode in setOf(AppMode.CameraLive, AppMode.CameraAdjust) &&
             (state.camera.settingsEditing || state.camera.showMoreSettings)
-        val bottomPadding = cameraReadoutBottomPadding(state.mode, state.camera)
+        val measuredMenuHeight = with(LocalDensity.current) {
+            val tray = menuBounds.trayHeightPx.toDp()
+            if (state.camera.showMoreSettings && !state.camera.settingsEditing)
+                maxOf(tray, menuBounds.optionsHeightPx.toDp() + 48.dp) else tray
+        }.takeIf { it > 0.dp }
+        val bottomPadding = cameraReadoutBottomPadding(state.mode, state.camera, measuredMenuHeight)
 
         // Produce the projected arrow and its lock state once. Both the arrow and numeric heading
         // consume this same result, so their colour cannot disagree at the tolerance boundary.
@@ -377,10 +383,10 @@ private const val TARGET_HEADING_SYNC_TOLERANCE_DEGREES = 3.0
  * Lift the complete dive readout for every editor opened from a bottom control. The centre mode
  * button opens the side rail instead, so it deliberately keeps the live-view position.
  */
-internal fun cameraReadoutBottomPadding(mode: AppMode, camera: CameraState) = when (mode) {
+internal fun cameraReadoutBottomPadding(mode: AppMode, camera: CameraState, measuredMenuHeight: androidx.compose.ui.unit.Dp? = null) = when (mode) {
     AppMode.CameraLive, AppMode.CameraAdjust ->
         if (camera.settingsEditing || camera.showMoreSettings) {
-            CAMERA_READOUT_MENU_PADDING
+            measuredMenuHeight?.plus(6.dp) ?: CAMERA_READOUT_MENU_PADDING
         } else {
             CAMERA_READOUT_LIVE_PADDING
         }

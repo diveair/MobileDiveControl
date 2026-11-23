@@ -1,9 +1,12 @@
 package com.mobiledivecontrol.ui.camera
 
+import androidx.compose.ui.draw.clipToBounds
+
 import android.view.ViewGroup
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -107,11 +110,13 @@ fun StateDrivenCameraPreview(
                 // debounce/coalescing has completed. Capture the still-live TextureView now and
                 // acknowledge only after Compose has submitted the covering bitmap twice.
                 awaitingReplacementStream = true
-                heldTransitionFrame = previewView.bitmap ?: lastStablePreviewFrame
-                coroutineScope.launch {
-                    withFrameNanos { }
-                    withFrameNanos { }
-                    onContinuityFramePresented()
+                controller.copyPreviewForTransition { bitmap ->
+                    heldTransitionFrame = bitmap ?: lastStablePreviewFrame
+                    coroutineScope.launch {
+                        withFrameNanos { }
+                        withFrameNanos { }
+                        onContinuityFramePresented()
+                    }
                 }
             },
             onPreviewPresented = {
@@ -176,12 +181,26 @@ fun StateDrivenCameraPreview(
         onEffectsConsumed()
     }
 
-    Box(modifier = modifier.fillMaxSize()) {
+    BoxWithConstraints(modifier = modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black)) {
+        val aspectSpec = com.mobiledivecontrol.core.CameraCatalog.settingsFor(cameraState)
+            .firstOrNull { it.id.endsWith(".aspect_ratio") }
+        val aspect = aspectSpec?.let { com.mobiledivecontrol.core.CameraCatalog.currentValue(cameraState, it) }
+        val ratio = when (aspect) {
+            "1:1" -> 1f
+            "4:3" -> 4f / 3f
+            "Full" -> null
+            "16:9" -> 16f / 9f
+            else -> null
+        }
+        val frameModifier = if (ratio == null) Modifier.fillMaxSize() else {
+            val width = minOf(maxWidth, maxHeight * ratio)
+            Modifier.size(width, width / ratio).align(Alignment.Center)
+        }
         AndroidView(
             factory = { previewView },
             // PreviewView already applies CameraX's sensor/display rotation and front mirroring.
             // A second 180-degree rotation inverted the image (and leaked across saved lens modes).
-            modifier = Modifier.fillMaxSize(),
+            modifier = frameModifier.clipToBounds(),
         )
 
         heldTransitionFrame?.let { bitmap ->
@@ -189,7 +208,7 @@ fun StateDrivenCameraPreview(
                 bitmap = bitmap.asImageBitmap(),
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
+                modifier = frameModifier,
             )
         }
 

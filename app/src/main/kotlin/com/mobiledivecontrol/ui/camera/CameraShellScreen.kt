@@ -1,5 +1,7 @@
 package com.mobiledivecontrol.ui.camera
 
+import androidx.compose.ui.layout.onSizeChanged
+
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
@@ -148,6 +150,7 @@ fun CameraShellScreen(
     warningMessage: String? = null,
     modifier: Modifier = Modifier,
 ) {
+    val menuBounds = com.mobiledivecontrol.ui.LocalCameraMenuBounds.current
     val settings = CameraCatalog.settingsFor(cameraState.activeMode, cameraState.deviceVariant)
     val settingsVisible = settings.isNotEmpty()
 
@@ -174,10 +177,16 @@ fun CameraShellScreen(
         }
 
         if (!cameraState.panoramaReviewAvailable) {
-            CaptureGuideOverlay(
-                cameraState = cameraState,
-                modifier = Modifier.fillMaxSize(),
-            )
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                val aspect = CameraCatalog.settingsFor(cameraState).firstOrNull { it.id.endsWith(".aspect_ratio") }
+                    ?.let { CameraCatalog.currentValue(cameraState, it) }
+                val ratio = when (aspect) { "1:1" -> 1f; "4:3" -> 4f / 3; "16:9" -> 16f / 9; else -> null }
+                val guideFrame = if (ratio == null) Modifier.fillMaxSize() else {
+                    val width = minOf(maxWidth, maxHeight * ratio)
+                    Modifier.size(width, width / ratio).align(Alignment.Center)
+                }
+                CaptureGuideOverlay(cameraState = cameraState, modifier = guideFrame)
+            }
             ModeGuideOverlay(
                 cameraState = cameraState,
                 modifier = Modifier.fillMaxSize(),
@@ -215,6 +224,15 @@ fun CameraShellScreen(
             )
         }
 
+        if (PhotoTimerState.remainingSeconds.intValue > 0) {
+            Text(
+                text = PhotoTimerState.remainingSeconds.intValue.toString(),
+                style = MaterialTheme.typography.displayLarge,
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.align(Alignment.Center),
+            )
+        }
         // Center: zoom overlay (fades after 1.4s)
         ZoomOverlay(
             zoomFactor = cameraState.zoomFactor,
@@ -289,6 +307,7 @@ fun CameraShellScreen(
             BottomSettingsTray(
                 cameraState = cameraState,
                 onCommand = onCameraCommand,
+                modifier = Modifier.onSizeChanged { menuBounds?.trayHeightPx = it.height },
             )
         }
 
@@ -309,6 +328,7 @@ fun CameraShellScreen(
             ProOptionsPanel(
                 cameraState = cameraState,
                 onCommand = onCameraCommand,
+                modifier = Modifier.onSizeChanged { menuBounds?.optionsHeightPx = it.height },
             )
         }
 
@@ -1826,11 +1846,14 @@ private fun BottomSettingsTray(
                         if (spec.supportsSensitivity) {
                             BottomEditCard(
                                 title = "Sensitivity",
-                                value = "Level ${sensitivity.level}",
+                                value = if (spec.id.endsWith(".iso")) CameraCatalog.isoSensitivityLabel(sensitivity) else "Level ${sensitivity.level}",
                                 selected = cameraState.sliderEditTarget == SliderEditTarget.Sensitivity,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
-                                SliderSensitivityMeter(current = sensitivity)
+                                if (spec.id.endsWith(".iso")) ToggleOptionDisplay(
+                                    currentValue = CameraCatalog.isoSensitivityLabel(sensitivity),
+                                    options = CameraCatalog.isoSensitivityLevels.map { CameraCatalog.isoSensitivityLabel(SliderSensitivity.of(it)) },
+                                ) else SliderSensitivityMeter(current = sensitivity)
                             }
                         }
 

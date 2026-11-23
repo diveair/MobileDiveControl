@@ -19,10 +19,10 @@ class CircularScaleTest {
 
     @Test
     fun `iso reaches the same Auto mode from both rails`() {
-        assertEquals("Auto", nudge("pro.iso", "50", -1))
+        assertEquals("Auto", nudge("pro.iso", "25", -1))
         assertEquals("Auto", nudge("pro.iso", "3200", +1))
         assertEquals("3200", nudge("pro.iso", "Auto", -1))
-        assertEquals("50", nudge("pro.iso", "Auto", +1))
+        assertEquals("25", nudge("pro.iso", "Auto", +1))
     }
 
     @Test
@@ -34,8 +34,10 @@ class CircularScaleTest {
     }
 
     @Test
-    fun `EV wraps directly because its native dial has no Auto mode`() {
-        assertEquals("+4.0", nudge("pro.exposure_value", "-4.0", -1))
-        assertEquals("-4.0", nudge("pro.exposure_value", "+4.0", +1))
+    fun `EV wraps through Auto in either direction`() {
+        assertEquals("Auto", nudge("pro.exposure_value", "-4.0", -1))
+        assertEquals("Auto", nudge("pro.exposure_value", "+4.0", +1))
+        assertEquals("-4.0", nudge("pro.exposure_value", "Auto", +1))
+        assertEquals("+4.0", nudge("pro.exposure_value", "Auto", -1))
     }
 }

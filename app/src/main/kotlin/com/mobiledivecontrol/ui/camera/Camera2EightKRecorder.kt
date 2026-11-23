@@ -75,17 +75,11 @@ internal class Camera2EightKRecorder(
         val fps: Int,
         val outputFile: File,
         val audioEnabled: Boolean,
-        val exposureCompensationIndex: Int?,
+        val look: LookPlan,
         val zoomRatio: Float,
-        val torchEnabled: Boolean,
         val focusDiopters: Float?,
         /** LOG in this app is the honest public 10-bit BT.2020 HLG acquisition contract. */
         val hdrLogMode: String,
-        /**
-         * The mode's explicit white point (manual kelvin, underwater filter or Auto Underwater),
-         * or null for the HAL's AWB. Without it a Pro Video 8K take silently fell back to auto.
-         */
-        val whitePoint: Pair<RggbChannelVector, ColorSpaceTransform?>? = null,
     )
 
     private val handler = Handler(Looper.getMainLooper())
@@ -263,7 +257,7 @@ internal class Camera2EightKRecorder(
                                 recordingSurface = recordingSurface,
                                 addTargets = true,
                             )
-                            configured.setRepeatingRequest(repeating, null, handler)
+                            configured.setRepeatingRequest(repeating, controlCaptureCallback, handler)
                             recorder.start()
                             startedAtElapsedMs = SystemClock.elapsedRealtime()
                             Log.i(
@@ -309,40 +303,15 @@ internal class Camera2EightKRecorder(
                 addTarget(recordingSurface)
             }
             set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(request.fps, request.fps))
-            set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
-            val whitePoint = request.whitePoint
-            if (whitePoint != null) {
-                set(CaptureRequest.CONTROL_AWB_LOCK, false)
-                set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
-                set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-                set(CaptureRequest.COLOR_CORRECTION_GAINS, whitePoint.first)
-                whitePoint.second?.let { set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
-            } else {
-                set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-            }
+            CameraControls.writeLook(Camera2RequestSink(this), request.look)
             if (request.focusDiopters != null) {
                 set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
                 set(CaptureRequest.LENS_FOCUS_DISTANCE, request.focusDiopters)
             } else {
                 set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
             }
-            request.exposureCompensationIndex?.let {
-                set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, it)
-            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 set(CaptureRequest.CONTROL_ZOOM_RATIO, request.zoomRatio)
-            }
-            set(
-                CaptureRequest.FLASH_MODE,
-                if (request.torchEnabled) CameraMetadata.FLASH_MODE_TORCH
-                else CameraMetadata.FLASH_MODE_OFF,
-            )
-            // USE_SCENE_MODE makes Camera2 ignore CONTROL_AWB_MODE; an explicit white point wins.
-            if (request.hdrLogMode == "HDR" && request.whitePoint == null) {
-                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
-                set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
-            } else {
-                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             }
             // These are session parameters in Samsung Camera's own Pro Video configuration.
             // Unsupported vendor tags throw at set(); each one is independently optional.
@@ -359,6 +328,33 @@ internal class Camera2EightKRecorder(
         runCatching {
             set(CaptureRequest.Key(name, Int::class.javaObjectType), value)
         }.onFailure { error -> Log.w(TAG, "Vendor session parameter unavailable: $name", error) }
+    }
+
+    var onCaptureTelemetry: ((android.hardware.camera2.TotalCaptureResult) -> Unit)? = null
+    private val controlCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest,
+            result: android.hardware.camera2.TotalCaptureResult) {
+            if (session !== this@Camera2EightKRecorder.session) return
+            CameraControlTrace.record("EightK", request, result)
+            onCaptureTelemetry?.invoke(result)
+        }
+    }
+
+    val cameraId: String? get() = request?.cameraId
+    private var lastLiveRequest: Request? = null
+
+    fun update(look: LookPlan, zoom: Float, focus: Float?) {
+        val baseline = request ?: return
+        val camera = cameraDevice ?: return
+        val active = session ?: return
+        val holder = surfaceView?.holder ?: return
+        val recorder = mediaRecorder ?: return
+        val live = baseline.copy(look = look, zoomRatio = zoom, focusDiopters = focus)
+        if (live == lastLiveRequest) return
+        try {
+            active.setRepeatingRequest(buildRequest(camera, live, holder.surface, recorder.surface, true), controlCaptureCallback, handler)
+            lastLiveRequest = live
+        } catch (error: Exception) { fail(error) }
     }
 
     fun stop() {
@@ -440,6 +436,7 @@ internal class Camera2EightKRecorder(
     }
 
     private fun cleanup() {
+        lastLiveRequest = null
         runCatching { session?.close() }
         runCatching { cameraDevice?.close() }
         runCatching { mediaRecorder?.reset() }

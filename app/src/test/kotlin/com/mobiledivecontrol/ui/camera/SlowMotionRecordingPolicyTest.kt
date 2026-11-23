@@ -32,6 +32,9 @@ class SlowMotionRecordingPolicyTest {
         val export = SlowMotionRecordingPolicy.bitrate(1920, 1080, 30.0, true)
         assertEquals(source / 2, export)
         assertTrue(SlowMotionRecordingPolicy.bitrate(1920, 1080, 30.0, false) > export)
-        assertThrows(IllegalArgumentException::class.java) { SlowMotionRecordingPolicy.sourceFrameRate(30) }
+        assertEquals(30, SlowMotionRecordingPolicy.sourceFrameRate(30))
+        assertEquals(24, SlowMotionRecordingPolicy.sourceFrameRate(24))
+        assertEquals(120, SlowMotionRecordingPolicy.sourceFrameRate(100))
+        assertThrows(IllegalArgumentException::class.java) { SlowMotionRecordingPolicy.sourceFrameRate(90) }
     }
 }

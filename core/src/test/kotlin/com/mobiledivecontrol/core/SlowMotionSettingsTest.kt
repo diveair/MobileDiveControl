@@ -57,7 +57,7 @@ class SlowMotionSettingsTest {
         val camera = camera(120).copy(capabilities = CameraCapabilities(evMin = -1.0, evMax = 1.0))
         val ev = CameraCatalog.settingsFor(camera).first { it.id == "slow_motion.exposure" }
         assertTrue(ev.options.size > 1)
-        assertTrue(ev.options.all { it.replace("+", "").toDouble() in -1.0..1.0 })
+        assertTrue(ev.options.all { it == "Auto" || it.replace("+", "").toDouble() in -1.0..1.0 })
     }
 
     @Test

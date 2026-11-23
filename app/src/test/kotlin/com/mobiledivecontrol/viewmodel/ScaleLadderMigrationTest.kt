@@ -23,8 +23,9 @@ class ScaleLadderMigrationTest {
         snapScaleValuesToLadders(mapOf(key to value))[key]
 
     @Test
-    fun `a legacy ISO 6400 lands on the nearest real rung, never on Auto`() {
-        assertEquals("3200", migrate("pro.iso", "6400"))
+    fun `ISO is preserved until actual lens limits are available`() {
+        assertEquals("6400", migrate("pro.iso", "6400"))
+        assertEquals("101", migrate("pro.iso", "101"))
     }
 
     @Test
@@ -79,11 +80,11 @@ class ScaleLadderMigrationTest {
         assertEquals("+2.0", migrate("pro.exposure_value", "+2.00"))
         // The old ladder's "Auto" names nothing on the native EV dial — it is dropped, so the
         // catalog default "0.0" applies, which is exactly the native reset behaviour.
-        assertEquals(null, migrate("photo.exposure_compensation", "Auto"))
-        assertEquals(null, migrate("pro.exposure_value", "Auto"))
+        assertEquals("Auto", migrate("photo.exposure_compensation", "Auto"))
+        assertEquals("Auto", migrate("pro.exposure_value", "Auto"))
         assertEquals("0.0", migrate("night.exposure", "0"))
         // The quick-bar keys snap onto THEIR ladder: a stored +3.0 cannot survive on a +/-2.0 bar.
-        assertEquals("+2.0", migrate("photo.exposure_compensation", "+3.0"))
+        assertEquals("+3.0", migrate("photo.exposure_compensation", "+3.0"))
         // The Pro dial reaches +/-4.0, so the same value survives there.
         assertEquals("+3.0", migrate("pro.exposure_value", "+3.0"))
     }
@@ -142,7 +143,7 @@ class ScaleLadderMigrationTest {
     fun `unrelated settings are untouched`() {
         val out = snapScaleValuesToLadders(mapOf("pro.lens" to "5x", "pro.iso" to "6400"))
         assertEquals("5x", out["pro.lens"])
-        assertEquals("3200", out["pro.iso"])
+        assertEquals("6400", out["pro.iso"])
     }
 
     @Test
@@ -168,7 +169,7 @@ class ScaleLadderMigrationTest {
         assertEquals(legacy.size, migrated.size, "no key may be dropped")
         migrated.forEach { (key, value) ->
             val ladder = when {
-                key.endsWith(".iso") -> CameraCatalog.isoLadder
+                key.endsWith(".iso") -> listOf(value).also { assertTrue(value.toInt() > 0) }
                 key.endsWith(".shutter_speed") -> CameraCatalog.shutterLadder
                 key.endsWith(".white_balance") -> CameraCatalog.whiteBalanceLadder
                 key == "photo.exposure_compensation" || key == "night.exposure" ->
@@ -202,7 +203,7 @@ class ScaleLadderMigrationTest {
         val wbProbeExpected =
             CameraCatalog.nearestWhiteBalanceOption(2_830, CameraCatalog.whiteBalanceLadder)!!
         val probes = listOf(
-            Triple(CameraCatalog.isoLadder, "6400", "3200"),
+            Triple(CameraCatalog.isoLadder, "6400", "6400"),
             Triple(CameraCatalog.shutterLadder, "1/2", "0.5\""),
             Triple(CameraCatalog.whiteBalanceLadder, "2830K", wbProbeExpected),
             Triple(CameraCatalog.exposureProLadder, "+1.23", "+1.2"),

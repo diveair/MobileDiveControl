@@ -34,8 +34,9 @@ import java.util.concurrent.TimeUnit
  * When [peakingEnabled] is `false` the shader is a trivial texture pass-through
  * (single texture fetch per pixel — negligible GPU cost).
  */
-class FocusPeakingSurfaceProcessor(
+class FocusPeakingSurfaceProcessor internal constructor(
     private val cbExecutor: Executor,
+    private val frameShader: SurfaceFrameShader? = null,
 ) : SurfaceProcessor {
 
     companion object {
@@ -58,7 +59,7 @@ void main() {
 """
 
         // ── Fragment shader (Sobel edge peaking) ──────────────────────
-        private const val FS = """
+        internal const val FS = """
 #extension GL_OES_EGL_image_external : require
 precision mediump float;
 varying vec2 vTex;
@@ -195,6 +196,38 @@ void main() {
     private val bindingGenerationLock = Any()
     @Volatile private var activeBindingGeneration = 0L
     @Volatile private var released = false
+    private var directFirstFrame: (() -> Unit)? = null
+
+    /** Camera2 preview adapter. Only the display passes through peaking; encoder targets stay separate. */
+    fun attachDirectPreview(size: android.util.Size, output: Surface, rotationDegrees: Int,
+        onReady: (Surface) -> Unit, onPresented: () -> Unit, onError: (Throwable) -> Unit) {
+        val generation = synchronized(bindingGenerationLock) { ++activeBindingGeneration }
+        glH.post {
+            try {
+                check(!released && frameShader == null)
+                eglInit()
+                makeTemporarySurfaceCurrent()
+                progInit()
+                bufInit()
+                texInit(size.width, size.height)
+                directPreview = true
+                directFirstFrame = onPresented
+                android.opengl.Matrix.setIdentityM(directRotation, 0)
+                android.opengl.Matrix.translateM(directRotation, 0, 0.5f, 0.5f, 0f)
+                android.opengl.Matrix.rotateM(directRotation, 0, -rotationDegrees.toFloat(), 0f, 0f, 1f)
+                android.opengl.Matrix.translateM(directRotation, 0, -0.5f, -0.5f, 0f)
+                outW = size.width
+                outH = size.height
+                outGeneration = generation
+                outEgl = EGL14.eglCreateWindowSurface(dpy, cfg, output, intArrayOf(EGL14.EGL_NONE), 0)
+                check(outEgl != EGL14.EGL_NO_SURFACE) { "Could not attach focus preview" }
+                val st = checkNotNull(inST)
+                st.setOnFrameAvailableListener { glH.post { draw(generation, generation, st) } }
+                val surface = checkNotNull(inSurf)
+                cbExecutor.execute { if (!released) onReady(surface) }
+            } catch (error: Throwable) { cbExecutor.execute { onError(error) } }
+        }
+    }
 
     fun newBinding(cameraBindingGeneration: Long): SurfaceProcessor {
         val surfaceGeneration = synchronized(bindingGenerationLock) {
@@ -229,9 +262,13 @@ void main() {
     private var inTex = 0
 
     // ── Output ────────────────────────────────────────────────────────
+    private data class EffectOutput(val output: SurfaceOutput, val egl: EGLSurface, val generation: Long)
+    private val effectOutputs = mutableListOf<EffectOutput>()
     private var outEgl: EGLSurface = EGL14.EGL_NO_SURFACE
     private var outSO: SurfaceOutput? = null
     private var outGeneration = 0L
+    private var directPreview = false
+    private val directRotation = FloatArray(16)
     private var outW = 0
     private var outH = 0
     private var inW = 0
@@ -340,6 +377,26 @@ void main() {
                 makeTemporarySurfaceCurrent()
                 progInit()
                 bufInit()
+                if (frameShader != null) {
+                    val stale = effectOutputs.filter { it.generation != generation || it.output.targets == output.targets }
+                    stale.forEach { EGL14.eglDestroySurface(dpy, it.egl); it.output.close() }
+                    effectOutputs.removeAll(stale.toSet())
+                    val surface = output.getSurface(cbExecutor) {
+                        glH.post {
+                            val entry = effectOutputs.firstOrNull { it.output === output }
+                            if (entry != null) {
+                                makeTemporarySurfaceCurrent()
+                                EGL14.eglDestroySurface(dpy, entry.egl)
+                                effectOutputs.remove(entry)
+                            }
+                            output.close()
+                        }
+                    }
+                    val egl = EGL14.eglCreateWindowSurface(dpy, cfg, surface, intArrayOf(EGL14.EGL_NONE), 0)
+                    check(egl != EGL14.EGL_NO_SURFACE) { "Could not connect portrait output" }
+                    effectOutputs += EffectOutput(output, egl, generation)
+                    return@post
+                }
                 if (outEgl != EGL14.EGL_NO_SURFACE) {
                     EGL14.eglDestroySurface(dpy, outEgl)
                     outEgl = EGL14.EGL_NO_SURFACE
@@ -382,9 +439,13 @@ void main() {
     ) {
         if (released || surfaceGeneration != activeBindingGeneration || inST !== requestedInput) return
         val st = inST ?: return
+        if (frameShader != null) {
+            drawEffectOutputs(surfaceGeneration, cameraBindingGeneration, st)
+            return
+        }
         if (outEgl == EGL14.EGL_NO_SURFACE) return
         if (outGeneration != surfaceGeneration) return
-        outSO ?: return
+        if (outSO == null && !directPreview) return
         try {
             // SurfaceTexture.updateTexImage() requires the texture's GL context to be current.
             // After a mode/resolution rebind the old window was deliberately parked above, so
@@ -403,7 +464,8 @@ void main() {
             st.getTransformMatrix(stm)
             // Ask CameraX what the output surface actually wants: it composes the input
             // transform with whatever rotation/crop this pipeline shape introduces.
-            outSO?.updateTransformMatrix(outStm, stm)
+            if (directPreview) android.opengl.Matrix.multiplyMM(outStm, 0, stm, 0, directRotation, 0)
+            else outSO?.updateTransformMatrix(outStm, stm)
 
             GLES20.glViewport(0, 0, outW, outH)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
@@ -431,6 +493,10 @@ void main() {
 
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             if (EGL14.eglSwapBuffers(dpy, outEgl)) {
+                directFirstFrame?.let { callback ->
+                    directFirstFrame = null
+                    cbExecutor.execute { if (!released) callback() }
+                }
                 lastDrawSuccessAtMs = SystemClock.elapsedRealtime()
                 CameraPipelineTelemetry.recordDisplayedFrame(
                     cameraBindingGeneration,
@@ -454,6 +520,51 @@ void main() {
     }
 
     // ── EGL init ──────────────────────────────────────────────────────
+    private fun drawEffectOutputs(generation: Long, cameraGeneration: Long, st: SurfaceTexture) {
+        try {
+            makeTemporarySurfaceCurrent()
+            st.updateTexImage()
+            st.getTransformMatrix(stm)
+            val timestamp = st.timestamp
+            for (entry in effectOutputs) {
+                if (entry.generation != generation) continue
+                val output = entry.output
+                if (!EGL14.eglMakeCurrent(dpy, entry.egl, entry.egl, ctx)) continue
+                output.updateTransformMatrix(outStm, stm)
+                val preview = output.targets and androidx.camera.core.CameraEffect.PREVIEW != 0
+                GLES20.glViewport(0, 0, output.size.width, output.size.height)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                GLES20.glUseProgram(prog)
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inTex)
+                GLES20.glUniform1i(lSamp, 0)
+                GLES20.glUniformMatrix4fv(lSTM, 1, false, outStm, 0)
+                GLES20.glUniform2f(lStep, 1f / maxOf(inW, 1), 1f / maxOf(inH, 1))
+                GLES20.glUniform1f(lOn, if (preview && peakingEnabled) 1f else 0f)
+                GLES20.glUniform1f(lThr, peakingThreshold)
+                GLES20.glUniform1f(lExposure, if (preview) exposureAssistMode.toFloat() else 0f)
+                vb!!.position(0)
+                GLES20.glVertexAttribPointer(lPos, 2, GLES20.GL_FLOAT, false, 0, vb)
+                GLES20.glEnableVertexAttribArray(lPos)
+                tb!!.position(0)
+                GLES20.glVertexAttribPointer(lTex, 2, GLES20.GL_FLOAT, false, 0, tb)
+                GLES20.glEnableVertexAttribArray(lTex)
+                frameShader?.bind(inW, inH, timestamp)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+                android.opengl.EGLExt.eglPresentationTimeANDROID(dpy, entry.egl, timestamp)
+                if (EGL14.eglSwapBuffers(dpy, entry.egl) && preview) {
+                    lastDrawSuccessAtMs = SystemClock.elapsedRealtime()
+                    CameraPipelineTelemetry.recordDisplayedFrame(cameraGeneration, lastDrawSuccessAtMs, timestamp)
+                }
+            }
+        } catch (error: Exception) { Log.e(TAG, "Portrait output failed", error) }
+    }
+
+    private fun releaseEffectOutputs() {
+        effectOutputs.forEach { EGL14.eglDestroySurface(dpy, it.egl); it.output.close() }
+        effectOutputs.clear()
+    }
+
     private fun eglInit() {
         if (dpy != EGL14.EGL_NO_DISPLAY) return
         dpy = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
@@ -467,7 +578,7 @@ void main() {
             EGL14.EGL_NONE)
         val cfgs = arrayOfNulls<EGLConfig>(1)
         val n = IntArray(1)
-        EGL14.eglChooseConfig(dpy, ca, 0, cfgs, 0, 1, n, 0)
+        EGL14.eglChooseConfig(dpy, if (frameShader != null) ca.dropLast(1).toIntArray() + intArrayOf(0x3142, 1, EGL14.EGL_NONE) else ca, 0, cfgs, 0, 1, n, 0)
         cfg = cfgs[0]!!
         ctx = EGL14.eglCreateContext(dpy, cfg, EGL14.EGL_NO_CONTEXT,
             intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
@@ -492,7 +603,7 @@ void main() {
     private fun progInit() {
         if (prog != 0) return
         val vs = compile(GLES20.GL_VERTEX_SHADER, VS)
-        val fs = compile(GLES20.GL_FRAGMENT_SHADER, FS)
+        val fs = compile(GLES20.GL_FRAGMENT_SHADER, frameShader?.source ?: FS)
         prog = GLES20.glCreateProgram()
         GLES20.glAttachShader(prog, vs)
         GLES20.glAttachShader(prog, fs)
@@ -504,6 +615,7 @@ void main() {
             GLES20.glDeleteProgram(prog); prog = 0
             throw RuntimeException("Link: $log")
         }
+        frameShader?.onProgram(prog)
         lPos  = GLES20.glGetAttribLocation(prog, "aPos")
         lTex  = GLES20.glGetAttribLocation(prog, "aTex")
         lSTM  = GLES20.glGetUniformLocation(prog, "uSTM")
@@ -566,6 +678,7 @@ void main() {
                     ) {
                         runCatching { makeTemporarySurfaceCurrent() }
                     }
+                    releaseEffectOutputs()
                     if (outEgl != EGL14.EGL_NO_SURFACE) {
                         EGL14.eglDestroySurface(dpy, outEgl)
                         outEgl = EGL14.EGL_NO_SURFACE
@@ -594,6 +707,8 @@ void main() {
             ) {
                 runCatching { makeTemporarySurfaceCurrent() }
             }
+            releaseEffectOutputs()
+            frameShader?.release()
             releaseIn()
             if (prog != 0) { GLES20.glDeleteProgram(prog); prog = 0 }
             if (outEgl != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(dpy, outEgl)

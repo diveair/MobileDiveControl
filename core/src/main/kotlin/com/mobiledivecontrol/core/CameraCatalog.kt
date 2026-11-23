@@ -46,6 +46,19 @@ data class CameraModeProfile(
 )
 
 object CameraCatalog {
+    val isoSensitivityLevels = listOf(1, 2, 3, 5, 10, 100)
+    fun isoIncrement(sensitivity: SliderSensitivity): Int? = sensitivity.level.takeIf { it in isoSensitivityLevels && it != 100 }
+    fun isoSensitivityLabel(sensitivity: SliderSensitivity): String = isoIncrement(sensitivity)?.let { "Step $it" } ?: "Regular scale"
+    private val isoStepCache = linkedMapOf<List<Int>, List<Int>>()
+    private fun isoSteps(minimum: Int, maximum: Int, increment: Int, offset: Int): List<Int> = synchronized(isoStepCache) {
+        val key = listOf(minimum, maximum, increment, offset)
+        isoStepCache[key] ?: ((minimum + offset..maximum step increment).toList() + listOf(minimum, maximum))
+            .distinct().sorted().also {
+                if (isoStepCache.size >= 64) isoStepCache.clear()
+                isoStepCache[key] = it
+            }
+    }
+    const val EV_AUTO = "Auto"
     // Stable reserved index: inserting the temporary action must not renumber capture modes.
     const val SAFETY_STOP_RAIL_INDEX = -1
     private val safetyStopEntry = CameraRailEntry("safety_stop", "Safety Stop", action = CameraRailAction.SafetyStop)
@@ -337,10 +350,64 @@ object CameraCatalog {
             videoShutterCapNs(camera),
             camera.settingValues["$prefix.resolution"] ?: defaultSettingValues["$prefix.resolution"],
         )
-        if (camera.activeMode != CameraModeId.SlowMotion) return settings
+        val steppedSettings = settings.map { spec ->
+            if (!spec.id.endsWith(".iso")) spec else {
+                val minimum = camera.capabilities?.isoMin ?: 25
+                val maximum = camera.capabilities?.isoMax ?: 3200
+                val current = camera.settingValues[spec.id]?.toIntOrNull()?.takeIf { it in minimum..maximum }
+                val increment = isoIncrement(camera.sliderSensitivities[spec.id] ?: SliderSensitivity.DEFAULT)
+                val numeric = if (increment == null) {
+                    (spec.options.mapNotNull(String::toIntOrNull) + listOfNotNull(minimum, maximum, current)).distinct().sorted()
+                } else {
+                    val offset = current?.let { (it - minimum) % increment } ?: 0
+                    isoSteps(minimum, maximum, increment, offset)
+                }
+                spec.copy(options = listOf("Auto") + numeric.map(Int::toString))
+            }
+        }
+        val lens = camera.settingValues["$prefix.lens"]
+        val lensCompatible = if (lens == "front" && camera.activeMode.captureType == CameraCaptureType.Video) {
+            steppedSettings.map { spec ->
+                val options = when {
+                    spec.id.endsWith(".log") -> listOf("Off")
+                    spec.id.endsWith(".resolution") -> spec.options.filter { it != "8K" }
+                    else -> spec.options
+                }.ifEmpty { listOf(spec.defaultValue) }
+                if (options == spec.options) spec else spec.copy(options = options,
+                    defaultValue = spec.defaultValue.takeIf { it in options } ?: options.first())
+            }
+        } else steppedSettings
+        fun value(suffix: String): String? = lensCompatible.firstOrNull { it.id.endsWith(suffix) }?.let { spec ->
+            camera.settingValues[spec.id]?.takeIf { it in spec.options } ?: spec.defaultValue
+        }
+        val fpsValue = captureFrameRateFps(value(".frame_rate"))
+        val pipeline = selectPipeline(camera.activeMode, value(".resolution"), fpsValue, value(".log") == "On")
+        val pipelineCaps = pipelineCaps(pipeline, fpsValue)
+        val compatible = lensCompatible.map { spec ->
+            val forced = when {
+                !pipelineCaps.manualExposure && (spec.id.endsWith(".iso") || spec.id.endsWith(".shutter_speed")) -> "Auto"
+                !pipelineCaps.manualWhiteBalance && spec.id.endsWith(".white_balance") -> WB_AUTO_CONTINUOUS
+                !pipelineCaps.manualWhiteBalance && spec.id.endsWith(".filters") -> "Off"
+                !pipelineCaps.manualWhiteBalance && spec.id.endsWith(".manual_focus") -> "AF"
+                !pipelineCaps.manualWhiteBalance && spec.id.endsWith(".focus_peaking") -> "Off"
+                lens == "0.6x" && spec.id.endsWith(".video_stabilization") -> "Off"
+                !pipelineCaps.cropAspect && spec.id.endsWith(".aspect_ratio") -> "16:9"
+                !pipelineCaps.hdr && spec.id.endsWith(".hdr") -> "Off"
+                pipeline == CameraPipeline.EightK && spec.id.endsWith(".video_format") -> "HEVC"
+                spec.id == "video.super_steady" && spec.status == CameraFeatureStatus.Unavailable -> "Off"
+                else -> null
+            }
+            if (forced != null && forced in spec.options) spec.copy(options = listOf(forced), defaultValue = forced,
+                status = CameraFeatureStatus.Unavailable, note = "This recording pipeline requires $forced.") else spec
+        }
+        if (camera.activeMode == CameraModeId.PortraitVideo) return compatible.map { spec ->
+            if (spec.id == "portrait_video.hdr") spec.copy(options = listOf("Off"), defaultValue = "Off",
+                status = CameraFeatureStatus.Unavailable, note = "Portrait effects require an SDR stream.") else spec
+        }
+        if (camera.activeMode != CameraModeId.SlowMotion) return compatible
         val fps = captureFrameRateFps(camera.settingValues["slow_motion.frame_rate"]
             ?: defaultSettingValues["slow_motion.frame_rate"]) ?: 240
-        return settings.map { spec ->
+        return compatible.map { spec ->
             if (spec.id == "slow_motion.focus_mode" && camera.capabilities?.manualFocusSupported == false) {
                 spec.copy(options = listOf("Fixed focus"), defaultValue = "Fixed focus",
                     note = "This lens has fixed focus.")
@@ -367,18 +434,29 @@ object CameraCatalog {
             return spec.copy(options = kept, defaultValue = default)
         }
         return when {
-            spec.id == "slow_motion.flash" && caps?.torchSupported == false -> clip { it == "Off" }
+            spec.id == "video.super_steady" -> if (caps?.superSteadySupported == true) spec.copy(
+                status = CameraFeatureStatus.Confirmed, note = "Samsung stabilization; requires rear FHD at 30 fps.",
+            ) else spec
+            spec.id.endsWith(".flash") && caps?.torchSupported == false -> clip { it == "Off" }
             // Keep these focus tiles reachable on fixed-focus lenses. Hyperlapse stays Fixed;
             // a Pro focus-value adjustment explicitly switches from 0.6x to the main lens.
             spec.id in setOf(
                 "pro.manual_focus",
+                "expert.manual_focus",
                 "pro_video.manual_focus",
                 "hyperlapse.manual_focus",
                 "hyperlapse.focus_peaking",
                 "hyperlapse.focus_curve",
+                "slow_motion.manual_focus",
+                "slow_motion.focus_peaking",
+                "slow_motion.focus_curve",
             ) -> spec
             spec.id.endsWith(".manual_focus") ->
                 if (caps?.manualFocusSupported == false) null else spec
+            spec.id.endsWith(".megapixels") && !caps?.availablePhotoResolutions.isNullOrEmpty() ->
+                spec.copy(options = caps!!.availablePhotoResolutions,
+                    defaultValue = spec.defaultValue.takeIf { it in caps.availablePhotoResolutions }
+                        ?: caps.availablePhotoResolutions.last())
             spec.id.endsWith(".iso") && caps?.isoMin != null && caps.isoMax != null ->
                 clip { option ->
                     val value = option.filter { it.isDigit() }.toIntOrNull()
@@ -404,22 +482,16 @@ object CameraCatalog {
                     ev == null || ev in caps.evMin..caps.evMax
                 }
             spec.id.endsWith(".frame_rate") && !caps?.availableVideoFrameRates.isNullOrEmpty() -> {
-                // Pro Video keeps every real rate reported anywhere on the selected camera
-                // visible. Choosing a rate that the current resolution cannot carry moves Pro
-                // Video to the best compatible resolution in ControlReducer. Hiding those rates
-                // behind the resolution selector made UHD's 24/30 row look like the whole camera.
-                val rates = if (spec.id == "pro_video.frame_rate") {
-                    caps!!.availableVideoFrameRates
-                } else {
-                    caps?.videoFrameRatesByResolution
+                // The FPS menu belongs to the selected size on the selected lens.
+                val rates = caps?.videoFrameRatesByResolution
                         ?.get(selectedResolution)
                         ?.takeIf { it.isNotEmpty() }
                         ?: caps!!.availableVideoFrameRates
-                }
                 clip { option ->
                     val fps = captureFrameRateFps(option)
                     fps in rates ||
-                        (spec.id == "slow_motion.frame_rate" && fps == 48 && 60 in rates)
+                        (spec.id == "slow_motion.frame_rate" && fps == 48 && 60 in rates) ||
+                        (spec.id == "slow_motion.frame_rate" && fps == 100 && 120 in rates)
                 }
             }
             spec.id == "hyperlapse.resolution" ->
@@ -430,12 +502,8 @@ object CameraCatalog {
                 spec
             spec.id == "slow_motion.resolution" &&
                 !caps?.availableVideoResolutions.isNullOrEmpty() -> {
-                // A resolution is not a Slow Motion resolution merely because ordinary Video can
-                // encode it. Samsung's public constrained/high-rate map must also expose at least
-                // one cadence from this mode. Leaving UHD visible when it carried only 24/30 fps
-                // let the reducer create the impossible UHD/30 "Slow Motion" graph and the S24 HAL
-                // rejected the stream combination with CAMERA_ERROR / Broken pipe.
-                val slowMotionRates = setOf(48, 60, 120, 240)
+                // Include only sizes with an executable cadence in this recorder.
+                val slowMotionRates = setOf(24, 30, 48, 60, 100, 120, 240)
                 clip { option ->
                     if (option !in caps!!.availableVideoResolutions) return@clip false
                     val rates = caps.videoFrameRatesByResolution[option].orEmpty()
@@ -448,14 +516,15 @@ object CameraCatalog {
                 // selects this resolution; hiding valid resolutions made the menu look incomplete.
                 clip { option -> option in caps!!.availableVideoResolutions }
             spec.id.endsWith(".video_stabilization") && caps?.videoStabilizationSupported == false -> null
-            spec.id in setOf("expert.save_format", "pro.save_format") &&
-                caps?.rawCaptureSupported == false ->
-                clip { option -> "RAW" !in option }
-            spec.id in setOf("expert.save_format", "pro.save_format") &&
-                caps?.rawJpegCaptureSupported == false ->
-                clip { option -> option != "RAW + JPEG" }
-            spec.id.endsWith(".save_format") && caps?.ultraHdrJpegSupported == false ->
-                clip { option -> option != "Ultra HDR JPEG" }
+            spec.id.endsWith(".save_format") -> clip { option ->
+                when (option) {
+                    "RAW" -> caps?.rawCaptureSupported != false
+                    "RAW + JPEG" -> caps?.rawCaptureSupported != false && caps?.rawJpegCaptureSupported != false
+                    "Ultra HDR JPEG" -> caps?.ultraHdrJpegSupported != false
+                    "PNG", "HEIF" -> caps?.encodedPhotoFormats?.contains(option) != false
+                    else -> true
+                }
+            }
             // No .white_balance branch by design: kelvin WB is applied app-side through
             // COLOR_CORRECTION_GAINS, not through a CameraCharacteristics range, the ladder's
             // 2300..10000 bounds already match colorGainsForKelvin's own clamp, and the native
@@ -518,7 +587,11 @@ object CameraCatalog {
             }
             add(SLIDER_TARGET_ZOOM)
         }
-        val ordered = if ("Focus" in options) listOf("Focus") + (options - "Focus") else options
+        val ordered = when {
+            mode == CameraModeId.Panorama -> listOf(SLIDER_TARGET_ZOOM) + (options - SLIDER_TARGET_ZOOM)
+            "Focus" in options -> listOf("Focus") + (options - "Focus")
+            else -> options
+        }
         return CameraSettingSpec(
             id = modeKey(mode) + SLIDER_ASSIGNMENT_SUFFIX,
             label = "Slider",
@@ -762,6 +835,7 @@ object CameraCatalog {
                 ev?.let { add(BottomBarItem.Setting(it)) }
                 // Panorama has no manual focus/ISO/shutter target, so this assignment is Zoom.
                 add(BottomBarItem.Setting(slider))
+                wb?.let { add(BottomBarItem.Setting(it)) }
                 panoramaGuides?.let { add(BottomBarItem.Setting(it)) }
                 add(BottomBarItem.GalleryShortcut)
             }
@@ -796,7 +870,8 @@ object CameraCatalog {
                 resolution?.let { add(BottomBarItem.Setting(it)) }
                 add(BottomBarItem.ModesButton)
                 ev?.let { add(BottomBarItem.Setting(it)) }
-                focusMode?.let { add(BottomBarItem.Setting(it)) }
+                focus?.let { add(BottomBarItem.Setting(it)) }
+                wb?.let { add(BottomBarItem.Setting(it)) }
                 frameRate?.let { add(BottomBarItem.Setting(it)) }
                 add(BottomBarItem.GalleryShortcut)
             }
@@ -1028,6 +1103,12 @@ object CameraCatalog {
             camera.settingValues["hyperlapse.lens"] == "0.6x"
         ) {
             "Fixed"
+        } else if (spec.id.endsWith(".manual_focus") &&
+            value.toDoubleOrNull()?.let { it.isFinite() && it in 0.0..1.0 } == true
+        ) {
+            // Focus pulls use continuous intermediate values, not only the UI's detents.
+            // Rejecting these values silently changes a manual request back to AF.
+            value
         } else if (spec.id == "hyperlapse.manual_focus" && value !in spec.options) {
             // Migrate the former read-only "Fixed" value to the Pro-style AF default.
             spec.defaultValue
@@ -1041,7 +1122,7 @@ object CameraCatalog {
                 ?.takeIf { it in spec.options }
                 ?: spec.defaultValue
         } else {
-            value
+            value.takeIf { it in spec.options } ?: spec.defaultValue
         }
     }
 
@@ -1067,15 +1148,13 @@ object CameraCatalog {
 
     fun isWhiteBalanceAutoShutter(value: String?): Boolean = value == WB_AUTO_SHUTTER
 
-    /** The four field controls whose physical wheel topology is a ring, not a rail. */
+    /** Every exposure control follows its ordered ring, including EV's Auto position. */
     fun isCircularSlider(spec: CameraSettingSpec): Boolean {
         if (spec.kind != CameraSettingKind.Slider) return false
         return spec.id.endsWith(".iso") ||
             spec.id.endsWith(".shutter_speed") ||
-            spec.id.endsWith(".white_balance") ||
-            spec.id.endsWith(".exposure_value") ||
-            spec.id.endsWith(".exposure_compensation") ||
-            spec.id.endsWith(".exposure")
+            spec.id.endsWith(".white_balance") || spec.id.endsWith(".exposure") ||
+            spec.id.endsWith(".exposure_value") || spec.id.endsWith(".exposure_compensation")
     }
 
     /**
@@ -1092,7 +1171,8 @@ object CameraCatalog {
      * writes EV only while neither axis is manual (`!aeOff`), and the two rules must agree.
      */
     fun evMeterLocked(camera: CameraState, spec: CameraSettingSpec): Boolean {
-        if (!spec.id.endsWith(".exposure_value") && !spec.id.endsWith(".exposure_compensation")) return false
+        if (!spec.id.endsWith(".exposure_value") && !spec.id.endsWith(".exposure_compensation") &&
+            !spec.id.endsWith(".exposure")) return false
         val prefix = spec.id.substringBeforeLast('.')
         val iso = camera.settingValues["$prefix.iso"]
         val shutter = camera.settingValues["$prefix.shutter_speed"]
@@ -1115,8 +1195,7 @@ object CameraCatalog {
         var values = camera.settingValues
         // Slow Motion probes the active capture camera (including front-camera rate limits).
         // Those limits must never rewrite saved choices belonging to another mode.
-        val modes = if (camera.activeMode == CameraModeId.SlowMotion) listOf(CameraModeId.SlowMotion)
-            else CameraModeId.entries
+        val modes = listOf(camera.activeMode)
         modes.forEach { mode ->
             val clippedSettings = settingsFor(camera.copy(activeMode = mode))
             clippedSettings
@@ -1158,7 +1237,15 @@ object CameraCatalog {
                         values = values + (spec.id to stored)
                     }
                     if (stored !in spec.options) {
-                        values = values + (spec.id to spec.defaultValue)
+                        val targetFps = captureFrameRateFps(stored)
+                        val replacement = if (spec.id.endsWith(".frame_rate") && targetFps != null) {
+                            val targetPlayback = playbackFrameRateFps(stored) ?: targetFps.toDouble()
+                            spec.options.minByOrNull { option ->
+                                kotlin.math.abs((captureFrameRateFps(option) ?: targetFps) - targetFps) * 1000.0 +
+                                    kotlin.math.abs((playbackFrameRateFps(option) ?: targetPlayback) - targetPlayback)
+                            }
+                        } else null
+                        values = values + (spec.id to (replacement ?: spec.defaultValue))
                     }
                 }
         }
@@ -1198,6 +1285,7 @@ object CameraCatalog {
         "pro_video.manual_focus" -> "pro_video.focus_peaking"
         "portrait_video.manual_focus" -> "portrait_video.focus_peaking"
         "hyperlapse.manual_focus" -> "hyperlapse.focus_peaking"
+        "slow_motion.manual_focus" -> "slow_motion.focus_peaking"
         else -> null
     }
 
@@ -1208,6 +1296,7 @@ object CameraCatalog {
         "pro_video.manual_focus" -> "pro_video.focus_curve"
         "portrait_video.manual_focus" -> "portrait_video.focus_curve"
         "hyperlapse.manual_focus" -> "hyperlapse.focus_curve"
+        "slow_motion.manual_focus" -> "slow_motion.focus_curve"
         else -> null
     }
 
@@ -1307,10 +1396,8 @@ object CameraCatalog {
                     "photo.save_format",
                     "Photo format",
                     "File",
-                    listOf("JPEG", "HEIF"),
+                    listOf("JPEG", "PNG", "HEIF", "RAW", "RAW + JPEG"),
                     "JPEG",
-                    CameraFeatureStatus.Unavailable,
-                    "HEIF output needs the Samsung vendor capture pipeline.",
                 ),
                 choice("photo.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3"),
                 choice("photo.timer", "Timer", "Core", timerOptions(), "Off"),
@@ -1366,8 +1453,8 @@ object CameraCatalog {
                 "Portrait",
                 (0..7).map(Int::toString),
                 "4",
-                CameraFeatureStatus.Unavailable,
-                "The native eight-step control is catalogued; rendering is vendor-only.",
+                CameraFeatureStatus.Confirmed,
+                "Strength of the recorded portrait effect.",
                 supportsSensitivity = false,
             ),
             choice(
@@ -1449,7 +1536,7 @@ object CameraCatalog {
             settings = listOf(
                 choice("expert.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
                 choice("expert.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
-                choice("expert.save_format", "RAW / JPEG", "Core", listOf("RAW", "JPEG", "RAW + JPEG"), "RAW + JPEG"),
+                choice("expert.save_format", "RAW / JPEG", "Core", listOf("RAW", "JPEG", "RAW + JPEG", "PNG", "HEIF"), "RAW + JPEG"),
                 choice("expert.lens", "Lens", "Core", lenses, "Auto"),
                 slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
                 slider("expert.iso", "ISO", "Manual", isoOptions, "Auto"),
@@ -1578,7 +1665,7 @@ object CameraCatalog {
             captureType = CameraCaptureType.Photo,
             availableLenses = lenses,
             availableResolutions = megapixels,
-            availableFormatOptions = listOf("JPEG", "RAW + JPEG"),
+            availableFormatOptions = listOf("JPEG", "PNG", "HEIF", "RAW", "RAW + JPEG"),
             availableExposureControls = listOf("White balance", "ISO", "Focus", "Shutter", "Exposure value"),
             availableAssistTools = listOf("Zebra", "False colour", "Guides", "HDR"),
             settings = listOf(
@@ -1594,7 +1681,7 @@ object CameraCatalog {
                     "pro.save_format",
                     "Photo format",
                     "File",
-                    listOf("JPEG", "RAW + JPEG"),
+                    listOf("JPEG", "PNG", "HEIF", "RAW", "RAW + JPEG"),
                     "JPEG",
                     CameraFeatureStatus.Confirmed,
                     "RAW + JPEG writes a sensor DNG and full-quality JPEG from one exposure when the active lens reports CameraX RAW_JPEG support.",
@@ -1643,6 +1730,7 @@ object CameraCatalog {
         settings = listOf(
             choice("panorama.lens", "Lens", "Core", lenses, "1x"),
             slider("panorama.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+            slider("panorama.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
             choice(
                 "panorama.hdr_log",
                 "HDR / LOG",
@@ -1777,7 +1865,7 @@ object CameraCatalog {
                     listOf("Day", "Night"),
                     "Day",
                     CameraFeatureStatus.Confirmed,
-                    "Night uses the camera's public NIGHT scene when available and a low-light AE/noise-reduction fallback otherwise.",
+                    "Night accumulates camera frames on the GPU for reduced noise and light trails.",
                 ),
                 slider("hyperlapse.manual_focus", "Focus", "Manual", focusOptions, "AF"),
                 toggle("hyperlapse.focus_peaking", "Focus Assist", "Assist"),
@@ -1798,7 +1886,7 @@ object CameraCatalog {
             availableLenses = lenses,
             availableResolutions = resolutions,
             availableFrameRates = frameRates,
-            availableFormatOptions = listOf("H.264", "HEVC", "HDR10+", "Log"),
+            availableFormatOptions = listOf("H.264", "HEVC", "HDR", "Log"),
             availableAudioControls = listOf("Audio recording"),
             availableAssistTools = listOf("Auto FPS", "Video stabilization", "Super Steady", "Filters", "Grid"),
             settings = listOf(
@@ -1816,7 +1904,7 @@ object CameraCatalog {
                 choice("video.lens", "Lens", "Core", lenses, "1x"),
                 choice("video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
                 slider("video.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
-                toggle("video.auto_fps", "Auto FPS", "Video", "Off"),
+                choice("video.auto_fps", "Auto FPS", "Video", listOf("Off", "30fps", "30/60fps"), "Off"),
                 choice("video.video_format", "Video format", "File", listOf("H.264", "HEVC"), "H.264"),
                 choice("video.video_stabilization", "Video stabilization", "Stabilization", listOf("Off", "Standard"), "Standard"),
                 toggle(
@@ -1825,9 +1913,9 @@ object CameraCatalog {
                     "Stabilization",
                     "Off",
                     CameraFeatureStatus.Unavailable,
-                    "Standard stabilization is applied; Samsung's wide-crop Super Steady path is vendor-only.",
+                    "Available when the camera exposes Samsung's Super Steady controls.",
                 ),
-                choice("video.hdr", "HDR10+", "Dynamic range", listOf("Off", "On"), "Off"),
+                choice("video.hdr", "HDR", "Dynamic range", listOf("Off", "On"), "Off"),
                 choice("video.log", "Log", "Dynamic range", listOf("Off", "On"), "Off"),
                 toggle("video.audio_recording", "Audio recording", "Audio", "On"),
                 choice("video.filters", "Filters", "Core", underwaterFilterOptions, "Off"),
@@ -1922,8 +2010,8 @@ object CameraCatalog {
                 "Portrait",
                 listOf("Blur", "Big circle", "Colour point", "Glitch"),
                 "Blur",
-                    CameraFeatureStatus.Unavailable,
-                "Samsung computational portrait-video effects are vendor-only.",
+                    CameraFeatureStatus.Confirmed,
+                "On-device person segmentation and recorded GPU effects.",
             ),
                 slider(
                     "portrait_video.effect_strength",
@@ -1952,22 +2040,26 @@ object CameraCatalog {
         modeName = CameraModeId.SlowMotion.label,
         captureType = CameraCaptureType.Video,
         availableLenses = lenses,
-        availableResolutions = listOf("FHD", "UHD 4K"),
-        availableFrameRates = listOf("48fps", "60fps", "120fps", "240fps"),
+        availableResolutions = listOf("FHD", "UHD 4K", "8K"),
+        availableFrameRates = listOf("24fps", "30fps", "48fps", "60fps", "100fps", "120fps", "240fps"),
         availableExposureControls = listOf("Exposure value", "Focus"),
         availableAssistTools = listOf("HDR", "Grid"),
         settings = listOf(
-            choice("slow_motion.resolution", "Video size", "Core", listOf("FHD", "UHD 4K"), "FHD"),
+            choice("slow_motion.resolution", "Video size", "Core", listOf("FHD", "UHD 4K", "8K"), "FHD"),
             choice(
                 "slow_motion.frame_rate",
                 "Frame rate",
                 "Core",
-                listOf("48fps", "60fps", "120fps", "240fps"),
-                "240fps",
+                listOf("24fps", "30fps", "48fps", "60fps", "100fps", "120fps", "240fps"),
+                "60fps",
             ),
             choice("slow_motion.lens", "Lens", "Core", lenses, "1x"),
             choice("slow_motion.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
             slider("slow_motion.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
+            slider("slow_motion.manual_focus", "Focus", "Manual", focusOptions, "AF"),
+            toggle("slow_motion.focus_peaking", "Focus Assist", "Assist"),
+            choice("slow_motion.focus_curve", "Focus Curve", "Assist", focusCurveOptions(), "SquareRoot"),
+            slider("slow_motion.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
                 choice(
                     "slow_motion.focus_mode",
                 "Focus",
@@ -2139,7 +2231,7 @@ object CameraCatalog {
      * mode-dependent clamp in the native app.
      */
     internal val isoNativeValues = listOf(
-        50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1600, 3200,
+        25, 32, 40, 50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1600, 3200,
     )
 
     private val isoOptions: List<String> by lazy {
@@ -2356,8 +2448,8 @@ object CameraCatalog {
      * SENSOR_SENSITIVITY x SENSOR_EXPOSURE_TIME during the field sweep — if it saturates, the
      * clip bound is where to pull back.
      */
-    private val evProOptions: List<String> by lazy { evLadder(-40..40) }
-    private val evQuickOptions: List<String> by lazy { evLadder(-20..20) }
+    private val evProOptions: List<String> by lazy { evLadder(-40..40) + EV_AUTO }
+    private val evQuickOptions: List<String> by lazy { evProOptions }
 
     private fun evLadder(tenthsRange: IntRange): List<String> =
         tenthsRange.map { tenths -> evLabel(tenths) }

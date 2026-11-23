@@ -904,6 +904,9 @@ data class CameraCapabilities(
     val availableVideoFrameRates: List<Int> = emptyList(),
     /** Empty until probed; exact capture-pipeline quality labels for the active lens. */
     val availableVideoResolutions: List<String> = emptyList(),
+    /** Native JPEG sizes of the selected lens, expressed in megapixels. */
+    val availablePhotoResolutions: List<String> = emptyList(),
+    val encodedPhotoFormats: List<String>? = null,
     /**
      * Recorder-compatible FPS values per quality label. This is deliberately a pair map rather
      * than two independent lists: a lens may offer 240 fps at HD but only 60 fps at UHD.
@@ -917,6 +920,7 @@ data class CameraCapabilities(
     val rawJpegCaptureSupported: Boolean? = null,
     /** Whether the selected camera has a physical continuous light. Used by Slow Motion. */
     val torchSupported: Boolean? = null,
+    val superSteadySupported: Boolean? = null,
 )
 
 sealed interface BottomBarItem {

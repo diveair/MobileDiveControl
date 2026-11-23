@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <!-- HEIF is exposed only on API 29+; older devices retain the existing JPEG/DNG path. -->
+    <uses-sdk tools:overrideLibrary="androidx.heifwriter" />
 
     <!--
         BLE communication with dive housing.

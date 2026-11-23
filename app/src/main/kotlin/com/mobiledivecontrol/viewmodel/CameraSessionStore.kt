@@ -26,7 +26,7 @@ internal fun snapFocusValuesToLadder(values: Map<String, String>): Map<String, S
     val result = values.toMutableMap()
     listOf(
         "photo.manual_focus", "expert.manual_focus", "pro.manual_focus", "pro_video.manual_focus",
-        "portrait_video.manual_focus", "hyperlapse.manual_focus",
+        "portrait_video.manual_focus", "hyperlapse.manual_focus", "slow_motion.manual_focus",
     )
         .forEach { key ->
             val value = result[key] ?: return@forEach
@@ -49,7 +49,7 @@ private val ISO_KEYS = listOf("expert.iso", "pro.iso", "pro_video.iso")
 private val SHUTTER_KEYS =
     listOf("expert.shutter_speed", "pro.shutter_speed", "pro_video.shutter_speed")
 private val WHITE_BALANCE_KEYS =
-    listOf("expert.white_balance", "pro.white_balance", "pro_video.white_balance")
+    listOf("expert.white_balance", "pro.white_balance", "pro_video.white_balance", "panorama.white_balance", "slow_motion.white_balance")
 
 // Two exposure scales, matching the native split: the Pro dialer runs +/-4.0, the quick EV bar
 // +/-2.0. Snapping each key against its OWN ladder is what stops a stored "+3.0" from surviving
@@ -91,7 +91,11 @@ internal fun snapScaleValuesToLadders(values: Map<String, String>): Map<String, 
     WHITE_BALANCE_KEYS.forEach { key ->
         if (result[key] == "Auto") result[key] = CameraCatalog.WB_AUTO_CONTINUOUS
     }
-    snapToLadder(result, ISO_KEYS, CameraCatalog.isoLadder, ::isoMagnitude)
+    // Fine ISO selections are literal sensor values. Hardware clipping happens after discovery.
+    ISO_KEYS.forEach { key ->
+        val value = result[key]
+        if (value != null && value != "Auto" && value.toIntOrNull()?.let { it > 0 } != true) result.remove(key)
+    }
     // Snap targets exclude the 1/24000 and 1/16000 rungs the native fast floor removes from
     // every render of this dial: a value snapped onto them would sit off the clipped ladder at
     // runtime, and the reducer resolves an unfound value to index 0 — which is Auto.

@@ -70,6 +70,7 @@ dependencies {
     implementation(libs.lifecycle.runtime.compose)
 
     // CameraX
+    implementation("androidx.heifwriter:heifwriter:1.1.0")
     implementation(libs.camerax.core)
     implementation(libs.camerax.camera2)
     implementation(libs.camerax.lifecycle)

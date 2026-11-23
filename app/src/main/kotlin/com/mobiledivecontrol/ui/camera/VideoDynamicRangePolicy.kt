@@ -11,8 +11,11 @@ internal object VideoDynamicRangePolicy {
     /** Native Samsung Log measured 98.9 Mbit/s at UHD30; request the nearest round target. */
     const val LOG_TARGET_VIDEO_BITRATE_BPS = 100_000_000
 
-    @Suppress("UNUSED_PARAMETER")
-    fun select(requestedMode: String, supported: Set<DynamicRange>): DynamicRange = DynamicRange.SDR
+    fun select(requestedMode: String, supported: Set<DynamicRange>): DynamicRange =
+        if (requestedMode == "HDR") {
+            listOf(DynamicRange.HDR10_PLUS_10_BIT, DynamicRange.HDR10_10_BIT, DynamicRange.HLG_10_BIT)
+                .firstOrNull { it in supported } ?: DynamicRange.SDR
+        } else DynamicRange.SDR
 
     fun targetVideoBitrate(requestedMode: String): Int? =
         LOG_TARGET_VIDEO_BITRATE_BPS.takeIf { requestedMode == "LOG" }
@@ -20,7 +23,7 @@ internal object VideoDynamicRangePolicy {
     /** Log is an acquisition contract, not permission to silently record an 8-bit substitute. */
     @Suppress("UNUSED_PARAMETER")
     fun isCaptureContractSatisfied(requestedMode: String, selected: DynamicRange): Boolean =
-        requestedMode != "LOG"
+        requestedMode != "LOG" && (requestedMode != "HDR" || selected != DynamicRange.SDR)
 
     /**
      * Log drops still capture and 8-bit RGBA analysis surfaces from the bound session. Live

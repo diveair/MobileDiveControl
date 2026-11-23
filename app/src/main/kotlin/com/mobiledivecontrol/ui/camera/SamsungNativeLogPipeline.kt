@@ -20,7 +20,14 @@ import java.io.File
 internal object SamsungNativeLogPipeline {
     const val BITRATE = 100_000_000
     const val READY_TIMEOUT_MS = 8_000L
-    private const val FIRMWARE = "S921WVLS6DZH3"
+    private val nativeHooksAvailable by lazy {
+        runCatching {
+            check(File("/system/framework/scamera_sdk_util.jar").isFile)
+            MediaRecorder::class.java.getMethod("semSetAuthor", Int::class.javaPrimitiveType)
+            MediaRecorder::class.java.getMethod("semSetRecordingMode", Int::class.javaPrimitiveType)
+            true
+        }.getOrDefault(false)
+    }
     private val requestMode by lazy { CaptureRequest.Key("samsung.android.control.recordingDrMode", Int::class.javaObjectType) }
     private val shootingMode by lazy { CaptureRequest.Key("samsung.android.control.shootingMode", Int::class.javaObjectType) }
     private val stabilization by lazy { CaptureRequest.Key("samsung.android.control.swVideoStabilization", Byte::class.javaObjectType) }
@@ -33,11 +40,10 @@ internal object SamsungNativeLogPipeline {
     private val resultMode by lazy { CaptureResult.Key("samsung.android.control.recordingDrMode", Int::class.javaObjectType) }
 
     fun isSupportedDevice(): Boolean = Build.MANUFACTURER.equals("samsung", true) &&
-        Build.MODEL == "SM-S921W" && Build.VERSION.SDK_INT == 36 &&
-        (Build.FINGERPRINT.contains(FIRMWARE) || Build.DISPLAY.contains(FIRMWARE))
+        Build.VERSION.SDK_INT >= 33 && nativeHooksAvailable
 
     fun requireSupported(cameraId: String, size: Size, fps: Int) {
-        check(isSupportedDevice()) { "Native Samsung LOG requires the qualified SM-S921W firmware $FIRMWARE (One UI 8.5)." }
+        check(isSupportedDevice()) { "Native Samsung LOG hooks are unavailable on this phone." }
         check(cameraId == "0") { "Native Samsung LOG currently supports the rear main camera only." }
         check(fps == 30 && size in listOf(Size(1920, 1080), Size(3840, 2160))) {
             "Native Samsung LOG requires 1080p or 4K at 30 fps."

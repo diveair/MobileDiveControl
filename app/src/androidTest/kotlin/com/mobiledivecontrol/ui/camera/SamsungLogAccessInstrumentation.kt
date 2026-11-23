@@ -160,7 +160,7 @@ class SamsungLogAccessInstrumentation : Instrumentation() {
                             SamsungNativeLogPipeline.configureWhiteBalance(request, 3400)
                         }
                     }
-                    current.onNativeLogCapture = { result ->
+                    current.onCaptureTelemetry = { result ->
                         report.put("observedIso", result.get(CaptureResult.SENSOR_SENSITIVITY))
                         report.put("observedExposureNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME))
                         report.put("gains", result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.toString())
@@ -201,6 +201,7 @@ class SamsungLogAccessInstrumentation : Instrumentation() {
                             })
                         }
                     },
+                    onPresented = {},
                     onError = { report.put("error", android.util.Log.getStackTraceString(it)); done.countDown() })
             }
             if (!done.await(35, TimeUnit.SECONDS)) report.put("error", "prepared recording timeout")

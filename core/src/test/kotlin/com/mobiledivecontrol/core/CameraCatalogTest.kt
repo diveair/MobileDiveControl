@@ -234,6 +234,7 @@ class CameraCatalogTest {
                 "modes",
                 "panorama.exposure",
                 "panorama.slider_assignment",
+                "panorama.white_balance",
                 "panorama.grid",
                 "gallery",
             ),
@@ -464,7 +465,7 @@ class CameraCatalogTest {
             ),
         )
         assertEquals(
-            listOf("JPEG"),
+            listOf("JPEG", "PNG", "HEIF"),
             CameraCatalog.settingsFor(unsupported).first { it.id == "pro.save_format" }.options,
         )
 
@@ -475,7 +476,7 @@ class CameraCatalogTest {
             ),
         )
         assertEquals(
-            listOf("RAW", "JPEG"),
+            listOf("RAW", "JPEG", "PNG", "HEIF"),
             CameraCatalog.settingsFor(rawOnly).first { it.id == "expert.save_format" }.options,
         )
 
@@ -486,7 +487,7 @@ class CameraCatalogTest {
             ),
         )
         assertEquals(
-            listOf("JPEG", "RAW + JPEG"),
+            listOf("JPEG", "PNG", "HEIF", "RAW", "RAW + JPEG"),
             CameraCatalog.settingsFor(simultaneous).first { it.id == "pro.save_format" }.options,
         )
     }
@@ -507,12 +508,13 @@ class CameraCatalogTest {
                 "slow_motion.lens",
                 "slow_motion.resolution",
                 "slow_motion.exposure",
-                "slow_motion.focus_mode",
+                "slow_motion.manual_focus",
+                "slow_motion.white_balance",
                 "slow_motion.frame_rate",
             ),
             horizontal,
         )
-        assertTrue(options.isEmpty())
+        assertEquals(listOf("slow_motion.focus_mode"), options)
     }
 
     @Test
@@ -562,7 +564,6 @@ class CameraCatalogTest {
             barIds(CameraModeId.Portrait),
         )
         listOf(
-            CameraModeId.SlowMotion,
             CameraModeId.PortraitVideo,
             CameraModeId.Night,
             CameraModeId.Food,
@@ -787,7 +788,7 @@ class CameraCatalogTest {
 
         val pro = CameraCatalog.launchCameraState(CameraModeId.Pro).copy(capabilities = caps)
         assertEquals(
-            listOf("JPEG", "RAW + JPEG"),
+            listOf("JPEG", "PNG", "HEIF", "RAW", "RAW + JPEG"),
             CameraCatalog.settingsFor(pro).first { it.id == "pro.save_format" }.options,
         )
 
@@ -806,9 +807,9 @@ class CameraCatalogTest {
     }
 
     @Test
-    fun `pro video shows all real frame rates independent of selected resolution`() {
+    fun `pro video only offers frame rates compatible with selected resolution`() {
         val caps = CameraCapabilities(
-            availableVideoFrameRates = listOf(24, 30, 60, 120, 240),
+            availableVideoFrameRates = listOf(30, 60, 120, 240),
             availableVideoResolutions = listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
             videoFrameRatesByResolution = mapOf(
                 "SD 480p" to listOf(30),
@@ -826,10 +827,10 @@ class CameraCatalogTest {
         val highSpeedSettings = CameraCatalog.settingsFor(highSpeed)
         val allProRates = highSpeedSettings.first { it.id == "pro_video.frame_rate" }.options
         assertEquals(
-            listOf(24, 30, 60, 120, 240),
+            listOf(30, 60, 120, 240),
             allProRates.mapNotNull(CameraCatalog::captureFrameRateFps).distinct(),
         )
-        listOf(24, 30, 60, 120, 240).forEach { captureFps ->
+        listOf(30, 60, 120, 240).forEach { captureFps ->
             assertContains(allProRates, CameraCatalog.proVideoFrameRateOption(captureFps))
         }
         listOf(60, 120, 240).forEach { captureFps ->
@@ -867,8 +868,8 @@ class CameraCatalogTest {
                 ("pro_video.frame_rate" to "30fps"),
         )
         assertEquals(
-            allProRates,
-            CameraCatalog.settingsFor(uhd).first { it.id == "pro_video.frame_rate" }.options,
+            listOf(24, 30, 60),
+            CameraCatalog.settingsFor(uhd).first { it.id == "pro_video.frame_rate" }.options.mapNotNull(CameraCatalog::captureFrameRateFps).distinct(),
         )
     }
 
@@ -927,11 +928,11 @@ class CameraCatalogTest {
     fun `slow motion offers every requested constrained output cadence`() {
         val fps = CameraCatalog.settingsFor(CameraModeId.SlowMotion, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "slow_motion.frame_rate" }
-        assertEquals(listOf("48fps", "60fps", "120fps", "240fps"), fps.options)
+        assertEquals(listOf("24fps", "30fps", "48fps", "60fps", "100fps", "120fps", "240fps"), fps.options)
     }
 
     @Test
-    fun `slow motion hides ordinary video resolutions with no high rate stream`() {
+    fun `slow motion includes ordinary cadences at their supported resolutions`() {
         val caps = CameraCapabilities(
             availableVideoFrameRates = listOf(24, 30, 60, 120, 240),
             availableVideoResolutions = listOf("FHD", "UHD 4K"),
@@ -945,7 +946,7 @@ class CameraCatalogTest {
         )
 
         assertEquals(
-            listOf("FHD"),
+            listOf("FHD", "UHD 4K"),
             CameraCatalog.settingsFor(camera)
                 .first { it.id == "slow_motion.resolution" }
                 .options,
@@ -979,34 +980,30 @@ class CameraCatalogTest {
      * affordance instead, and EV authority is governed by the ISO/shutter Auto states.
      */
     @Test
-    fun `pro exposure ladder is the native 81-entry dial`() {
+    fun `pro exposure ladder has 81 numeric values and Auto`() {
         val ev = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
             .first { it.id == "pro.exposure_value" }
             .options
 
-        assertEquals(81, ev.size)
+        assertEquals(82, ev.size)
         assertEquals("-4.0", ev.first())
         assertEquals("0.0", ev[40])
-        assertEquals("+4.0", ev.last())
-        assertTrue("Auto" !in ev, "the native EV dial has no Auto rung")
+        assertEquals("+4.0", ev[ev.lastIndex - 1])
+        assertEquals("Auto", ev.last())
         // Exactly one tenth between neighbours, all the way across.
-        ev.map { it.replace("+", "").toDouble() }.zipWithNext { a, b ->
+        ev.mapNotNull { it.replace("+", "").toDoubleOrNull() }.zipWithNext { a, b ->
             assertTrue(abs(b - a - 0.1) < 1e-9, "$a -> $b is not a 0.1 EV step")
         }
     }
 
     /** The quick EV bar every non-Pro mode shows natively: the same array's middle 41 entries. */
     @Test
-    fun `photo exposure ladder is the native 41-entry quick bar`() {
-        val ev = CameraCatalog.settingsFor(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra)
-            .first { it.id == "photo.exposure_compensation" }
-            .options
-
-        assertEquals(41, ev.size)
-        assertEquals("-2.0", ev.first())
-        assertEquals("0.0", ev[20])
-        assertEquals("+2.0", ev.last())
-        assertTrue("Auto" !in ev)
+    fun `photo exposure ladder matches the circular pro dial`() {
+        val photo = CameraCatalog.settingsFor(CameraModeId.Photo, GalaxyDeviceVariant.S26Ultra)
+            .first { it.id == "photo.exposure_compensation" }.options
+        val pro = CameraCatalog.settingsFor(CameraModeId.Pro, GalaxyDeviceVariant.S26Ultra)
+            .first { it.id == "pro.exposure_value" }.options
+        assertEquals(pro, photo)
     }
 
     /**
@@ -1023,7 +1020,7 @@ class CameraCatalogTest {
 
         assertEquals(
             listOf(
-                "Auto", "50", "64", "80", "100", "125", "160", "200", "250", "320",
+                "Auto", "25", "32", "40", "50", "64", "80", "100", "125", "160", "200", "250", "320",
                 "400", "500", "640", "800", "1600", "3200",
             ),
             iso,
@@ -1319,9 +1316,10 @@ class CameraCatalogTest {
         // to the middle 41 with its endpoints exact (20 * 0.1 is exact in IEEE-754), and the
         // clipped default stays "0.0".
         val ev = clipped.first { it.id == "pro.exposure_value" }
-        assertEquals(41, ev.options.size)
+        assertEquals(42, ev.options.size)
         assertEquals("-2.0", ev.options.first())
-        assertEquals("+2.0", ev.options.last())
+        assertEquals("+2.0", ev.options[ev.options.lastIndex - 1])
+        assertEquals("Auto", ev.options.last())
         assertEquals("0.0", ev.defaultValue)
     }
 

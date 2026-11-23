@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.camera2.*
 import android.hardware.camera2.params.SessionConfiguration
+import android.hardware.camera2.params.OutputConfiguration
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
@@ -17,6 +18,8 @@ import android.util.Log
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import android.view.PixelCopy
+import android.graphics.Bitmap
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
@@ -38,14 +41,17 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         val nativeLog: Boolean = false,
         val recordAudio: Boolean = true,
         val nativeStabilization: Boolean = true,
+        val hyperlapseAuto: Boolean = false,
+        val physicalCameraId: String? = null,
     )
     data class Controls(
-        val ev: Int? = null,
+        val look: LookPlan? = null,
         val zoom: Float = 1f,
         val torch: Boolean = false,
         val focus: Float? = null,
         val fixedFocus: Boolean = false,
         val singleAf: Boolean = false,
+        val focusAssist: Boolean = false,
     )
 
     private val main = Handler(Looper.getMainLooper())
@@ -56,6 +62,10 @@ internal class PreparedCamera2Recorder(private val context: Context) {
     private var controls = Controls()
     private var view: SurfaceView? = null
     private var input: Surface? = null
+    private var nightAccumulator: HyperlapseNightAccumulator? = null
+    private var nightInput: Surface? = null
+    private var previewInput: Surface? = null
+    private var focusPreview: FocusPeakingSurfaceProcessor? = null
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var recorder: MediaRecorder? = null
@@ -69,6 +79,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
     private var stopping = false
     private var ready = false
     private var onReady: (() -> Unit)? = null
+    private var onPresented: (() -> Unit)? = null
     private var onError: ((Throwable) -> Unit)? = null
     private var onFinalized: ((Result<Long>) -> Unit)? = null
     private var sourceRange: Range<Int>? = null
@@ -82,17 +93,36 @@ internal class PreparedCamera2Recorder(private val context: Context) {
     private var lastSlowMotionTelemetryAt = 0L
     private var nativeReadyTimeout: Runnable? = null
     var configureNativeLogRequest: ((CaptureRequest.Builder) -> Unit)? = null
-    var onNativeLogCapture: ((TotalCaptureResult) -> Unit)? = null
+    var onCaptureTelemetry: ((TotalCaptureResult) -> Unit)? = null
+    var onHyperlapseCapture: ((TotalCaptureResult) -> Unit)? = null
+    private var hyperlapseAutoKey: CaptureRequest.Key<Int>? = null
     val ownsCamera: Boolean get() = config != null
     val isReady: Boolean get() = ready && recorder != null && !recorderPreparing && !stopping
     val isBusy: Boolean get() = destination != null || stopping
     val elapsedDurationMs: Long get() = if (startedAt == 0L) 0L else SystemClock.elapsedRealtime() - startedAt
 
-    fun prepare(host: PreviewView, selection: Config, values: Controls, onReady: () -> Unit, onError: (Throwable) -> Unit) {
+    fun copyPreview(callback: (Bitmap?) -> Unit) {
+        val source = view
+        if (source == null || !source.holder.surface.isValid || source.width <= 0 || source.height <= 0) {
+            callback(null)
+            return
+        }
+        val bitmap = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+        try {
+            PixelCopy.request(source, bitmap, { result ->
+                if (result == PixelCopy.SUCCESS) callback(bitmap)
+                else { bitmap.recycle(); callback(null) }
+            }, main)
+        } catch (_: IllegalArgumentException) { bitmap.recycle(); callback(null) }
+    }
+
+    fun prepare(host: PreviewView, selection: Config, values: Controls, onReady: () -> Unit,
+        onPresented: () -> Unit, onError: (Throwable) -> Unit) {
         check(!ownsCamera)
         config = selection
         controls = values
         this.onReady = onReady
+        this.onPresented = onPresented
         this.onError = onError
         val token = ++generation
         if (selection.nativeLog) {
@@ -111,7 +141,46 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         view = surfaceView
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
-                if (token == generation) open(selection, holder, token)
+                if (token != generation) return
+                if ((selection.highSpeedFps ?: 0) >= 100) {
+                    // Constrained high-speed output topology stays camera -> display/encoder.
+                    previewInput = holder.surface
+                    open(selection, holder, token)
+                    return
+                }
+                val rotation = when (host.display?.rotation) {
+                    Surface.ROTATION_90 -> 90
+                    Surface.ROTATION_180 -> 180
+                    Surface.ROTATION_270 -> 270
+                    else -> 0
+                }
+                val processor = FocusPeakingSurfaceProcessor({ action -> main.post(action); Unit })
+                focusPreview = processor
+                processor.peakingEnabled = controls.focusAssist
+                processor.attachDirectPreview(selection.size, holder.surface, if (selection.night) 0 else rotation,
+                    onReady = { displayInput ->
+                        if (token != generation) return@attachDirectPreview
+                        previewInput = displayInput
+                        if (selection.night) {
+                            val accumulator = HyperlapseNightAccumulator(selection.size.width, selection.size.height)
+                            nightAccumulator = accumulator
+                            accumulator.setMode(NightAccumulationMode.TRAILS)
+                            accumulator.setOutputIntervalNs(HyperlapseNightMath.outputIntervalNs(selection.captureRate))
+                            accumulator.setPreviewMaxFps(30)
+                            accumulator.setDisplayRotation(rotation)
+                            accumulator.start(onInputSurfaceReady = { surface ->
+                                if (token == generation) {
+                                    nightInput = surface
+                                    accumulator.setPreviewSurface(displayInput, host.width, host.height)
+                                    open(selection, holder, token)
+                                } else accumulator.release()
+                            }, onError = { error -> if (token == generation) fail(error) })
+                        } else open(selection, holder, token)
+                    }, onPresented = {
+                        surfaceView.postOnAnimation {
+                            if (token == generation) this@PreparedCamera2Recorder.onPresented?.invoke()
+                        }
+                    }, onError = { error -> if (token == generation) fail(error) })
             }
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
             override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -133,12 +202,17 @@ internal class PreparedCamera2Recorder(private val context: Context) {
     private fun open(selection: Config, holder: SurfaceHolder, token: Int) {
         try {
             val manager = context.getSystemService(CameraManager::class.java)
-            if (selection.highSpeedFps != null && selection.highSpeedFps >= 120) {
+            @Suppress("UNCHECKED_CAST")
+            hyperlapseAutoKey = if (selection.hyperlapseAuto) manager.getCameraCharacteristics(selection.cameraId)
+                .availableCaptureRequestKeys.firstOrNull {
+                    it.name == "samsung.android.control.recordingMotionSpeedMode"
+                } as? CaptureRequest.Key<Int> else null
+            if (selection.highSpeedFps != null && selection.highSpeedFps >= 100) {
                 val map = checkNotNull(manager.getCameraCharacteristics(selection.cameraId)
                     .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP))
                 sourceRange = map.getHighSpeedVideoFpsRangesFor(selection.size)
                     .filter { it.lower == it.upper &&
-                        if (selection.slowMotion) it.upper == selection.highSpeedFps
+                        if (selection.slowMotion) it.upper == SlowMotionRecordingPolicy.sourceFrameRate(selection.highSpeedFps)
                         else it.upper >= selection.highSpeedFps.coerceAtLeast(120) }
                     .minByOrNull { it.upper }
                     ?: error("No high-speed stream for ${selection.size} at ${selection.highSpeedFps} fps")
@@ -150,12 +224,13 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                         .filter { it.lower == it.upper }.minByOrNull { it.upper }
                 }
             } else if (selection.highSpeedFps != null) {
-                sourceRange = Range(60, 60)
+                val sourceFps = SlowMotionRecordingPolicy.sourceFrameRate(selection.highSpeedFps)
+                sourceRange = Range(sourceFps, sourceFps)
                 previewRange = Range(30, 30)
             }
             // Keep an advertised preview-only fallback while the old recorder drains. Stable
             // Samsung high-speed preview uses both targets once a suspended recorder is ready.
-            if (selection.slowMotion && selection.highSpeedFps!! < 120) previewRange = sourceRange
+            if (selection.slowMotion && selection.highSpeedFps!! < 100) previewRange = sourceRange
             if (selection.nativeLog) {
                 sourceRange = Range(selection.playbackFps, selection.playbackFps)
                 previewRange = sourceRange
@@ -322,9 +397,9 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             }
         }
         try {
-            val surfaces = listOf(holder.surface, checkNotNull(input))
+            val surfaces = nightInput?.let { listOf(it) } ?: listOf(checkNotNull(previewInput), checkNotNull(input))
             if (config?.nativeLog == true) {
-                val outputs = listOf(SamsungNativeLogPipeline.output(holder.surface, false),
+                val outputs = listOf(SamsungNativeLogPipeline.output(checkNotNull(previewInput), false),
                     SamsungNativeLogPipeline.output(checkNotNull(input), true))
                 val configuration = SessionConfiguration(SessionConfiguration.SESSION_REGULAR,
                     outputs, { command -> main.post(command); Unit }, callback)
@@ -333,13 +408,23 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                 SamsungNativeLogPipeline.configureRequest(request, checkNotNull(config).nativeStabilization)
                 configuration.setSessionParameters(request.build())
                 camera.createCaptureSession(configuration)
-            } else if ((config?.highSpeedFps ?: 0) >= 120) camera.createConstrainedHighSpeedCaptureSession(surfaces, callback, main)
+            } else if (Build.VERSION.SDK_INT >= 28 && config?.physicalCameraId != null) {
+                val outputs = surfaces.map { surface ->
+                    OutputConfiguration(surface).apply { setPhysicalCameraId(config?.physicalCameraId) }
+                }
+                val sessionType = if ((config?.highSpeedFps ?: 0) >= 100) SessionConfiguration.SESSION_HIGH_SPEED
+                    else SessionConfiguration.SESSION_REGULAR
+                camera.createCaptureSession(SessionConfiguration(sessionType,
+                    outputs, { command -> main.post(command); Unit }, callback))
+            }
+            else if ((config?.highSpeedFps ?: 0) >= 100) camera.createConstrainedHighSpeedCaptureSession(surfaces, callback, main)
             else camera.createCaptureSession(surfaces, callback, main)
         } catch (error: Throwable) { fail(error) }
     }
 
     fun update(values: Controls) {
-        if (values == controls && config?.nativeLog != true) return
+        focusPreview?.peakingEnabled = values.focusAssist
+        if (values == controls) return
         if (values.singleAf != controls.singleAf) singleAfTriggered = false
         controls = values
         if (session != null && !stopping) {
@@ -357,8 +442,14 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         // variable preview-only route can deliver just 7.5 fps in dim light after a 240 fps take.
         // Remove the encoder target while its old recorder drains, then restore it after prepare.
         val preparedPreview = !recording && preparedPreviewRange != null && recorder != null && !stopping
-        builder.addTarget(checkNotNull(view).holder.surface)
-        if (recording || preparedPreview || (selection.nativeLog && recorder != null && !stopping)) builder.addTarget(checkNotNull(input))
+        val accumulatedInput = nightInput
+        if (accumulatedInput != null) {
+            builder.addTarget(accumulatedInput)
+            nightAccumulator?.setEncoderSurface(if (recording) input else null)
+        } else {
+            builder.addTarget(checkNotNull(previewInput))
+            if (recording || preparedPreview || (selection.nativeLog && recorder != null && !stopping)) builder.addTarget(checkNotNull(input))
+        }
         builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
         (if (recording) sourceRange else if (preparedPreview) preparedPreviewRange else previewRange)
@@ -367,7 +458,14 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             CameraMetadata.CONTROL_AF_MODE_OFF else if (controls.singleAf) CameraMetadata.CONTROL_AF_MODE_AUTO
             else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         controls.focus?.let { builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, it) }
-        controls.ev?.let { builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, it) }
+        controls.look?.let { look ->
+            // Constrained sessions own 3A and cadence. Regular sessions use the same controls as CameraX.
+            val constrained = (selection.highSpeedFps ?: 0) >= 100
+            CameraControls.writeLook(Camera2RequestSink(builder), if (constrained) look.copy(
+                exposure = ExposurePlan.Auto((look.exposure as? ExposurePlan.Auto)?.evIndex, null),
+                whitePoint = WhitePointPlan.HalAuto(false), fpsRange = null,
+            ) else look)
+        }
         if (Build.VERSION.SDK_INT >= 30) builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, controls.zoom)
         else if (selection.slowMotion) {
             val active = context.getSystemService(CameraManager::class.java)
@@ -396,39 +494,38 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         }
         if (selection.night && selection.highSpeedFps == null) {
             val chars = context.getSystemService(CameraManager::class.java).getCameraCharacteristics(selection.cameraId)
-            if (chars.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)?.contains(CameraMetadata.CONTROL_SCENE_MODE_NIGHT) == true) {
-                builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
-                builder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_NIGHT)
-            } else {
-                chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                    ?.filter { it.lower in 1..15 && it.upper <= 30 }?.minByOrNull { it.lower }
-                    ?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
-                if (chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
-                        ?.contains(CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY) == true)
-                    builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)
-            }
+            chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                ?.filter { it.lower in 1..15 && it.upper <= 30 }?.minByOrNull { it.lower }
+                ?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+            if (chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+                    ?.contains(CameraMetadata.NOISE_REDUCTION_MODE_FAST) == true)
+                builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
         }
+
         if (selection.nativeLog) {
             configureNativeLogRequest?.invoke(builder)
             SamsungNativeLogPipeline.configureRequest(builder, selection.nativeStabilization)
             builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(selection.playbackFps, selection.playbackFps))
         }
+        hyperlapseAutoKey?.let { builder.set(it, 10) }
         val token = generation
         val callback = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                 if (token != generation) return
+                CameraControlTrace.record(if (selection.nativeLog) "NativeLog" else if (selection.highSpeedFps != null) "HighSpeed" else "Hyperlapse", request, result)
                 if (selection.nativeLog) {
                     // A persistent session can deliver a previous take's queued results after
                     // rearm. Only the current request may mark the next recorder ready.
                     if (s !== session || serial != repeatingSerial) return
                     try {
-                        onNativeLogCapture?.invoke(result)
                         if (!stopping && !SamsungNativeLogPipeline.isNativeResult(result)) {
                             if (ready) fail(IllegalStateException("Samsung native LOG mode was lost: result mode=${SamsungNativeLogPipeline.captureMode(result)}."))
                             return
                         }
                     } catch (error: Throwable) { fail(error); return }
                 }
+                onCaptureTelemetry?.invoke(result)
+                if (selection.hyperlapseAuto) onHyperlapseCapture?.invoke(result)
                 observedFocus = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
                 val now = SystemClock.elapsedRealtime()
                 if (selection.slowMotion && recording && now - lastSlowMotionTelemetryAt >= 1000) {
@@ -455,6 +552,9 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                     ready = true
                     Log.i("DivePrepared", "Preview ready $config; camera session prepared before shutter")
                     onReady?.invoke()
+                    if ((config?.highSpeedFps ?: 0) >= 100) view?.postOnAnimation {
+                        if (token == generation) onPresented?.invoke()
+                    }
                 }
             }
         }
@@ -604,6 +704,12 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         ready = false
         runCatching { session?.close() }
         runCatching { device?.close() }
+        nightAccumulator?.release()
+        nightAccumulator = null
+        nightInput = null
+        focusPreview?.release()
+        focusPreview = null
+        previewInput = null
         runCatching { recorder?.release() }
         runCatching { input?.release() }
         session = null
@@ -627,6 +733,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         singleAfTriggered = false
         lastSlowMotionTelemetryAt = 0L
         onReady = null
+        onPresented = null
         onError = null
         onFinalized = null
     }

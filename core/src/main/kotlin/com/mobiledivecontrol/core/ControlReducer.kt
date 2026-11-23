@@ -571,7 +571,7 @@ class ControlReducer(
         CameraCommand.ZoomIn -> handleWheel(state, +1)
         CameraCommand.ZoomOut -> handleWheel(state, -1)
         is CameraCommand.SetZoom -> {
-            val zoom = command.value.coerceIn(1.0, state.camera.capabilities?.zoomMaxRatio ?: 8.0)
+            val zoom = command.value.coerceIn(minimumZoom(state.camera), state.camera.capabilities?.zoomMaxRatio ?: 8.0)
             Reduction(
                 state = state.copy(
                     camera = state.camera.copy(zoomFactor = zoom),
@@ -945,7 +945,7 @@ class ControlReducer(
             return adjustSetting(state, assigned, focusAwareStep(camera, assigned, step), repeatCount)
         }
         val maxZoom = camera.capabilities?.zoomMaxRatio ?: 8.0
-        val zoom = (camera.zoomFactor + step * 0.1).coerceIn(1.0, maxZoom)
+        val zoom = (camera.zoomFactor + step * 0.1).coerceIn(minimumZoom(camera), maxZoom)
         return reduceCamera(state, CameraCommand.SetZoom(zoom))
     }
 
@@ -1764,7 +1764,11 @@ class ControlReducer(
                 return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
             }
             val current = preparedCamera.sliderSensitivities[spec.id] ?: SliderSensitivity.DEFAULT
-            val next = cycleSensitivity(current, step)
+            val next = if (spec.id.endsWith(".iso")) {
+                val levels = CameraCatalog.isoSensitivityLevels
+                val index = levels.indexOf(current.level).takeIf { it >= 0 } ?: levels.lastIndex
+                SliderSensitivity.of(levels[(index + step).mod(levels.size)])
+            } else cycleSensitivity(current, step)
             Reduction(
                 state = preparedState.copy(
                     camera = preparedCamera.copy(
@@ -1845,6 +1849,12 @@ class ControlReducer(
             val isFocusSetting = spec.id.endsWith(".manual_focus")
             val currentSensitivity = preparedCamera.sliderSensitivities[spec.id] ?: SliderSensitivity.DEFAULT
 
+            if (spec.id.endsWith(".iso") && CameraCatalog.isoIncrement(currentSensitivity) != null) {
+                val next = advanceOption(CameraCatalog.currentValue(preparedCamera, spec), spec.options, step, wrap = true)
+                val nextCamera = applySettingValue(preparedCamera, spec.id, next)
+                return Reduction(state = preparedState.copy(camera = nextCamera), effects =
+                    cameraEffectForSetting(spec.id, next)?.let { listOf(PlatformEffect.ExecuteCamera(it)) }.orEmpty())
+            }
             if (isFocusSetting) {
                 if (!supportsManualFocusForSelectedLens(preparedCamera, spec)) {
                     return Reduction(state = preparedState, effects = manualFocusPreparation.effects)
@@ -2142,9 +2152,17 @@ class ControlReducer(
         }
     }
 
+    private fun minimumZoom(camera: CameraState): Double {
+        val lens = CameraCatalog.settingsFor(camera).firstOrNull { it.id.endsWith(".lens") }
+            ?.let { CameraCatalog.currentValue(camera, it) }
+        return if (lens != "front" && "0.6x" in camera.detectedLenses) 0.6 else 1.0
+    }
+
     private fun proFocusNeedsMainLens(camera: CameraState): Boolean = when (camera.activeMode) {
+        CameraModeId.ExpertRaw -> camera.settingValues["expert.lens"] == "0.6x"
         CameraModeId.Pro -> camera.settingValues["pro.lens"] == "0.6x"
         CameraModeId.ProVideo -> camera.settingValues["pro_video.lens"] == "0.6x"
+        CameraModeId.SlowMotion -> camera.settingValues["slow_motion.lens"] == "0.6x"
         else -> false
     }
 
@@ -2153,7 +2171,12 @@ class ControlReducer(
         adjustingValue: Boolean = false,
     ): ManualFocusPreparation {
         if (!adjustingValue || !proFocusNeedsMainLens(state.camera)) return ManualFocusPreparation(state)
-        val lensId = if (state.camera.activeMode == CameraModeId.Pro) "pro.lens" else "pro_video.lens"
+        val lensId = when (state.camera.activeMode) {
+            CameraModeId.ExpertRaw -> "expert.lens"
+            CameraModeId.Pro -> "pro.lens"
+            CameraModeId.SlowMotion -> "slow_motion.lens"
+            else -> "pro_video.lens"
+        }
         val camera = applySettingValue(state.camera, lensId, "1x").copy(
             // The current capability belongs to 0.6x, not the main camera being opened.
             // Allow this first detent; the runtime probes and applies focus on the new lens.
@@ -2168,6 +2191,20 @@ class ControlReducer(
     private fun applySettingValue(camera: CameraState, settingId: String, value: String): CameraState {
         val prefix = settingId.substringBeforeLast('.', "")
         var updatedValues = camera.settingValues + (settingId to value)
+        if (settingId.endsWith(".lens") && value == "front") {
+            updatedValues = updatedValues + ("$prefix.log" to "Off") +
+                ("$prefix.super_steady" to "Off")
+            if (updatedValues["$prefix.resolution"] == "8K") updatedValues = updatedValues + ("$prefix.resolution" to "FHD")
+            // Preserve cadence until the new lens reports its actual compatible rates.
+        }
+
+        if (settingId == "video.super_steady" && value == "On") {
+            updatedValues = updatedValues + ("video.resolution" to "FHD") + ("video.frame_rate" to "30fps") +
+                ("video.lens" to "0.6x") + ("video.log" to "Off") + ("video.hdr" to "Off")
+        }
+        if (settingId in setOf("video.lens", "video.resolution", "video.frame_rate") &&
+            ((settingId == "video.lens" && value != "0.6x") || (settingId == "video.resolution" && value != "FHD") ||
+                (settingId == "video.frame_rate" && value != "30fps"))) updatedValues = updatedValues + ("video.super_steady" to "Off")
         val expertLabCaptureActivated = when (settingId) {
             "expert.virtual_aperture" -> value != "F16.0"
             "expert.nd_filter" -> value != "Off"
@@ -2317,6 +2354,10 @@ class ControlReducer(
                 zoomFactor = parseZoom(value) ?: camera.zoomFactor,
                 settingValues = updatedValues,
             )
+        } else if (settingId == "video.super_steady" && value == "On") {
+            camera.copy(settingValues = updatedValues, zoomFactor = 0.6)
+        } else if (settingId.endsWith(".lens")) {
+            camera.copy(settingValues = updatedValues, zoomFactor = parseZoom(value) ?: 1.0)
         } else {
             camera.copy(settingValues = updatedValues)
         }
@@ -2783,6 +2824,7 @@ class ControlReducer(
             CameraModeId.ProVideo -> "pro_video.lens"
             CameraModeId.PortraitVideo -> "portrait_video.lens"
             CameraModeId.Hyperlapse -> "hyperlapse.lens"
+            CameraModeId.SlowMotion -> "slow_motion.lens"
             else -> return true
         }
         val currentLens = camera.settingValues[lensSettingId] ?: "Auto"

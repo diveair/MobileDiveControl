@@ -31,7 +31,10 @@ class SlowMotionCaptureInstrumentation : Instrumentation() {
         start()
     }
 
-    override fun onStart() {
+    override fun onStart() = runSlowMotionRecordingProbe(arguments)
+}
+
+internal fun Instrumentation.runSlowMotionRecordingProbe(arguments: Bundle) {
         val report = JSONObject()
         val directory = File(targetContext.getExternalFilesDir(null), "slow-motion-validation/${System.currentTimeMillis()}")
             .apply { mkdirs() }
@@ -63,13 +66,13 @@ class SlowMotionCaptureInstrumentation : Instrumentation() {
             runOnMainSync { model = ViewModelProvider(activity)[DiveViewModel::class.java] }
             fun dispatch(command: CameraCommand) = runOnMainSync { model.dispatch(command) }
             runOnMainSync { model.dismissIntro() }
-            dispatch(CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryRailEntries.indexOfFirst {
-                it.mode == CameraModeId.SlowMotion
-            }))
+            val mode = CameraModeId.valueOf(arguments.getString("mode") ?: "SlowMotion")
+            val prefix = if (mode == CameraModeId.ProVideo) "pro_video" else "slow_motion"
+            dispatch(CameraCommand.ActivateModeRailEntry(CameraCatalog.primaryRailEntries.indexOfFirst { it.mode == mode }))
             SystemClock.sleep(2500)
             fun select(suffix: String, value: String) {
                 val state = model.state.value.camera
-                val spec = CameraCatalog.settingsFor(state).first { it.id == "slow_motion.$suffix" }
+                val spec = CameraCatalog.settingsFor(state).first { it.id == "$prefix.$suffix" }
                 val current = CameraCatalog.currentValue(state, spec)
                 require(value in spec.options) { "$suffix=$value unavailable: ${spec.options}" }
                 if (current != value) dispatch(CameraCommand.NudgeSetting(spec.id,
@@ -80,10 +83,11 @@ class SlowMotionCaptureInstrumentation : Instrumentation() {
                 }
             }
             select("lens", arguments.getString("lens") ?: "1x")
+            if (mode == CameraModeId.ProVideo) { select("log", "Off"); select("hdr", "Off") }
             val requestedResolution = arguments.getString("resolution")?.replace('_', ' ') ?: "FHD"
-            if (requestedResolution != "FHD") select("frame_rate", "60fps")
+            if (requestedResolution != "FHD") select("frame_rate", if (mode == CameraModeId.ProVideo) CameraCatalog.proVideoFrameRateOption(30) else "30fps")
             select("resolution", requestedResolution)
-            select("exposure", arguments.getString("exposure") ?: "0.0")
+            select(if (mode == CameraModeId.ProVideo) "exposure_value" else "exposure", arguments.getString("exposure") ?: "0.0")
             arguments.getString("torch")?.let { select("flash", it) }
             val clips = JSONArray()
             report.put("clips", clips)
@@ -95,12 +99,13 @@ class SlowMotionCaptureInstrumentation : Instrumentation() {
                 }
             }
             for (fps in rates) {
-                select("frame_rate", "${fps}fps")
+                select("frame_rate", if (mode == CameraModeId.ProVideo) CameraCatalog.proVideoFrameRateOption(fps) else "${fps}fps")
                 arguments.getString("focus")?.let { select("focus_mode", it.replace('_', ' ')) }
                 arguments.getString("zoom")?.toDoubleOrNull()?.let {
                     dispatch(CameraCommand.SetZoom(it))
                     SystemClock.sleep(500)
                 }
+                check(model.state.value.camera.settingValues["$prefix.lens"] == (arguments.getString("lens") ?: "1x"))
                 val previousSaved = latestSaved()
                 previewPhase(fps, "before")
                 sendStatus(0, Bundle().apply { putString("stream", "Capturing slow motion $fps fps\n") })
@@ -109,6 +114,18 @@ class SlowMotionCaptureInstrumentation : Instrumentation() {
                 await("recorder start") { !RecordingClock.paused.value && RecordingClock.durationMs.value > 0L }
                 val startLatencyMs = SystemClock.elapsedRealtime() - startAt
                 SystemClock.sleep((arguments.getString("durationMs")?.toLong() ?: 4000L).coerceIn(1000L, 10000L))
+                val selectedLens = arguments.getString("lens") ?: "1x"
+                val expectedPhysical = when (selectedLens) { "0.6x" -> "2"; "1x" -> "5"; "3x" -> "6"; else -> null }
+                val sample = CameraControlTrace.focusSample
+                val sourceFps = if (mode == CameraModeId.SlowMotion) SlowMotionRecordingPolicy.sourceFrameRate(fps) else fps
+                check(checkNotNull(sample?.frameDurationNs) <= 1_000_000_000.0 / sourceFps * 1.05) {
+                    "Selected $fps fps but sensor cadence is $sample"
+                }
+                val expectedFocal = when (selectedLens) { "0.6x" -> 2.2f; "1x" -> 5.4f; "3x" -> 7f; else -> null }
+                if (expectedPhysical != null) check(sample?.physicalId == expectedPhysical ||
+                    (sample?.focalLength != null && kotlin.math.abs(sample.focalLength - checkNotNull(expectedFocal)) < 0.1f)) {
+                    "Selected $selectedLens but recorded ${CameraControlTrace.focusSample}"
+                }
                 val pauseAt = SystemClock.elapsedRealtime()
                 dispatch(CameraCommand.PauseVideoRecording)
                 await("review", 30000) { RecordingClock.reviewUri.value != null && !RecordingClock.reviewFinalizing.value }
@@ -137,6 +154,9 @@ class SlowMotionCaptureInstrumentation : Instrumentation() {
                     }
                     val format = extractor.getTrackFormat(track)
                     clip.put("format", format.toString())
+                    val expectedSize = if (requestedResolution == "UHD 4K") 3840 to 2160 else 1920 to 1080
+                    check(format.getInteger(MediaFormat.KEY_WIDTH) == expectedSize.first &&
+                        format.getInteger(MediaFormat.KEY_HEIGHT) == expectedSize.second) { "Wrong saved resolution: $format" }
                     extractor.selectTrack(track)
                     var frames = 0
                     var previousUs = -1L
@@ -185,7 +205,7 @@ class SlowMotionCaptureInstrumentation : Instrumentation() {
         }
     }
 
-    private fun latestSaved(): Uri? {
+private fun Instrumentation.latestSaved(): Uri? {
         val collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
         return targetContext.contentResolver.query(collection, arrayOf(MediaStore.Video.Media._ID),
             "${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? AND ${MediaStore.Video.Media.IS_PENDING}=0",
@@ -194,9 +214,8 @@ class SlowMotionCaptureInstrumentation : Instrumentation() {
         }
     }
 
-    private fun await(label: String, timeoutMs: Long = 15000, condition: () -> Boolean) {
+private fun await(label: String, timeoutMs: Long = 15000, condition: () -> Boolean) {
         val until = SystemClock.elapsedRealtime() + timeoutMs
         while (!condition() && SystemClock.elapsedRealtime() < until) SystemClock.sleep(50)
         check(condition()) { "Timed out waiting for $label" }
     }
-}

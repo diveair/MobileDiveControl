@@ -9,6 +9,13 @@ import org.junit.jupiter.api.Test
 
 class PreviewRecoveryPolicyTest {
     @Test
+    fun `camera reuse requires the same device and a disconnected preview consumer`() {
+        assertTrue(canReuseCameraDevice("0", "0", true))
+        assertFalse(canReuseCameraDevice("0", "1", true))
+        assertFalse(canReuseCameraDevice(null, null, true))
+        assertFalse(canReuseCameraDevice("0", "0", false))
+    }
+    @Test
     fun `resume never tears down a surface that is still being restored`() {
         assertEquals(
             PreviewRecoveryDecision.Wait,
@@ -225,7 +232,7 @@ class PreviewRecoveryPolicyTest {
                 cameraPresent = true,
                 currentBindingGeneration = 42L,
                 lastDisplayedBindingGeneration = 42L,
-                elapsedSinceFirstPresentedMs = 100L,
+                elapsedSinceFirstPresentedMs = CAMERA_GRAPH_POST_PRESENT_SETTLE_MS / 2,
             ),
         )
     }
@@ -257,10 +264,10 @@ class PreviewRecoveryPolicyTest {
     @Test
     fun `rapid graph requests wait for a quiet navigation window`() {
         assertEquals(
-            400L,
+            CAMERA_GRAPH_REQUEST_DEBOUNCE_MS / 2,
             cameraGraphRequestQuietRemainingMs(
                 latestRequestAtMs = 1_000L,
-                nowMs = 1_300L,
+                nowMs = 1_000L + CAMERA_GRAPH_REQUEST_DEBOUNCE_MS / 2,
             ),
         )
         assertEquals(

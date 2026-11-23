@@ -517,9 +517,9 @@ class ControlCoreTest {
         )
 
         val down = reducer.reduce(AppState(camera = camera), CameraCommand.NavigateDown).state.camera
-        assertEquals("120fps", down.settingValues["slow_motion.frame_rate"])
+        assertEquals("48fps", down.settingValues["slow_motion.frame_rate"])
         val up = reducer.reduce(AppState(camera = down), CameraCommand.NavigateUp).state.camera
-        assertEquals("240fps", up.settingValues["slow_motion.frame_rate"])
+        assertEquals("60fps", up.settingValues["slow_motion.frame_rate"])
     }
 
     @Test
@@ -776,7 +776,7 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `high speed selection enforces constrained-session controls and manual control exits it`() {
+    fun `high speed selection enforces automation and disabled ISO leaves cadence unchanged`() {
         val reducer = ControlReducer()
         val caps = CameraCapabilities(
             availableVideoFrameRates = listOf(30, 60, 120, 240),
@@ -823,10 +823,10 @@ class ControlCoreTest {
             CameraCommand.NudgeSetting("pro_video.iso", +1),
         ).state.camera
         assertEquals(
-            CameraCatalog.proVideoFrameRateOption(60),
+            highSpeed.settingValues["pro_video.frame_rate"],
             manualIso.settingValues["pro_video.frame_rate"],
         )
-        assertTrue(manualIso.settingValues["pro_video.iso"] != "Auto")
+        assertEquals("Auto", manualIso.settingValues["pro_video.iso"])
     }
 
     @Test
@@ -912,7 +912,7 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `selecting a pro frame rate moves to the best compatible resolution`() {
+    fun `pro frame rate cycles within the selected resolution`() {
         val reducer = ControlReducer()
         val caps = CameraCapabilities(
             availableVideoFrameRates = listOf(24, 30, 60, 120, 240),
@@ -939,9 +939,9 @@ class ControlCoreTest {
             CameraCommand.AdjustOptionsItem(fpsIndex, +1),
         ).state.camera
 
-        assertEquals(60, CameraCatalog.captureFrameRateFps(sixty.settingValues["pro_video.frame_rate"]))
+        assertEquals(24, CameraCatalog.captureFrameRateFps(sixty.settingValues["pro_video.frame_rate"]))
         assertEquals(23.976, CameraCatalog.playbackFrameRateFps(sixty.settingValues["pro_video.frame_rate"]))
-        assertEquals("FHD", sixty.settingValues["pro_video.resolution"])
+        assertEquals("UHD 4K", sixty.settingValues["pro_video.resolution"])
     }
 
     @Test
@@ -1126,7 +1126,7 @@ class ControlCoreTest {
         core.updateMeteredExposure(MeteredExposure(iso = 137, shutterNs = 5_000_000L, wbKelvin = 5_649))
 
         val seeded = core.dispatch(CameraCommand.NudgeSetting("pro.iso", +1))
-        assertEquals("50", seeded.state.camera.settingValues["pro.iso"])
+        assertEquals("25", seeded.state.camera.settingValues["pro.iso"])
         val shutterSeeded = core.dispatch(CameraCommand.NudgeSetting("pro.shutter_speed", +1))
         assertEquals("1/24000", shutterSeeded.state.camera.settingValues["pro.shutter_speed"])
         val wbSeeded = core.dispatch(CameraCommand.NudgeSetting("pro.white_balance", +1))
@@ -1142,7 +1142,7 @@ class ControlCoreTest {
         }
         blind.dispatch(CameraCommand.Confirm)
         val stepped = blind.dispatch(CameraCommand.NudgeSetting("pro.iso", +1))
-        assertEquals("50", stepped.state.camera.settingValues["pro.iso"])
+        assertEquals("25", stepped.state.camera.settingValues["pro.iso"])
     }
 
     /**
