@@ -58,6 +58,27 @@ src/test/kotlin/com/mobiledivecontrol/core/
   SafetyStateMachineTest.kt
 ```
 
+## Production source and verification
+
+| Purpose | Location |
+| --- | --- |
+| Android app source, manifest, resources, and bundled models | `app/src/main/` |
+| Shared Kotlin code | `core/src/main/` |
+| Unit tests | `app/src/test/`, `core/src/test/` |
+| Device tests and debug-only code | `app/src/androidTest/`, `app/src/debug/` |
+| Verification scripts and scenarios | `test.cmd`, `test.ps1`, `camera-stress-test.ps1`, `tools/`, `scenarios/`, `TEST_PROTOCOL.md` |
+| Dependency versions and Gradle wrapper | `gradle/` |
+
+Gradle resolves libraries from the repositories in `settings.gradle.kts`. Keep downloaded dependencies, JDK 17, and Android SDK 35 on the build machine.
+
+To copy the current production source and build configuration, run this from PowerShell at the repository root and choose a new destination folder:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\export-production.ps1 -Destination "C:\path\to\MobileDiveControl-production"
+```
+
+The export includes local source edits and bundled runtime assets. It skips tests, debug source, generated output, Gradle caches, local SDK settings, Git history, and recovery files. On the build machine, set `JAVA_HOME` and `ANDROID_HOME`, then run `.\gradlew.bat :app:assembleRelease` from the exported folder. The release APK requires signing before distribution.
+
 ## Running
 
 You need a local JDK 17+.
