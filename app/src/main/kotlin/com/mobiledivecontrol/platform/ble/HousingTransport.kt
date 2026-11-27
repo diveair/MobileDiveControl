@@ -7,12 +7,10 @@ import com.mobiledivecontrol.core.HousingCharacteristic
  * Android-side extension of the platform-agnostic [BleTransport] contract.
  *
  * The core interface describes a happy-path request/response link. A real radio also has
- * to answer two questions the core cannot: which characteristics this particular housing
- * actually exposes, and why the link went away. Both drive product behaviour — an absent
- * characteristic disables a feature rather than failing the connection, and a peer-initiated
- * close means the diver held OK to power the housing off rather than swimming out of range.
+ * to report the discovered characteristics and transport-level disconnect cause.
  */
 interface HousingTransport : BleTransport {
+    fun setStandby(enabled: Boolean) {}
 
     /**
      * Characteristics resolved on the connected device.
@@ -37,9 +35,7 @@ interface HousingTransport : BleTransport {
 /**
  * Why a connection ended.
  *
- * [RemoteClosed] is distinct from [LinkLoss] because the housing closes the connection
- * itself when the diver long-presses OK to power it down. Presenting that as
- * "reconnecting…" would be a lie the diver cannot act on.
+ * A peer-initiated GATT close does not identify a power-off.
  */
 enum class DisconnectCause {
     LinkLoss,

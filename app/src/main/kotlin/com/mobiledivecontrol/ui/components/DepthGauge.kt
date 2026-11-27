@@ -52,7 +52,7 @@ fun DepthGauge(
     waterPressureKpa: Double?,
     useMetric: Boolean = true,
     temperatureCelsius: Double? = null,
-    headingDegrees: Double? = null,
+    headingLabel: String? = null,
     headingTargetSynchronized: Boolean = false,
     modifier: Modifier = Modifier,
     maxDepthMeters: Double? = null,
@@ -78,8 +78,8 @@ fun DepthGauge(
         MaxDepthNdlReadout(maxDepthMeters, useMetric, ndlSeconds, depthMeters)
         ReadoutSeparator()
         Text(
-            text = headingDegrees?.let(::formatHeading) ?: "---° --",
-            color = headingReadoutColor(headingDegrees, headingTargetSynchronized),
+            text = headingLabel ?: "---° --",
+            color = headingReadoutColor(headingLabel, headingTargetSynchronized),
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
             fontFamily = FontFamily.Monospace,
@@ -111,7 +111,7 @@ fun DepthGauge(
 /** Units stay with each number; small labels underneath keep the pair narrow and unambiguous. */
 @Composable
 private fun DepthReadout(meters: Double?, metric: Boolean, label: String, color: Color) {
-    val value = meters?.let { String.format(Locale.US, "%.1f", if (metric) it else it * 3.28084) } ?: "--"
+    val value = meters?.let { String.format(Locale.US, "%.1f", com.mobiledivecontrol.core.depthInDisplayUnits(it, metric)) } ?: "--"
     HudValueReadout(value + if (metric) "m" else "ft", label, color)
 }
 
@@ -196,10 +196,10 @@ private fun HudValueReadout(value: String, label: String, color: Color) {
 }
 
 internal fun headingReadoutColor(
-    headingDegrees: Double?,
+    headingLabel: String?,
     headingTargetSynchronized: Boolean,
 ) = when {
-    headingDegrees == null -> DiveColors.TextMuted
+    headingLabel == null -> DiveColors.TextMuted
     headingTargetSynchronized -> DiveColors.Success
     else -> DiveColors.HeadingViolet
 }
@@ -213,7 +213,7 @@ private fun ReadoutSeparator() {
     )
 }
 
-private fun formatHeading(degrees: Double): String {
+internal fun formatHeading(degrees: Double): String {
     val normalized = HeadingMath.normalize(degrees)
     val value = normalized.toInt().let { whole ->
         // Round manually after normalisation so 359.6 becomes 000 rather than an invalid 360.
@@ -223,9 +223,10 @@ private fun formatHeading(degrees: Double): String {
 }
 
 private fun cardinal(degrees: Double): String {
-    val names = arrayOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
-    return names[((HeadingMath.normalize(degrees) + 22.5) / 45.0).toInt() % names.size]
+    return cardinalNames[((HeadingMath.normalize(degrees) + 22.5) / 45.0).toInt() % cardinalNames.size]
 }
+
+private val cardinalNames = arrayOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 
 /** The same bands TemperatureDisplay used in the top slot, so the move changes nothing but place. */
 private fun temperatureTint(celsius: Double) = when {

@@ -1,6 +1,7 @@
 package com.mobiledivecontrol.core
 
 import java.time.Duration
+import com.mobiledivecontrol.core.HousingSealTransitions.Banner
 
 class ControlReducer(
     private val safetyStateMachine: SafetyStateMachine = SafetyStateMachine(),
@@ -51,19 +52,30 @@ class ControlReducer(
         is GalleryCommand -> reduceGalleryGrid(state, command)
     }
 
+    private fun AppState.enterHousingStandby(): AppState = copy(
+        housingStandby = true,
+        shutOffPrompt = if (housing.connected) ShutOffPrompt.AwaitingPress else null,
+    )
+
     fun updateBleState(
         state: AppState,
         newState: BleConnectionState,
         reconnectAttempt: Int = 0,
         reconnectDelay: Duration? = null,
+        atMonotonicMs: Long = pressureMonotonicMs(),
     ): Reduction {
         val connected = newState == BleConnectionState.Ready || newState == BleConnectionState.Degraded
         val inputEnabled = newState == BleConnectionState.Ready || newState == BleConnectionState.Degraded
 
+        val staysAsleep = state.housingStandby && !(newState == BleConnectionState.Ready &&
+            (!state.housing.connected || state.safety.vacuumReleaseDisconnectObserved))
         var nextState = state.copy(
             bleConnectionState = newState,
+            housingStandby = staysAsleep,
+            shutOffPrompt = if (staysAsleep && connected) state.shutOffPrompt else null,
             housing = state.housing.copy(
                 connected = connected,
+                connectedAtMs = if (connected) state.housing.connectedAtMs ?: atMonotonicMs else null,
                 inputEnabled = inputEnabled,
             ),
         )
@@ -71,32 +83,21 @@ class ControlReducer(
         val effects = mutableListOf<PlatformEffect>()
         val notes = mutableListOf<String>()
 
-        if (state.housing.connected && !connected && (state.diveProfile.atSurface || state.diveProfile.surfaceConfirmedBeforeLoss) &&
-            state.safety.sealState in setOf(SealState.Passed, SealState.LeakMonitoring)) {
-            val seal = state.safety
-            // The next connection is a new observation period. Keep earned trust as a
-            // candidate to verify, never compare its first packet with a stale leak window.
-            nextState = nextState.copy(safety = seal.copy(
-                sealState = SealState.Unknown, coverOpen = null,
-                verifiedVacuumKpa = seal.barometricPressureKpa.takeIf { seal.sealConfidence >= SealConfidence.Provisional },
-                verifiedVacuumConfidence = seal.sealConfidence,
-                verifiedVacuumStartedAtEpochMs = seal.leakMonitoringStartedAtEpochMs,
-                verifiedVacuumRecordedAtEpochMs = System.currentTimeMillis(),
-                baselinePressureKpa = null, stabilizationSamples = emptyList(),
-                pendingOutlierKpa = null, pendingAdoptionKpa = null,
-                leakMonitoringStartedAtEpochMs = null, leakMonitoringElapsedMs = 0,
-                capCloseReminder = false, adoptedHold = false, warning = null))
+        if (state.housing.connected && !connected) {
+            nextState = nextState.copy(safety = safetyAfterTelemetryGap(state))
         }
 
         if (state.safety.vacuumReleasedPrompt) {
             if (state.housing.connected && !connected) {
-                nextState = nextState.copy(safety = nextState.safety.copy(vacuumReleaseDisconnectObserved = true,
+                nextState = nextState.copy(safety = nextState.safety.copy(vacuumReleaseDisconnectObserved = true, coverOpen = null,
                     vacuumReleaseChoice = VacuumReleaseChoice.ShutDown))
-            } else if (newState == BleConnectionState.Ready && state.safety.vacuumReleaseDisconnectObserved) {
+            } else if (newState == BleConnectionState.Ready && (state.safety.vacuumReleaseDisconnectObserved ||
+                    (state.housingStandby && !nextState.housingStandby))) {
                 nextState = nextState.copy(safety = nextState.safety.copy(
                     vacuumReleasedPrompt = false, vacuumReleaseDisconnectObserved = false,
+                    sealMonitor = nextState.safety.sealMonitor.copy(confirmedRelease = false),
                     vacuumReleaseChoice = VacuumReleaseChoice.ShutDown,
-                    checkDismissed = false, coverOpen = null, sealState = SealState.Unknown))
+                    checkDismissed = false, sealState = SealState.Unknown))
             }
         }
 
@@ -128,6 +129,23 @@ class ControlReducer(
             effects = effects,
             notes = notes,
         )
+    }
+
+    /** A surface hold must be matched to fresh pressure before its earned confidence can resume. */
+    internal fun safetyAfterTelemetryGap(state: AppState): SafetyState {
+        val seal = state.safety
+        if ((!state.diveProfile.atSurface && !state.diveProfile.surfaceConfirmedBeforeLoss &&
+                seal.sealMonitor.location != HousingSealTransitions.Location.Surface) ||
+            seal.sealState !in setOf(SealState.Passed, SealState.LeakMonitoring)) return seal
+        return seal.copy(sealState = SealState.Unknown, coverOpen = null,
+            verifiedVacuumKpa = seal.barometricPressureKpa.takeIf { seal.sealConfidence >= SealConfidence.Provisional },
+            verifiedVacuumConfidence = seal.sealConfidence,
+            verifiedVacuumStartedAtEpochMs = seal.leakMonitoringStartedAtEpochMs,
+            verifiedVacuumRecordedAtEpochMs = state.barometricPressureTelemetry?.receivedAtEpochMs ?: nowMs(),
+            baselinePressureKpa = null, stabilizationSamples = emptyList(),
+            pendingOutlierKpa = null, pendingAdoptionKpa = null,
+            leakMonitoringStartedAtEpochMs = null, leakMonitoringElapsedMs = 0,
+            capCloseReminder = false, adoptedHold = false, warning = null)
     }
 
     fun updatePermission(state: AppState, permission: PermissionKind, granted: Boolean): Reduction {
@@ -226,10 +244,16 @@ class ControlReducer(
         startedAtEpochMs: Long?,
         recordedAtEpochMs: Long?,
     ): Reduction {
+        val memory = state.safety.sealMonitor
+        val saved = memory.snapshot
+        val matchesVerifiedHold = saved != null && saved.observation.vacuum == HousingSealTransitions.Vacuum.Stable &&
+            confidence >= SealConfidence.ManufacturerMinimum &&
+            kotlin.math.abs(saved.ambientKpa - saved.magnitudeKpa - kpa) <= SealMonitoring.limits.rebootMatchToleranceKpa
         return Reduction(
             state = state.copy(
                 safety = state.safety.copy(
                     verifiedVacuumKpa = kpa,
+                    sealMonitor = if (matchesVerifiedHold) memory.copy(snapshot = saved?.copy(verifiedHold = true)) else memory,
                     verifiedVacuumConfidence = confidence,
                     verifiedVacuumStartedAtEpochMs = startedAtEpochMs,
                     verifiedVacuumRecordedAtEpochMs = recordedAtEpochMs,
@@ -284,7 +308,7 @@ class ControlReducer(
             state = state,
             result = safetyStateMachine.apply(
                 state = state.safety,
-                signal = SafetySignal.BarometricPressureSample(sensorUpdate.kpa, System.currentTimeMillis()),
+                signal = SafetySignal.BarometricPressureSample(sensorUpdate.kpa, nowMs()),
             ),
         )
         is SensorUpdate.WaterPressure -> Reduction(
@@ -357,6 +381,8 @@ class ControlReducer(
         CameraCommand.ToggleVideoRecording,
         CameraCommand.StartVideoRecording -> when {
             !state.permissions.camera -> warning(state, "Camera Permission: Disabled")
+            CameraCatalog.s24CaptureRates(state.camera.activeMode, state.camera.capabilities)?.isEmpty() == true ->
+                warning(state, "${state.camera.activeMode.label} is unavailable on this lens. Select another lens.")
             recordingAudioRequired(state.camera) && !state.permissions.microphone ->
                 warning(state, "Microphone Permission: Disabled")
             else -> Reduction(
@@ -552,7 +578,7 @@ class ControlReducer(
         CameraCommand.OpenModeRail -> Reduction(
             state = state.copy(
                 camera = modeRailForCurrentMode(
-                    camera = state.camera,
+                    state = state,
                     returnZone = if (state.camera.focusedZone == CameraUiZone.SettingsPanel) {
                         CameraUiZone.SettingsPanel
                     } else {
@@ -563,10 +589,12 @@ class ControlReducer(
         )
         is CameraCommand.ActivateModeRailEntry -> activateModeRailEntry(state, command.index)
         CameraCommand.ToggleOptionsMenu -> toggleOptionsMenu(state)
+        CameraCommand.VerifyUhdRates -> if (state.camera.recording || state.camera.capabilities?.pendingUhdRates.isNullOrEmpty())
+            Reduction(state = state) else Reduction(state = state, effects = listOf(PlatformEffect.ExecuteCamera(command)))
         is CameraCommand.SelectOptionsItem -> selectOptionsItem(state, command.index)
         is CameraCommand.AdjustOptionsItem -> {
-            val selected = selectOptionsItem(state, command.index).state
-            adjustSelectedOptionsSetting(selected, command.step)
+            val selected = selectOptionsItem(state, command.index)
+            if (selected.effects.isNotEmpty()) selected else adjustSelectedOptionsSetting(selected.state, command.step)
         }
         CameraCommand.ZoomIn -> handleWheel(state, +1)
         CameraCommand.ZoomOut -> handleWheel(state, -1)
@@ -637,9 +665,22 @@ class ControlReducer(
             // otherwise the strip keeps showing a rung the write path clamps away, and the next
             // detent resolves the unfound value from index 0.
             val withCaps = state.camera.copy(capabilities = command.capabilities)
-            Reduction(
-                state = state.copy(camera = CameraCatalog.resnapToClippedLadders(withCaps)),
-            )
+            val caps = command.capabilities
+            val videoMode = withCaps.activeMode in setOf(CameraModeId.Video, CameraModeId.ProVideo, CameraModeId.SlowMotion)
+            val selectedLens = if (videoMode && caps.galaxyS24VideoModes && caps.videoCaptureLens != null) {
+                CameraCatalog.settingsFor(withCaps).firstOrNull { it.id.endsWith(".lens") }?.let { CameraCatalog.currentValue(withCaps, it) }
+            } else null
+            when {
+                selectedLens != null && caps.videoCaptureLens != selectedLens -> Reduction(state = state)
+                withCaps.activeMode == CameraModeId.SlowMotion && selectedLens != null && selectedLens != "1x" &&
+                    "1x" in withCaps.detectedLenses && CameraCatalog.s24CaptureRates(withCaps.activeMode, caps)?.isEmpty() == true -> {
+                    // The prior default was ultrawide. Resolve a lens without either slow-motion rate
+                    // before snapping its saved size and cadence against the main camera's capabilities.
+                    val camera = withCaps.copy(settingValues = withCaps.settingValues + ("slow_motion.lens" to "1x"), zoomFactor = 1.0)
+                    Reduction(state = state.copy(camera = camera))
+                }
+                else -> Reduction(state = state.copy(camera = CameraCatalog.resnapToClippedLadders(withCaps)))
+            }
         }
         is CameraCommand.UpdateDetectedLenses -> {
             val nextCamera = state.camera.copy(detectedLenses = command.lenses)
@@ -753,18 +794,71 @@ class ControlReducer(
         )
     }
 
+    internal fun startFromVisibleDown(state: AppState, now: Long, useMetric: Boolean): Reduction {
+        val s = state.safety
+        val m = s.sealMonitor
+        val verify = m.inspected && m.verification == Verification.Inspection
+        val normal = m.verification == Verification.Idle && m.incidents.isEmpty()
+        if (m.banner != Banner.B03 || (!verify && !normal) || !SealMonitoring.guard(state, now) || s.coverOpen != true ||
+            !depthReadsZero(pressureDepthMeters(s.waterPressureKpa), useMetric)) return Reduction(state)
+        return mergeSafetyResult(state, safetyStateMachine.apply(s.copy(vacuumReleasedPrompt = false,
+            sealMonitor = m.copy(verification = if (verify) Verification.Testing else Verification.Idle, holdSinceMs = null, confirmedRelease = false,
+                acknowledged = m.acknowledged - Banner.NoSuction - Banner.NotBuilding)),
+            SafetySignal.StartVacuumCheckRequested))
+    }
+
     private fun reduceSafety(state: AppState, command: SafetyCommand): Reduction = when (command) {
+        is SafetyCommand.SelectReleaseAnswer -> {
+            val m = state.safety.sealMonitor
+            if (m.banner != Banner.ConfirmRelease) Reduction(state) else Reduction(state.copy(
+                safety = state.safety.copy(sealMonitor = m.copy(releaseAnswerYes = command.yes))))
+        }
+        SafetyCommand.ConfirmReleaseAnswer -> {
+            val s = state.safety
+            val m = s.sealMonitor
+            if (!state.housing.connected || m.banner != Banner.ConfirmRelease || !m.releaseQuestion) Reduction(state)
+            else {
+                val yes = m.releaseAnswerYes
+                Reduction(state.copy(safety = s.copy(vacuumReleasedPrompt = yes, vacuumReleaseDisconnectObserved = false,
+                    vacuumReleaseChoice = VacuumReleaseChoice.ShutDown, checkDismissed = false,
+                    restartFailAgoMinutes = if (yes) null else s.restartFailAgoMinutes,
+                    sealMonitor = m.copy(releaseQuestion = false, releaseAnswerYes = false, confirmedRelease = yes,
+                        lostWhileOfflineMinutes = if (yes) null else m.lostWhileOfflineMinutes,
+                        incidents = if (yes) m.incidents else m.incidents + SealIncident.SurfaceLeak,
+                        verification = if (yes) Verification.Idle else Verification.Inspection,
+                        inspected = false, transition = if (yes) Banner.B00 else Banner.B05))))
+            }
+        }
         is SafetyCommand.SelectVacuumReleaseChoice -> Reduction(if (state.safety.vacuumReleasedPrompt)
             state.copy(safety = state.safety.copy(vacuumReleaseChoice = command.choice)) else state)
-        SafetyCommand.ConfirmVacuumReleaseChoice -> if (!state.housing.connected) Reduction(state) else mergeSafetyResult(
-            state, safetyStateMachine.apply(state.safety, SafetySignal.ConfirmVacuumReleaseChoiceRequested))
-        SafetyCommand.StartVacuumCheck -> mergeSafetyResult(
-            state = state,
-            result = safetyStateMachine.apply(
-                state = state.safety,
-                signal = SafetySignal.StartVacuumCheckRequested,
-            ),
-        )
+        SafetyCommand.ConfirmVacuumReleaseChoice -> when {
+            !state.housing.connected || state.safety.sealMonitor.banner != Banner.Release -> Reduction(state)
+            state.safety.vacuumReleaseChoice == VacuumReleaseChoice.ShutDown ->
+                Reduction(if (state.camera.recording || state.camera.panoramaReviewAvailable) state else state.enterHousingStandby())
+            else -> mergeSafetyResult(state, safetyStateMachine.apply(state.safety, SafetySignal.ConfirmVacuumReleaseChoiceRequested))
+        }
+        SafetyCommand.StartVacuumCheck -> Reduction(state) // Only a freshly routed physical DOWN can start.
+        SafetyCommand.OpenVacuumSetup -> {
+            val s = state.safety
+            val m = s.sealMonitor
+            val inspect = m.incidents.isNotEmpty() || m.verification in setOf(Verification.Failed, Verification.Interrupted)
+            Reduction(state.copy(safety = s.copy(checkDismissed = false, vacuumReleasedPrompt = false, warning = null,
+                sealMonitor = m.copy(verification = if (inspect) Verification.Inspection else Verification.Idle,
+                    acknowledged = (m.acknowledged + m.banner) - Banner.B17 - Banner.B19, inspected = false))))
+        }
+        SafetyCommand.ConfirmInspection -> {
+            val s = state.safety
+            val m = s.sealMonitor
+            if (m.banner != Banner.B15 || m.verification != Verification.Inspection ||
+                m.location != HousingSealTransitions.Location.Surface) Reduction(state)
+            else Reduction(state.copy(safety = s.copy(checkDismissed = false,
+                sealMonitor = m.copy(inspected = true, acknowledged = m.acknowledged - Banner.B03))))
+        }
+        SafetyCommand.AcknowledgeSealBanner -> {
+            val s = state.safety
+            Reduction(state.copy(safety = s.copy(sealMonitor = s.sealMonitor.copy(
+                acknowledged = s.sealMonitor.acknowledged + s.sealMonitor.banner))))
+        }
         SafetyCommand.CancelVacuumCheck -> mergeSafetyResult(
             state = state,
             result = safetyStateMachine.apply(
@@ -772,18 +866,24 @@ class ControlReducer(
                 signal = SafetySignal.CancelVacuumCheckRequested,
             ),
         )
-        SafetyCommand.DismissSealCheck -> mergeSafetyResult(
-            state = state,
-            result = safetyStateMachine.apply(
-                state = state.safety,
-                signal = SafetySignal.DismissSealCheckRequested,
-            ),
-        )
+        SafetyCommand.DismissSealCheck -> {
+            val dismissed = mergeSafetyResult(state, safetyStateMachine.apply(state.safety, SafetySignal.DismissSealCheckRequested))
+            val camera = state.camera
+            if (state.safety.sealMonitor.banner == Banner.B03 &&
+                (state.mode == AppMode.CameraLive || state.mode == AppMode.CameraAdjust) &&
+                !camera.recordingPaused && !camera.panoramaReviewAvailable) {
+                val centered = camera.copy(focusedZone = CameraUiZone.SettingsPanel,
+                    settingsCursor = CameraCatalog.settingsBarItems(camera).indexOf(BottomBarItem.ModesButton),
+                    showMoreSettings = false, settingsEditing = false, sliderEditTarget = SliderEditTarget.Value)
+                dismissed.copy(state = dismissed.state.copy(camera = centered))
+            } else dismissed
+        }
         SafetyCommand.SkipToResult -> mergeSafetyResult(
             state = state,
             result = safetyStateMachine.apply(
                 state = state.safety,
-                signal = SafetySignal.SkipToResultRequested,
+                signal = if (state.safety.sealMonitor.verification == Verification.Testing)
+                    SafetySignal.CancelVacuumCheckRequested else SafetySignal.SkipToResultRequested,
             ),
         )
         SafetyCommand.ResetSealState -> mergeSafetyResult(
@@ -845,7 +945,13 @@ class ControlReducer(
                 warning(state, "Transparent Phone Mode unavailable.")
             }
         }
-        SystemCommand.SwitchToSafetyMode -> Reduction(state = state.copy(mode = AppMode.Safety))
+        SystemCommand.SwitchToSafetyMode -> {
+            val next = state.copy(mode = AppMode.Safety)
+            val m = next.safety.sealMonitor
+            if (m.banner == Banner.B00 && m.location == HousingSealTransitions.Location.Surface &&
+                m.verification == Verification.Idle) reduceSafety(next, SafetyCommand.OpenVacuumSetup)
+            else Reduction(next)
+        }
         SystemCommand.SwitchToDiagnosticsMode -> Reduction(
             state = state.copy(
                 mode = AppMode.Diagnostics,
@@ -1036,7 +1142,7 @@ class ControlReducer(
             CameraUiZone.LiveView -> cycleModeFromSettingsBar(state, -1)
             CameraUiZone.ModeRail -> {
                 val nextCamera = if (camera.railLevel == CameraRailLevel.Primary) {
-                    camera.copy(highlightedPrimaryIndex = CameraCatalog.movePrimaryRail(camera.highlightedPrimaryIndex, -1, state.diveProfile.stopActive))
+                    camera.copy(highlightedPrimaryIndex = CameraCatalog.movePrimaryRail(camera.highlightedPrimaryIndex, -1, state.diveProfile.stopActive, state.vacuumMenuAvailable))
                 } else {
                     camera.copy(highlightedSecondaryIndex = (camera.highlightedSecondaryIndex - 1).coerceAtLeast(0))
                 }
@@ -1066,7 +1172,7 @@ class ControlReducer(
             CameraUiZone.LiveView -> cycleModeFromSettingsBar(state, +1)
             CameraUiZone.ModeRail -> {
                 val nextCamera = if (camera.railLevel == CameraRailLevel.Primary) {
-                    camera.copy(highlightedPrimaryIndex = CameraCatalog.movePrimaryRail(camera.highlightedPrimaryIndex, 1, state.diveProfile.stopActive))
+                    camera.copy(highlightedPrimaryIndex = CameraCatalog.movePrimaryRail(camera.highlightedPrimaryIndex, 1, state.diveProfile.stopActive, state.vacuumMenuAvailable))
                 } else {
                     camera.copy(highlightedSecondaryIndex = (camera.highlightedSecondaryIndex + 1).coerceAtMost(CameraCatalog.secondaryModes.lastIndex))
                 }
@@ -1189,7 +1295,8 @@ class ControlReducer(
                 if (camera.showMoreSettings) {
                     // Options is an editor, just like the Focus OK-menu: OK commits the
                     // current state and returns to the unchanged horizontal settings rail.
-                    toggleOptionsMenu(state)
+                    if (CameraCatalog.selectedOptionsSetting(camera)?.id == "verify_uhd")
+                        reduceCamera(state, CameraCommand.VerifyUhdRates) else toggleOptionsMenu(state)
                 } else if (camera.settingsEditing) {
                     confirmSettingEdit(state)
                 } else {
@@ -1258,7 +1365,7 @@ class ControlReducer(
                 }
             }
             camera.focusedZone == CameraUiZone.SettingsPanel -> Reduction(
-                state = state.copy(camera = modeRailForCurrentMode(camera)),
+                state = state.copy(camera = modeRailForCurrentMode(state)),
             )
             camera.focusedZone == CameraUiZone.ModeRail && camera.railLevel == CameraRailLevel.Secondary -> Reduction(
                 state = state.copy(
@@ -1276,17 +1383,15 @@ class ControlReducer(
     }
 
     private fun modeRailForCurrentMode(
-        camera: CameraState,
+        state: AppState,
         returnZone: CameraUiZone = CameraUiZone.LiveView,
     ): CameraState {
+        val camera = state.camera
         return camera.copy(
             focusedZone = CameraUiZone.ModeRail,
             modeRailReturnZone = returnZone,
             railLevel = CameraRailLevel.Primary,
-            // Every deliberate menu opening starts at its first action. The active camera mode is
-            // still remembered and remains unchanged; only the side-menu cursor resets so the
-            // housing always presents Track Heading at the top, regardless of its last position.
-            highlightedPrimaryIndex = 0,
+            highlightedPrimaryIndex = if (state.vacuumMenuAvailable) CameraCatalog.VACUUM_RAIL_INDEX else 0,
             highlightedSecondaryIndex = CameraCatalog.secondaryIndexForMode(camera.activeMode),
             settingsEditing = false,
             sliderEditTarget = SliderEditTarget.Value,
@@ -1341,7 +1446,26 @@ class ControlReducer(
     private fun activatePrimaryRailEntry(state: AppState): Reduction {
         val camera = state.camera
         val entry = camera.primaryHighlightedEntry
+        if (entry.action == CameraRailAction.ShutOff) {
+            if (camera.recording || camera.panoramaReviewAvailable) return Reduction(state)
+            val s = state.safety
+            val checking = s.sealMonitor.verification == Verification.Testing ||
+                s.sealState == SealState.Vacuuming || s.sealState == SealState.MotorStopping ||
+                s.sealState == SealState.WaitingForCoverClosed || (s.leakMonitoringStartedAtEpochMs != null &&
+                    s.sealConfidence < SealConfidence.ManufacturerMinimum)
+            val stopped = if (checking) reduce(state, SafetyCommand.CancelVacuumCheck) else Reduction(state)
+            val safety = stopped.state.safety
+            val nextSafety = if (checking) safety.copy(sealMonitor = safety.sealMonitor.copy(
+                verification = Verification.Interrupted, inspected = false, holdSinceMs = null,
+                incidents = safety.sealMonitor.incidents + SealIncident.IncompleteCheck)) else safety
+            return stopped.copy(state = stopped.state.copy(camera = exitModeRail(camera), safety = nextSafety).enterHousingStandby())
+        }
+        if (entry.action == CameraRailAction.EstablishVacuum) {
+            if (!state.vacuumMenuAvailable) return Reduction(state)
+            return Reduction(state.copy(camera = exitModeRail(camera), safety = state.safety.copy(checkDismissed = false)))
+        }
         if (entry.action == CameraRailAction.SafetyStop) {
+            if (state.diveProfile.continuationPending) return Reduction(state)
             if (!state.diveProfile.stopActive) return Reduction(state.copy(camera = camera.copy(highlightedPrimaryIndex = 0)))
             return Reduction(state.copy(camera = exitModeRail(camera), diveProfile = state.diveProfile.copy(
                 stopPresentation = DiveStopPresentation.Expanded)))
@@ -1401,7 +1525,11 @@ class ControlReducer(
     }
 
     private fun activateModeRailEntry(state: AppState, index: Int): Reduction {
-        if (index !in CameraCatalog.primaryRailEntries.indices &&
+        val visibleVacuum = index == CameraCatalog.VACUUM_RAIL_INDEX && state.vacuumMenuAvailable &&
+            state.camera.focusedZone == CameraUiZone.ModeRail && state.camera.railLevel == CameraRailLevel.Primary
+        val visibleShutOff = index == CameraCatalog.SHUT_OFF_RAIL_INDEX &&
+            state.camera.focusedZone == CameraUiZone.ModeRail && state.camera.railLevel == CameraRailLevel.Primary
+        if (index !in CameraCatalog.primaryRailEntries.indices && !visibleVacuum && !visibleShutOff &&
             !(index == CameraCatalog.SAFETY_STOP_RAIL_INDEX && state.diveProfile.stopActive)) return Reduction(state = state)
         val selectedState = state.copy(
             camera = state.camera.copy(
@@ -1513,7 +1641,7 @@ class ControlReducer(
         val item = items.getOrNull(state.camera.settingsCursor) ?: return Reduction(state = state)
         return when (item) {
             is BottomBarItem.ModesButton -> {
-                val nextCamera = modeRailForCurrentMode(state.camera, returnZone = CameraUiZone.SettingsPanel)
+                val nextCamera = modeRailForCurrentMode(state, returnZone = CameraUiZone.SettingsPanel)
                 Reduction(state = state.copy(camera = nextCamera))
             }
             is BottomBarItem.LensShortcut -> {
@@ -1598,6 +1726,8 @@ class ControlReducer(
 
     private fun selectOptionsItem(state: AppState, index: Int): Reduction {
         if (!state.camera.showMoreSettings) return Reduction(state = state)
+        if (CameraCatalog.optionsMenuSettings(state.camera).getOrNull(index)?.id == "verify_uhd")
+            return reduceCamera(state, CameraCommand.VerifyUhdRates)
         val lastIndex = CameraCatalog.optionsMenuSettings(state.camera).lastIndex
         if (lastIndex < 0) return Reduction(state = state)
         return Reduction(
@@ -2261,31 +2391,9 @@ class ControlReducer(
         var selectedFps = CameraCatalog.captureFrameRateFps(
             updatedValues["$prefix.frame_rate"],
         )
-        if (settingId == "pro_video.frame_rate" && selectedFps != null) {
-            val ratesByResolution = camera.capabilities?.videoFrameRatesByResolution.orEmpty()
-            val currentResolution = updatedValues["$prefix.resolution"]
-            if (
-                ratesByResolution.isNotEmpty() &&
-                selectedFps !in ratesByResolution[currentResolution].orEmpty()
-            ) {
-                // Keep every device-supported Pro rate reachable from one FPS menu. When the
-                // current resolution cannot carry it, land on the highest-quality compatible
-                // resolution in the catalog's own order (on the S24: FHD for 60/120/240 fps).
-                val compatibleResolution = CameraCatalog.settingsFor(
-                    camera.copy(settingValues = updatedValues),
-                ).firstOrNull { it.id == "$prefix.resolution" }
-                    ?.options
-                    ?.lastOrNull { resolution ->
-                        selectedFps in ratesByResolution[resolution].orEmpty()
-                    }
-                if (compatibleResolution != null) {
-                    updatedValues = updatedValues + ("$prefix.resolution" to compatibleResolution)
-                }
-            }
-        }
         if (settingId.endsWith(".resolution")) {
-            val compatibleRates = camera.capabilities?.videoFrameRatesByResolution
-                ?.get(value)
+            val compatibleRates = (CameraCatalog.s24CaptureRates(camera.activeMode, camera.capabilities)
+                ?: camera.capabilities?.videoFrameRatesByResolution)?.get(value)
                 .orEmpty()
                 .sorted()
             if (selectedFps != null && compatibleRates.isNotEmpty() && selectedFps !in compatibleRates) {
@@ -2294,11 +2402,7 @@ class ControlReducer(
                 val compatibleFps = compatibleRates.lastOrNull { it <= selectedFps!! }
                     ?: compatibleRates.first()
                 selectedFps = compatibleFps
-                val compatibleValue = if (prefix == "pro_video") {
-                    CameraCatalog.proVideoFrameRateOption(compatibleFps)
-                } else {
-                    "${compatibleFps}fps"
-                }
+                val compatibleValue = "${compatibleFps}fps"
                 updatedValues = updatedValues + ("$prefix.frame_rate" to compatibleValue)
             }
         }
@@ -2345,9 +2449,18 @@ class ControlReducer(
             settingId.endsWith(".exposure_display") && value != "Off" -> true
             else -> false
         }
-        if (incompatibleWithHighSpeed && highSpeedSelected) {
+        if (settingId == "$prefix.frame_rate" && selectedFps != 30 && updatedValues["$prefix.log"] == "On") {
+            updatedValues = updatedValues + ("$prefix.log" to "Off")
+        }
+        if (settingId == "$prefix.log" && value == "On" && prefix in setOf("video", "pro_video")) {
+            updatedValues = updatedValues + ("$prefix.frame_rate" to "30fps")
+        } else if (incompatibleWithHighSpeed && highSpeedSelected) {
             updatedValues = updatedValues +
                 ("$prefix.frame_rate" to preferredNormalFrameRate(camera, prefix))
+        }
+        if (prefix in setOf("video", "pro_video", "slow_motion") &&
+            (settingId == "$prefix.frame_rate" || updatedValues["$prefix.frame_rate"] != camera.settingValues["$prefix.frame_rate"])) {
+            updatedValues = updatedValues + ("$prefix.playback_fps" to CameraCatalog.MATCH_CAPTURE)
         }
         val next = if (settingId == "photo.zoom_level" || settingId == "video.zoom") {
             camera.copy(
@@ -2371,16 +2484,19 @@ class ControlReducer(
     private fun preferredNormalFrameRate(camera: CameraState, prefix: String): String {
         val capabilities = camera.capabilities
         val resolution = camera.settingValues["$prefix.resolution"]
+        val modeRates = CameraCatalog.s24CaptureRates(camera.activeMode, capabilities)
+        if (modeRates != null) {
+            val rates = modeRates[resolution].orEmpty()
+            val current = CameraCatalog.captureFrameRateFps(camera.settingValues["$prefix.frame_rate"])
+            val preferred = rates.lastOrNull { it < HIGH_SPEED_FPS_MIN } ?: current?.takeIf { it in rates } ?: rates.firstOrNull()
+            return preferred?.let { "${it}fps" } ?: camera.settingValues["$prefix.frame_rate"].orEmpty()
+        }
         val rates = capabilities?.videoFrameRatesByResolution
             ?.get(resolution)
             ?.takeIf { it.isNotEmpty() }
             ?: capabilities?.availableVideoFrameRates.orEmpty()
         val normal = rates.filter { it in 1 until HIGH_SPEED_FPS_MIN }.maxOrNull() ?: 30
-        return if (prefix == "pro_video") {
-            CameraCatalog.proVideoFrameRateOption(normal)
-        } else {
-            "${normal}fps"
-        }
+        return "${normal}fps"
     }
 
     /**

@@ -65,10 +65,8 @@ import kotlinx.coroutines.launch
  * The launcher and the expanded panel move as one floating unit so the
  * interface can be positioned anywhere on screen during device testing.
  *
- * These buttons emit real wire bytes through the same entry point the radio uses, so what they
- * exercise is the actual decode-and-route path rather than a parallel one. There is deliberately
- * no simulated *connection*: the app must never show a link it does not have, and a fake session
- * fought the real radio the moment hardware was attached.
+ * The on-screen buttons use the wire decoder and input router with a local input source.
+ * Only the explicit LINK control simulates a connection.
  */
 @Composable
 fun DebugSimulationPanel(
@@ -192,8 +190,7 @@ private fun DebugButtonCluster(viewModel: DiveViewModel) {
             ) {
                 viewModel.simulateButton(HousingButtonEvent.ZoomIn)
             }
-            // Forces the link to Ready so the simulated buttons above are actually routed
-            // when no housing is attached.
+            // Explicitly simulate a connected session for bench testing.
             HousingButton(
                 label = "LINK",
                 color = Color.Black,

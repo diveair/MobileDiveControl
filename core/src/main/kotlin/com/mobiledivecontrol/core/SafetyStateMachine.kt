@@ -121,6 +121,8 @@ data class SafetyThresholds(
      * anyone actually diving.
      */
     val surfaceMaxDepthM: Double = 0.5,
+    val surfaceReturnMarginM: Double = 0.1,
+    val sealValidationSamples: Long = 2L,
 ) {
     /**
      * Confidence is a function of hold time alone. Leak detection is independent of it and
@@ -212,11 +214,7 @@ class SafetyStateMachine(
     private fun confirmVacuumReleaseChoice(state: SafetyState): SafetyMachineResult {
         if (!state.vacuumReleasedPrompt || state.vacuumReleaseChoice != VacuumReleaseChoice.RestartPump)
             return SafetyMachineResult(state)
-        if (state.coverOpen != true) return SafetyMachineResult(state,
-            note = "Remove the blue cap before restarting the pump.")
-        if (pressureDepthMeters(state.waterPressureKpa)?.let { it > thresholds.surfaceMaxDepthM } == true)
-            return SafetyMachineResult(state, note = "Return to the surface before restarting the pump.")
-        return startVacuumCheck(state.copy(vacuumReleasedPrompt = false,
+        return SafetyMachineResult(state.copy(vacuumReleasedPrompt = false,
             vacuumReleaseDisconnectObserved = false, vacuumReleaseChoice = VacuumReleaseChoice.ShutDown,
             checkDismissed = false))
     }
@@ -243,6 +241,8 @@ class SafetyStateMachine(
         return SafetyMachineResult(
             state = state.copy(
                 sealState = SealState.Vacuuming,
+                surfaceVentStartedAtMs = null,
+                pendingOutlierKpa = null,
                 vacuumBestKpa = null,
                 vacuumLastProgressAtMs = null,
                 vacuumRateWindowStartMs = null,
@@ -431,6 +431,11 @@ class SafetyStateMachine(
             return restartSealFailed(state, timestampMs)
         }
 
+        // A matching pre-disconnect reading identifies a previously observed hold. It can
+        // suppress a repeat cap prompt, but only the verified record above can restore trust.
+        val previous = state.sealMonitor.snapshot
+        val sameHold = previous != null && previous.observation.vacuum == HousingSealTransitions.Vacuum.Stable &&
+            kotlin.math.abs(kpa - (previous.ambientKpa - previous.magnitudeKpa)) <= thresholds.rebootMatchToleranceKpa
         val message = "Existing vacuum detected (-%.1f kPa). Monitoring seal.".format(drop)
         return SafetyMachineResult(
             state = state.copy(
@@ -440,7 +445,7 @@ class SafetyStateMachine(
                 stabilizationSamples = listOf(kpa),
                 leakMonitoringStartedAtEpochMs = timestampMs,
                 leakMonitoringElapsedMs = 0L,
-                capCloseReminder = true,
+                capCloseReminder = !sameHold,
                 adoptedHold = true,
                 vacuumReleasedPrompt = false,
                 pendingAdoptionKpa = null,
@@ -717,6 +722,8 @@ class SafetyStateMachine(
                 state = state.copy(
                     coverOpen = true,
                     sealState = SealState.CoverOpen,
+                    pendingOutlierKpa = null,
+                    surfaceVentStartedAtMs = null,
                     sealConfidence = SealConfidence.Monitoring,
                     stabilizationSamples = emptyList(),
                     leakMonitoringStartedAtEpochMs = null,
@@ -782,10 +789,11 @@ class SafetyStateMachine(
      * Elapsed time gates only how high [SealConfidence] may climb.
      */
     private fun handleLeakMonitoringPressure(
-        state: SafetyState,
+        previous: SafetyState,
         kpa: Double,
         timestampMs: Long,
     ): SafetyMachineResult {
+        val state = if (previous.surfaceVentStartedAtMs == null) previous else previous.copy(surfaceVentStartedAtMs = null)
         val monitoringStarted = state.leakMonitoringStartedAtEpochMs ?: timestampMs
         val elapsedMs = (timestampMs - monitoringStarted).coerceAtLeast(0L)
 
@@ -796,6 +804,31 @@ class SafetyStateMachine(
         // A real event loses only ~half a second to confirmation, because real pressure stays
         // where it moved.
         val lastAccepted = state.stabilizationSamples.lastOrNull()
+        // Pressure can rise in steps when the silver valve opens, including during the first
+        // countdown. The last validated surface hold is the reference throughout this ramp.
+        val ambient = state.surfaceAmbientKpa ?: state.waterPressureKpa
+        val monitor = state.sealMonitor
+        if (lastAccepted != null && ambient != null && kpa - lastAccepted > thresholds.stabilizationToleranceKpa &&
+            monitor.location == HousingSealTransitions.Location.Surface && monitor.incidents.isEmpty() &&
+            monitor.last?.observation == HousingSealTransitions.Observation(
+                HousingSealTransitions.Location.Surface, HousingSealTransitions.Vacuum.Stable) &&
+            (monitor.verification == Verification.Idle || monitor.verification == Verification.Passed)) {
+            val since = previous.surfaceVentStartedAtMs ?: timestampMs
+            val age = timestampMs - since
+            val pending = previous.pendingOutlierKpa
+            val tolerance = thresholds.stabilizationToleranceKpa
+            val atAmbient = kotlin.math.abs(kpa - ambient) <= tolerance
+            val partialPlateau = !atAmbient && pending != null && kotlin.math.abs(kpa - pending) <= tolerance
+            if (age in 0..SURFACE_VENT_SETTLING_MS && !(partialPlateau && age >= PARTIAL_LOSS_CONFIRM_MS)) {
+                if (previous.surfaceVentStartedAtMs != null && atAmbient && pending != null &&
+                    kotlin.math.abs(pending - ambient) <= tolerance) {
+                    return surfaceRelease(state, elapsedMs)
+                }
+                return SafetyMachineResult(state.copy(surfaceVentStartedAtMs = since, pendingOutlierKpa = kpa,
+                    leakMonitoringElapsedMs = elapsedMs))
+            }
+            return sealFailed(state.copy(pendingOutlierKpa = null), "Surface vacuum loss persisted without a confirmed return to ambient.")
+        }
         val jumped = lastAccepted != null &&
             kotlin.math.abs(kpa - lastAccepted) > thresholds.glitchJumpKpa
         if (jumped) {
@@ -852,7 +885,6 @@ class SafetyStateMachine(
 
         // Creeping approach to ambient — too slow to trip the jump gate, but two consecutive
         // readings effectively at atmosphere mean the vacuum is gone however it happened.
-        val ambient = state.surfaceAmbientKpa ?: state.waterPressureKpa
         val atAmbient = ambient != null &&
             samples.size >= 2 &&
             samples.takeLast(2).all { it >= ambient - thresholds.stabilizationToleranceKpa }
@@ -1016,8 +1048,12 @@ class SafetyStateMachine(
     ): SafetyMachineResult {
         val depthM = pressureDepthMeters(state.waterPressureKpa)
         val atSurface = depthM != null && depthM <= thresholds.surfaceMaxDepthM
-        val deliberate = vent && atSurface && (elapsedMs >= thresholds.manufacturerMinimumMs || state.adoptedHold)
-        if (!deliberate) return sealFailed(state, message)
+        if (!vent || !atSurface || (elapsedMs < thresholds.manufacturerMinimumMs && !state.adoptedHold))
+            return sealFailed(state, message)
+        return surfaceRelease(state, elapsedMs)
+    }
+
+    private fun surfaceRelease(state: SafetyState, elapsedMs: Long): SafetyMachineResult {
         return SafetyMachineResult(
             state = state.copy(
                 sealState = SealState.Unknown,
@@ -1027,13 +1063,17 @@ class SafetyStateMachine(
                 leakMonitoringStartedAtEpochMs = null,
                 leakMonitoringElapsedMs = 0L,
                 checkDismissed = false,
-                vacuumReleasedPrompt = atSurface,
+                surfaceVentStartedAtMs = null,
+                pendingOutlierKpa = null,
+                capCloseReminder = false,
+                adoptedHold = false,
+                vacuumReleasedPrompt = true,
                 vacuumReleaseDisconnectObserved = false,
                 vacuumReleaseChoice = VacuumReleaseChoice.ShutDown,
                 warning = null,
             ),
             effects = safeHardwareState(),
-            note = "Vacuum released after ${elapsedMs / 1000}s — past hard verify, treating as deliberate.",
+            note = "Surface vacuum returned to ambient after ${elapsedMs / 1000}s.",
         )
     }
 
@@ -1118,6 +1158,8 @@ class SafetyStateMachine(
     )
 
     private companion object {
+        const val PARTIAL_LOSS_CONFIRM_MS = 1_500L
+        const val SURFACE_VENT_SETTLING_MS = 3_000L
         /** States in which the shell is either being evacuated or already holding a vacuum. */
         val VACUUM_IN_FLIGHT_STATES = setOf(
             SealState.Vacuuming,

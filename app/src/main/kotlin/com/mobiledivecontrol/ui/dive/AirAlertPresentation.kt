@@ -1,5 +1,7 @@
 package com.mobiledivecontrol.ui.dive
 
+import com.mobiledivecontrol.ui.components.MessageBanner
+import androidx.compose.foundation.BorderStroke
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.background
@@ -85,12 +87,12 @@ fun AirAlertOverlay(state: AppState, onCommand: (DiveSettingsCommand) -> Unit, m
         return
     }
     if (air.entry != null || air.prompt != null) {
-        AirAlertCard(air, dive, send, modifier.width(540.dp))
+        AirAlertCard(air, dive, send, if (airIsSimpleReminder(air)) modifier else modifier.width(540.dp))
         return
     }
 }
 
-private fun airIsSimpleReminder(air: AirAlertState): Boolean {
+internal fun airIsSimpleReminder(air: AirAlertState): Boolean {
     val prompt = air.prompt ?: return false
     if (air.entry != null || prompt.confirmation) return false
     val action = air.settings.actionFor(prompt.number)
@@ -116,6 +118,20 @@ private fun AirAlertCard(air: AirAlertState, dive: DiveProfileState, send: (AirA
     val colour = if (alert) Color(s.colour.argb) else DiveColors.DiveCyan
     var pulse by remember(prompt?.number, s.flash) { mutableStateOf(true) }
     LaunchedEffect(alert, s.flash) { while (alert && s.flash) { delay(750); pulse = !pulse } }
+    if (reminderOnly) {
+        MessageBanner(DiveColors.DeepBlack.copy(alpha = if (LocalAlertRecording.current) 0f else s.opacityPercent / 100f), modifier,
+            border = BorderStroke(if (pulse) 3.dp else 1.dp, colour.copy(alpha = if (pulse) 1f else 0.35f))) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                AutoShrinkText(message, color = colour, style = TextStyle(fontSize = 23.sp, fontWeight = FontWeight.Bold),
+                    modifier = Modifier.weight(2f), maxLines = 2)
+                ReminderTime("DIVE TIME", airDiveClock(air.elapsedMs), Modifier.weight(1f))
+                ReminderTime("NEXT ALERT", airNextAlertAtMs(air)?.let(::airDiveClock) ?: "None", Modifier.weight(1f))
+                AirAction("OK", colour) { send(AirAlertCommand.PromptAction(2)) }
+            }
+        }
+        return
+    }
     val estimate = AirAlertEngine.estimate(air, dive, now)
     val readingEstimate = AirAlertEngine.readingEstimate(air.copy(entry = entry), dive, now)
     Column(modifier
@@ -135,16 +151,6 @@ private fun AirAlertCard(air: AirAlertState, dive: DiveProfileState, send: (AirA
             else -> message
         }, color = colour, style = TextStyle(fontSize = 23.sp, lineHeight = 28.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center),
             modifier = Modifier.fillMaxWidth(), minFontSize = 14.sp, maxLines = 2)
-        if (reminderOnly) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically) {
-                ReminderTime("DIVE TIME", airDiveClock(air.elapsedMs), Modifier.weight(1f))
-                Box(Modifier.width(1.dp).height(36.dp).background(colour.copy(alpha = 0.4f)))
-                ReminderTime("NEXT ALERT", airNextAlertAtMs(air)?.let(::airDiveClock) ?: "None", Modifier.weight(1f))
-            }
-            AirAction("OK", colour) { send(AirAlertCommand.PromptAction(2)) }
-            return@Column
-        }
         if (entry != null) {
             val value = entry.text.toIntOrNull() ?: 0
             val range = s.pressureRange(entry.purpose)

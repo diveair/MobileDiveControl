@@ -72,6 +72,25 @@ class AndroidBleTransport(
 
     @Volatile
     private var gatt: BluetoothGatt? = null
+    @Volatile private var standby = false
+    private var mutedCurrentConnection = false
+
+    override fun setStandby(enabled: Boolean) {
+        if (standby == enabled) return
+        standby = enabled
+        val client = gatt ?: return
+        runCatching { client.requestConnectionPriority(if (enabled) BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
+            else BluetoothGatt.CONNECTION_PRIORITY_HIGH) }.onFailure { note("Standby radio configuration: ${it.message}") }
+        if (!enabled && !mutedCurrentConnection) return // A new connection already subscribed during discovery.
+        mutedCurrentConnection = enabled
+        scope?.launch {
+            for (key in HousingBleProfile.subscriptionOrder) {
+                if (standby != enabled || gatt !== client) break
+                if (key == HousingCharacteristic.ButtonEvents) continue // SHUTTER can wake the existing link.
+                if (key in handles.keys) configureSubscription(key, !enabled)
+            }
+        }
+    }
 
     @Volatile
     private var scope: CoroutineScope? = null
@@ -157,7 +176,7 @@ class AndroidBleTransport(
         }
 
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(if (preferredAddress == null && !standby) ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_LOW_POWER)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
 
@@ -165,10 +184,13 @@ class AndroidBleTransport(
         activeScan.set(callback)
 
         return try {
-            scanner.startScan(emptyList(), settings, callback)
+            val filters = if (standby) listOf(android.bluetooth.le.ScanFilter.Builder().apply {
+                if (preferredAddress != null) setDeviceAddress(preferredAddress) else setDeviceName(HousingBleProfile.advertisingName)
+            }.build()) else emptyList()
+            scanner.startScan(filters, settings, callback)
             val found = withTimeoutOrNull(timeoutMs) { finished.await() }
                 ?: candidates.values.maxByOrNull { it.rssi }
-            if (found == null) reportUnmatchedScan(seen)
+            if (found == null && !standby) reportUnmatchedScan(seen)
             found
         } catch (error: SecurityException) {
             note("Scan denied: ${error.message}")
@@ -542,7 +564,9 @@ class AndroidBleTransport(
      * to stop discarding the packets, and the CCCD write is what tells the housing to send
      * them. Doing the first alone is the classic "notifications never arrive" bug.
      */
-    override suspend fun subscribe(characteristic: HousingCharacteristic): Boolean {
+    override suspend fun subscribe(characteristic: HousingCharacteristic): Boolean = configureSubscription(characteristic, true)
+
+    private suspend fun configureSubscription(characteristic: HousingCharacteristic, enabled: Boolean): Boolean {
         val client = gatt ?: return false
         val worker = queue ?: return false
         val handle = handles[characteristic] ?: run {
@@ -558,7 +582,7 @@ class AndroidBleTransport(
         }
 
         val enabledLocally = try {
-            client.setCharacteristicNotification(handle, true)
+            client.setCharacteristicNotification(handle, enabled)
         } catch (error: SecurityException) {
             note("Subscribe denied: ${error.message}")
             false
@@ -573,7 +597,7 @@ class AndroidBleTransport(
             return false
         }
 
-        val value = if (notify) {
+        val value = if (!enabled) BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE else if (notify) {
             BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
         } else {
             BluetoothGattDescriptor.ENABLE_INDICATION_VALUE

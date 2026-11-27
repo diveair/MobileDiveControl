@@ -1,8 +1,131 @@
 # Slow-motion capture and validation
 
-Validated on Samsung Galaxy S24 SM-S921W, Android 16, on 2026-09-03.
+## Galaxy S24 UHD 120 in Slow Motion (November 26, 2026)
 
-## Recording contract
+On the SM-S921W running firmware `S921WVLS6DZH3`, select **Slow Motion → 0.6× or 1× → UHD 4K → 120fps**. Select **Playback FPS → 30fps** for nominal four-times slow motion. **Options → Test UHD capture rates** provides an optional moving-subject check on this firmware. Other eligible firmware builds enable the rate after that check passes for the selected lens.
+
+On the SM-S921W, Nauticase opens public logical camera 0 with Samsung shooting mode 13 in a regular Camera2 session. Optical zoom selects physical sensor 2 at 0.6× and sensor 5 at 1×. Both lenses use a 1280 × 720 viewfinder at 30 FPS in standby. During recording, every request targets the 3840 × 2160 HEVC recorder and one in four also feeds the display. Under moderate thermal pressure the idle preview requests an advertised fixed 24 FPS. During an ongoing take, one request in five feeds the display while the recorder continues at its requested 120 FPS. The lower viewfinder rate stays in effect through the existing cooldown. The optional qualifier still measures every capture result.
+
+The following production-recorder measurements were collected on firmware `S921WVLS6DZH3` with audio enabled. File FPS uses the first and last video presentation timestamps. These two takes passed the lens, cadence and audio checks. Scene movement was insufficient for the decoded-frame test.
+
+| Lens | Sensor FPS | UHD HEVC frames | File FPS | Video duration | AAC duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0.6× | 118.51 | 525 | 118.51 | 4.430 s | 4.428 s |
+| 1× | 117.79 | 521 | 117.86 | 4.421 s | 4.420 s |
+
+In a seven-second comparison on the same handset, the earlier 1× build averaged 117.17 FPS with 10 long intervals. Two takes with the updated viewfinder each averaged 118.18 FPS with three long intervals. The updated 0.6× build averaged 118.37 FPS with one. These are video-track measurements from first to last presentation timestamp. A long interval exceeds 1.5 times the nominal 8.33 ms frame period.
+
+On-device tests switched the viewfinder from one display update per four capture requests to one per five during a single recording on each lens. Reduced standby measured 24.03 FPS at 1× and 24.00 FPS at 0.6×. Both returned to 30 FPS after recovery. The UHD HEVC files averaged 118.33 FPS at 1× and 118.75 FPS at 0.6×, each with an AAC track. These tests exercised the app's reduced-load path. Temperature rise and sustained runtime in a housing remain unmeasured.
+
+## UHD capture rates and thermal handling
+
+UHD means an encoded 3840 × 2160 frame at 16:9. Video, Pro Video and Slow Motion discover rates for the selected lens. On the tested SM-S921W, Video and Pro Video offer UHD 60 on the 0.6×, 1×, 3× and front cameras. All three rear lenses delivered nominal 60 FPS in saved files with audio. The front camera accepts the setting but its delivered rate varied.
+
+| S24 lens | Video at UHD 60 | Pro Video at UHD 60 |
+| --- | ---: | ---: |
+| 0.6× ultrawide | 59.96 FPS | 59.96 FPS |
+| 1× main | 59.57 FPS | 60.00 FPS |
+| 3× telephoto | 59.65 FPS | 59.65 FPS |
+| Front | 50.98 FPS | 51.28 FPS |
+
+The ultrawide's regular video configuration table advertises UHD 60 while its default stream duration suggests 30. The original filter discarded the advertised rate. At 3×, a logical-camera request produced 30 FPS and could select the main sensor. Nauticase now pins the preview and recorder to the telephoto, sets the fixed rate at session creation and records UHD alongside a 1920 × 1080 viewfinder. The capture results identified physical camera 6 at 7.0 mm.
+
+The front camera reported 16.67 ms frame duration even when it skipped intervals. In an independent 5.2-second test with only a UHD encoder attached, successive camera timestamps averaged 53.77 FPS and encoded samples averaged 53.76 FPS. This reproduced the shortfall upstream of the app's preview and housing controls.
+
+With 60 FPS capture and 30 FPS playback selected separately on the 3× lens, Pro Video saved 269 UHD frames at 29.83 playback FPS. The video lasted 9.131 s and the retimed audio lasted 9.152 s.
+
+1. **Discover candidate sessions.** Preserve existing UHD 60 discovery and recording. For additional rates, query the regular session's fixed AE ranges, recorder output sizes and per-size minimum duration. Separately query fixed high-speed ranges for the exact UHD size. Check a surface-input hardware encoder for the same size, rate and MIME type. A private physical camera can participate in a regular pinned session. An independently openable sensor can use its own public camera ID.
+2. **Verify through the actual recorder.** On a qualifying lens, open **Options → Test UHD capture rates**, select a rate and aim at a moving subject in good light. Nauticase records about 4.5 seconds using the production preview topology, sensor route and encoder. It checks sensor timestamps, encoded frame count and sample timing, wall-clock capture duration, exact encoded size and codec, and AAC duration when microphone permission is present. Small clock deviations are accepted. The temporary clip is deleted. A successful test enables that rate on return to the camera. A change of firmware invalidates the result. Tests are explicit and stay out of app startup.
+3. **Record at the qualified rate.** Use the same regular or constrained session that passed. Preserve the source frame clock and apply the chosen playback timing to video and audio after recording. A regular camera advertising 100 FPS and a constrained camera advertising 120 FPS are separate capabilities.
+4. **Handle thermal pressure.** On Android 10 and later, moderate thermal pressure reduces viewfinder work on supported UHD 60–120 FPS paths. The encoder keeps its selected cadence. Severe pressure suspends UHD 100/120 FPS. UHD 60 FPS remains available until Android reports critical pressure. At the applicable limit, an active take goes through the normal save path. Capture becomes available as soon as the status falls below its limit. Viewfinder load stays reduced for 30 seconds after moderate pressure clears. The optional rate-qualification test still requires a cool handset.
+
+For release qualification, exercise each supported route on a physical handset. Check moving-subject frame detail, independent capture and playback timing with sound, housing shutter controls, pause/resume/save, camera ownership on mode changes, and heat recovery in the actual enclosure. Android thermal status and energy use during idle preview and sustained recording are separate measurements. Testing on a handset that exposes only UHD 60 cannot establish positive hardware results for UHD 100 or 120.
+
+## Current recording behavior (November 24, 2026)
+
+Video, Pro Video and Slow Motion discover capture rates for the selected lens and resolution. Selecting a new capture rate sets Playback FPS to Match capture. An explicit playback override changes the timing of every recorded frame. When audio recording is on, the audio changes speed with the picture. Matching speeds use the original recording directly.
+
+On the Galaxy S24 SM-S921W rear 1× camera, test clips confirmed 8K at 24/30, UHD at 24/30/60, and FHD at nominal 120 and 240 FPS. At FHD 120, the sensor reported 8.436 ms per frame. A 120→30 clip had an 8.546 s video track and an 8.597 s audio track. At FHD 240, the sensor reported 4.167 ms per frame. For UHD 120 the public high-speed size query rejected 3840×2160. An independent HEVC recording targeting a fixed 120 through a regular Camera2 session measured 16.663 ms between sensor frames and 59.71 FPS in the file. This phone therefore offers UHD up to 60 FPS in Nauticase. A phone that advertises a constrained UHD 120 session with a compatible encoder can offer UHD 120.
+
+The base Galaxy S24 limits the selectable capture menu separately for Video/Pro Video and Slow Motion. Video/Pro Video allow HD 30, FHD 24/30/60/120, UHD 24/30/60 and 8K 24/30. Slow Motion allows FHD 120/240 and UHD 120 wherever the selected lens exposes that pair. If a saved lens supports neither Slow Motion rate, Nauticase selects the 1× lens when available. Playback FPS remains independently adjustable.
+
+A further UHD test pinned the recording output to the main physical sensor through logical camera 0, used the video recording stream use case, disabled auto exposure, and requested a 4 ms exposure and 8.333 ms frame duration. The camera delivered the 4 ms exposure but reported a 16.667 ms frame duration. The UHD HEVC file measured 59.63 FPS. The native Samsung UHD clip described below measured approximately 118.54 source FPS.
+
+The same manual UHD 120 request on the independently openable 0.6× camera (ID 2) produced 160 HEVC frames at 59.60 FPS, with a median sensor timestamp interval of 16.673 ms. CameraX 1.7.0 also rejected strict UHD at fixed 120 on cameras 0 and 2 with slow motion explicitly enabled, using both capability sources and both preview configurations. In-app UHD 120 on these two lenses remains unverified on this firmware.
+
+## S24 UHD 120 session rejection (November 25, 2026)
+
+The [November 26 follow-up](../artifacts/S24-UHD120-follow-up.txt) covers two prototype UHD files measuring approximately 117 FPS, the fresh true-size camera test, and independent HEVC/AAC timing. On supported devices the standard constrained recorder is tried before a single full-size texture feeding the encoder and viewfinder. The app checks sensor and encoded cadence, lens evidence, the audio/video presentation windows and decoded frame differences before accepting a new UHD high-rate qualification. Public camera IDs 0 and 2 on this S24 firmware still omit UHD from their high-speed sizes.
+
+The SM-S921W ran Android 16 and Samsung Camera 16.5.02.36 (1650236000). The installed SamsungCamera.apk and the APK used for disassembly had the same SHA-256, `555311163016fa96d61ff0596c86d9ab7d5a2559e725103ee7286662d88257a7`. The DEX files were checked against the entries in that APK.
+
+- With UHD and 120 both selected in Samsung Camera's Slow Motion UI, Android's camera service reported `com.sec.android.app.camera` as the active client of camera ID **56**. This was a live preview observation. The separate native clip measurement is described below.
+- In the installed bytecode, `SlowMotionPresenter.onConnectMakerPrepared` passes the selected FPS as both ends of the range. `SlowMotionVideoMakerBase.connectCamDevice` prepares the recording surface and dispatches to `CamDevice.i`. The implementation selects `CamDevice.SessionMode.HIGH_SPEED` and calls `CameraDevice.createCaptureSession(SessionConfiguration)`.
+- An ordinary app on the same phone enumerated IDs **0, 1, 2, 3**. Across their standard and available maximum-resolution stream maps, the largest advertised high-speed size was 1920×1080. Each advertised regular AE ranges up to 60 FPS. Nauticase previously received `Unknown camera ID 56` when querying characteristics through CameraManager. Samsung's vendor metadata for camera 56 does contain the UHD 120 pair.
+- An isolated Android app configured a real HEVC recording surface at 3840×2160, requested a fixed 120 FPS and called the public high-speed session constructor on rear camera 0. Session creation threw `IllegalArgumentException` in `SurfaceUtils.checkConstrainedHighSpeedSurfaces` (One UI line 288), called from `CameraDeviceImpl.createCaptureSessionInternal` (line 1018). Its accepted size list contained 1280×720, 1920×1080 and 1920×824. The failure happened before capture requests could run. The earlier regular-session tests measured about 60 actual frames per second.
+- These observations establish a difference in device access and stream validation. Samsung's internal access decision remains unverified. The blocker for native capture on this firmware is access to an app-visible camera session that accepts the UHD surface and delivers nominal 120 FPS.
+- On public ultrawide camera 2, an ordinary app could read a Samsung high-speed metadata row for UHD at fixed 120. The Qualcomm hardware HEVC encoder advertised a UHD 120 performance point and configured successfully. Three public constrained sessions on camera 2 rejected the UHD recording surface before the first capture, with the encoder alone, with an FHD preview, and with a UHD preview and fixed 120 FPS session parameters. Android reported thermal status 0 throughout. The [device evidence ZIP](../artifacts/Nauticase-S24-UHD120-Lens-Evidence.zip) contains the B0 inventory and B1–B3 exceptions.
+
+The [S24 capture matrix](../artifacts/Nauticase-S24-capture-matrix.csv) lists the menu, active lens and measured timing for 60 Video, Pro Video and Slow Motion combinations. The [measurement excerpts](../artifacts/Nauticase-S24-capture-matrix-evidence.txt) cover configuration failures and recording-state transitions as well as saved clips. At FHD 120, one main-camera test yielded 596 distinct callback timestamps across 149 frame-number anchors. The frame number advanced by 296 over that interval, giving 118.54 FPS, in agreement with the saved file. Counting every derived callback timestamp substantially overestimated the rate on this handset. Android documents how high-speed capture requests are batched. [Android high-speed session reference](https://developer.android.com/reference/android/hardware/camera2/CameraConstrainedHighSpeedCaptureSession)
+
+The Android high-speed contract requires a size and range from the selected camera's published stream map. [Android StreamConfigurationMap](https://developer.android.com/reference/android/hardware/camera2/params/StreamConfigurationMap#getHighSpeedVideoSizes())
+
+### Native lens selection and request timing
+
+On November 25, the selected controls in Samsung Camera's Slow Motion size picker and Android's active camera client identified these routes on the SM-S921W:
+
+| Native selection confirmed in the picker | Camera service ID | Corresponding app-facing rear route |
+| --- | ---: | --- |
+| UHD, 120 FPS, 0.6× | 58 | Public camera 2 or logical camera 0 with physical output 2 |
+| UHD, 120 FPS, 1× | 56 | Public camera 0, main physical sensor 5 |
+
+The observation was made in preview. The same native IDs were active at FHD 120. The size-picker selection is therefore necessary to identify UHD. The separate stock HEVC clip measured 118.54 FPS after startup. It establishes the stock file cadence for one recording.
+
+We also tested the public logical-camera route to the ultrawide. The preview and UHD HEVC encoder were both pinned to physical camera 2 through camera 0. A fixed 120 FPS request with a 4 ms exposure produced 277 physical capture results reporting a 2.2 mm focal length. Sensor timestamps averaged **59.54 FPS** and 267 encoded UHD samples averaged **59.53 FPS**. The median sensor interval was 16.673 ms.
+
+The installed camera app's `SlowMotionPresenter.onConnectMakerPrepared` supplies a fixed FPS range. Its slow-motion maker prepares the recording surface. The `CamDeviceImpl` high-speed branch resolves to Android session type 1 (`SESSION_HIGH_SPEED`) and supplies the output configurations to `CameraDevice.createCaptureSession`. At record time, `SlowMotionVideoMakerBase.startRecordRepeating` passes the upper FPS bound to `calculateSlowMotionRecordRepeatingCnt`. That method schedules the recording and preview surfaces at separate rates using the capture-to-preview FPS ratio. This explains how the viewfinder can update more slowly than the encoder. The traces do not measure the instantaneous preview FPS or identify the internal Samsung driver rule that enables UHD.
+
+The camera service dump contains separate Android and Samsung high-speed tables. For both 56 and 58, Samsung's table includes 3840 × 2160 at a fixed 120 while the Android high-speed table tops out at FHD. Camera 2 also has the Samsung UHD tuple. The ordinary app inventory exposes IDs 0–3, and logical camera 0 identifies 2, 5 and 6 as physical children. The fixed 120 high-speed session on public camera 0 failed during Android's surface-size validation, before repeating requests or encoding began. Matching Samsung's preview schedule cannot change that earlier result. The public rear cameras also report session-configuration query version 34. Android documents the newer `CameraDeviceSetup` query for cameras reporting a value greater than 34. [Android CameraManager](https://developer.android.com/reference/android/hardware/camera2/CameraManager#isCameraDeviceSetupSupported(java.lang.String))
+
+### CameraX high-speed and Feature Group tests on the SM-S921W
+
+On November 25, 2026, an isolated on-device test used CameraX 1.5.3 (the previous Nauticase dependency) and stable 1.7.0. On both versions, `Recorder.getHighSpeedVideoCapabilities` returned null on IDs 0, 1, 2 and 3, and Android reported no high-speed 2160p camcorder profile on any of them. The test requested only `Quality.UHD` with a fixed [120,120] range. Both versions rejected high-speed binding on the default rear camera with preview and with the recorder alone. CameraX 1.7.0 also rejected both configurations when the recorder used its codec capability source. Each attempt failed before recording with “No supported quality on the device for high-speed capture.”
+
+On 1.7.0, `CameraInfo.isSessionConfigSupported` accepted a required `UHD_RECORDING` feature group with preview and video. The session's advertised fixed rates were 15, 24, 26, 27 and 30 FPS. It rejected both the required UHD and `FPS_60` combination and the required UHD group with an explicit [120,120] frame-rate range. A regular session with a strict UHD quality selector and the same explicit range also returned false. The published 1.7.0 API supplies a groupable `FPS_60` feature and has no corresponding `FPS_120` feature. The 30 FPS ceiling here applies to this CameraX preview/record configuration. The in-app Camera2 recorder independently demonstrated UHD 60 on this phone.
+
+An actionable firmware change would be to expose 3840×2160 with a fixed [120,120] high-speed range on an app-visible rear camera and provide the corresponding high-speed encoder profile. An OEM-supported in-app capture API that delivers the same frames would also meet the requirement. [CameraX Feature Group API](https://developer.android.com/reference/androidx/camera/core/featuregroup/GroupableFeature) · [CameraX high-speed capture and device support](https://developer.android.com/blog/posts/high-speed-capture-and-slow-motion-video-with-camera-x-1-5)
+
+### Nauticase CameraX 1.7.0 upgrade verification
+
+Nauticase binds its preview, recording and analysis use cases with the stable SessionConfig API. Its cached per-lens probe requests a required recording quality together with preview through Feature Group, with the existing quality-selector fallback for providers that cannot answer the group query. Direct recording continues to use its separate camera and encoder capability checks. SDR recording now selects AVC or HEVC through CameraX's video MIME API.
+
+On the SM-S921W, ordinary Video recorded 1920×1080 at 29.58 FPS and Pro Video recorded 3840×2160 at 59.58 FPS. Slow Motion captured FHD at a measured 8.436 ms sensor interval and saved 262 frames at 29.64 FPS with an explicit 30 FPS playback setting. The resulting video and AAC tracks lasted 8.840 and 8.909 seconds. A late lens capability refresh now preserves the playback override, and the audio mux uses track indices to detect end of stream when AAC starts with encoder priming.
+
+During validation, the Android camera service identified the outgoing and incoming clients as the same Nauticase test process and rejected their combined resource cost of 117 against the device maximum of 100. The app now waits for release of the outgoing CameraX device before opening a direct recorder. The Expert RAW → Hyperlapse → Slow Motion transition and Portrait → Video transition passed on the phone. The app and core suites passed 917 tests.
+
+### Samsung Camera capture-for-result comparison
+
+On the same S24, an isolated app requested a video from Samsung Camera with Android's capture-for-result intent and a private output URI. It requested Samsung's Slow motion mode, and Samsung's UI showed UHD and 120 selected. The phone used camera 56. After a four-second test and confirmation in Samsung's review screen, the caller received `RESULT_OK` and a 39,115,858-byte MP4 directly in its cache. The video track contained 458 HEVC frames at 3840×2160 over 3.909 seconds. After the startup interval, the sample timing measured 118.54 FPS. The AAC track lasted 3.904 seconds. The MediaStore check found no new Gallery entry, and uninstalling the test app deleted the private clip. This measurement used Samsung Camera as the foreground recorder. Nauticase requires recording in its own UI with the housing controls available.
+
+### Samsung-supported in-app access and APV
+
+Samsung lists the Galaxy Camera SDK among its retired developer resources. Samsung’s CamCyclopedia describes UniHAL+ integrations for supported S24 social apps, including video stabilization and low-light processing. It also describes feature-specific SDK libraries. The article gives no UHD 120 contract or eligibility criteria for other apps. I found no published application procedure or SDK contract granting independent apps S24 UHD 120 capture. The availability and terms of any private partner interface require confirmation from Samsung. [Retired Galaxy SDKs](https://developer.samsung.com/retired-content) · [Samsung CamCyclopedia on UniHAL+ and in-app camera integrations](https://community.samsung.com/my/conversations/camera-camcyclopedia/social-app-camera/r1_27414927)
+
+Samsung documents APV recording through UHD 120 on the Galaxy S26 Ultra. The SM-S921W on firmware `BP4A.251205.006.S921WVLS6DZH3` registered 113 Android media codec entries. The only APV encoder was `c2.android.apv.encoder` (software), and its `areSizeAndRateSupported(3840, 2160, 120)` returned false. The camera stream and encoder each need to support the requested rate. The native S24 clip above used HEVC. [Samsung APV model and recording specifications](https://developer.samsung.com/mobile/apv.html)
+
+#### Technical inquiry ready for Samsung Developer 1:1 Support
+
+**Subject — Galaxy S24 SM-S921W public or partner API for in-app 3840×2160 at 120 FPS**
+
+Nauticase is an Android camera app for a Bluetooth underwater housing. Users operate the camera through physical housing buttons and need our live dive overlay and recording controls in the foreground. We need a rear 1× 3840×2160 sensor stream at nominal 120 FPS that can feed an Android encoder surface in our own activity. HEVC is sufficient.
+
+On an SM-S921W running Android 16, firmware `BP4A.251205.006.S921WVLS6DZH3`, Samsung Camera 16.5.02.36 delivered about 118.54 FPS in a 3840×2160 HEVC clip. Public Camera2 enumerates cameras 0 through 3. The rear camera's constrained high-speed session rejects 3840×2160, and a regular recording requested at 120 delivers about 60 FPS. CameraX 1.7.0 reports no high-speed UHD profile and rejects the session both with and without preview.
+
+Does Samsung provide a supported in-app SDK, session configuration or Galaxy Camera partner integration (including UniHAL+ where applicable) for this combination on the base Canadian S24? If so, please share the API or onboarding contact, eligible models and firmware, signing and distribution requirements, and recording restrictions. If this is a camera-provider capability reporting issue, could Galaxy Camera engineering confirm the affected builds and whether a firmware release exposes the UHD 120 size/rate pair and matching encoder profile to third-party apps?
+
+The 1:1 form requires a Samsung account. Relevant attachments are the camera capability summary, high-speed rejection and measured clip metadata above. [Samsung Developer 1:1 Support](https://developer.samsung.com/dashboard/support)
+
+## September 3, 2026 recording contract and historical measurements
 
 | Selection | Camera stream | Saved playback | Processing |
 | --- | --- | --- | --- |

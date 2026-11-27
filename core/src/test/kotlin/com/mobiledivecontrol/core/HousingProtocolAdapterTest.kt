@@ -12,7 +12,12 @@ class HousingProtocolAdapterTest {
         adapter.forceMode(AppMode.Safety)
         adapter.handleNotification(HousingCharacteristic.CoverState.shortHex, byteArrayOf(0x00.toByte()))
 
-        val outcome = adapter.dispatch(SafetyCommand.StartVacuumCheck)
+        assertEquals(emptyList(), adapter.dispatch(SafetyCommand.StartVacuumCheck).transportRequests)
+        repeat(2) {
+            adapter.updateSensor(SensorUpdate.WaterPressure(101.3))
+            adapter.updateSensor(SensorUpdate.BarometricPressure(101.3))
+        }
+        val outcome = adapter.handleNotification(HousingCharacteristic.ButtonEvents.shortHex, byteArrayOf(0x61))
 
         assertEquals(SealState.Vacuuming, outcome.state.safety.sealState)
         val writes = outcome.transportRequests.map { it as BleTransportRequest.Write }

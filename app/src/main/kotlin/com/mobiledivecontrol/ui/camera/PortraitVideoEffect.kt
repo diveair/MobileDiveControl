@@ -24,7 +24,18 @@ internal interface SurfaceFrameShader {
 
 internal class PortraitFrameShader : SurfaceFrameShader {
     data class Mask(val width: Int, val height: Int, val bytes: ByteBuffer, val atMs: Long)
-    val pending = AtomicReference<Mask?>()
+    private val pending = AtomicReference<Mask?>()
+    private val spare = AtomicReference<ByteBuffer?>()
+
+    fun acquireMaskBuffer(size: Int): ByteBuffer {
+        val bytes = spare.getAndSet(null)?.takeIf { it.capacity() == size } ?: ByteBuffer.allocateDirect(size)
+        bytes.clear()
+        return bytes
+    }
+
+    fun publish(mask: Mask) {
+        pending.getAndSet(mask)?.let { spare.set(it.bytes) }
+    }
     @Volatile var effect = 1
     @Volatile var strength = 4f / 7f
     private var texture = 0
@@ -40,6 +51,7 @@ internal class PortraitFrameShader : SurfaceFrameShader {
         vec4 portrait(vec4 c) {
             if (uEffect < 0.5 || uStrength < 0.001) return c;
             float person = smoothstep(0.25, 0.75, texture2D(uMask, vec2(vTex.x, 1.0-vTex.y)).r);
+            if (person >= 1.0) return c;
             vec3 background = c.rgb;
             if (uEffect < 2.5) {
                 vec3 sum = vec3(0.0); float weight = 0.0;
@@ -95,6 +107,8 @@ internal class PortraitFrameShader : SurfaceFrameShader {
             } else GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, mask.width, mask.height,
                 GLES20.GL_LUMINANCE, GLES20.GL_UNSIGNED_BYTE, mask.bytes)
             maskAt = mask.atMs
+            // The upload has consumed the client memory. The producer may now refill it.
+            spare.set(mask.bytes)
         }
         GLES20.glUniform1i(maskUniform, 1)
         GLES20.glUniform1f(effectUniform, if (SystemClock.uptimeMillis()-maskAt < 500) effect.toFloat() else 0f)
@@ -119,32 +133,42 @@ internal class PortraitSegmenter(context: Context) : AutoCloseable {
     private val rgba = ByteBuffer.allocateDirect(256 * 144 * 4)
     private var lastAt = 0L
 
-    fun analyze(image: ImageProxy, output: PortraitFrameShader) {
+    fun analyze(image: ImageProxy, output: PortraitFrameShader, reduceLoad: Boolean) {
         val now = SystemClock.uptimeMillis()
-        if (now-lastAt < 80) return
+        if (now - lastAt < (if (reduceLoad) 200L else 80L)) return
         lastAt = now
         val plane = image.planes.firstOrNull() ?: return
         if (plane.pixelStride != 4) return
-        rgba.clear()
         val crop = image.cropRect
         // Preserve sensor coordinates; the SurfaceTexture transform handles display rotation/mirroring.
-        for (y in 0 until 144) for (x in 0 until 256) {
-            val offset = (crop.top+y*crop.height()/144)*plane.rowStride + (crop.left+x*crop.width()/256)*4
-            for (c in 0..3) rgba.put(plane.buffer.get(offset+c))
-        }
-        rgba.flip()
+        samplePortraitRgba(plane.buffer, plane.rowStride, crop.left, crop.top, crop.width(), crop.height(), rgba)
         ByteBufferImageBuilder(rgba, 256, 144, MPImage.IMAGE_FORMAT_RGBA).build().use { input ->
             val masks = engine.segmentForVideo(input, now).confidenceMasks().orElse(emptyList())
             try {
                 val mask = masks.lastOrNull() ?: return
                 val floats = ByteBufferExtractor.extract(mask).order(ByteOrder.nativeOrder()).asFloatBuffer()
-                val bytes = ByteBuffer.allocateDirect(mask.width * mask.height)
+                val bytes = output.acquireMaskBuffer(mask.width * mask.height)
                 for (i in 0 until mask.width*mask.height) bytes.put((floats.get(i).coerceIn(0f,1f)*255f).toInt().toByte())
                 bytes.flip()
-                output.pending.set(PortraitFrameShader.Mask(mask.width, mask.height, bytes, now))
+                output.publish(PortraitFrameShader.Mask(mask.width, mask.height, bytes, now))
             } finally { masks.forEach { it.close() } }
         }
     }
 
     override fun close() = engine.close()
+}
+
+/** Copies the same four RGBA bytes per nearest-neighbour sample, including on padded planes. */
+internal fun samplePortraitRgba(
+    source: ByteBuffer, rowStride: Int, left: Int, top: Int, width: Int, height: Int, target: ByteBuffer,
+) {
+    val pixels = source.duplicate().order(target.order())
+    target.clear()
+    for (y in 0 until 144) {
+        val row = (top + y * height / 144) * rowStride + left * 4
+        for (x in 0 until 256) {
+            target.putInt(pixels.getInt(row + (x * width / 256) * 4))
+        }
+    }
+    target.flip()
 }

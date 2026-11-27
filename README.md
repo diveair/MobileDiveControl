@@ -81,6 +81,8 @@ The export includes local source edits and bundled runtime assets. It skips test
 
 ## Running
 
+For live safety-stop testing on a USB-connected phone, open `Depth Lab.cmd` on Windows. The controller shows the simulated depth alongside the physical Bluetooth housing reading. Setup and removal are covered in [the dive profile guide](docs/DIVE_PROFILE.md#windows-usb-depth-controller).
+
 You need a local JDK 17+.
 
 Run the automated test suite:

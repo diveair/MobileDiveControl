@@ -10,6 +10,9 @@ import com.mobiledivecontrol.platform.ble.PressurePacketRecorder
 import com.mobiledivecontrol.platform.ble.AndroidBleTransport
 import com.mobiledivecontrol.platform.ble.HousingLink
 import com.mobiledivecontrol.platform.ble.HousingStore
+import com.mobiledivecontrol.platform.ble.HousingLinkEvent
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.onSubscription
 
 /**
  * Process-scoped owner of the housing link.
@@ -21,7 +24,7 @@ import com.mobiledivecontrol.platform.ble.HousingStore
  * The transport is built through a factory lambda rather than constructed here so the link can be
  * driven by a fake transport in a JVM test without an Android radio.
  */
-class DiveControlApp : Application() {
+open class DiveControlApp : Application() {
 
     @Volatile private var pressureRecorder: PressurePacketRecorder? = null
 
@@ -38,6 +41,10 @@ class DiveControlApp : Application() {
     }
 
     val housingStore: HousingStore by lazy { HousingStore(this) }
+
+    /** Subscribe first, then replay the current link so a packet cannot slip between the two. */
+    open fun housingEventsForDisplay(): Flow<HousingLinkEvent> =
+        housingLink.events.onSubscription { housingLink.snapshot().forEach { emit(it) } }
 
     val housingLink: HousingLink by lazy {
         HousingLink(

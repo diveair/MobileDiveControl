@@ -12,6 +12,8 @@ data class CameraRailEntry(
 
 enum class CameraRailAction {
     TrackHeading,
+    EstablishVacuum,
+    ShutOff,
     SafetyStop,
     DiveSettings,
     Diagnostics,
@@ -61,17 +63,23 @@ object CameraCatalog {
     const val EV_AUTO = "Auto"
     // Stable reserved index: inserting the temporary action must not renumber capture modes.
     const val SAFETY_STOP_RAIL_INDEX = -1
+    const val VACUUM_RAIL_INDEX = -2
+    const val SHUT_OFF_RAIL_INDEX = -3
     private val safetyStopEntry = CameraRailEntry("safety_stop", "Safety Stop", action = CameraRailAction.SafetyStop)
+    private val vacuumEntry = CameraRailEntry("establish_vacuum", "ESTABLISH VACUUM", action = CameraRailAction.EstablishVacuum)
+    private val shutOffEntry = CameraRailEntry("shut_off", "Shut Off", action = CameraRailAction.ShutOff)
 
-    fun primaryRailWithStop(active: Boolean): List<IndexedValue<CameraRailEntry>> = buildList {
+    fun primaryRailWithStop(active: Boolean, vacuumAvailable: Boolean = false): List<IndexedValue<CameraRailEntry>> = buildList {
+        if (vacuumAvailable) add(IndexedValue(VACUUM_RAIL_INDEX, vacuumEntry))
+        add(IndexedValue(SHUT_OFF_RAIL_INDEX, shutOffEntry))
         primaryRailEntries.forEachIndexed { index, entry ->
             add(IndexedValue(index, entry))
             if (index == 0 && active) add(IndexedValue(SAFETY_STOP_RAIL_INDEX, safetyStopEntry))
         }
     }
 
-    fun movePrimaryRail(index: Int, delta: Int, stopActive: Boolean): Int {
-        val visible = primaryRailWithStop(stopActive)
+    fun movePrimaryRail(index: Int, delta: Int, stopActive: Boolean, vacuumAvailable: Boolean = false): Int {
+        val visible = primaryRailWithStop(stopActive, vacuumAvailable)
         val position = visible.indexOfFirst { it.index == index }.coerceAtLeast(0)
         return visible[Math.floorMod(position + delta, visible.size)].index
     }
@@ -103,7 +111,7 @@ object CameraCatalog {
         // A state screen rather than a capture profile. Keeping it as an action avoids inventing
         // a camera mode with fake lenses/settings while still placing it last in the Modes menu.
         CameraRailEntry("diagnostics", "Diagnostics", action = CameraRailAction.Diagnostics),
-        // Up wraps from Track Heading to Dive Settings, then Diagnostics.
+        // Dive Settings and Diagnostics keep their existing stable indices.
         CameraRailEntry("dive_settings", "Dive Settings", action = CameraRailAction.DiveSettings),
     )
 
@@ -142,7 +150,11 @@ object CameraCatalog {
         defaultSettingValues.mapValues { (settingId, value) ->
             // Each mode owns a distinct prefixed lens key. They all begin at the widest physical
             // rear camera, then diverge independently as the user changes and persists them.
-            if (settingId.endsWith(".lens")) "0.6x" else value
+            when {
+                settingId.endsWith(".lens") -> "0.6x"
+                settingId.endsWith(".aspect_ratio") -> "Full"
+                else -> value
+            }
         }
     }
 
@@ -199,6 +211,34 @@ object CameraCatalog {
 
     fun settingsFor(mode: CameraModeId, variant: GalaxyDeviceVariant): List<CameraSettingSpec> {
         return profile(mode, variant).settings
+    }
+
+    private val s24VideoCaptureRates = mapOf(
+        "HD 720p" to listOf(30),
+        "FHD" to listOf(24, 30, 60, 120),
+        "UHD 4K" to listOf(24, 30, 60, 100, 120),
+        "8K" to listOf(24, 30),
+    )
+    private val s24SlowMotionCaptureRates = mapOf(
+        "FHD" to listOf(120, 240),
+        "UHD 4K" to listOf(60, 100, 120),
+    )
+
+    /** Intersect the S24 shooting mode with this lens's camera and encoder capabilities. */
+    internal fun s24CaptureRates(mode: CameraModeId, caps: CameraCapabilities?): Map<String, List<Int>>? {
+        if (caps?.galaxyS24VideoModes != true) return null
+        val modeRates = when (mode) {
+            CameraModeId.Video, CameraModeId.ProVideo -> s24VideoCaptureRates
+            CameraModeId.SlowMotion -> s24SlowMotionCaptureRates
+            else -> return null
+        }
+        return buildMap {
+            for ((size, requested) in modeRates) {
+                val available = caps.videoFrameRatesByResolution[size].orEmpty()
+                val rates = requested.filter { it in available }
+                if (rates.isNotEmpty()) put(size, rates)
+            }
+        }
     }
 
     private data class SettingsKey(
@@ -283,13 +323,19 @@ object CameraCatalog {
                 selectedResolution,
             ),
         ) {
+            val modeRates = s24CaptureRates(mode, capabilities)
+            val sizeSetting = base.firstOrNull { it.id.endsWith(".resolution") }
+            val selectedSize = if (modeRates == null || selectedResolution in modeRates) selectedResolution
+                else sizeSetting?.defaultValue?.takeIf { it in modeRates } ?: modeRates.keys.firstOrNull()
             base.mapNotNull { spec ->
-                applyCapabilities(
-                    spec,
-                    capabilities,
-                    videoShutterCapNs,
-                    selectedResolution,
-                )
+                if (modeRates != null && (spec === sizeSetting || spec.id in captureRateIds)) {
+                    val options = if (spec === sizeSetting) spec.options.filter { it in modeRates }
+                        else modeRates[selectedSize].orEmpty().map { "${it}fps" }
+                    if (options.isEmpty()) null else spec.copy(options = options,
+                        defaultValue = spec.defaultValue.takeIf { it in options } ?: options.first())
+                } else {
+                    applyCapabilities(spec, capabilities, videoShutterCapNs, selectedResolution)
+                }
             }
         }
     }
@@ -341,14 +387,13 @@ object CameraCatalog {
 
     /** [settingsFor] with every clamp the CameraState itself implies — the one call the reducer and UI share. */
     fun settingsFor(camera: CameraState): List<CameraSettingSpec> {
-        val prefix = modeKey(camera.activeMode)
         val settings = settingsFor(
             camera.activeMode,
             camera.deviceVariant,
             camera.detectedLenses,
             camera.capabilities,
             videoShutterCapNs(camera),
-            camera.settingValues["$prefix.resolution"] ?: defaultSettingValues["$prefix.resolution"],
+            selectedResolution(camera),
         )
         val steppedSettings = settings.map { spec ->
             if (!spec.id.endsWith(".iso")) spec else {
@@ -365,7 +410,7 @@ object CameraCatalog {
                 spec.copy(options = listOf("Auto") + numeric.map(Int::toString))
             }
         }
-        val lens = camera.settingValues["$prefix.lens"]
+        val lens = camera.settingValues[modeKey(camera.activeMode) + ".lens"]
         val lensCompatible = if (lens == "front" && camera.activeMode.captureType == CameraCaptureType.Video) {
             steppedSettings.map { spec ->
                 val options = when {
@@ -381,8 +426,13 @@ object CameraCatalog {
             camera.settingValues[spec.id]?.takeIf { it in spec.options } ?: spec.defaultValue
         }
         val fpsValue = captureFrameRateFps(value(".frame_rate"))
-        val pipeline = selectPipeline(camera.activeMode, value(".resolution"), fpsValue, value(".log") == "On")
-        val pipelineCaps = pipelineCaps(pipeline, fpsValue)
+        val directUhd = value(".resolution") == "UHD 4K" && fpsValue in camera.capabilities?.verifiedDirectUhdRates.orEmpty() &&
+            camera.activeMode in setOf(CameraModeId.Video, CameraModeId.ProVideo, CameraModeId.SlowMotion)
+        val pipeline = if (directUhd) CameraPipeline.HighSpeed else
+            selectPipeline(camera.activeMode, value(".resolution"), fpsValue, value(".log") == "On",
+                camera.capabilities?.galaxyS24VideoModes == true, lens)
+        val pipelineCaps = if (directUhd) PipelineCaps(manualExposure = false, manualWhiteBalance = false,
+            cropAspect = false, hdr = false) else pipelineCaps(pipeline, fpsValue)
         val compatible = lensCompatible.map { spec ->
             val forced = when {
                 !pipelineCaps.manualExposure && (spec.id.endsWith(".iso") || spec.id.endsWith(".shutter_speed")) -> "Auto"
@@ -481,6 +531,12 @@ object CameraCatalog {
                     val ev = option.replace("+", "").toDoubleOrNull()
                     ev == null || ev in caps.evMin..caps.evMax
                 }
+            spec.id in captureRateIds && !caps?.videoFrameRatesByResolution.isNullOrEmpty() -> {
+                val rates = caps!!.videoFrameRatesByResolution[selectedResolution].orEmpty().filter { it > 0 }.distinct().sorted()
+                val options = rates.map { "${it}fps" }
+                if (options.isEmpty()) null else spec.copy(options = options,
+                    defaultValue = spec.defaultValue.takeIf { it in options } ?: options.first())
+            }
             spec.id.endsWith(".frame_rate") && !caps?.availableVideoFrameRates.isNullOrEmpty() -> {
                 // The FPS menu belongs to the selected size on the selected lens.
                 val rates = caps?.videoFrameRatesByResolution
@@ -489,9 +545,7 @@ object CameraCatalog {
                         ?: caps!!.availableVideoFrameRates
                 clip { option ->
                     val fps = captureFrameRateFps(option)
-                    fps in rates ||
-                        (spec.id == "slow_motion.frame_rate" && fps == 48 && 60 in rates) ||
-                        (spec.id == "slow_motion.frame_rate" && fps == 100 && 120 in rates)
+                    fps in rates
                 }
             }
             spec.id == "hyperlapse.resolution" ->
@@ -503,11 +557,10 @@ object CameraCatalog {
             spec.id == "slow_motion.resolution" &&
                 !caps?.availableVideoResolutions.isNullOrEmpty() -> {
                 // Include only sizes with an executable cadence in this recorder.
-                val slowMotionRates = setOf(24, 30, 48, 60, 100, 120, 240)
                 clip { option ->
                     if (option !in caps!!.availableVideoResolutions) return@clip false
                     val rates = caps.videoFrameRatesByResolution[option].orEmpty()
-                    rates.isEmpty() || rates.any { it in slowMotionRates } || 60 in rates
+                    caps.videoFrameRatesByResolution.isEmpty() || rates.any { it > 0 }
                 }
             }
             spec.id.endsWith(".resolution") && !caps?.availableVideoResolutions.isNullOrEmpty() ->
@@ -669,6 +722,8 @@ object CameraCatalog {
     }
 
     fun highlightedPrimaryEntry(camera: CameraState): CameraRailEntry {
+        if (camera.highlightedPrimaryIndex == SHUT_OFF_RAIL_INDEX) return shutOffEntry
+        if (camera.highlightedPrimaryIndex == VACUUM_RAIL_INDEX) return vacuumEntry
         if (camera.highlightedPrimaryIndex == SAFETY_STOP_RAIL_INDEX) return safetyStopEntry
         return primaryRailEntries[camera.highlightedPrimaryIndex.coerceIn(0, primaryRailEntries.lastIndex)]
     }
@@ -755,8 +810,9 @@ object CameraCatalog {
         detectedLenses: List<String> = emptyList(),
         capabilities: CameraCapabilities? = null,
         videoShutterCapNs: Long? = null,
+        selectedResolution: String? = null,
     ): List<BottomBarItem> {
-        val allSettings = settingsFor(mode, variant, detectedLenses, capabilities, videoShutterCapNs)
+        val allSettings = settingsFor(mode, variant, detectedLenses, capabilities, videoShutterCapNs, selectedResolution)
 
         fun find(vararg suffixes: String): CameraSettingSpec? =
             allSettings.firstOrNull { spec -> suffixes.any { spec.id.endsWith(it) } }
@@ -891,6 +947,7 @@ object CameraCatalog {
                 effectStrength?.let { add(BottomBarItem.Setting(it)) }
                 audioRecording?.let { add(BottomBarItem.Setting(it)) }
                 frameRate?.let { add(BottomBarItem.Setting(it)) }
+                aspectRatio?.let { add(BottomBarItem.Setting(it)) }
                 add(BottomBarItem.GalleryShortcut)
             }
         }
@@ -1000,7 +1057,13 @@ object CameraCatalog {
         detectedLenses = camera.detectedLenses,
         capabilities = camera.capabilities,
         videoShutterCapNs = videoShutterCapNs(camera),
+        selectedResolution = selectedResolution(camera),
     )
+
+    private fun selectedResolution(camera: CameraState): String? {
+        val id = modeKey(camera.activeMode) + ".resolution"
+        return camera.settingValues[id] ?: defaultSettingValues[id]
+    }
 
     /**
      * Settings owned by the vertical Options panel. The six manual controls already present on
@@ -1019,7 +1082,13 @@ object CameraCatalog {
                 .filter { it.id.endsWith(".focus_peaking") || it.id.endsWith(".focus_curve") }
                 .mapTo(horizontalIds) { it.id }
         }
-        val extras = allSettings.filterNot { it.id in horizontalIds }
+        val extras = allSettings.filterNot {
+            it.id in horizontalIds || (it.id.endsWith(".aspect_ratio") && it.options == listOf("Full"))
+        } + if (camera.activeMode in setOf(CameraModeId.Video, CameraModeId.ProVideo, CameraModeId.SlowMotion) &&
+            camera.capabilities?.pendingUhdRates?.isNotEmpty() == true) {
+            listOf(CameraSettingSpec("verify_uhd", "Test UHD capture rates", "Video", CameraSettingKind.Choice,
+                listOf("Open"), "Open"))
+        } else emptyList()
         if (camera.activeMode !in setOf(CameraModeId.Pro, CameraModeId.ProVideo)) return extras
 
         val locations = camera.recordingSaveLocations.ifEmpty { listOf(RecordingSaveLocation.Default) }
@@ -1042,6 +1111,7 @@ object CameraCatalog {
                 "pro_video.log",
                 "pro_video.resolution",
                 "pro_video.frame_rate",
+                "pro_video.playback_fps",
                 "pro_video.guides",
                 "pro_video.aspect_ratio",
                 "pro_video.metering",
@@ -1116,9 +1186,9 @@ object CameraCatalog {
             canonicalGuideValue(value)
         } else if (spec.id.startsWith("slow_motion.") && value !in spec.options) {
             spec.defaultValue
-        } else if (spec.id == "pro_video.frame_rate" && '/' !in value) {
+        } else if (spec.id == "pro_video.frame_rate" && '/' in value) {
             captureFrameRateFps(value)
-                ?.let { captureFps -> proVideoFrameRateOption(captureFps) }
+                ?.let { captureFps -> "${captureFps}fps" }
                 ?.takeIf { it in spec.options }
                 ?: spec.defaultValue
         } else {
@@ -1230,9 +1300,9 @@ object CameraCatalog {
                 .filter { spec -> spec.kind != CameraSettingKind.Slider }
                 .forEach choiceLoop@{ spec ->
                     var stored = values[spec.id] ?: return@choiceLoop
-                    if (spec.id == "pro_video.frame_rate" && '/' !in stored) {
+                    if (spec.id == "pro_video.frame_rate" && '/' in stored) {
                         stored = captureFrameRateFps(stored)
-                            ?.let { captureFps -> proVideoFrameRateOption(captureFps) }
+                            ?.let { captureFps -> "${captureFps}fps" }
                             ?: stored
                         values = values + (spec.id to stored)
                     }
@@ -1249,7 +1319,12 @@ object CameraCatalog {
                     }
                 }
         }
-        return if (values === camera.settingValues) camera else camera.copy(settingValues = values)
+        if (values === camera.settingValues) return camera
+        val prefix = modeKey(camera.activeMode)
+        // Capability discovery can normalize a stored rate after the user has already
+        // chosen playback. Only a user change to capture settings resets playback.
+        val updated = camera.copy(settingValues = values)
+        return if (values["$prefix.resolution"] != camera.settingValues["$prefix.resolution"]) resnapToClippedLadders(updated) else updated
     }
 
     /**
@@ -1444,17 +1519,17 @@ object CameraCatalog {
                 "Portrait",
                 listOf("Blur", "Studio", "High-key mono", "Low-key mono", "Backdrop", "Color point"),
                 "Blur",
-                CameraFeatureStatus.Unavailable,
-                "Samsung computational portrait effects are vendor-only.",
+                CameraFeatureStatus.Confirmed,
+                "Applies the selected look around a detected person in the preview and photo.",
             ),
             slider(
                 "portrait.effect_strength",
                 "Effect strength",
                 "Portrait",
                 (0..7).map(Int::toString),
-                "4",
+                "5",
                 CameraFeatureStatus.Confirmed,
-                "Strength of the recorded portrait effect.",
+                "Adjusts the portrait effect from the original photo at 0 to full strength at 7.",
                 supportsSensitivity = false,
             ),
             choice(
@@ -1536,6 +1611,8 @@ object CameraCatalog {
             settings = listOf(
                 choice("expert.flash", "Flash", "Core", listOf("Auto", "Off", "On"), "Off"),
                 choice("expert.megapixels", "Photo MP", "Core", megapixels, megapixels.first()),
+                choice("expert.aspect_ratio", "Aspect ratio", "Core", photoAspectRatios(), "4:3",
+                    note = "Sets JPEG framing. Sensor DNG files retain their native dimensions."),
                 choice("expert.save_format", "RAW / JPEG", "Core", listOf("RAW", "JPEG", "RAW + JPEG", "PNG", "HEIF"), "RAW + JPEG"),
                 choice("expert.lens", "Lens", "Core", lenses, "Auto"),
                 slider("expert.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
@@ -1729,6 +1806,8 @@ object CameraCatalog {
         availableAssistTools = listOf("Guides", "HDR / LOG"),
         settings = listOf(
             choice("panorama.lens", "Lens", "Core", lenses, "1x"),
+            choice("panorama.aspect_ratio", "Aspect ratio", "Core", listOf("Full"), "Full",
+                note = "The viewfinder fills the screen. The sweep determines the stitched image width."),
             slider("panorama.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
             slider("panorama.white_balance", "White balance", "Manual", whiteBalanceOptions, WB_AUTO_CONTINUOUS),
             choice(
@@ -1831,6 +1910,8 @@ object CameraCatalog {
             settings = listOf(
                 choice("hyperlapse.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
                 choice("hyperlapse.resolution", "Video size", "Core", listOf("FHD", "UHD 4K"), "FHD"),
+                choice("hyperlapse.aspect_ratio", "Aspect ratio", "Core", listOf("Full"), "Full",
+                    note = "The viewfinder fills the screen. The recorder uses the selected video size."),
                 choice("hyperlapse.lens", "Lens", "Core", lenses, "1x"),
                 slider("hyperlapse.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
                 choice(
@@ -1878,7 +1959,7 @@ object CameraCatalog {
     private fun videoProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
         val resolutions = listOf("8K", "UHD 4K", "FHD", "HD 720p", "SD 480p")
-        val frameRates = listOf("30fps", "60fps")
+        val frameRates = videoFrameRates(variant)
         return CameraModeProfile(
             mode = CameraModeId.Video,
             modeName = CameraModeId.Video.label,
@@ -1899,7 +1980,8 @@ object CameraCatalog {
                     CameraFeatureStatus.Confirmed,
                     "Every entry is capability-gated; 8K uses the verified Camera2 + HEVC path.",
                 ),
-                choice("video.frame_rate", "Frame rate", "Core", frameRates, "30fps"),
+                choice("video.frame_rate", "Capture FPS", "Core", frameRates, "30fps"),
+                playbackSetting("video"),
                 choice("video.aspect_ratio", "Aspect ratio", "Core", videoAspectRatios(), "16:9"),
                 choice("video.lens", "Lens", "Core", lenses, "1x"),
                 choice("video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
@@ -1926,20 +2008,13 @@ object CameraCatalog {
 
     private fun proVideoProfile(variant: GalaxyDeviceVariant): CameraModeProfile {
         val lenses = photoLenses(variant)
-        val frameRates = videoFrameRates(variant).flatMap { captureLabel ->
-            val captureFps = captureFrameRateFps(captureLabel) ?: return@flatMap emptyList()
-            (proVideoPlaybackFrameRates + captureFps.toDouble())
-                .distinct()
-                .sorted()
-                .filter { playbackFps -> playbackFps <= captureFps }
-                .map { playbackFps -> proVideoFrameRateOption(captureFps, playbackFps) }
-        }
+        val frameRates = videoFrameRates(variant)
         return CameraModeProfile(
             mode = CameraModeId.ProVideo,
             modeName = CameraModeId.ProVideo.label,
             captureType = CameraCaptureType.Video,
             availableLenses = lenses,
-            availableResolutions = listOf("FHD", "UHD 4K", "8K"),
+            availableResolutions = videoResolutionOptions,
             availableFrameRates = frameRates,
             availableFormatOptions = listOf("Standard", "HDR", "Samsung LOG (experimental)"),
             availableExposureControls = listOf(
@@ -1959,16 +2034,17 @@ object CameraCatalog {
                 choice("pro_video.resolution", "Resolution", "File", videoResolutionOptions, "UHD 4K"),
                 choice(
                     "pro_video.frame_rate",
-                    "FPS / Playback",
+                    "Capture FPS",
                     "File",
                     frameRates,
-                    proVideoFrameRateOption(30),
+                    "30fps",
                 ),
+                playbackSetting("pro_video"),
                 choice(
                     "pro_video.aspect_ratio",
                     "Aspect ratio",
                     "File",
-                    listOf("16:9", "4:3"),
+                    listOf("16:9", "4:3", "Full"),
                     "16:9",
                 ),
                 choice("pro_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
@@ -2000,6 +2076,7 @@ object CameraCatalog {
         availableAssistTools = listOf("Portrait Video Effects", "Focus Assist", "HDR", "Grid"),
         settings = listOf(
             choice("portrait_video.lens", "Lens", "Core", lenses, "1x"),
+            choice("portrait_video.aspect_ratio", "Aspect ratio", "Core", videoAspectRatios(), "16:9"),
             choice("portrait_video.resolution", "Video size", "Core", listOf("FHD", "UHD 4K"), "FHD"),
             choice("portrait_video.frame_rate", "Frame rate", "Core", listOf("30fps"), "30fps"),
             choice("portrait_video.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
@@ -2040,19 +2117,23 @@ object CameraCatalog {
         modeName = CameraModeId.SlowMotion.label,
         captureType = CameraCaptureType.Video,
         availableLenses = lenses,
-        availableResolutions = listOf("FHD", "UHD 4K", "8K"),
+        availableResolutions = listOf("HD 720p", "FHD 1920×824", "FHD", "UHD 4K", "8K"),
         availableFrameRates = listOf("24fps", "30fps", "48fps", "60fps", "100fps", "120fps", "240fps"),
         availableExposureControls = listOf("Exposure value", "Focus"),
         availableAssistTools = listOf("HDR", "Grid"),
         settings = listOf(
-            choice("slow_motion.resolution", "Video size", "Core", listOf("FHD", "UHD 4K", "8K"), "FHD"),
+            choice("slow_motion.resolution", "Video size", "Core", listOf("HD 720p", "FHD 1920×824", "FHD", "UHD 4K", "8K"), "FHD"),
+            choice("slow_motion.aspect_ratio", "Aspect ratio", "Core", listOf("Full"), "Full",
+                note = "The viewfinder fills the screen. The recorder uses the selected video size."),
             choice(
                 "slow_motion.frame_rate",
-                "Frame rate",
+                "Capture FPS",
                 "Core",
                 listOf("24fps", "30fps", "48fps", "60fps", "100fps", "120fps", "240fps"),
                 "60fps",
             ),
+            playbackSetting("slow_motion"),
+            toggle("slow_motion.audio_recording", "Audio recording", "Audio", "On"),
             choice("slow_motion.lens", "Lens", "Core", lenses, "1x"),
             choice("slow_motion.flash", "Flash / Torch", "Core", listOf("Off", "Torch"), "Off"),
             slider("slow_motion.exposure", "EV", "Core", evQuickOptions, "0.0", supportsSensitivity = false),
@@ -2161,7 +2242,14 @@ object CameraCatalog {
     private fun videoFrameRates(_variant: GalaxyDeviceVariant): List<String> =
         listOf(24, 25, 30, 48, 50, 60, 90, 100, 120, 240).map { "${it}fps" }
 
-    private val proVideoPlaybackFrameRates = listOf(23.976, 24.0, 29.97, 30.0, 48.0)
+    const val MATCH_CAPTURE = "Match capture"
+    private val captureRateIds = setOf("video.frame_rate", "pro_video.frame_rate", "slow_motion.frame_rate")
+    private fun playbackSetting(prefix: String) = choice("$prefix.playback_fps", "Playback FPS", "File",
+        listOf(MATCH_CAPTURE, "23.976fps", "24fps", "25fps", "29.97fps", "30fps", "48fps", "50fps", "60fps", "100fps", "120fps", "240fps"),
+        MATCH_CAPTURE)
+
+    fun selectedPlaybackFps(value: String?, captureFps: Int): Double =
+        value?.removeSuffix("fps")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 } ?: captureFps.toDouble()
 
     private fun frameRateLabel(fps: Double): String =
         if (fps % 1.0 == 0.0) fps.toInt().toString() else fps.toString()
@@ -2466,6 +2554,10 @@ object CameraCatalog {
 
 val CameraState.primaryHighlightedEntry: CameraRailEntry
     get() = CameraCatalog.highlightedPrimaryEntry(this)
+
+internal val CameraState.vacuumEntrySelected: Boolean
+    get() = focusedZone == CameraUiZone.ModeRail && railLevel == CameraRailLevel.Primary &&
+        highlightedPrimaryIndex == CameraCatalog.VACUUM_RAIL_INDEX
 
 val CameraState.secondaryHighlightedMode: CameraModeId
     get() = CameraCatalog.highlightedSecondaryMode(this)

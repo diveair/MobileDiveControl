@@ -8,6 +8,14 @@ import org.junit.jupiter.api.Test
 
 class StartupPermissionSequenceTest {
     @Test
+    fun `reopened setup can upgrade a previously granted approximate location`() {
+        val location = listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
+        val step = nextStartupPermissionStep(listOf(location), emptySet(), setOf(location.first()),
+            emptySet(), popupControlRequired = false, popupControlSatisfied = true)
+        assertEquals(location, step.permissions)
+    }
+
+    @Test
     fun `feature permission can open without housing popup control after startup`() {
         assertEquals(true, canLaunchFeaturePermissionDialog(true, false, false))
         assertEquals(false, canLaunchFeaturePermissionDialog(false, false, false))

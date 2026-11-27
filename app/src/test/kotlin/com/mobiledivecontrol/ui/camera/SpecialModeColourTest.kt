@@ -505,6 +505,8 @@ class SpecialModeColourTest {
         )
 
         assertEquals(listOf(24, 30), samsungVendorEightKFrameRates(configurations))
+        assertEquals(listOf(24, 30, 60), samsungVendorEightKFrameRates(
+            intArrayOf(7680, 4320, 24, 60, 0, 0), setOf(15, 24, 30, 60, 120)))
         assertEquals(emptyList<Int>(), samsungVendorEightKFrameRates(intArrayOf(7680, 4000, 30)))
     }
 }

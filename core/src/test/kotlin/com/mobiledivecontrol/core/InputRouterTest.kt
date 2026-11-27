@@ -129,17 +129,17 @@ class InputRouterTest {
     // --- Seal check interception ---
 
     @Test
-    fun `ok starts the vacuum check while the cover is open`() {
+    fun `down starts the vacuum check from the displayed setup prompt`() {
         for (sealState in listOf(SealState.CoverOpen, SealState.ReadyToVacuum, SealState.Unknown)) {
             val state = readyState(
                 mode = AppMode.CameraLive,
-                safety = SafetyState(sealState = sealState, coverOpen = true),
+                safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.B03), sealState = sealState, coverOpen = true),
             )
-            val route = router.route(state, HousingButtonEvent.Ok)
+            val route = router.route(state, HousingButtonEvent.Down)
             assertEquals(
                 listOf(SafetyCommand.StartVacuumCheck),
                 route.commands,
-                "OK should start the check from $sealState",
+                "DOWN should start the check from $sealState",
             )
         }
     }
@@ -206,7 +206,7 @@ class InputRouterTest {
         val dismiss = router.route(
             readyState(
                 mode = AppMode.CameraLive,
-                safety = SafetyState(sealState = SealState.CoverOpen, coverOpen = true),
+                safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.B03), sealState = SealState.CoverOpen, coverOpen = true),
             ),
             HousingButtonEvent.BackOrSafety,
         )
@@ -215,7 +215,7 @@ class InputRouterTest {
         val cancel = router.route(
             readyState(
                 mode = AppMode.CameraLive,
-                safety = SafetyState(sealState = SealState.Vacuuming, coverOpen = true),
+                safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Pumping), sealState = SealState.Vacuuming, coverOpen = true),
             ),
             HousingButtonEvent.BackOrSafety,
         )
@@ -241,7 +241,7 @@ class InputRouterTest {
             val route = router.route(
                 readyState(
                     mode = AppMode.CameraLive,
-                    safety = SafetyState(sealState = sealState, coverOpen = true),
+                    safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Reached), sealState = sealState, coverOpen = true),
                 ),
                 HousingButtonEvent.BackOrSafety,
             )
@@ -259,16 +259,16 @@ class InputRouterTest {
         val prompt = router.route(
             readyState(
                 mode = AppMode.CameraLive,
-                safety = SafetyState(sealState = SealState.CoverOpen, coverOpen = true),
+                safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.B03), sealState = SealState.CoverOpen, coverOpen = true),
             ),
             HousingButtonEvent.Down,
         )
-        assertEquals(listOf(SafetyCommand.DismissSealCheck), prompt.commands)
+        assertEquals(listOf(SafetyCommand.StartVacuumCheck), prompt.commands)
 
         val pumping = router.route(
             readyState(
                 mode = AppMode.CameraLive,
-                safety = SafetyState(sealState = SealState.Vacuuming, coverOpen = true),
+                safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Pumping), sealState = SealState.Vacuuming, coverOpen = true),
             ),
             HousingButtonEvent.Down,
         )
@@ -277,7 +277,7 @@ class InputRouterTest {
         val capPrompt = router.route(
             readyState(
                 mode = AppMode.CameraLive,
-                safety = SafetyState(sealState = SealState.MotorStopping, coverOpen = true),
+                safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Reached), sealState = SealState.MotorStopping, coverOpen = true),
             ),
             HousingButtonEvent.Down,
         )
@@ -316,7 +316,7 @@ class InputRouterTest {
 
     /** The failed banner's confirm: UP resets the seal; anywhere else UP stays with the camera. */
     @Test
-    fun `up confirms a failed seal and is otherwise never intercepted`() {
+    fun `up keeps camera navigation even after seal failure`() {
         val failed = router.route(
             readyState(
                 mode = AppMode.CameraLive,
@@ -324,7 +324,7 @@ class InputRouterTest {
             ),
             HousingButtonEvent.Up,
         )
-        assertEquals(listOf(SafetyCommand.ResetSealState), failed.commands)
+        assertEquals(listOf(CameraCommand.NavigateUp), failed.commands)
 
         for (sealState in SealState.entries - SealState.Failed) {
             val route = router.route(
@@ -351,7 +351,7 @@ class InputRouterTest {
             val reminder = router.route(
                 readyState(
                     mode = AppMode.CameraLive,
-                    safety = SafetyState(sealState = sealState, capCloseReminder = true),
+                    safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Reached), sealState = sealState, capCloseReminder = true),
                 ),
                 HousingButtonEvent.Ok,
             )
@@ -379,7 +379,7 @@ class InputRouterTest {
             val visible = router.route(
                 readyState(
                     mode = AppMode.CameraLive,
-                    safety = SafetyState(sealState = sealState, coverOpen = true),
+                    safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Reached), sealState = sealState, coverOpen = true),
                 ),
                 HousingButtonEvent.Ok,
             )

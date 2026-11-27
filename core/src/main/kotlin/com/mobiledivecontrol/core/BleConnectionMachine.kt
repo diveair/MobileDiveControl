@@ -10,12 +10,7 @@ sealed interface BleSignal {
     data object Ready : BleSignal
     data object Disconnect : BleSignal
 
-    /**
-     * Housing powered off via hardware (OK long press per vendor spec §5.3 Table 7).
-     * No BLE notification is sent — the housing firmware simply shuts down,
-     * causing BLE disconnect. The app should transition to Idle (not Reconnecting)
-     * because there is no device to reconnect to.
-     */
+    /** Reserved for a positive firmware shutdown indication. A GATT close emits Disconnect. */
     data object HousingPoweredOff : BleSignal
 
     data object Degrade : BleSignal

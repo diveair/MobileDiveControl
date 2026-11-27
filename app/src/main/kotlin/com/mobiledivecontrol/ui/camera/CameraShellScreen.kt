@@ -1,5 +1,6 @@
 package com.mobiledivecontrol.ui.camera
 
+import com.mobiledivecontrol.ui.components.MessageBanner
 import androidx.compose.ui.layout.onSizeChanged
 
 import android.graphics.Bitmap
@@ -120,6 +121,8 @@ import com.mobiledivecontrol.core.selectedSetting
 import com.mobiledivecontrol.core.BottomBarItem
 import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.testing.CameraStressVisualStatus
+import com.mobiledivecontrol.platform.CompassReading
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -136,6 +139,7 @@ fun CameraShellScreen(
     cameraState: CameraState,
     safetyState: SafetyState,
     safetyStopActive: Boolean = false,
+    vacuumMenuAvailable: Boolean = false,
     cameraPermissionGranted: Boolean = false,
     locationPrerequisitesReady: Boolean = false,
     lifecycleOwner: androidx.lifecycle.LifecycleOwner? = null,
@@ -146,7 +150,7 @@ fun CameraShellScreen(
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     onPointingGesture: ((PointingGesture) -> Unit)? = null,
     onCameraCommand: (CameraCommand) -> Unit = {},
-    headingDegrees: Double? = null,
+    compassReadings: StateFlow<CompassReading>,
     warningMessage: String? = null,
     modifier: Modifier = Modifier,
 ) {
@@ -170,7 +174,7 @@ fun CameraShellScreen(
                 onMeteredExposure = onMeteredExposure,
                 onPointingGesture = onPointingGesture,
                 onCameraCommand = onCameraCommand,
-                headingDegrees = headingDegrees,
+                compassReadings = compassReadings,
             )
         } else {
             CameraPreviewPlaceholder()
@@ -290,6 +294,7 @@ fun CameraShellScreen(
             RightModeRail(
                 cameraState = cameraState,
                 safetyStopActive = safetyStopActive,
+                vacuumMenuAvailable = vacuumMenuAvailable,
                 onCommand = onCameraCommand,
             )
         }
@@ -306,6 +311,7 @@ fun CameraShellScreen(
         ) {
             BottomSettingsTray(
                 cameraState = cameraState,
+                vacuumMenuAvailable = vacuumMenuAvailable,
                 onCommand = onCameraCommand,
                 modifier = Modifier.onSizeChanged { menuBounds?.trayHeightPx = it.height },
             )
@@ -356,19 +362,11 @@ private fun CameraFailureBanner(
     message: String,
     modifier: Modifier = Modifier,
 ) {
-    Text(
-        text = message,
-        color = DiveColors.TextPrimary,
-        style = MaterialTheme.typography.labelMedium,
-        fontWeight = FontWeight.Bold,
-        maxLines = 3,
-        overflow = TextOverflow.Ellipsis,
-        modifier = modifier
-            .fillMaxWidth(0.72f)
-            .background(DiveColors.Warning.copy(alpha = 0.9f), RoundedCornerShape(10.dp))
-            .border(1.dp, DiveColors.DeepBlack.copy(alpha = 0.65f), RoundedCornerShape(10.dp))
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-    )
+    MessageBanner(DiveColors.Warning.copy(alpha = 0.9f), modifier,
+        border = androidx.compose.foundation.BorderStroke(1.dp, DiveColors.DeepBlack.copy(alpha = 0.65f))) {
+        Text(message, color = DiveColors.TextPrimary, style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 12.dp))
+    }
 }
 
 /**
@@ -1472,24 +1470,27 @@ private fun SaveLocationAlbumCover(
 private fun RightModeRail(
     cameraState: CameraState,
     safetyStopActive: Boolean,
+    vacuumMenuAvailable: Boolean,
     onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val items = CameraCatalog.primaryRailWithStop(safetyStopActive)
+    val items = remember(safetyStopActive, vacuumMenuAvailable) {
+        CameraCatalog.primaryRailWithStop(safetyStopActive, vacuumMenuAvailable)
+    }
     val highlightedIndex = items.indexOfFirst { it.index == cameraState.highlightedPrimaryIndex }.coerceAtLeast(0)
     val listState = rememberLazyListState()
 
     // Auto-scroll to keep highlighted item visible
-    LaunchedEffect(highlightedIndex, safetyStopActive) {
+    LaunchedEffect(highlightedIndex, items) {
         listState.animateScrollToItem(
-            index = highlightedIndex.coerceIn(0, items.lastIndex),
+            index = (highlightedIndex - 1).coerceIn(0, items.lastIndex),
         )
     }
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = modifier
-            .width(162.dp)
+            .width(200.dp)
             .fillMaxHeight()
             .background(DiveColors.DeepBlack.copy(alpha = 0.42f), RoundedCornerShape(24.dp))
             .border(1.dp, DiveColors.SurfaceBorder.copy(alpha = 0.7f), RoundedCornerShape(24.dp))
@@ -1528,9 +1529,9 @@ private fun RightModeRail(
                 ) {
                     Text(
                         text = entry.label,
-                        color = if (selected) DiveColors.TextPrimary else DiveColors.TextSecondary,
-                        style = if (selected) MaterialTheme.typography.titleMedium
-                        else MaterialTheme.typography.bodyMedium,
+                        color = if (indexed.index == CameraCatalog.VACUUM_RAIL_INDEX) Color.Yellow
+                            else if (selected) DiveColors.TextPrimary else DiveColors.TextSecondary,
+                        style = MaterialTheme.typography.bodyMedium,
                         fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -1742,6 +1743,7 @@ private fun BottomSettingsTrayLegacy(
 @Composable
 private fun BottomSettingsTray(
     cameraState: CameraState,
+    vacuumMenuAvailable: Boolean,
     onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1938,6 +1940,7 @@ private fun BottomSettingsTray(
             CenteredModesBar(
                 items = items,
                 cameraState = cameraState,
+                vacuumMenuAvailable = vacuumMenuAvailable,
                 onCommand = onCommand,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -1949,6 +1952,7 @@ private fun BottomSettingsTray(
 private fun CenteredModesBar(
     items: List<BottomBarItem>,
     cameraState: CameraState,
+    vacuumMenuAvailable: Boolean,
     onCommand: (CameraCommand) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1973,6 +1977,7 @@ private fun CenteredModesBar(
         BottomBarChip(
             item = centerItem,
             cameraState = cameraState,
+            valueOverride = if (vacuumMenuAvailable) "Vacuum" else null,
             selected = cameraState.settingsCursor == modesIndex,
             compact = false,
             onClick = { onCommand(CameraCommand.OpenModeRail) },
@@ -2103,6 +2108,7 @@ private fun BottomBarChip(
     cameraState: CameraState,
     selected: Boolean,
     compact: Boolean = false,
+    valueOverride: String? = null,
     onClick: (() -> Unit)? = null,
 ) {
     if (item is BottomBarItem.GalleryShortcut) {
@@ -2111,7 +2117,7 @@ private fun BottomBarChip(
     }
     val icon = bottomBarIcon(item)
     val label = bottomBarLabel(item)
-    val value = bottomBarValue(item, cameraState)
+    val value = valueOverride ?: bottomBarValue(item, cameraState)
     val compactDirectExposure = compact &&
         (item as? BottomBarItem.Setting)?.spec?.id in compactExposureSettingIds
     val compactValueOnly = compact &&

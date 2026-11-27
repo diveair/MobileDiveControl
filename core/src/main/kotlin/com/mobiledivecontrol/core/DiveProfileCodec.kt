@@ -14,7 +14,7 @@ object DiveProfileCodec {
         require(state.logs.size <= DiveProfileTracker.MAX_LOGS)
         DataOutputStream(bytes).use { out ->
             out.writeInt(0x44495645)
-            out.writeInt(5)
+            out.writeInt(6)
             out.settings(state.settings)
             out.writeBoolean(state.active != null)
             state.active?.let { out.session(it) }
@@ -29,7 +29,7 @@ object DiveProfileCodec {
         require(bytes.size <= MAX_ENCODED_BYTES)
         return DataInputStream(ByteArrayInputStream(bytes)).use { input ->
             require(input.readInt() == 0x44495645)
-            val version = input.readInt().also { require(it in 1..5) }
+            val version = input.readInt().also { require(it in 1..6) }
             val settings = input.settings()
             val active = if (input.readBoolean()) input.session(version) else null
             val count = input.readInt().also { require(it in 0..DiveProfileTracker.MAX_LOGS) }
@@ -107,6 +107,9 @@ object DiveProfileCodec {
             writeBoolean(exposure.cnsOutsideTable); writeDouble(exposure.maxOtu24Hours)
             writeDouble(exposure.maxPpO2Ata ?: -1.0)
         }
+        writeInt(s.continuation.ordinal)
+        writeInt(s.diverReserveConfirmations)
+        writeLong(s.lastReserveConfirmationElapsedMs ?: -1L)
     }
 
     private fun DataInputStream.session(version: Int): DiveSession {
@@ -137,8 +140,13 @@ object DiveProfileCodec {
             boundedDouble(200.0), boundedDouble(1_000_000.0), readBoolean(), boundedDouble(1_441_000_000.0),
             readDouble().also { require(it.isFinite() && (it == -1.0 || it in 0.0..10.0)) }.takeIf { it >= 0 },
         ) else null
+        val continuation = if (version >= 6) DiveContinuation.entries[readInt()] else DiveContinuation.None
+        val confirmations = if (version >= 6) readInt().also { require(it >= 0) } else 0
+        val confirmedAt = if (version >= 6) readLong().also { require(it in -1L..elapsed) }.takeIf { it >= 0 } else null
+        require((confirmations > 0) == (confirmedAt != null))
         return DiveSession(start, settings, elapsed, max, samples, phase, progress, started, incomplete, result,
             limitReached = limitReached, shallowestAfterStopMeters = shallowest, minimumNdlSeconds = minimumNdl,
-            exposure = exposure)
+            exposure = exposure, continuation = continuation, diverReserveConfirmations = confirmations,
+            lastReserveConfirmationElapsedMs = confirmedAt)
     }
 }

@@ -25,6 +25,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -37,6 +38,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Everything the app learns from the housing radio, in the order it happened.
@@ -188,6 +190,75 @@ class HousingLink(
     /** True between a successful motor-on write and a successful motor-off write. */
     @Volatile private var motorBelievedRunning: Boolean = false
     @Volatile private var sensorReadsPaused: Boolean = false
+    @Volatile private var standby = false
+
+    fun setStandby(enabled: Boolean) {
+        if (standby == enabled) return
+        standby = enabled
+        Log.i(TAG, if (enabled) "Housing standby entered" else "Housing standby ended")
+        session?.let { active ->
+            active.sensors.setReadsEnabled(!enabled)
+            active.transport.setStandby(enabled)
+            active.standbyProbe?.cancel()
+            if (!enabled) active.powerPress.tryReceive()
+            if (enabled) {
+                latestWater = null
+                validVacuumAt = null
+                coverOpenSeen = false
+                telemetry.clear()
+                if (lastSignal == BleSignal.Ready) active.standbyProbe = scope.launch { monitorStandbyLink(active) }
+            }
+        }
+    }
+
+    fun checkLinkAfterPowerPress() {
+        session?.powerPress?.trySend(Unit)
+    }
+
+    private suspend fun monitorStandbyLink(active: Session) {
+        val transport = active.transport
+        val readable = listOf(HousingCharacteristic.BatteryLevel, HousingCharacteristic.FirmwareRevision,
+            HousingCharacteristic.SerialNumber).firstOrNull { it in transport.availableCharacteristics } ?: return
+        var missed = false
+        while (standby && session === active && !active.ended.isCompleted) {
+            if (missed) delay(1_000L) else {
+                // Bring one read forward to the end of the physical hold if Android hasn't
+                // reported the disconnect yet. A live housing returns to its idle cadence.
+                withTimeoutOrNull(15_000L) {
+                    active.powerPress.receive()
+                    delay(3_000L)
+                }
+            }
+            if (!standby || session !== active || active.ended.isCompleted) return
+            // A responsive link stays asleep. Two unanswered reads recover a stale GATT
+            // session even when Android hasn't delivered its disconnect callback.
+            val reply = try {
+                transport.readCharacteristic(readable)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w(TAG, "Standby link probe failed", error)
+                null
+            }
+            if (!standby || session !== active) return
+            val unanswered = reply == null || reply.isEmpty()
+            if (unanswered && missed) {
+                active.ended.complete(DisconnectCause.LinkLoss)
+                return
+            }
+            missed = unanswered
+        }
+    }
+    @Volatile private var latestWater: HousingLinkEvent.Notification? = null
+    @Volatile private var validVacuumAt: Long? = null
+    private fun freshPumpDepth(now: Long): Double? {
+        val packet = latestWater ?: return null
+        val baroAt = validVacuumAt ?: return null
+        if (now - packet.receivedAtMonotonicMs !in 0 until com.mobiledivecontrol.core.PRESSURE_STALE_MS ||
+            now - baroAt !in 0 until com.mobiledivecontrol.core.PRESSURE_STALE_MS) return null
+        val water = parser.decodeWaterPressure(packet.payload) as? ParseResult.Success ?: return null
+        return com.mobiledivecontrol.core.pressureDepthMeters(water.value.kpa)
+    }
 
     fun setSensorReadsPaused(paused: Boolean) {
         sensorReadsPaused = paused
@@ -195,7 +266,7 @@ class HousingLink(
     }
 
     private fun refreshSensorReadPolicy() {
-        session?.sensors?.setReadsEnabled(!sensorReadsPaused && !motorBelievedRunning)
+        session?.sensors?.setPressureOnly(sensorReadsPaused || motorBelievedRunning)
     }
 
     private var motorWatchdog: Job? = null
@@ -241,7 +312,7 @@ class HousingLink(
      * Never throws. A command issued while the link is down is a warning, not a crash — the
      * housing buttons keep working the moment the link comes back.
      */
-    suspend fun send(command: HousingCommand): Boolean {
+    suspend fun send(command: HousingCommand, pumpPermitted: ((Double) -> Boolean)? = null): Boolean {
         HousingFeatureFlags.rejectionReason(command)?.let { reason ->
             Log.w(TAG, "Blocked high-risk housing command $command: $reason")
             emit(HousingLinkEvent.Warning(reason))
@@ -279,7 +350,14 @@ class HousingLink(
         val writeStartedMs = pressureMonotonicMs()
         if (tracePump) Log.i("DivePump", "Sending $command")
         val succeeded = runCatching {
-            writeLock.withLock { execute(active.transport, requests) }
+            writeLock.withLock {
+                val startsPump = command == HousingCommand.SetVacuumMotor(true) ||
+                    (pumpPermitted != null && command == HousingCommand.SetSolenoidValve(true))
+                if (startsPump &&
+                    (session !== active || active.ended.isCompleted || !coverOpenSeen ||
+                        pumpPermitted == null || freshPumpDepth(pressureMonotonicMs())?.let(pumpPermitted) != true)) false
+                else execute(active.transport, requests)
+            }
         }.getOrElse { error ->
             if (error is CancellationException) throw error
             Log.w(TAG, "Housing command $command failed", error)
@@ -420,10 +498,6 @@ class HousingLink(
 
             when (result.kind) {
                 SessionResult.Kind.Unavailable -> delay(PREREQUISITE_POLL_MS)
-                SessionResult.Kind.PoweredOff -> {
-                    attempt = 0
-                    delay(POWERED_OFF_RESCAN_MS)
-                }
                 SessionResult.Kind.Retry -> {
                     if (result.reachedReady) attempt = 0
                     attempt += 1
@@ -441,17 +515,23 @@ class HousingLink(
         }
 
         val transport = transportFactory(store.lastAddress)
+        if (standby) transport.setStandby(true)
+        latestWater = null
+        validVacuumAt = null
+        coverOpenSeen = false
+        telemetry.clear()
         val current = Session(transport)
         session = current
 
         try {
             transport.setDisconnectListener { cause -> current.ended.complete(cause) }
             transport.setNotificationListener { characteristic, value ->
-                current.sensors.receive(characteristic, value, SensorPacketSource.Notification)
+                if (session === current && !current.ended.isCompleted && (!standby || characteristic == HousingCharacteristic.ButtonEvents))
+                    current.sensors.receive(characteristic, value, SensorPacketSource.Notification)
             }
 
             emit(HousingLinkEvent.Ble(BleSignal.StartScan))
-            val device = transport.scan(SCAN_WINDOW_MS)
+            val device = transport.scan(if (standby) 120_000L else SCAN_WINDOW_MS)
                 ?: return SessionResult(reachedReady = false, kind = SessionResult.Kind.Retry)
 
             emit(HousingLinkEvent.Ble(BleSignal.Connect))
@@ -492,26 +572,20 @@ class HousingLink(
             emit(HousingLinkEvent.Ble(BleSignal.Ready))
             reconcileMotorAfterReconnect()
 
-            val disconnectCause = coroutineScope {
+            coroutineScope {
                 val sensorJob = launch { current.sensors.run(available) }
                 try {
-                    current.ended.await()
+                    val cause = current.ended.await()
+                    // Publish the radio event before waiting for an outstanding sensor read to unwind.
+                    Log.i(TAG, "Housing link ended: $cause")
+                    emit(HousingLinkEvent.Ble(BleSignal.Disconnect))
                 } finally {
                     sensorJob.cancelAndJoin()
                 }
             }
-            return when (disconnectCause) {
-                DisconnectCause.RemoteClosed -> {
-                    emit(HousingLinkEvent.Ble(BleSignal.HousingPoweredOff))
-                    emit(HousingLinkEvent.Warning("Housing powered off."))
-                    SessionResult(reachedReady = true, kind = SessionResult.Kind.PoweredOff)
-                }
-                else -> {
-                    emit(HousingLinkEvent.Ble(BleSignal.Disconnect))
-                    SessionResult(reachedReady = true, kind = SessionResult.Kind.Retry)
-                }
-            }
+            return SessionResult(reachedReady = true, kind = SessionResult.Kind.Retry)
         } finally {
+            current.standbyProbe?.cancel()
             session = null
             withContext(NonCancellable) { closeQuietly(transport) }
         }
@@ -528,9 +602,7 @@ class HousingLink(
     private fun observeCoverState(characteristic: HousingCharacteristic, payload: ByteArray) {
         if (characteristic != HousingCharacteristic.CoverState) return
         val decoded = parser.decodeCoverState(payload)
-        if (decoded is ParseResult.Success<SensorUpdate.CoverState> && decoded.value.open) {
-            coverOpenSeen = true
-        }
+        coverOpenSeen = decoded is ParseResult.Success && decoded.value.open
     }
 
     private suspend fun readDeviceInfo(
@@ -686,7 +758,13 @@ class HousingLink(
                     // housing already sitting cover-open would offer the start prompt while the
                     // interlock still refused the pump.
                     HousingCharacteristic.from(event.characteristicShortHex)?.let {
-                        observeCoverState(it, event.payload)
+                        when (it) {
+                            HousingCharacteristic.WaterPressure -> latestWater = event
+                            HousingCharacteristic.BarometricPressure -> validVacuumAt = event.receivedAtMonotonicMs.takeIf {
+                                parser.decodeBarometricPressure(event.payload) is ParseResult.Success
+                            }
+                            else -> observeCoverState(it, event.payload)
+                        }
                     }
                 }
             }
@@ -702,6 +780,8 @@ class HousingLink(
 
     private inner class Session(val transport: HousingTransport) {
         val ended = CompletableDeferred<DisconnectCause>()
+        val powerPress = Channel<Unit>(Channel.CONFLATED)
+        @Volatile var standbyProbe: Job? = null
         val sensors = HousingSensorMonitor(
             read = transport::readCharacteristic,
             deliver = { characteristic, payload, source ->
@@ -709,7 +789,7 @@ class HousingLink(
                     emit(HousingLinkEvent.Notification(characteristic.shortHex, payload, source))
                 }
             },
-        ).also { it.setReadsEnabled(!sensorReadsPaused && !motorBelievedRunning) }
+        ).also { it.setPressureOnly(sensorReadsPaused || motorBelievedRunning); it.setReadsEnabled(!standby) }
     }
 
     private data class SessionResult(
@@ -723,8 +803,7 @@ class HousingLink(
             /** Try the whole sequence again after the reconnect backoff. */
             Retry,
 
-            /** The diver powered the housing down. Rescan slowly rather than spinning. */
-            PoweredOff,
+
         }
     }
 
@@ -797,7 +876,6 @@ class HousingLink(
         /** Permissions and the adapter can be granted or switched on while the app is running. */
         const val PREREQUISITE_POLL_MS = 2_000L
 
-        /** A deliberately powered-off housing should not be scanned for at full rate. */
-        const val POWERED_OFF_RESCAN_MS = 5_000L
+
     }
 }

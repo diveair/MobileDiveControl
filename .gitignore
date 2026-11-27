@@ -39,6 +39,7 @@ desktop.ini
 .codex-tmp/
 /tmp/
 /artifacts/
+/tools/depth_lab/__pycache__/
 
 # Graphify machine-local caches, intermediates, and conversation memory
 /graphify-out/cache/

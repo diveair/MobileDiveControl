@@ -1,5 +1,7 @@
 package com.mobiledivecontrol.ui.dive
 
+import com.mobiledivecontrol.ui.components.MessageBanner
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -33,11 +35,14 @@ internal fun AirGasWarningCard(air: AirAlertState, dive: DiveProfileState,
         AutoShrinkText(airGasTitle(warning, dive), accent,
             TextStyle(fontSize = 24.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center),
             modifier = Modifier.fillMaxWidth(), maxLines = 2)
-        Text(when (warning.level) {
-            AirGasLevel.Empty -> "Check your gauge. Signal your buddy and follow your emergency training."
-            AirGasLevel.Critical -> "Gas margin critically low. Check your gauge and signal your buddy. Optional safety stop only if gas allows."
+        val plannedStopAscent = warning.promptsPlannedStopAscent(dive)
+        Text(when {
+            plannedStopAscent -> "ESTIMATED AIR LOW. CHECK GAUGE; FOLLOW DIVE PLAN."
+            warning.level == AirGasLevel.Empty -> "Check your gauge. Signal your buddy and follow your emergency training."
+            warning.level == AirGasLevel.Critical -> "Gas margin critically low. Check your gauge and signal your buddy. Optional safety stop only if gas allows."
             else -> "The estimate has reached your ascent and reserve budget. Check your gauge and follow your dive plan."
-        }, color = DiveColors.TextPrimary, fontSize = 14.sp, lineHeight = 18.sp, textAlign = TextAlign.Center)
+        }, color = DiveColors.TextPrimary, fontSize = 14.sp, lineHeight = 18.sp, textAlign = TextAlign.Center,
+            fontWeight = if (plannedStopAscent) FontWeight.Bold else null)
         // Keep the warning latched, but never show a stale exit forecast after losing its inputs.
         val surface = warning.projectedSurfaceBar.takeIf {
             AirAlertEngine.estimate(air, dive, pressureMonotonicMs())?.ascentAndStopBar != null
@@ -94,9 +99,9 @@ private fun BuddyAirAction(label: String, action: () -> Unit) {
 
 @Composable
 internal fun AirSharedAirNotice(send: (AirAlertCommand) -> Unit) {
-    Box(contentAlignment = Alignment.Center) {
-        Row(Modifier.widthIn(max = 540.dp).background(DiveColors.DeepBlack.copy(alpha = if (LocalAlertRecording.current) 0f else 1f), RoundedCornerShape(10.dp))
-            .border(1.dp, DiveColors.DiveCyan, RoundedCornerShape(10.dp)).padding(horizontal = 14.dp, vertical = 8.dp),
+    MessageBanner(DiveColors.DeepBlack.copy(alpha = if (LocalAlertRecording.current) 0f else 1f),
+        border = BorderStroke(1.dp, DiveColors.DiveCyan)) {
+        Row(Modifier.padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             Column {
                 Text("BUDDY AIR · GAS UNKNOWN", color = DiveColors.DiveCyan, fontSize = 14.sp, fontWeight = FontWeight.Bold)

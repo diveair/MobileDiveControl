@@ -5,22 +5,33 @@ import androidx.camera.core.ImageProxy
 
 /** Sparse preview/white-balance sampling; full-resolution YUV conversion uses ImageProxy.toBitmap. */
 internal class AnalysisPixelReader(image: ImageProxy) {
-    private val planes = image.planes
-    private val buffers = planes.map { it.buffer.duplicate() }
-    private val yuv = image.format == ImageFormat.YUV_420_888
+    private class Plane(layout: ImageProxy.PlaneProxy) {
+        val buffer = layout.buffer.duplicate()
+        val rowStride = layout.rowStride
+        val pixelStride = layout.pixelStride
+        val limit = buffer.limit()
 
-    private fun component(plane: Int, x: Int, y: Int): Int? {
-        val layout = planes.getOrNull(plane) ?: return null
-        val buffer = buffers[plane]
-        val offset = y * layout.rowStride + x * layout.pixelStride
-        return if (offset in 0 until buffer.limit()) buffer.get(offset).toInt() and 255 else null
+        fun component(x: Int, y: Int): Int {
+            val offset = y * rowStride + x * pixelStride
+            return if (offset in 0 until limit) buffer.get(offset).toInt() and 255 else -1
+        }
     }
 
+    private val layouts = image.planes
+    private val first = layouts.getOrNull(0)?.let(::Plane)
+    private val u = layouts.getOrNull(1)?.let(::Plane)
+    private val v = layouts.getOrNull(2)?.let(::Plane)
+    private val yuv = image.format == ImageFormat.YUV_420_888
+
     fun argb(x: Int, y: Int): Int? {
-        if (yuv) return yuvToArgb(component(0, x, y) ?: return null,
-            component(1, x / 2, y / 2) ?: return null, component(2, x / 2, y / 2) ?: return null)
-        val layout = planes.firstOrNull() ?: return null
-        val buffer = buffers.first()
+        val layout = first ?: return null
+        if (yuv) {
+            val luma = layout.component(x, y)
+            val cb = u?.component(x / 2, y / 2) ?: return null
+            val cr = v?.component(x / 2, y / 2) ?: return null
+            return if (luma < 0 || cb < 0 || cr < 0) null else yuvToArgb(luma, cb, cr)
+        }
+        val buffer = layout.buffer
         val offset = y * layout.rowStride + x * layout.pixelStride
         if (layout.pixelStride < 4 || offset < 0 || offset + 3 >= buffer.limit()) return null
         return ((buffer.get(offset + 3).toInt() and 255) shl 24) or

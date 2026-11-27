@@ -1,11 +1,16 @@
 package com.mobiledivecontrol.ui.camera
 
+import android.content.Context
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraManager
+
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.os.SystemClock
 import android.util.Log
 import com.mobiledivecontrol.BuildConfig
 import java.util.concurrent.ConcurrentHashMap
+import java.util.WeakHashMap
 
 /** Passive debug evidence for manual verification; never submits or modifies a request. */
 internal object CameraControlTrace {
@@ -26,7 +31,10 @@ internal object CameraControlTrace {
     )
     private fun relevant(name: String) = name in names || name.contains("lensPos", ignoreCase = true)
 
-    fun record(pipeline: String, request: CaptureRequest, result: CaptureResult) {
+    private data class TraceKeys(val requests: List<CaptureRequest.Key<*>>, val results: List<CaptureResult.Key<*>>)
+    private val sessionKeys = WeakHashMap<CameraCaptureSession, TraceKeys>()
+
+    fun record(pipeline: String, request: CaptureRequest, result: CaptureResult, context: Context, session: CameraCaptureSession) {
         if (!BuildConfig.DEBUG) return
         val now = SystemClock.elapsedRealtime()
         if (now - (lastAt[pipeline] ?: 0L) < 1000L) return
@@ -38,8 +46,19 @@ internal object CameraControlTrace {
                 result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID) else null,
             result.get(CaptureResult.LENS_FOCAL_LENGTH), result.get(CaptureResult.SENSOR_FRAME_DURATION))
         runCatching {
-            val requested = request.keys.filter { relevant(it.name) }.joinToString { "${it.name}=${request.get(it)}" }
-            val actual = result.keys.filter { relevant(it.name) }.joinToString { "${it.name}=${result.get(it)}" }
+            // Discover optional vendor tags once per session. Values and their presence still
+            // come from this specific request/result, including changes between capture modes.
+            val keys = synchronized(sessionKeys) {
+                sessionKeys[session] ?: runCatching {
+                    val chars = context.getSystemService(CameraManager::class.java).getCameraCharacteristics(session.device.id)
+                    TraceKeys(((chars.availableCaptureRequestKeys.orEmpty() + request.keys).filter { relevant(it.name) }).distinct(),
+                        ((chars.availableCaptureResultKeys.orEmpty() + result.keys).filter { relevant(it.name) }).distinct())
+                }.getOrNull()?.also { sessionKeys[session] = it }
+            }
+            val requestKeys = keys?.requests ?: request.keys.filter { relevant(it.name) }
+            val resultKeys = keys?.results ?: result.keys.filter { relevant(it.name) }
+            val requested = requestKeys.mapNotNull { key -> request.get(key)?.let { "${key.name}=$it" } }.joinToString()
+            val actual = resultKeys.mapNotNull { key -> result.get(key)?.let { "${key.name}=$it" } }.joinToString()
             Log.d("DiveControls", "$pipeline request: $requested")
             Log.d("DiveControls", "$pipeline result: $actual")
         }

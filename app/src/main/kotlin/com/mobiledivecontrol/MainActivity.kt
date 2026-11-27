@@ -18,8 +18,15 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,6 +37,10 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mobiledivecontrol.platform.ble.BlePermissions
 import com.mobiledivecontrol.accessibility.PermissionDialogHousingBridge
@@ -144,6 +155,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        setTheme(R.style.Theme_DiveControl)
         super.onCreate(savedInstanceState)
 
         // Keep screen on — the diver can't touch it to wake it
@@ -154,6 +166,17 @@ class MainActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         diveViewModel = ViewModelProvider(this)[DiveViewModel::class.java]
+        lifecycleScope.launch {
+            diveViewModel.state.map { it.housingStandby to (it.shutOffPrompt != null) }.distinctUntilChanged().collect { (sleeping, instructionVisible) ->
+                if (sleeping) onSkyGuideSelectionChanged(false)
+                // The black standby surface stays in the foreground. A screen timeout here
+                // would leave the diver behind the keyguard on housing reconnect.
+                window.attributes = window.attributes.apply {
+                    screenBrightness = if (sleeping && !instructionVisible) STANDBY_BRIGHTNESS
+                        else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                }
+            }
+        }
         if ((applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 &&
             intent.getBooleanExtra(EXTRA_PREVIEW_WELCOME, false)
         ) {
@@ -163,7 +186,33 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val viewModel: DiveViewModel = viewModel()
+            val state by viewModel.state.collectAsState()
+            if (state.housingStandby) {
+                val enabled by viewModel.bluetoothEnabled.collectAsState()
+                androidx.compose.runtime.LaunchedEffect(enabled, blePermissionsGranted) {
+                    if (enabled && blePermissionsGranted) startHousingLinkService() else {
+                        stopHousingLinkService()
+                        viewModel.advanceBle(com.mobiledivecontrol.core.BleSignal.Fail)
+                    }
+                }
+                Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black),
+                    contentAlignment = androidx.compose.ui.Alignment.Center) {
+                    if (state.shutOffPrompt != null) {
+                        DiveControlTheme {
+                            com.mobiledivecontrol.ui.components.MessageBanner(androidx.compose.ui.graphics.Color.Black) {
+                                Text("Hold MENU/OK for 3 seconds\nto power off the housing.",
+                                    modifier = Modifier.padding(horizontal = 24.dp).widthIn(max = 540.dp),
+                                    color = androidx.compose.ui.graphics.Color.White,
+                                    style = MaterialTheme.typography.headlineLarge,
+                                    textAlign = TextAlign.Center)
+                            }
+                        }
+                    }
+                }
+                return@setContent
+            }
             val welcomeVisible by viewModel.welcomeVisible.collectAsState()
+            val firstLaunchSealStep by viewModel.firstLaunchSealStep.collectAsState()
             // The welcome card held every system prompt back; start them the moment it ends.
             androidx.compose.runtime.LaunchedEffect(welcomeVisible) {
                 if (!welcomeVisible) checkAndRequestPermissions()
@@ -171,13 +220,10 @@ class MainActivity : ComponentActivity() {
             // onResume runs outside the composition; keep a handle so a Bluetooth toggle made
             // from quick settings is picked up the moment the diver returns to the app.
             bluetoothStateRefresh = viewModel::refreshBluetoothState
-            compassMonitoring = viewModel::setCompassMonitoring
-            val state by viewModel.state.collectAsState()
             val effects by viewModel.effects.collectAsState()
             val useMetric by viewModel.depthUnitMetric.collectAsState()
             val introVisible by viewModel.introVisible.collectAsState()
             val bluetoothEnabled by viewModel.bluetoothEnabled.collectAsState()
-            val compassReading by viewModel.compassReading.collectAsState()
             val targetHeading by viewModel.targetHeading.collectAsState()
             val capPromptVisible by viewModel.capPromptVisible.collectAsState()
             val galleryConsentRequest by viewModel.galleryConsentRequest.collectAsState()
@@ -358,59 +404,68 @@ class MainActivity : ComponentActivity() {
                 checkAndRequestPermissions()
             }
 
-            DiveControlTheme {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    // Main UI
-                    DiveControlScreen(
-                        bluetoothEnabled = bluetoothEnabled,
-                        compassReading = compassReading,
-                        targetHeading = targetHeading,
-                        state = state,
-                        cameraPermissionGranted = cameraPermissionGranted,
-                        locationPrerequisitesReady = locationPermissionGranted &&
-                            locationServicesEnabled,
-                        lifecycleOwner = this@MainActivity,
-                        useMetric = useMetric,
-                        effects = effects,
-                        onEffectsConsumed = viewModel::clearEffects,
-                        onDetectedLenses = { lenses ->
-                            viewModel.dispatch(
-                                com.mobiledivecontrol.core.CameraCommand.UpdateDetectedLenses(lenses)
-                            )
-                        },
-                        onCapabilities = { caps ->
-                            viewModel.dispatch(
-                                com.mobiledivecontrol.core.CameraCommand.UpdateCameraCapabilities(caps)
-                            )
-                        },
-                        onMeteredExposure = viewModel::updateMeteredExposure,
-                        onPointingGesture = viewModel::setTargetHeadingFromPoint,
-                        onCameraCommand = { command -> viewModel.dispatch(command) },
-                        onGalleryCommand = { command -> viewModel.dispatch(command) },
-                        onDiagnosticsCommand = { command -> viewModel.dispatch(command) },
-                        onDiveSettingsCommand = { command -> viewModel.dispatch(command) },
-                        onSafetyCommand = { command -> viewModel.dispatch(command) },
-                        introVisible = introVisible,
-                        onIntroDismiss = {
-                            viewModel.dismissIntro()
-                            // Completion changes the next-launch permission policy immediately;
-                            // re-evaluate so startup cannot remain artificially active this run.
-                            checkAndRequestPermissions()
-                        },
-                        // Runtime grants use Android's native dialogs. Accessibility is not part
-                        // of first-run setup and this flow never launches Android Settings.
-                        permissionsGranted = missingRuntimePermissionLabels.isEmpty(),
-                        missingPermissions = missingRuntimePermissionLabels,
-                        permissionDialogVisible = runtimePermissionRequestInFlight,
-                        onPermissionsSetup = ::openPermissionSetup,
-                        capPromptVisible = capPromptVisible,
-                        onCapPromptDismiss = viewModel::dismissCapPrompt,
-                        welcomeVisible = welcomeVisible,
-                        onWelcomeFinished = viewModel::finishWelcome,
-                    )
+            val observeSeal = androidx.compose.runtime.remember(viewModel) { viewModel::setSealBannerDisplayed }
+            androidx.compose.runtime.CompositionLocalProvider(
+                com.mobiledivecontrol.ui.components.LocalSealBannerObserver provides observeSeal
+            ) {
+                DiveControlTheme {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        // Main UI
+                        DiveControlScreen(
+                            bluetoothEnabled = bluetoothEnabled,
+                            compassReadings = viewModel.compassReading,
+                            onCompassMonitoring = viewModel::setCompassMonitoring,
+                            targetHeading = targetHeading,
+                            state = state,
+                            cameraPermissionGranted = cameraPermissionGranted,
+                            locationPrerequisitesReady = locationPermissionGranted &&
+                                locationServicesEnabled,
+                            lifecycleOwner = this@MainActivity,
+                            useMetric = useMetric,
+                            effects = effects,
+                            onEffectsConsumed = viewModel::clearEffects,
+                            onDetectedLenses = { lenses ->
+                                viewModel.dispatch(
+                                    com.mobiledivecontrol.core.CameraCommand.UpdateDetectedLenses(lenses)
+                                )
+                            },
+                            onCapabilities = { caps ->
+                                viewModel.dispatch(
+                                    com.mobiledivecontrol.core.CameraCommand.UpdateCameraCapabilities(caps)
+                                )
+                            },
+                            onMeteredExposure = viewModel::updateMeteredExposure,
+                            onPointingGesture = viewModel::setTargetHeadingFromPoint,
+                            onCameraCommand = { command -> viewModel.dispatch(command) },
+                            onGalleryCommand = { command -> viewModel.dispatch(command) },
+                            onDiagnosticsCommand = { command -> viewModel.dispatch(command) },
+                            onDiveSettingsCommand = { command -> viewModel.dispatch(command) },
+                            onSafetyCommand = { command -> viewModel.dispatch(command) },
+                            introVisible = introVisible,
+                            onIntroDismiss = {
+                                viewModel.dismissIntro()
+                                // Completion changes the next-launch permission policy immediately;
+                                // re-evaluate so startup cannot remain artificially active this run.
+                                checkAndRequestPermissions()
+                            },
+                            // Runtime grants use Android's native dialogs. Accessibility is not part
+                            // of first-run setup and this flow never launches Android Settings.
+                            permissionsGranted = missingRuntimePermissionLabels.isEmpty(),
+                            missingPermissions = missingRuntimePermissionLabels,
+                            permissionDialogVisible = runtimePermissionRequestInFlight,
+                            onPermissionsSetup = ::openPermissionSetup,
+                            capPromptVisible = capPromptVisible,
+                            onCapPromptDismiss = viewModel::dismissCapPrompt,
+                            welcomeVisible = welcomeVisible,
+                            showSealOnWelcome = !viewModel.needsPermissionWelcome,
+                            firstLaunchSealStep = firstLaunchSealStep,
+                            onIntroPromptFinished = viewModel::finishIntroPrompt,
+                            onWelcomeFinished = viewModel::finishWelcome,
+                        )
 
-                    // Debug simulation panel (tap 🐛 on the right edge)
-                    DebugSimulationPanel(viewModel = viewModel)
+                        // Debug simulation panel (tap 🐛 on the right edge)
+                        DebugSimulationPanel(viewModel = viewModel)
+                    }
                 }
             }
         }
@@ -418,6 +473,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        if (::diveViewModel.isInitialized) {
+            if (!hasFocus) diveViewModel.updateSealInstructionWindow(false)
+            diveViewModel.setSealWindowFocused(hasFocus)
+        }
         if (hasFocus) {
             hideSystemBars()
             window.decorView.post { checkAndRequestPermissions() }
@@ -425,15 +484,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private var bluetoothStateRefresh: (() -> Unit)? = null
-    private var compassMonitoring: ((Boolean) -> Unit)? = null
-
-    override fun onStart() {
-        super.onStart()
-        compassMonitoring?.invoke(true)
-    }
 
     override fun onStop() {
-        compassMonitoring?.invoke(false)
+        diveViewModel.interruptSurfaceTest()
+        diveViewModel.flushCameraSettings()
         super.onStop()
     }
 
@@ -452,9 +506,6 @@ class MainActivity : ComponentActivity() {
         bluetoothStateRefresh?.invoke()
     }
 
-    private fun startupRuntimePermissionGroups(): List<List<Pair<String, String>>> =
-        startupRuntimePermissionGroups(Build.VERSION.SDK_INT, BlePermissions.required())
-
     private fun requiredRuntimePermissions(): List<Pair<String, String>> =
         startupRuntimePermissionGroups().flatten().distinctBy { it.first }
 
@@ -472,6 +523,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkAndRequestPermissions(force: Boolean = false) {
+        if (::diveViewModel.isInitialized && diveViewModel.state.value.housingStandby) return
         refreshPermissionState()
         val pending = pendingRuntimePermissionRequest()
         if (force) {
@@ -500,15 +552,22 @@ class MainActivity : ComponentActivity() {
                 "popupConnected=$popupControlReady",
         )
         startupPermissionSequenceActive = step.gate != StartupPermissionGate.Complete
+        val resumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        val focused = window.decorView.hasWindowFocus()
+        val featureDialogActive = activeOnDemandPermissionRequest != null || skyGuidePermissionRequestInFlight
+        diveViewModel.updateSealInstructionWindow(
+            !welcomeHoldsSystemPrompts() && pending.isEmpty() && !startupPermissionSequenceActive &&
+                !runtimePermissionRequestInFlight && !featureDialogActive && resumed && focused,
+        )
         // Re-entered from LaunchedEffect(welcomeVisible) the moment the card finishes.
         if (welcomeHoldsSystemPrompts()) return
 
         if (canLaunchStartupPermissionDialog(
                 step = step,
-                lifecycleResumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
-                windowFocused = window.decorView.hasWindowFocus(),
+                lifecycleResumed = resumed,
+                windowFocused = focused,
                 requestInFlight = runtimePermissionRequestInFlight,
-                onDemandRequestActive = activeOnDemandPermissionRequest != null || skyGuidePermissionRequestInFlight,
+                onDemandRequestActive = featureDialogActive,
             )
         ) {
             startupPermissionsAttempted += step.permissions
@@ -754,6 +813,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private companion object {
+        const val STANDBY_BRIGHTNESS = 0.01f
         const val STARTUP_PERMISSION_DIALOG_SETTLE_MS = 350L
         const val STARTUP_PERMISSION_LOG_TAG = "StartupPermissions"
         const val SKY_GUIDE_PERMISSION_RETRY_LIMIT = 1

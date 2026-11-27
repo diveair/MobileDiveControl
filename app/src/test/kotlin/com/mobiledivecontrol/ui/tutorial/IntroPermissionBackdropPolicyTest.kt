@@ -1,11 +1,46 @@
 package com.mobiledivecontrol.ui.tutorial
 
+import com.mobiledivecontrol.FirstLaunchSealStep
+import com.mobiledivecontrol.core.BleConnectionState
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 
 class IntroPermissionBackdropPolicyTest {
+    @Test
+    fun `first launch finishes dialogs then shows seal on artwork before any housing link banner`() {
+        for (link in listOf(BleConnectionState.Ready, BleConnectionState.Connecting, BleConnectionState.Scanning)) {
+            fun phase(step: FirstLaunchSealStep) = introPhase(
+                step, permissionsGranted = true, bleState = link, carouselStarted = false, everConnected = false,
+            )
+            assertFalse(shouldShowIntroMessage(phase(FirstLaunchSealStep.WaitingForDialogs)))
+            val seal = phase(FirstLaunchSealStep.OnHousingAnimation)
+            assertEquals(IntroPhase.InsertAndSeal, seal)
+            assertTrue(shouldShowIntroMessage(seal))
+            val powerOn = FirstLaunchSealStep.OnHousingAnimation.afterPrompt(link)
+            assertEquals(IntroPhase.TurnOnHousing, phase(powerOn))
+            assertEquals(powerOn, powerOn.afterPrompt(link))
+        }
+    }
+
+    @Test
+    fun `power waits through empty scans and failed attempts until the live housing becomes ready`() {
+        val power = FirstLaunchSealStep.PowerOn
+        assertEquals(power, power.linkChanged(BleConnectionState.Scanning).linkChanged(BleConnectionState.Reconnecting))
+        val connecting = power.linkChanged(BleConnectionState.Connecting)
+        fun phase(step: FirstLaunchSealStep, link: BleConnectionState, carousel: Boolean = false) =
+            introPhase(step, true, link, carousel, everConnected = false)
+        assertEquals(IntroPhase.Connecting, phase(connecting, BleConnectionState.Connecting))
+        assertEquals(connecting, connecting.afterPrompt(BleConnectionState.Subscribing))
+        assertEquals(power, connecting.linkChanged(BleConnectionState.Failed))
+        assertEquals(IntroPhase.Connecting, phase(connecting.linkChanged(BleConnectionState.Ready), BleConnectionState.Ready))
+        val connected = connecting.afterPrompt(BleConnectionState.Ready)
+        assertEquals(IntroPhase.JustConnected, phase(connected, BleConnectionState.Ready))
+        assertEquals(power, connected.linkChanged(BleConnectionState.Reconnecting))
+        assertEquals(IntroPhase.Carousel, phase(connected.afterPrompt(BleConnectionState.Ready), BleConnectionState.Ready, true))
+    }
+
     @Test
     fun `native permission dialog gets bare housing artwork without app permission copy`() {
         assertFalse(shouldShowIntroMessage(IntroPhase.NeedsPermissions))

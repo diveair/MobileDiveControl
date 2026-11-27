@@ -181,6 +181,20 @@ internal fun migrateLegacyPanoramaDynamicRange(values: Map<String, String>): Map
         ("panorama.hdr_log" to selected)
 }
 
+/** Split the old combined dial before merging default values from the new catalog. */
+internal fun migrateVideoFrameRates(saved: Map<String, String>): Map<String, String> {
+    val legacy = saved["pro_video.frame_rate"]?.takeIf { '/' in it } ?: return saved
+    val capture = CameraCatalog.captureFrameRateFps(legacy) ?: return saved
+    val playback = CameraCatalog.playbackFrameRateFps(legacy)
+    return saved.toMutableMap().apply {
+        put("pro_video.frame_rate", "${capture}fps")
+        if (playback != null && playback != capture.toDouble()) {
+            val label = if (playback % 1.0 == 0.0) playback.toInt().toString() else playback.toString()
+            putIfAbsent("pro_video.playback_fps", "${label}fps")
+        }
+    }
+}
+
 class CameraSessionStore(context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
 
@@ -189,7 +203,7 @@ class CameraSessionStore(context: Context) {
             ?.let { stored -> runCatching { CameraModeId.valueOf(stored) }.getOrNull() }
             ?: CameraModeId.Photo
 
-        val savedSettingValues = restoreStringMap(KEY_SETTING_VALUES)
+        val savedSettingValues = migrateVideoFrameRates(restoreStringMap(KEY_SETTING_VALUES))
         val initialSettingValues = if (preferences.contains(KEY_SETTING_VALUES)) {
             CameraCatalog.defaultSettingValues
         } else {
@@ -282,13 +296,6 @@ class CameraSessionStore(context: Context) {
         result.entries
             .filter { (key, value) -> key.endsWith(".lens") && value == "2x" }
             .forEach { (key, _) -> result[key] = "1x" }
-        // Pro Video now spells both columns in one option. Preserve the capture cadence chosen
-        // by older builds and make its playback cadence identical until the user changes it.
-        result["pro_video.frame_rate"]?.takeIf { '/' !in it }?.let { legacy ->
-            CameraCatalog.captureFrameRateFps(legacy)?.let { captureFps ->
-                result["pro_video.frame_rate"] = CameraCatalog.proVideoFrameRateOption(captureFps)
-            }
-        }
         // Samsung's duration choices are minutes. Builds that labelled the same numeric choices
         // as seconds persisted values such as "30s"; retain the user's rung while correcting it.
         result["hyperlapse.recording_time"]?.takeIf { it.endsWith("s") }?.let { legacy ->

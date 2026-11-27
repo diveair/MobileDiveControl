@@ -9,6 +9,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.mobiledivecontrol.DiveControlApp
+import com.mobiledivecontrol.core.HousingSealTransitions.Banner
+import com.mobiledivecontrol.core.Verification
 import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.AppMode
 import com.mobiledivecontrol.core.BleSignal
@@ -19,27 +21,37 @@ import com.mobiledivecontrol.core.ControlCore
 import com.mobiledivecontrol.core.GalleryCommand
 import com.mobiledivecontrol.core.HousingButtonEvent
 import com.mobiledivecontrol.core.HousingCharacteristic
+import com.mobiledivecontrol.core.SensorPacketSource
+import com.mobiledivecontrol.core.ParseResult
+import com.mobiledivecontrol.core.ProtocolParser
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.ProcessingOutcome
 import com.mobiledivecontrol.core.SafetyCommand
 import com.mobiledivecontrol.core.SealConfidence
 import com.mobiledivecontrol.core.SealState
 import com.mobiledivecontrol.core.SensorUpdate
+import com.mobiledivecontrol.core.ShutOffPrompt
+import com.mobiledivecontrol.core.pressureMonotonicMs
 import com.mobiledivecontrol.platform.GalleryRepository
 import com.mobiledivecontrol.platform.CompassHeadingMonitor
 import com.mobiledivecontrol.platform.CompassReading
 import com.mobiledivecontrol.platform.HeadingStore
 import com.mobiledivecontrol.FirstRunOnboardingStore
+import com.mobiledivecontrol.FirstLaunchSealStep
+import com.mobiledivecontrol.startupRuntimePermissionGroups
 import com.mobiledivecontrol.platform.PhoneBatteryMonitor
 import com.mobiledivecontrol.platform.ble.BlePermissions
 import com.mobiledivecontrol.platform.ble.HousingFeatureFlags
 import com.mobiledivecontrol.platform.ble.HousingLink
 import com.mobiledivecontrol.platform.ble.HousingLinkEvent
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.onSubscription
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import com.mobiledivecontrol.core.HeadingMath
 import com.mobiledivecontrol.ui.camera.PointingGesture
@@ -106,22 +118,58 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     private val housingShutdownPrefs = application.getSharedPreferences("housing_shutdown", android.content.Context.MODE_PRIVATE)
     private var safetyStopMotionRunning = false
     private var safetyStopMotionBaseline: com.mobiledivecontrol.core.DiveProfileState? = null
+    private val sealStore = com.mobiledivecontrol.platform.HousingSealStore(application)
+    private var displayedSeal: Banner? = null
+    private var windowFocused = false
+    fun setSealBannerDisplayed(banner: Banner?) { displayedSeal = banner }
+    fun setSealWindowFocused(focused: Boolean) { windowFocused = focused }
+    fun interruptSurfaceTest() {
+        val safety = controlCore.state.safety
+        if (safety.sealMonitor.verification == Verification.Testing || safety.sealState == SealState.Vacuuming)
+            dispatch(SafetyCommand.CancelVacuumCheck)
+    }
+    private val _depthUnitMetric = MutableStateFlow(true)
+    val depthUnitMetric: StateFlow<Boolean> = _depthUnitMetric.asStateFlow()
     private val controlCore = ControlCore(
         initialState = sessionStore.restoreAppState().let { restored -> restored.copy(diveProfile = restoredDiveProfile,
+            housingStandby = housingShutdownPrefs.getBoolean("standby", false),
             airAlerts = com.mobiledivecontrol.core.AirAlertState(settings = airAlertStore.read()),
             safety = restored.safety.copy(
+                sealMonitor = sealStore.read(),
                 vacuumReleasedPrompt = housingShutdownPrefs.getBoolean("pending", false),
                 vacuumReleaseDisconnectObserved = housingShutdownPrefs.getBoolean("disconnected", false))) },
         triggerSafetyStopAtSurface = false,
+        displayedSealBanner = { displayedSeal.takeIf { windowFocused } },
+        useMetricDepth = { _depthUnitMetric.value },
     )
     private val galleryRepository = GalleryRepository(application)
     private val diveApp: DiveControlApp? = application as? DiveControlApp
     private val housingLink: HousingLink? = diveApp?.housingLink
+    private var shutOffPromptTimer: Job? = null
     private val phoneBatteryMonitor = PhoneBatteryMonitor(application)
     private val vacuumStore = com.mobiledivecontrol.platform.VacuumStore(application)
     private val compassMonitor = CompassHeadingMonitor(application)
+    private var compassRequested = false
     private val headingStore = HeadingStore(application)
     private val firstRunOnboardingStore = FirstRunOnboardingStore(application)
+    private val introButtonParser = ProtocolParser()
+    val needsPermissionWelcome = firstRunOnboardingStore.beginLaunch(
+        permissionsGranted = startupRuntimePermissionGroups().all { group ->
+            group.all { (permission, _) -> application.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED }
+        },
+    )
+    private val _firstLaunchSealStep = MutableStateFlow(
+        if (needsPermissionWelcome) FirstLaunchSealStep.WaitingForDialogs else FirstLaunchSealStep.Done,
+    )
+    val firstLaunchSealStep = _firstLaunchSealStep.asStateFlow()
+
+    fun updateSealInstructionWindow(ready: Boolean) {
+        _firstLaunchSealStep.update { it.permissionWindowChanged(ready) }
+    }
+
+    fun finishIntroPrompt(shown: FirstLaunchSealStep) {
+        _firstLaunchSealStep.compareAndSet(shown, shown.afterPrompt(_state.value.bleConnectionState))
+    }
 
     val compassReading: StateFlow<CompassReading> = compassMonitor.reading
     private val _targetHeading = MutableStateFlow(headingStore.read())
@@ -145,9 +193,6 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     private val _galleryConsentRequest = MutableStateFlow<GalleryConsentRequest?>(null)
     val galleryConsentRequest: StateFlow<GalleryConsentRequest?> = _galleryConsentRequest.asStateFlow()
 
-    private val _depthUnitMetric = MutableStateFlow(true)
-    val depthUnitMetric: StateFlow<Boolean> = _depthUnitMetric.asStateFlow()
-
     /**
      * Whether the intro carousel is on screen.
      *
@@ -156,7 +201,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * dismisses the animation. While visible it owns housing input — see [interceptForIntro].
      */
     private val _introVisible = MutableStateFlow(
-        !firstRunOnboardingStore.isComplete() && !housingShutdownPrefs.getBoolean("pending", false),
+        (needsPermissionWelcome || !firstRunOnboardingStore.isComplete()) && !housingShutdownPrefs.getBoolean("pending", false),
     )
     val introVisible: StateFlow<Boolean> = _introVisible.asStateFlow()
 
@@ -166,7 +211,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * Raised on every app launch (each new app process; a rotation or other Activity recreation
      * keeps this ViewModel and does not replay it), and it always comes first: Android's
      * permission prompts are held back until it finishes, so a first launch reads
-     * welcome -> permissions -> "hold shutter" banner. Lowered by [finishWelcome].
+     * welcome -> permissions -> insert and seal on the animated housing. Lowered by [finishWelcome].
      */
     private val _welcomeVisible = MutableStateFlow(true)
     val welcomeVisible: StateFlow<Boolean> = _welcomeVisible.asStateFlow()
@@ -229,6 +274,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                 ),
             )
         }
+        housingLink?.setStandby(controlCore.state.housingStandby)
         collectHousingLink()
         collectPhoneBattery()
         housingLink?.setSensorReadsPaused(controlCore.state.safety.sealState == SealState.Vacuuming)
@@ -236,10 +282,9 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         collectPendingSaves()
         collectDiveProfile()
         val airSettings = controlCore.state.airAlerts.settings
-        if (airSettings.source == com.mobiledivecontrol.core.AirSource.Receiver && airSettings.mapping.verified) {
+        if (!controlCore.state.housingStandby && airSettings.source == com.mobiledivecontrol.core.AirSource.Receiver && airSettings.mapping.verified) {
             airReceiver.execute(com.mobiledivecontrol.core.AirReceiverRequest(0, com.mobiledivecontrol.core.AirReceiverAction.Connect), airSettings)
         }
-        compassMonitor.start()
     }
 
     override fun onCleared() {
@@ -253,7 +298,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         }
         // Whatever the rate limiter has not written yet goes to disk now, synchronously, so
         // teardown can never lose a setting the diver changed.
-        pendingSave.value?.let { state -> runCatching { sessionStore.save(state) } }
+        flushCameraSettings()
         runCatching { diveProfileStore.save(safetyStopMotionBaseline ?: controlCore.state.diveProfile) }
         diveStopNotifier.close()
         phoneBatteryMonitor.stop()
@@ -264,11 +309,12 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     private fun collectDiveProfile() {
         viewModelScope.launch {
             while (true) {
+                if (controlCore.state.housingStandby) state.first { !it.housingStandby }
                 kotlinx.coroutines.delay(500)
-                val previousProfile = controlCore.state.diveProfile
-                val previousAir = controlCore.state.airAlerts
+                if (controlCore.state.housingStandby) continue
+                val previousState = controlCore.state
                 val outcome = controlCore.tickDiveProfile()
-                if (outcome.state.diveProfile != previousProfile || outcome.state.airAlerts != previousAir) emitOutcome(outcome)
+                if (outcome.state !== previousState || outcome.effects.isNotEmpty()) emitOutcome(outcome)
             }
         }
         viewModelScope.launch(Dispatchers.IO) {
@@ -290,11 +336,19 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             // the dial for thirty seconds would then persist nothing until they stopped.
             pendingSave.collect { state ->
                 if (state == null) return@collect
-                runCatching { sessionStore.save(state) }
-                pendingSave.compareAndSet(state, null)
+                flushCameraSettings()
                 kotlinx.coroutines.delay(SAVE_MIN_INTERVAL_MS)
             }
         }
+    }
+
+    /** Read the latest pending snapshot under the same lock for background and lifecycle writes. */
+    @Synchronized
+    fun flushCameraSettings() {
+        val latest = pendingSave.value ?: return
+        runCatching { sessionStore.save(latest) }
+            .onSuccess { pendingSave.compareAndSet(latest, null) }
+            .onFailure { android.util.Log.w("DiveControl", "Could not persist camera settings", it) }
     }
 
     /**
@@ -307,7 +361,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * can never blank it back to unknown.
      */
     private fun collectPhoneBattery() {
-        phoneBatteryMonitor.start()
+        if (!controlCore.state.housingStandby) phoneBatteryMonitor.start()
         viewModelScope.launch {
             phoneBatteryMonitor.percent.collect { percent ->
                 if (percent != null) {
@@ -322,6 +376,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setCompassMonitoring(active: Boolean) {
+        compassRequested = active
         if (active) compassMonitor.start() else compassMonitor.stop()
     }
 
@@ -349,7 +404,8 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     fun setTargetHeadingFromPoint(gesture: PointingGesture) {
         // The analyzer calls from its CameraX executor; ControlCore is deliberately main-confined.
         viewModelScope.launch {
-            if (controlCore.state.camera.recording) return@launch
+            // A frame submitted just before the HUD disappeared can finish recognition afterwards.
+            if (!compassRequested || controlCore.state.camera.recording) return@launch
             val cameraHeading = compassReading.value.headingDegrees
             if (cameraHeading == null) {
                 surfaceWarning("Hold the camera level enough to acquire a compass heading.")
@@ -391,23 +447,29 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * press would update the display without ever becoming a command.
      */
     private fun collectHousingLink() {
-        val link = housingLink ?: return
+        val app = diveApp ?: return
         viewModelScope.launch {
-            // The link outlives this view model, so by the time we subscribe it may already be
-            // connected. `onSubscription` replays what it knows after the subscription exists but
-            // before collection starts, which closes the window where a signal could slip past.
-            link.events
-                .onSubscription { link.snapshot().forEach { emit(it) } }
-                .collect { event -> applyLinkEvent(event) }
+            app.housingEventsForDisplay().collect(::applyLinkEvent)
         }
     }
 
     private fun applyLinkEvent(event: HousingLinkEvent) {
+        val sleeping = controlCore.state.housingStandby
+        if (sleeping && event !is HousingLinkEvent.Ble) {
+            if (event is HousingLinkEvent.Notification) onNotification(event.characteristicShortHex, event.payload,
+                event.source, event.receivedAtEpochMs, event.receivedAtMonotonicMs)
+            return
+        }
         when (event) {
             is HousingLinkEvent.Ble -> {
+                if (sleeping && event.signal == BleSignal.StartScan &&
+                    controlCore.state.bleConnectionState == com.mobiledivecontrol.core.BleConnectionState.Scanning) return
                 advanceBle(event.signal)
+                if (sleeping && !controlCore.state.housingStandby) {
+                    housingLink?.snapshot()?.filterIsInstance<HousingLinkEvent.Notification>()?.forEach(::applyLinkEvent)
+                }
                 if (!benchLinkForced && event.signal == BleSignal.Ready &&
-                    housingLink?.consumeStartupRequest() == true
+                    housingLink?.consumeStartupRequest() == true && !firstRunOnboardingStore.isComplete()
                 ) {
                     _capPromptVisible.value = false
                     _introVisible.value = true
@@ -446,6 +508,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * looks exactly like one the state machine produced.
      */
     fun dispatch(command: ControlCommand) {
+        if (controlCore.state.housingStandby) return
         if (command is SafetyCommand) {
             HousingFeatureFlags.rejectionReason(command)?.let { reason ->
                 surfaceWarning(reason)
@@ -519,11 +582,12 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun onButtonPayload(payload: ByteArray) {
+    fun onButtonPayload(payload: ByteArray, source: SensorPacketSource = SensorPacketSource.Notification) {
+        if (controlCore.state.housingStandby) return
         if (PermissionDialogHousingBridge.handleButtonPayload(payload)) return
         if (interceptForIntro(HousingCharacteristic.ButtonEvents.shortHex, payload)) return
         if (interceptForCapPrompt(HousingCharacteristic.ButtonEvents.shortHex, payload)) return
-        val outcome = controlCore.handleButtonPayload(payload)
+        val outcome = controlCore.handleNotificationPayload(HousingCharacteristic.ButtonEvents.shortHex, payload, source = source)
         // One line per housing press, carrying what the press did to focus: the whole
         // input->value half of the control loop, readable live from logcat.
         val camera = outcome.state.camera
@@ -546,6 +610,15 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         receivedAtEpochMs: Long = System.currentTimeMillis(),
         receivedAtMonotonicMs: Long = com.mobiledivecontrol.core.pressureMonotonicMs(),
     ) {
+        if (controlCore.state.housingStandby) {
+            if (source == SensorPacketSource.Notification && HousingCharacteristic.from(characteristic) == HousingCharacteristic.ButtonEvents) {
+                val before = controlCore.state
+                val outcome = controlCore.handleNotificationPayload(characteristic, payload,
+                    java.time.Instant.ofEpochMilli(receivedAtEpochMs), source, receivedAtMonotonicMs)
+                if (outcome.state !== before || outcome.effects.isNotEmpty()) emitOutcome(outcome)
+            }
+            return
+        }
         if (safetyStopMotionRunning && HousingCharacteristic.from(characteristic) == HousingCharacteristic.WaterPressure) return
         if (HousingCharacteristic.from(characteristic) == HousingCharacteristic.ButtonEvents &&
             PermissionDialogHousingBridge.handleButtonPayload(payload)
@@ -597,13 +670,27 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         if (HousingCharacteristic.from(characteristic) != HousingCharacteristic.ButtonEvents) {
             return false
         }
-        // The welcome card is not interactive; a press while it is up must neither skip the
-        // intro nor reach the camera underneath.
-        if (_welcomeVisible.value) return true
-        if (!_introVisible.value) {
-            val sinceDismiss = System.currentTimeMillis() - introDismissedAtMs
-            return sinceDismiss in 0 until INTRO_DISMISS_GUARD_MS
+        val welcome = _welcomeVisible.value
+        val sealStep = _firstLaunchSealStep.value
+        if (sealStep != FirstLaunchSealStep.PowerOn &&
+            System.currentTimeMillis() - introDismissedAtMs in 0 until INTRO_DISMISS_GUARD_MS) return true
+        if (welcome || (_introVisible.value && sealStep != FirstLaunchSealStep.Done)) {
+            val button = introButtonParser.decodeButtonPacket(payload)
+            if (button is ParseResult.Success) {
+                val event = button.value.event
+                if (welcome && event !is HousingButtonEvent.Unknown) {
+                    finishWelcome()
+                    introDismissedAtMs = System.currentTimeMillis()
+                } else if (!welcome) {
+                    val next = sealStep.onButton(event)
+                    if (next != sealStep && _firstLaunchSealStep.compareAndSet(sealStep, next)) {
+                        introDismissedAtMs = System.currentTimeMillis()
+                    }
+                }
+            }
+            return true
         }
+        if (!_introVisible.value) return false
         // Same bound the protocol parser applies. A malformed packet must not count as a press.
         if (payload.size != 1) return true
 
@@ -638,6 +725,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     fun dismissIntro() {
         if (!_introVisible.value) return
         introDismissedAtMs = System.currentTimeMillis()
+        _firstLaunchSealStep.value = FirstLaunchSealStep.Done
         firstRunOnboardingStore.markComplete()
         _introVisible.value = false
         maybeShowCapPrompt()
@@ -659,7 +747,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
         // dies the instant telemetry arrives. The only reliable skip is a seal already engaged —
         // pumping, holding or passed — which the pressure-based detection establishes honestly.
         lastCoverOpen = _state.value.safety.coverOpen
-        val show = !_state.value.safety.vacuumReleasedPrompt && _state.value.safety.sealState !in SEAL_ENGAGED_STATES
+        val show = _state.value.safety.sealMonitor.banner == Banner.Cap
         if (show) capPromptRaisedAtMs = System.currentTimeMillis()
         android.util.Log.i(
             "DiveControl",
@@ -749,12 +837,14 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     val missingPermissions: StateFlow<List<String>> = _missingPermissions.asStateFlow()
 
     fun updateSensor(update: SensorUpdate) {
+        if (controlCore.state.housingStandby) return
         val outcome = controlCore.updateSensor(update)
         emitOutcome(outcome)
     }
 
     private fun foregroundStopOwnsOk(characteristic: String, payload: ByteArray): Boolean =
-        _state.value.diveProfile.stopExpanded && HousingCharacteristic.from(characteristic) == HousingCharacteristic.ButtonEvents &&
+        (_state.value.diveProfile.stopExpanded || _state.value.diveProfile.continuationPending) &&
+            HousingCharacteristic.from(characteristic) == HousingCharacteristic.ButtonEvents &&
             payload.size == 1 && payload[0] == 0x50.toByte()
 
     /** One explicit, finite hardware-UI exercise through the normal required-stop path. */
@@ -775,8 +865,8 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
                 // A 30 m profile requires the stop. Cross its real configured depth on ascent,
                 // show red, recover through yellow to green, then end at the surface once.
                 val depths = listOf(0.0, 2.0, 30.0, target + 1.0, target) + List(24) { target } +
-                    List(48) { target - (it + 1) * 0.025 } + List(16) { target - 1.2 } +
-                    List(48) { target - 1.2 + (it + 1) * 0.025 } + List(32) { target } + 0.0
+                    List(64) { target - (it + 1) * 0.025 } + List(16) { target - 1.6 } +
+                    List(64) { target - 1.6 + (it + 1) * 0.025 } + List(32) { target } + 0.0
                 for (depth in depths) {
                     updateSensor(SensorUpdate.WaterPressure(com.mobiledivecontrol.core.STANDARD_SURFACE_PRESSURE_KPA +
                         depth * com.mobiledivecontrol.core.FRESHWATER_KPA_PER_METER))
@@ -897,15 +987,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Simulate a button press for UI testing without hardware.
-     * Maps [HousingButtonEvent] to its wire byte and processes it.
-     */
-    /**
-     * Bring the link to Ready without hardware, so the button simulator can actually drive the
-     * control loop. Without this the simulator is inert exactly when it is needed — with no
-     * housing attached, InputRouter refuses every simulated press ("Housing input is disabled"),
-     * which is right for the housing but wrong for the bench. Debug-panel only; the real link
-     * still governs itself through [advanceBle] from the BLE layer.
+     * Explicit LINK toggle for testing connection-dependent behavior without hardware.
      */
     fun simulateHousingLink() {
         if (benchLinkForced) {
@@ -930,13 +1012,6 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
 
     fun simulateButton(event: HousingButtonEvent) {
         android.util.Log.d("DiveControl", "simulateButton: event=$event")
-        // Bench controls must work when the very reason they are open is that no housing is
-        // available. Route through the real wire decoder and InputRouter, but automatically
-        // establish the existing latched bench link instead of requiring an unexplained LINK
-        // press before Up/Down/Left/Right can move a menu.
-        if (!_state.value.housing.inputEnabled && !benchLinkForced) {
-            simulateHousingLink()
-        }
         val wireByte = when (event) {
             HousingButtonEvent.Right -> 0x10
             HousingButtonEvent.Shutter -> 0x20
@@ -949,7 +1024,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             HousingButtonEvent.ZoomOut -> 0x80
             is HousingButtonEvent.Unknown -> event.rawValue.toInt()
         }
-        onButtonPayload(byteArrayOf(wireByte.toByte()))
+        onButtonPayload(byteArrayOf(wireByte.toByte()), source = SensorPacketSource.Simulation)
     }
 
     /** One emission avoids replaying every mode (and rebuilding every camera graph) after stress. */
@@ -958,9 +1033,13 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun emitOutcome(outcome: ProcessingOutcome) {
+        val sleeping = outcome.state.housingStandby
+        val standbyChanged = sleeping != _state.value.housingStandby
+        val saveCamera = !sleeping || standbyChanged || _state.value.camera !== outcome.state.camera
         if (outcome.state.safety.vacuumReleasedPrompt != _state.value.safety.vacuumReleasedPrompt ||
-            outcome.state.safety.vacuumReleaseDisconnectObserved != _state.value.safety.vacuumReleaseDisconnectObserved) {
-            housingShutdownPrefs.edit().putBoolean("pending", outcome.state.safety.vacuumReleasedPrompt)
+            outcome.state.safety.vacuumReleaseDisconnectObserved != _state.value.safety.vacuumReleaseDisconnectObserved ||
+            standbyChanged) {
+            housingShutdownPrefs.edit().putBoolean("standby", sleeping).putBoolean("pending", outcome.state.safety.vacuumReleasedPrompt)
                 .putBoolean("disconnected", outcome.state.safety.vacuumReleaseDisconnectObserved).apply()
         }
         // Every dispatch reaches here — up to 500 a second during a focus sweep — and the
@@ -1002,7 +1081,47 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             airAlertStore.save(newAir.settings)
             airReceiver.configure(newAir.settings)
         }
+        if (_state.value.safety.sealMonitor !== outcome.state.safety.sealMonitor)
+            sealStore.update(_state.value.safety.sealMonitor, outcome.state.safety.sealMonitor)
+        val previousLink = _state.value.bleConnectionState
+        val previousPrompt = _state.value.shutOffPrompt
         _state.value = outcome.state
+        val prompt = outcome.state.shutOffPrompt
+        if (previousPrompt !== prompt) {
+            shutOffPromptTimer?.cancel()
+            shutOffPromptTimer = if (prompt is ShutOffPrompt.MenuPressed) {
+                housingLink?.checkLinkAfterPowerPress()
+                viewModelScope.launch(Dispatchers.Main) {
+                    delay(prompt.hideAtMonotonicMs - pressureMonotonicMs())
+                    emitOutcome(controlCore.expireShutOffPrompt(prompt))
+                }
+            } else null
+        }
+        val stopBeforeRadioStandby = standbyChanged && sleeping && outcome.effects.any { it is PlatformEffect.ExecuteHousing }
+        if (standbyChanged) {
+            if (stopBeforeRadioStandby) {
+                val stopWrites = processHousingEffects(outcome.effects)
+                viewModelScope.launch {
+                    stopWrites?.join()
+                    if (controlCore.state.housingStandby) housingLink?.setStandby(true)
+                }
+            } else housingLink?.setStandby(sleeping)
+            if (sleeping) {
+                phoneBatteryMonitor.stop()
+                setCompassMonitoring(false)
+                airReceiver.disconnect()
+                ramps.values.forEach { it.job?.cancel() }
+                ramps.clear()
+                _effects.value = emptyList()
+            } else {
+                phoneBatteryMonitor.start()
+                if (newAir.settings.source == com.mobiledivecontrol.core.AirSource.Receiver && newAir.settings.mapping.verified)
+                    airReceiver.execute(com.mobiledivecontrol.core.AirReceiverRequest(0, com.mobiledivecontrol.core.AirReceiverAction.Connect), newAir.settings)
+            }
+        }
+        if (previousLink != outcome.state.bleConnectionState) {
+            _firstLaunchSealStep.update { it.linkChanged(outcome.state.bleConnectionState) }
+        }
         if (newAir.receiverRequest != oldAir.receiverRequest) newAir.receiverRequest?.let {
             airReceiver.execute(it, newAir.settings)
         }
@@ -1015,7 +1134,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             // a LEVEL, not an event — treating it as "the cap just came off" closed this doorway
             // within a second of it being raised, every time the process had restarted.
             val coverJustOpened = safety.coverOpen == true && lastCoverOpen == false
-            if (coverJustOpened || safety.sealState in SEAL_ENGAGED_STATES) {
+            if (coverJustOpened || safety.sealMonitor.banner != Banner.Cap) {
                 _capPromptVisible.value = false
             }
         }
@@ -1079,7 +1198,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             lastPersistedTier = null
         }
         lastSealState = sealNow
-        pendingSave.value = outcome.state
+        if (saveCamera) pendingSave.value = outcome.state
         // AF IS A TERMINUS. Crossing into it must consume the gesture: any distance still owed
         // from the approach would otherwise keep dispatching, and each queued tick leaving AF
         // walks onward — 1.000 into AF and straight out to 0.000 in one motion. Landing on AF
@@ -1093,7 +1212,7 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             _effects.value = outcome.effects
             if (PlatformEffect.TrackCurrentHeading in outcome.effects) trackCurrentHeading()
             processGalleryEffects(outcome.effects)
-            processHousingEffects(outcome.effects)
+            if (!stopBeforeRadioStandby) processHousingEffects(outcome.effects)
             processRampEffects(outcome.effects)
         }
     }
@@ -1105,15 +1224,15 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
      * checks again. The duplication is deliberate: a refusal has to be reported to the diver, and
      * a command that silently does nothing is the failure mode the product forbids.
      */
-    private fun processHousingEffects(effects: List<PlatformEffect>) {
+    private fun processHousingEffects(effects: List<PlatformEffect>): kotlinx.coroutines.Job? {
         val commands = effects.filterIsInstance<PlatformEffect.ExecuteHousing>().map { it.command }
-        if (commands.isEmpty()) return
+        if (commands.isEmpty()) return null
 
         val application = getApplication<Application>()
         if (!BlePermissions.allGranted(application)) {
-            permissionBlockedHousingEffects = effects
+            permissionBlockedHousingEffects = effects.takeUnless { commands.contains(com.mobiledivecontrol.core.HousingCommand.SetVacuumMotor(true)) } ?: emptyList()
             requestRuntimePermissions(setOf(RuntimePermissionNeed.Bluetooth))
-            return
+            return null
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(application, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -1124,16 +1243,25 @@ class DiveViewModel(application: Application) : AndroidViewModel(application) {
             requestRuntimePermissions(setOf(RuntimePermissionNeed.Notifications))
         }
 
-        val link = housingLink ?: return
+        val link = housingLink ?: return null
 
-        viewModelScope.launch {
+        val pumpStart = controlCore.state.safety.motorStartedAtEpochMs
+        val startsPump = com.mobiledivecontrol.core.HousingCommand.SetVacuumMotor(true) in commands
+        val permitPump: ((Double) -> Boolean)? = if (startsPump) { depth ->
+            windowFocused && controlCore.pumpWritePermitted(pumpStart, depth)
+        } else null
+        return viewModelScope.launch {
             for (command in commands) {
                 val rejection = HousingFeatureFlags.rejectionReason(command)
                 if (rejection != null) {
                     surfaceWarning(rejection)
                     continue
                 }
-                link.send(command)
+                val sent = link.send(command, permitPump)
+                if (!sent && startsPump) {
+                    if (pumpStart == controlCore.state.safety.motorStartedAtEpochMs) interruptSurfaceTest()
+                    break
+                }
             }
         }
     }

@@ -109,9 +109,9 @@ class CameraHudOverlayLayoutTest {
         assertEquals("LOG", currentCameraHdrLogLabel(log))
         assertEquals(null, currentCameraHdrLogLabel(hdr))
         assertEquals(null, currentCameraHdrLogLabel(base))
-        assertEquals("LOG 8K · 7680×4320", currentCameraResolutionStatusLabel(log))
-        assertEquals("8K · 7680×4320", currentCameraResolutionStatusLabel(hdr))
-        assertEquals("8K · 7680×4320", currentCameraResolutionStatusLabel(base))
+        assertEquals("LOG 30 FPS 8K · 7680×4320", currentCameraResolutionStatusLabel(log))
+        assertEquals("30 FPS 8K · 7680×4320", currentCameraResolutionStatusLabel(hdr))
+        assertEquals("30 FPS 8K · 7680×4320", currentCameraResolutionStatusLabel(base))
     }
 
     @Test
@@ -129,7 +129,7 @@ class CameraHudOverlayLayoutTest {
                     ("pro_video.resolution" to resolution) +
                     ("pro_video.hdr" to "On"),
             )
-            assertEquals(if (resolution == "8K") label else "HDR $label", currentCameraResolutionStatusLabel(camera))
+            assertEquals(if (resolution == "8K") "30 FPS $label" else "HDR 30 FPS $label", currentCameraResolutionStatusLabel(camera))
         }
     }
 

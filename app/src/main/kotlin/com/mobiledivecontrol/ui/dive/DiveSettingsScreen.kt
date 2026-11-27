@@ -1,6 +1,5 @@
 package com.mobiledivecontrol.ui.dive
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -12,17 +11,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -37,9 +28,6 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
-import kotlin.math.abs
-import kotlin.math.ceil
-import kotlinx.coroutines.delay
 import com.mobiledivecontrol.ui.components.AutoShrinkText
 
 internal fun diveDepth(meters: Double, metric: Boolean): String =
@@ -136,6 +124,10 @@ fun DiveSettingsScreen(
                         .format(DateTimeFormatter.ofPattern("MMM d · HH:mm")) + "  ·  " + selected.settings.gas.label,
                         color = DiveColors.TextSecondary, fontSize = 12.sp)
                     DiveProfileChart(selected, useMetric, Modifier.weight(1f).fillMaxWidth().padding(vertical = 6.dp))
+                    selected.lastReserveConfirmationElapsedMs?.let { elapsed ->
+                        Text("Reserve confirmed by diver ×${selected.diverReserveConfirmations} · Last at ${diveTime(elapsed / 1000)}",
+                            color = DiveColors.TextSecondary, fontSize = 12.sp)
+                    }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text("MAX ${diveDepth(selected.maxDepthMeters, useMetric)}", color = DiveColors.DiveCyan, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                         Text(logNdlText(profile, selected), color = DiveColors.TextPrimary, fontSize = 14.sp,
@@ -227,154 +219,5 @@ private fun SettingsChevron(label: String, delta: Int, field: DiveSettingsField,
     }.semantics { contentDescription = "$label ${if (delta < 0) "previous" else "next"}" },
         contentAlignment = Alignment.Center) {
         Text(if (delta < 0) "‹" else "›", color = DiveColors.DiveCyan, fontSize = 26.sp, lineHeight = 26.sp)
-    }
-}
-
-@Composable
-fun DiveStopBanner(profile: DiveProfileState, useMetric: Boolean, modifier: Modifier = Modifier,
-    onCommand: (DiveSettingsCommand) -> Unit = {}, forceCompact: Boolean = false, recording: Boolean = false) {
-    val dive = profile.active ?: return
-    val decompressionCeiling = profile.requiredDecompressionCeilingMeters
-    val decompressionRequired = profile.decompressionHold
-    if (profile.atSurface && !decompressionRequired) return
-    if (!dive.stopRecommended && !dive.stopStarted && !decompressionRequired) return
-    if (profile.stopPresentation == DiveStopPresentation.Dismissed && !decompressionRequired) return
-    val approaching = dive.phase == DiveStopPhase.Armed && profile.depthMeters?.let {
-        it <= dive.settings.bandMax + 2 && dive.maxDepthMeters - it >= 0.5
-    } == true
-    if (profile.sensorAvailable && dive.phase in setOf(DiveStopPhase.Watching, DiveStopPhase.Armed) &&
-        !approaching && !decompressionRequired) return
-    val missing = !profile.sensorAvailable
-    val complete = dive.phase == DiveStopPhase.Complete && !decompressionRequired
-    val target = dive.settings.stopDepthMeters.toDouble()
-    val zone = stopDepthZone(profile.depthMeters.takeIf { !missing }, target)
-    val accent = safetyStopAccent(profile)
-    val motion = profile.verticalMetersPerMinute?.takeIf { !missing && !complete && abs(it) >= 0.6 }
-    val stopHeading = "${diveDepth(target, useMetric).replace(" ", "")} SAFETY STOP"
-    if (forceCompact || (profile.stopPresentation == DiveStopPresentation.Minimized && !decompressionRequired)) {
-        Column(modifier.widthIn(max = 430.dp).fillMaxWidth()
-            .background(Color.Black.copy(alpha = if (recording) 0f else 0.9f), RoundedCornerShape(10.dp))
-            .border(1.dp, accent, RoundedCornerShape(10.dp))
-            .clickable(enabled = !forceCompact && !decompressionRequired) { onCommand(DiveSettingsCommand.ExpandStop) }
-            .padding(horizontal = 12.dp, vertical = 5.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            val title = when {
-                decompressionCeiling != null -> "DECOMPRESSION · CEILING ${diveDepth(ceil(decompressionCeiling * 10) / 10, useMetric)}"
-                decompressionRequired -> "DECOMPRESSION STATUS UNKNOWN"
-                complete -> "SAFETY STOP COMPLETE"
-                else -> "$stopHeading  ${diveTime(dive.remainingSeconds.toLong())}"
-            }
-            Text(title, color = accent, fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-            Text(if (missing) "DEPTH LOST · TIMER PAUSED" else
-                "DEPTH ${diveDepth(profile.depthMeters!!, useMetric)}" +
-                    if (decompressionRequired) " · SAFETY TIMER PAUSED" else "",
-                color = accent, fontSize = 12.sp)
-        }
-        return
-    }
-    Column(modifier.widthIn(max = 430.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-    if (!recording && motion != null && motion < 0) StopMotionTriangle(motion, useMetric,
-        warningColor = accent)
-    Column(Modifier.fillMaxWidth()
-        .background(Color.Black.copy(alpha = if (recording) 0f else 1f), RoundedCornerShape(14.dp))
-        .background(accent.copy(alpha = if (recording) 0f else 0.16f), RoundedCornerShape(14.dp))
-        .border(2.dp, accent, RoundedCornerShape(14.dp))
-        .clickable(enabled = dive.stopStarted) { onCommand(DiveSettingsCommand.AcknowledgeStop) }
-        .padding(horizontal = 18.dp, vertical = 12.dp),
-        horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(when {
-            missing -> "DEPTH LOST · TIMER PAUSED"
-            decompressionRequired -> if (decompressionCeiling == null) "DECOMPRESSION STATUS UNKNOWN" else "DECOMPRESSION REQUIRED"
-            complete -> "SAFETY STOP COMPLETE"
-            approaching -> "APPROACHING SAFETY STOP"
-            else -> stopHeading
-        }, color = accent, fontWeight = FontWeight.Bold, fontSize = if (complete && !missing) 20.sp else 14.sp)
-        if (complete && !missing) {
-            Text("✓", color = DiveColors.Success, fontWeight = FontWeight.Bold, fontSize = 48.sp)
-            Text("${dive.settings.stopDurationSeconds / 60} MIN STOP COMPLETED SUCCESSFULLY",
-                color = DiveColors.Success, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-        } else Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            if (decompressionCeiling != null) {
-                // Round the shown ceiling upward in the displayed units, never to a shallower depth.
-                val unitsPerMeter = if (useMetric) 1.0 else 3.28084
-                val ceilingText = "%.1f %s".format(Locale.US, ceil(decompressionCeiling * unitsPerMeter * 10) / 10,
-                    if (useMetric) "m" else "ft")
-                Text("CEILING $ceilingText", color = accent, fontSize = 28.sp,
-                    fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-            } else Text(if (decompressionRequired) "CEILING —" else diveTime(dive.remainingSeconds.toLong()), color = accent,
-                    fontSize = 40.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-            Text(if (missing) "DEPTH —" else "DEPTH " + "%.1f %s".format(Locale.US,
-                profile.depthMeters!! * if (useMetric) 1.0 else 3.28084, if (useMetric) "m" else "ft"),
-                color = accent, fontSize = 23.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-        }
-        val instruction = when {
-            missing -> "Waiting for fresh depth readings"
-            decompressionRequired -> if (decompressionCeiling == null) "Ceiling unavailable · Safety timer paused"
-                else "Stay below ceiling · Safety timer paused"
-            complete -> ""
-            zone == StopDepthZone.TooShallow -> "TOO SHALLOW · Descend slowly to ${diveDepth(target, useMetric)}"
-            else -> ""
-        }
-        if (instruction.isNotEmpty()) Text(instruction, color = accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-        if (!decompressionRequired && dive.stopStarted) {
-            Text(if (complete) "OK  DISMISS" else "OK  MINIMIZE", color = accent, fontSize = 14.sp,
-                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp)
-                    .border(1.dp, accent, RoundedCornerShape(8.dp))
-                    .clickable { onCommand(DiveSettingsCommand.AcknowledgeStop) }
-                    .padding(horizontal = 20.dp, vertical = 8.dp))
-        }
-    }
-    if (!recording && motion != null && motion > 0) StopMotionTriangle(motion, useMetric, warningColor = accent)
-    }
-}
-
-/** One colour decision drives the card, triangle and any visible backing edges. */
-fun safetyStopAccent(profile: DiveProfileState): Color {
-    val dive = profile.active ?: return DiveColors.Warning
-    val zone = stopDepthZone(profile.depthMeters, dive.settings.stopDepthMeters.toDouble())
-    return when {
-        !profile.sensorAvailable -> DiveColors.Warning
-        profile.decompressionHold -> DiveColors.Critical
-        dive.phase == DiveStopPhase.Complete || zone == StopDepthZone.OnTarget -> DiveColors.Success
-        zone == StopDepthZone.TooShallow && (profile.verticalMetersPerMinute ?: 0.0) < 0.6 -> DiveColors.Critical
-        else -> DiveColors.Warning
-    }
-}
-
-@Composable
-private fun StopMotionTriangle(metersPerMinute: Double, metric: Boolean, compact: Boolean = false,
-    warningColor: Color = DiveColors.Warning) {
-    val ascending = metersPerMinute < 0
-    val rate = abs(metersPerMinute) / 60.0 * if (metric) 1.0 else 3.28084
-    var warningBright by remember(ascending) { mutableStateOf(true) }
-    // A coroutine keeps the flash running even when the phone disables system animations.
-    LaunchedEffect(ascending) {
-        if (ascending) while (true) {
-            delay(500)
-            warningBright = !warningBright
-        }
-    }
-    Box(Modifier.fillMaxWidth().height(if (compact) 60.dp else 84.dp)
-        .semantics { contentDescription = if (ascending) "Ascending" else "Descending" }) {
-        Canvas(Modifier.matchParentSize()) {
-            val edgeY = if (ascending) size.height else 0f
-            val pointY = if (ascending) 0f else size.height
-            val path = Path().apply {
-                moveTo(0f, edgeY)
-                lineTo(size.width / 2, pointY)
-                lineTo(size.width, edgeY)
-                close()
-            }
-            drawPath(path, warningColor)
-        }
-        Column(Modifier.align(if (ascending) Alignment.BottomCenter else Alignment.TopCenter)
-            .padding(vertical = if (compact) 3.dp else 7.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(if (ascending) "WARNING ASCENDING" else "WARNING DESCENDING",
-                color = if (ascending && warningBright) DiveColors.Warning else Color.Black,
-                fontSize = if (compact) 11.sp else 14.sp, lineHeight = if (compact) 13.sp else 16.sp,
-                fontWeight = FontWeight.ExtraBold)
-            Text("%.1f %s/sec".format(Locale.US, rate, if (metric) "m" else "ft"), color = Color.Black,
-                fontSize = if (compact) 12.sp else 16.sp, lineHeight = if (compact) 14.sp else 18.sp,
-                fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-        }
     }
 }

@@ -134,10 +134,13 @@ fun airGasTitle(warning: AirGasWarning, dive: DiveProfileState): String = when (
     AirGasLevel.Low -> "LOW AIR RESERVE"
     AirGasLevel.Reserve -> when {
         dive.active?.stopStarted == true -> "CHECK AIR RESERVE"
-        dive.active?.stopRecommended == true -> "HEAD TO YOUR SAFETY STOP"
+        warning.promptsPlannedStopAscent(dive) -> "BEGIN PLANNED ASCENT TO SAFETY STOP"
         else -> "BEGIN YOUR PLANNED ASCENT"
     }
 }
+
+fun AirGasWarning.promptsPlannedStopAscent(dive: DiveProfileState): Boolean =
+    level == AirGasLevel.Reserve && dive.active?.let { it.stopRecommended && !it.stopStarted } == true
 
 fun airGasSpeech(level: AirGasLevel): String = when (level) {
     AirGasLevel.Reserve -> "Low air reserve. Check your gauge and begin your planned ascent."
@@ -151,6 +154,6 @@ fun airWarningStopProfile(state: AppState): DiveProfileState {
     val air = state.airAlerts.simulation?.air ?: state.airAlerts
     val dive = state.diveProfile
     return if (!air.sharedAir && air.gasWarning?.level?.critical == true &&
-        !dive.decompressionHold && dive.active?.limitReached != true)
+        dive.stopPresentation == DiveStopPresentation.Expanded && !dive.decompressionHold && dive.active?.limitReached != true)
         dive.copy(stopPresentation = DiveStopPresentation.Minimized) else dive
 }

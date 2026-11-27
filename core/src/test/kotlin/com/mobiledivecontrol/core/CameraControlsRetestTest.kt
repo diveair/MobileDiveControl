@@ -7,6 +7,20 @@ import kotlin.test.assertTrue
 
 class CameraControlsRetestTest {
     private val reducer = ControlReducer()
+    @Test fun `S24 selects the pinned regular recorder only for lenses needing the UHD 60 route`() {
+        for (mode in listOf(CameraModeId.Video, CameraModeId.ProVideo)) {
+            assertEquals(CameraPipeline.RegularUhd, selectPipeline(mode, "UHD 4K", 60, false, true, "3x"))
+            assertEquals(CameraPipeline.CameraX, selectPipeline(mode, "UHD 4K", 30, false, true, "3x"))
+            assertEquals(CameraPipeline.CameraX, selectPipeline(mode, "UHD 4K", 60, false, false, "3x"))
+            assertEquals(CameraPipeline.CameraX, selectPipeline(mode, "FHD", 60, false, true, "3x"))
+            for (lens in listOf("Auto", "0.6x", "1x", "front"))
+                assertEquals(CameraPipeline.CameraX, selectPipeline(mode, "UHD 4K", 60, false, true, lens))
+        }
+        val control = pipelineCaps(CameraPipeline.RegularUhd, 60)
+        assertTrue(control.manualExposure && control.manualWhiteBalance)
+        assertFalse(control.hdr || control.cropAspect)
+        assertEquals(CameraPipeline.HighSpeed, selectPipeline(CameraModeId.SlowMotion, "UHD 4K", 120, false, true, "0.6x"))
+    }
     @Test fun `all EV dials traverse minus four plus four Auto and wrap`() {
         for (mode in CameraModeId.entries) {
             val state = CameraCatalog.launchCameraState(activeMode = mode)
@@ -42,7 +56,7 @@ class CameraControlsRetestTest {
             settingValues = CameraCatalog.defaultSettingValues + ("slow_motion.lens" to "3x") + ("slow_motion.resolution" to "FHD"),
         )
         val fps = CameraCatalog.settingsFor(base).first { it.id == "slow_motion.frame_rate" }
-        assertEquals(listOf("24fps", "30fps", "48fps", "60fps", "100fps", "120fps", "240fps"), fps.options)
+        assertEquals(listOf("24fps", "30fps", "60fps", "120fps", "240fps"), fps.options)
         for (value in fps.options) {
             val current = CameraCatalog.currentValue(base, fps)
             val next = reducer.reduce(AppState(camera = base), CameraCommand.NudgeSetting(fps.id, fps.options.indexOf(value) - fps.options.indexOf(current))).state.camera

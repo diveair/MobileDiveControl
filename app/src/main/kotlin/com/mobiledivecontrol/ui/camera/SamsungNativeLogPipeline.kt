@@ -10,10 +10,8 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaRecorder
 import android.os.Build
-import android.util.Log
 import android.util.Size
 import android.view.Surface
-import dalvik.system.PathClassLoader
 import java.io.File
 
 /** Firmware-specific native LOG path qualified against Samsung Pro Video on the connected S24. */
@@ -22,7 +20,7 @@ internal object SamsungNativeLogPipeline {
     const val READY_TIMEOUT_MS = 8_000L
     private val nativeHooksAvailable by lazy {
         runCatching {
-            check(File("/system/framework/scamera_sdk_util.jar").isFile)
+            check(SamsungCameraParameters.available)
             MediaRecorder::class.java.getMethod("semSetAuthor", Int::class.javaPrimitiveType)
             MediaRecorder::class.java.getMethod("semSetRecordingMode", Int::class.javaPrimitiveType)
             true
@@ -52,10 +50,7 @@ internal object SamsungNativeLogPipeline {
 
     fun configureCamera(camera: CameraDevice, stabilized: Boolean) {
         try {
-            val loader = PathClassLoader("/system/framework/scamera_sdk_util.jar", Log::class.java.classLoader)
-            Class.forName("com.samsung.android.sdk.camera.impl.internal.CustomInterfaceHelper", true, loader)
-                .getMethod("setSamsungParameter", CameraDevice::class.java, String::class.java)
-                .invoke(null, camera, "shootingmode=35;operation_mode=none;recording_dr_mode=log10;sw-vdis=$stabilized;sw-super_vdis=false;recording-fps=30;stream_type=0;")
+            SamsungCameraParameters.set(camera, "shootingmode=35;operation_mode=none;recording_dr_mode=log10;sw-vdis=$stabilized;sw-super_vdis=false;recording-fps=30;stream_type=0;")
         } catch (error: Exception) {
             throw IllegalStateException("Samsung native LOG camera configuration is unavailable.", error)
         }

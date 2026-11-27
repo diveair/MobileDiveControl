@@ -42,6 +42,8 @@ import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.theme.DiveColors
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.StateFlow
+import com.mobiledivecontrol.platform.CompassReading
 
 @Composable
 fun StateDrivenCameraPreview(
@@ -56,7 +58,7 @@ fun StateDrivenCameraPreview(
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     onPointingGesture: ((PointingGesture) -> Unit)? = null,
     onCameraCommand: ((CameraCommand) -> Unit)? = null,
-    headingDegrees: Double? = null,
+    compassReadings: StateFlow<CompassReading>,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -158,15 +160,24 @@ fun StateDrivenCameraPreview(
         }
     }
 
-    LaunchedEffect(cameraState, safetyState, headingDegrees, locationPrerequisitesReady) {
+    LaunchedEffect(controller, compassReadings) {
+        compassReadings.collect { controller.updateHeading(it.headingDegrees) }
+    }
+
+    LaunchedEffect(cameraState, locationPrerequisitesReady) {
         controller.applyState(
             cameraState = cameraState,
             waterPressureKpa = safetyState.waterPressureKpa,
             atmosphericPressureKpa = safetyState.barometricPressureKpa,
             surfaceAmbientKpa = safetyState.surfaceAmbientKpa,
             waterTemperatureC = safetyState.waterTemperatureC,
-            headingDegrees = headingDegrees,
         )
+    }
+
+    LaunchedEffect(safetyState.waterPressureKpa, safetyState.barometricPressureKpa,
+        safetyState.surfaceAmbientKpa, safetyState.waterTemperatureC) {
+        controller.updateDiveReadings(safetyState.waterPressureKpa, safetyState.barometricPressureKpa,
+            safetyState.surfaceAmbientKpa, safetyState.waterTemperatureC)
     }
 
     LaunchedEffect(effects) {
@@ -212,7 +223,8 @@ fun StateDrivenCameraPreview(
             )
         }
 
-        if (!cameraReady) {
+        val cooling by controller.cameraCooling
+        if (!cameraReady || cooling) {
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
@@ -228,7 +240,7 @@ fun StateDrivenCameraPreview(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Starting camera...",
+                        text = if (cooling) "Camera cooling · Preview resumes automatically" else "Starting camera...",
                         color = DiveColors.TextSecondary,
                         style = MaterialTheme.typography.bodyMedium,
                     )

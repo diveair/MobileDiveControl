@@ -1,18 +1,35 @@
 package com.mobiledivecontrol.core
 
+import com.mobiledivecontrol.core.HousingSealTransitions.Banner
+
 data class RouteDecision(
     val commands: List<ControlCommand> = emptyList(),
     val modeOverride: AppMode? = null,
     val note: String? = null,
 )
 
+fun AppState.continuationOwnsOk(visibleSeal: Banner? = safety.sealMonitor.banner): Boolean {
+    if (!diveProfile.continuationPending || airAlertVisible(this) || safety.vacuumReleasedPrompt ||
+        safety.sealState == SealState.Failed) return false
+    return when (visibleSeal) {
+        Banner.B06, Banner.B07, Banner.B08, Banner.B10, Banner.B15, Banner.Release, Banner.ConfirmRelease -> false
+        else -> true
+    }
+}
+
 class InputRouter {
-    fun route(state: AppState, event: HousingButtonEvent): RouteDecision {
+    fun route(
+        state: AppState,
+        event: HousingButtonEvent,
+        visibleSeal: Banner? = state.safety.sealMonitor.banner,
+        onScreenButton: Boolean = false,
+    ): RouteDecision {
+        if (state.housingStandby) return RouteDecision()
         if (state.controlsLocked) {
             return RouteDecision(note = "Controls are locked.")
         }
 
-        if (!state.housing.inputEnabled) {
+        if (!state.housing.inputEnabled && !onScreenButton) {
             return RouteDecision(note = "Housing input is disabled.")
         }
 
@@ -20,9 +37,15 @@ class InputRouter {
             return RouteDecision(note = "Unknown button ${event.rawValue.toHexString()} ignored.")
         }
 
-        // Record stays a camera action even while pressure entry or a warning is on screen.
-        // OK alone reports pressure; starting a clip must never save an unconfirmed estimate.
+        val shutOffSelected = state.camera.focusedZone == CameraUiZone.ModeRail &&
+            state.camera.railLevel == CameraRailLevel.Primary &&
+            state.camera.highlightedPrimaryIndex == CameraCatalog.SHUT_OFF_RAIL_INDEX &&
+            (state.mode == AppMode.CameraLive || state.mode == AppMode.CameraAdjust)
+        // Only the highlighted vacuum and standby actions borrow the camera shutter.
         if (event == HousingButtonEvent.Shutter && state.mode in setOf(AppMode.CameraLive, AppMode.CameraAdjust)) {
+            if (shutOffSelected || (state.camera.vacuumEntrySelected && state.vacuumMenuAvailable)) {
+                return RouteDecision(commands = listOf(CameraCommand.Confirm))
+            }
             return routeCameraLive(state, event)
         }
 
@@ -31,12 +54,26 @@ class InputRouter {
         if (air.gasWarning?.level?.critical == true || air.buddyConfirmation ||
             air.entry?.purpose == AirEntryPurpose.NextTank) routeAirAlerts(state, event)?.let { return it }
 
+        if (event == HousingButtonEvent.Ok && state.continuationOwnsOk(visibleSeal))
+            return RouteDecision(commands = listOf(DiveSettingsCommand.ConfirmContinuationReserve))
+
         // The foreground stop owns OK until minimized/dismissed. Hidden prompts cannot act on it.
         if (event == HousingButtonEvent.Ok && state.diveProfile.stopExpanded && !airAlertVisible(state)) {
             return RouteDecision(commands = listOf(DiveSettingsCommand.AcknowledgeStop))
         }
-        sealCheckInterception(state, event)?.let { return it }
+        if (shutOffSelected && event == HousingButtonEvent.Ok && !airAlertVisible(state) &&
+            (visibleSeal == Banner.Reached || visibleSeal == Banner.Pumping || visibleSeal == Banner.B16)) {
+            return RouteDecision(commands = listOf(CameraCommand.Confirm))
+        }
+        val ordinaryHold = visibleSeal == null && state.safety.sealState == SealState.LeakMonitoring &&
+            state.safety.sealMonitor.verification == Verification.Idle && state.safety.sealMonitor.incidents.isEmpty()
+        if ((visibleSeal == state.safety.sealMonitor.banner || ordinaryHold) && !state.diveProfile.stopExpanded &&
+            !airAlertVisible(state) && !state.camera.recordingLocationChooserVisible &&
+            state.mode !in setOf(AppMode.Diagnostics, AppMode.DiveSettings)) {
+            sealCheckInterception(state, event)?.let { return it }
+        }
         routeAirAlerts(state, event)?.let { return it }
+        if (event == HousingButtonEvent.Ok && state.diveProfile.continuationPending) return RouteDecision()
 
         return when (state.mode) {
             AppMode.CameraLive -> routeCameraLive(state, event)
@@ -76,78 +113,48 @@ class InputRouter {
      */
     private fun sealCheckInterception(state: AppState, event: HousingButtonEvent): RouteDecision? {
         val safety = state.safety
-        if (safety.vacuumReleasedPrompt) {
-            when (event) {
-                HousingButtonEvent.Left, HousingButtonEvent.BackOrSafety -> return RouteDecision(
-                    commands = listOf(SafetyCommand.SelectVacuumReleaseChoice(VacuumReleaseChoice.ShutDown)))
-                HousingButtonEvent.Right -> return RouteDecision(
-                    commands = listOf(SafetyCommand.SelectVacuumReleaseChoice(VacuumReleaseChoice.RestartPump)))
-                // Shutdown consumes short/repeated OK; firmware handles the physical long press.
-                HousingButtonEvent.Ok -> return RouteDecision(commands = listOf(SafetyCommand.ConfirmVacuumReleaseChoice))
-                else -> Unit
+        val banner = safety.sealMonitor.banner
+        val command = when (banner) {
+            Banner.ConfirmRelease -> when (event) {
+                HousingButtonEvent.Left -> SafetyCommand.SelectReleaseAnswer(false)
+                HousingButtonEvent.Right -> SafetyCommand.SelectReleaseAnswer(true)
+                HousingButtonEvent.Ok -> SafetyCommand.ConfirmReleaseAnswer
+                else -> null
             }
+            Banner.Release -> when (event) {
+                HousingButtonEvent.Left, HousingButtonEvent.BackOrSafety ->
+                    SafetyCommand.SelectVacuumReleaseChoice(VacuumReleaseChoice.ShutDown)
+                HousingButtonEvent.Right -> SafetyCommand.SelectVacuumReleaseChoice(VacuumReleaseChoice.RestartPump)
+                HousingButtonEvent.Ok -> SafetyCommand.ConfirmVacuumReleaseChoice
+                else -> null
+            }
+            Banner.B03 -> when (event) {
+                HousingButtonEvent.Down -> SafetyCommand.StartVacuumCheck
+                HousingButtonEvent.Ok, HousingButtonEvent.BackOrSafety -> SafetyCommand.DismissSealCheck
+                else -> null
+            }
+            Banner.B15 -> when (event) {
+                HousingButtonEvent.Ok -> SafetyCommand.ConfirmInspection
+                HousingButtonEvent.Down -> return RouteDecision()
+                else -> null
+            }
+            Banner.B04, Banner.B05, Banner.B09, Banner.B13, Banner.B14, Banner.B17, Banner.B19,
+            Banner.NoSuction, Banner.NotBuilding -> when (event) {
+                HousingButtonEvent.Down -> SafetyCommand.OpenVacuumSetup
+                HousingButtonEvent.Ok -> SafetyCommand.AcknowledgeSealBanner
+                else -> null
+            }
+            Banner.B06, Banner.B07, Banner.B08, Banner.B10 ->
+                if (event == HousingButtonEvent.Ok) SafetyCommand.AcknowledgeSealBanner else null
+            Banner.Pumping, Banner.B16 ->
+                if ((event == HousingButtonEvent.Down && safety.sealState == SealState.Vacuuming) ||
+                    event == HousingButtonEvent.BackOrSafety) SafetyCommand.CancelVacuumCheck else null
+            Banner.Reached -> if (event in setOf(HousingButtonEvent.Ok, HousingButtonEvent.Down,
+                HousingButtonEvent.BackOrSafety)) SafetyCommand.DismissSealCheck else null
+            else -> if (event == HousingButtonEvent.BackOrSafety && safety.sealState == SealState.LeakMonitoring)
+                SafetyCommand.SkipToResult else null
         }
-        val promptVisible = safety.coverOpen == true && !safety.vacuumReleasedPrompt &&
-            safety.sealState in SEAL_START_STATES &&
-            !safety.checkDismissed &&
-            // A primed boot record still awaiting its first pressure sample means the housing may
-            // already be sealed — offering (or accepting) a pump start in that window would run
-            // the motor against a closed shell for nothing.
-            safety.verifiedVacuumKpa == null
-
-        return when (event) {
-            // The failed banner's confirm: "check the O-ring, remove the cap, press UP". Reset
-            // returns the seal to Unknown so the normal start flow takes over from there.
-            HousingButtonEvent.Up ->
-                if (safety.sealState == SealState.Failed) {
-                    RouteDecision(commands = listOf(SafetyCommand.ResetSealState))
-                } else {
-                    null
-                }
-
-            HousingButtonEvent.Ok -> when {
-                promptVisible -> RouteDecision(commands = listOf(SafetyCommand.StartVacuumCheck))
-                // The close-the-cap banner tells the diver OK returns them to the camera, so the
-                // press that answers it is consumed here: it closes the banner and nothing else.
-                // The next OK is the camera's again.
-                safety.sealState in SEAL_CAP_PROMPT_STATES && !safety.checkDismissed ->
-                    RouteDecision(commands = listOf(SafetyCommand.DismissSealCheck))
-                // The adopted-vacuum reminder: monitoring is already running underneath, so OK
-                // only clears the banner — same promise its "camera controls" line makes. Passed
-                // is included because adoption's own clock promotes the seal while the reminder
-                // is still waiting to be answered.
-                (safety.sealState == SealState.LeakMonitoring || safety.sealState == SealState.Passed) &&
-                    safety.capCloseReminder && !safety.checkDismissed ->
-                    RouteDecision(commands = listOf(SafetyCommand.DismissSealCheck))
-                else -> null
-            }
-
-            // This housing has no dedicated back key — "back" is a long-press on Down that
-            // firmware reports as a separate byte — so every centred seal banner also answers to
-            // a plain Down press, and the hints say DOWN. Borrowed only while a banner is
-            // actually on screen: during leak monitoring there is no banner, and Down stays a
-            // camera control for the whole half-hour hold.
-            HousingButtonEvent.Down -> when {
-                promptVisible -> RouteDecision(commands = listOf(SafetyCommand.DismissSealCheck))
-                safety.sealState in SEAL_CAP_PROMPT_STATES && !safety.checkDismissed ->
-                    RouteDecision(commands = listOf(SafetyCommand.DismissSealCheck))
-                safety.sealState == SealState.Vacuuming ->
-                    RouteDecision(commands = listOf(SafetyCommand.CancelVacuumCheck))
-                else -> null
-            }
-            HousingButtonEvent.BackOrSafety -> when {
-                promptVisible -> RouteDecision(commands = listOf(SafetyCommand.DismissSealCheck))
-                safety.sealState == SealState.Vacuuming ->
-                    RouteDecision(commands = listOf(SafetyCommand.CancelVacuumCheck))
-                safety.sealState in SEAL_CAP_PROMPT_STATES && !safety.checkDismissed ->
-                    RouteDecision(commands = listOf(SafetyCommand.DismissSealCheck))
-                safety.sealState == SealState.LeakMonitoring ->
-                    RouteDecision(commands = listOf(SafetyCommand.SkipToResult))
-                else -> null
-            }
-            // Shutter is never intercepted, in any seal stage.
-            else -> null
-        }
+        return command?.let { RouteDecision(commands = listOf(it)) }
     }
 
     private fun routeCameraLive(state: AppState, event: HousingButtonEvent): RouteDecision = when (event) {
@@ -188,7 +195,7 @@ class InputRouter {
     }
 
     private fun routeSafety(event: HousingButtonEvent): RouteDecision = when (event) {
-        HousingButtonEvent.Ok -> RouteDecision(commands = listOf(SafetyCommand.StartVacuumCheck))
+        HousingButtonEvent.Ok -> RouteDecision(commands = listOf(SystemCommand.SwitchToCameraMode))
         HousingButtonEvent.Shutter -> RouteDecision(commands = listOf(HousingCommand.TriggerFlash))
         HousingButtonEvent.BackOrSafety -> RouteDecision(commands = listOf(SafetyCommand.CancelVacuumCheck))
         else -> RouteDecision(note = "Safety mode ignores $event.")
@@ -259,17 +266,6 @@ class InputRouter {
     }
 
     internal companion object {
-        /** Seal states in which the start prompt is offered. */
-        val SEAL_START_STATES = setOf(
-            SealState.CoverOpen,
-            SealState.ReadyToVacuum,
-            SealState.Unknown,
-        )
-
-        /**
-         * Pump finished, cap still off — the "close the blue cap" chip is up and Back only
-         * hides it. The vacuum survives; nothing about the workflow is torn down.
-         */
         val SEAL_CAP_PROMPT_STATES = setOf(
             SealState.MotorStopping,
             SealState.WaitingForCoverClosed,

@@ -215,6 +215,8 @@ data class HousingState(
     val serialNumber: String? = null,
     val lastButton: HousingButtonEvent? = null,
     val lastRawButton: UByte? = null,
+    /** Monotonic start of this live BLE session; never restored from disk. */
+    val connectedAtMs: Long? = null,
 )
 
 /** Ordered exactly as the paused-recording chooser is painted and traversed. */
@@ -376,6 +378,7 @@ enum class SealConfidence {
 }
 
 data class SafetyState(
+    val sealMonitor: SealMonitor = SealMonitor(),
     val sealState: SealState = SealState.Unknown,
     val sealConfidence: SealConfidence = SealConfidence.Monitoring,
     val coverOpen: Boolean? = null,
@@ -416,6 +419,8 @@ data class SafetyState(
      * accepted reading and waits for a second reading to agree before it can mean anything.
      */
     val pendingOutlierKpa: Double? = null,
+    /** First rising sample in a short, surface-only check for a vent to ambient pressure. */
+    val surfaceVentStartedAtMs: Long? = null,
     /**
      * The pressure a previous session recorded after its hold passed the hard verify, primed at
      * launch from persistence. Consumed by the next adoption decision: a live reading that still
@@ -439,9 +444,8 @@ data class SafetyState(
      */
     val restartFailAgoMinutes: Long? = null,
     /**
-     * True when a vacuum was adopted rather than pumped, until the diver answers the reminder.
-     * An adopted vacuum arrives with no evidence the blue cap was ever screwed back down, so the
-     * close-the-cap banner shows once on top of the monitoring that is already running.
+     * Ask the diver to close the cap when monitoring starts on pressure evidence after a pump-down
+     * or a newly encountered vacuum. Reconnecting to the same observed hold does not re-arm it.
      */
     val capCloseReminder: Boolean = false,
     /**
@@ -628,8 +632,15 @@ data class AppState(
     /** Phone battery 0–100, or null when not yet read. Null must never render as 0. */
     val phoneBatteryPercent: Int? = null,
     val controlsLocked: Boolean = false,
+    val housingStandby: Boolean = false,
+    val shutOffPrompt: ShutOffPrompt? = null,
     val lastWarning: String? = null,
 )
+
+sealed interface ShutOffPrompt {
+    data object AwaitingPress : ShutOffPrompt
+    data class MenuPressed(val hideAtMonotonicMs: Long) : ShutOffPrompt
+}
 
 sealed interface HousingButtonEvent {
     data object Up : HousingButtonEvent
@@ -656,6 +667,7 @@ sealed interface CameraCommand : ControlCommand {
     data object DeletePanorama : CameraCommand
     data object ToggleVideoRecording : CameraCommand
     data object StartVideoRecording : CameraCommand
+    data object VerifyUhdRates : CameraCommand
     data object StopVideoRecording : CameraCommand
     data object PauseVideoRecording : CameraCommand
     data object ResumeVideoRecording : CameraCommand
@@ -730,7 +742,12 @@ sealed interface PhoneControlCommand : ControlCommand {
 
 sealed interface SafetyCommand : ControlCommand {
     data class SelectVacuumReleaseChoice(val choice: VacuumReleaseChoice) : SafetyCommand
+    data class SelectReleaseAnswer(val yes: Boolean) : SafetyCommand
+    data object ConfirmReleaseAnswer : SafetyCommand
     data object ConfirmVacuumReleaseChoice : SafetyCommand
+    data object OpenVacuumSetup : SafetyCommand
+    data object ConfirmInspection : SafetyCommand
+    data object AcknowledgeSealBanner : SafetyCommand
     data object StartVacuumCheck : SafetyCommand
     data object CancelVacuumCheck : SafetyCommand
     /** Silences the pre-dive prompt without disabling the feature; cleared when the cover opens. */
@@ -921,6 +938,10 @@ data class CameraCapabilities(
     /** Whether the selected camera has a physical continuous light. Used by Slow Motion. */
     val torchSupported: Boolean? = null,
     val superSteadySupported: Boolean? = null,
+    val galaxyS24VideoModes: Boolean = false,
+    val videoCaptureLens: String? = null,
+    val pendingUhdRates: List<Int> = emptyList(),
+    val verifiedDirectUhdRates: Set<Int> = emptySet(),
 )
 
 sealed interface BottomBarItem {

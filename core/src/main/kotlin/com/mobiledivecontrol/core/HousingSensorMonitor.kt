@@ -26,6 +26,17 @@ class HousingSensorMonitor(
     private var sequence = 0L
     private val readsEnabled = MutableStateFlow(true)
     private var readGeneration = 0L
+    private var pressureOnly = false
+
+    /** While pumping, leave the radio free for motor/valve writes unless a pressure heartbeat is due. */
+    fun setPressureOnly(enabled: Boolean) {
+        synchronized(lock) {
+            if (enabled != pressureOnly) {
+                pressureOnly = enabled
+                readGeneration++
+            }
+        }
+    }
 
     /** Suspend fallback reads during the pump workflow; notifications remain live. */
     fun setReadsEnabled(enabled: Boolean) {
@@ -94,7 +105,10 @@ class HousingSensorMonitor(
 
     private fun dueIn(sensor: HousingCharacteristic): Long {
         val now = nowMs()
-        val afterReceipt = receipts[sensor]?.let { it.atMs + intervals.getValue(sensor) } ?: now
+        if (pressureOnly && sensor != HousingCharacteristic.WaterPressure &&
+            sensor != HousingCharacteristic.BarometricPressure) return PRESSURE_STALE_MS
+        val interval = if (pressureOnly) PRESSURE_STALE_MS / 2 else intervals.getValue(sensor)
+        val afterReceipt = receipts[sensor]?.let { it.atMs + interval } ?: now
         return (maxOf(afterReceipt, retryAt[sensor] ?: now) - now).coerceAtLeast(0L)
     }
 

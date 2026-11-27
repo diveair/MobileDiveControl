@@ -7,6 +7,44 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class CameraCatalogTest {
+
+    @Test
+    fun `S24 capture menus intersect each shooting mode with the active lens`() {
+        val all = listOf(15, 24, 26, 30, 60, 100, 120, 240)
+        val rawRates = listOf("SD 480p", "HD 720p", "FHD 1920×824", "FHD", "UHD 4K", "8K").associateWith { all }
+        val caps = CameraCapabilities(galaxyS24VideoModes = true, videoFrameRatesByResolution = rawRates)
+        fun menu(mode: CameraModeId, prefix: String, caps: CameraCapabilities): Map<String, List<Int>> {
+            val camera = CameraCatalog.launchCameraState(mode).copy(capabilities = caps)
+            val sizes = CameraCatalog.settingsFor(camera).firstOrNull { it.id == "$prefix.resolution" }?.options.orEmpty()
+            return sizes.associateWith { size ->
+                val settings = CameraCatalog.settingsFor(camera.copy(settingValues = camera.settingValues + ("$prefix.resolution" to size)))
+                settings.single { it.id == "$prefix.frame_rate" }.options.map { it.removeSuffix("fps").toInt() }
+            }
+        }
+        val video = mapOf("HD 720p" to listOf(30), "FHD" to listOf(24, 30, 60, 120),
+            "UHD 4K" to listOf(24, 30, 60, 100, 120), "8K" to listOf(24, 30))
+        assertEquals(video, menu(CameraModeId.Video, "video", caps))
+        assertEquals(video, menu(CameraModeId.ProVideo, "pro_video", caps))
+        assertEquals(mapOf("FHD" to listOf(120, 240), "UHD 4K" to listOf(60, 100, 120)), menu(CameraModeId.SlowMotion, "slow_motion", caps))
+        val s24Main = caps.copy(videoFrameRatesByResolution = rawRates + ("UHD 4K" to listOf(24, 30, 60)))
+        assertEquals(mapOf("FHD" to listOf(120, 240), "UHD 4K" to listOf(60)), menu(CameraModeId.SlowMotion, "slow_motion", s24Main))
+        val normalLens = caps.copy(videoFrameRatesByResolution = mapOf("FHD" to listOf(30, 60)))
+        assertTrue(menu(CameraModeId.SlowMotion, "slow_motion", normalLens).isEmpty())
+        val atWide = CameraCatalog.launchCameraState(CameraModeId.SlowMotion,
+            detectedLenses = listOf("0.6x", "1x", "front"),
+            settingValues = CameraCatalog.freshInstallSettingValues)
+        val reducer = ControlReducer()
+        val main = reducer.reduce(AppState(camera = atWide), CameraCommand.UpdateCameraCapabilities(
+            normalLens.copy(videoCaptureLens = "0.6x"))).state.camera
+        assertEquals("1x", main.settingValues["slow_motion.lens"])
+        assertEquals("0.6x", main.settingValues["video.lens"])
+        val updated = reducer.reduce(AppState(camera = main), CameraCommand.UpdateCameraCapabilities(
+            s24Main.copy(videoCaptureLens = "1x"))).state
+        val stale = reducer.reduce(updated, CameraCommand.UpdateCameraCapabilities(normalLens.copy(videoCaptureLens = "0.6x")))
+        assertEquals(updated, stale.state)
+        assertEquals("120fps", updated.camera.settingValues["slow_motion.frame_rate"])
+        assertEquals(null, CameraCatalog.s24CaptureRates(CameraModeId.SlowMotion, caps.copy(galaxyS24VideoModes = false)))
+    }
     @Test
     fun `primary rail contains the required housing modes in order`() {
         val labels = CameraCatalog.primaryRailEntries.map { it.label }
@@ -514,7 +552,7 @@ class CameraCatalogTest {
             ),
             horizontal,
         )
-        assertEquals(listOf("slow_motion.focus_mode"), options)
+        assertEquals(listOf("slow_motion.playback_fps", "slow_motion.audio_recording", "slow_motion.focus_mode"), options)
     }
 
     @Test
@@ -537,7 +575,7 @@ class CameraCatalogTest {
                 "portrait_video.resolution", "portrait_video.lens", "modes",
                 "portrait_video.exposure", "portrait_video.manual_focus",
                 "portrait_video.background_effect", "portrait_video.effect_strength",
-                "portrait_video.audio_recording", "portrait_video.frame_rate", "gallery",
+                "portrait_video.audio_recording", "portrait_video.frame_rate", "portrait_video.aspect_ratio", "gallery",
             ),
             barIds(CameraModeId.PortraitVideo),
         )
@@ -702,6 +740,15 @@ class CameraCatalogTest {
     }
 
     @Test
+    fun `all selectable modes resolve full framing on a clean installation`() {
+        CameraCatalog.centerModeCycle.forEach { mode ->
+            val camera = CameraCatalog.launchCameraState(mode, settingValues = CameraCatalog.freshInstallSettingValues)
+            val aspect = CameraCatalog.settingsFor(camera).single { it.id.endsWith(".aspect_ratio") }
+            assertEquals("Full", CameraCatalog.currentValue(camera, aspect), mode.name)
+        }
+    }
+
+    @Test
     fun `fresh state defaults every lens bearing mode to 0_6x`() {
         val defaults = CameraCatalog.freshInstallSettingValues
             .filterKeys { it.endsWith(".lens") }
@@ -730,6 +777,7 @@ class CameraCatalogTest {
                 "pro_video.log",
                 "pro_video.resolution",
                 "pro_video.frame_rate",
+                "pro_video.playback_fps",
                 "pro_video.guides",
                 "pro_video.aspect_ratio",
                 "pro_video.metering",
@@ -831,16 +879,11 @@ class CameraCatalogTest {
             allProRates.mapNotNull(CameraCatalog::captureFrameRateFps).distinct(),
         )
         listOf(30, 60, 120, 240).forEach { captureFps ->
-            assertContains(allProRates, CameraCatalog.proVideoFrameRateOption(captureFps))
+            assertContains(allProRates, "${captureFps}fps")
         }
-        listOf(60, 120, 240).forEach { captureFps ->
-            listOf(23.976, 24.0, 29.97, 30.0, 48.0).forEach { playbackFps ->
-                assertContains(
-                    allProRates,
-                    CameraCatalog.proVideoFrameRateOption(captureFps, playbackFps),
-                )
-            }
-        }
+        val playback = highSpeedSettings.first { it.id == "pro_video.playback_fps" }
+        assertEquals(CameraCatalog.MATCH_CAPTURE, playback.defaultValue)
+        assertTrue(listOf("23.976fps", "24fps", "29.97fps", "30fps", "48fps", "240fps").all { it in playback.options })
         assertEquals(
             listOf("SD 480p", "HD 720p", "FHD", "UHD 4K"),
             highSpeedSettings.first { it.id == "pro_video.resolution" }.options,
@@ -874,7 +917,7 @@ class CameraCatalogTest {
     }
 
     @Test
-    fun `combined pro video FPS entries expose capture and playback columns`() {
+    fun `independent playback rates and legacy paired values`() {
         assertEquals(240, CameraCatalog.captureFrameRateFps("240fps/23.976fps playback"))
         assertEquals(23.976, CameraCatalog.playbackFrameRateFps("240fps/23.976fps playback"))
         assertEquals(60, CameraCatalog.captureFrameRateFps("60fps"))
@@ -885,18 +928,16 @@ class CameraCatalogTest {
         val settings = CameraCatalog.settingsFor(CameraModeId.ProVideo, GalaxyDeviceVariant.S26Ultra)
         val ids = settings.map { it.id }
         val fps = settings.first { it.id == "pro_video.frame_rate" }
-        assertTrue(ids.none { it.contains("playback_frame_rate") })
-        assertContains(fps.options, "60fps/48fps playback")
-        assertContains(fps.options, "120fps/24fps playback")
-        assertContains(fps.options, "240fps/48fps playback")
-        assertTrue(fps.options.all { '/' in it })
+        assertContains(ids, "pro_video.playback_fps")
+        assertTrue(fps.options.all { '/' !in it })
+        assertContains(fps.options, "120fps")
 
         val legacy = CameraCatalog.launchCameraState(CameraModeId.ProVideo).copy(
             settingValues = CameraCatalog.defaultSettingValues + ("pro_video.frame_rate" to "60fps"),
         )
         val legacySpec = CameraCatalog.settingsFor(legacy).first { it.id == "pro_video.frame_rate" }
         assertEquals(
-            CameraCatalog.proVideoFrameRateOption(60),
+            "60fps",
             CameraCatalog.currentValue(legacy, legacySpec),
         )
     }
@@ -918,10 +959,8 @@ class CameraCatalogTest {
             .options
 
         assertEquals(listOf(24, 30), fps.mapNotNull(CameraCatalog::captureFrameRateFps).distinct())
-        assertContains(fps, CameraCatalog.proVideoFrameRateOption(24, 23.976))
-        assertContains(fps, CameraCatalog.proVideoFrameRateOption(24, 24.0))
-        assertContains(fps, CameraCatalog.proVideoFrameRateOption(30, 29.97))
-        assertContains(fps, CameraCatalog.proVideoFrameRateOption(30, 30.0))
+        val playback = CameraCatalog.settingsFor(camera).first { it.id == "pro_video.playback_fps" }
+        assertTrue(listOf("23.976fps", "24fps", "29.97fps", "30fps", "60fps").all { it in playback.options })
     }
 
     @Test

@@ -4,11 +4,14 @@ import java.time.Instant
 import kotlin.test.*
 
 class DiveProfileTest {
-    @Test fun `quarter metre target window includes its boundaries and distinguishes shallow from deep`() {
-        assertEquals(StopDepthZone.OnTarget, stopDepthZone(4.75, 5.0))
-        assertEquals(StopDepthZone.OnTarget, stopDepthZone(5.25, 5.0))
-        assertEquals(StopDepthZone.TooShallow, stopDepthZone(4.749, 5.0))
-        assertEquals(StopDepthZone.TooDeep, stopDepthZone(5.251, 5.0))
+    @Test fun `depth warnings begin at one and a half metres either side of the selected stop`() {
+        for (target in 3..6) {
+            val depth = target.toDouble()
+            assertEquals(StopDepthZone.OnTarget, stopDepthZone(depth - 1.499, depth))
+            assertEquals(StopDepthZone.OnTarget, stopDepthZone(depth + 1.499, depth))
+            assertEquals(StopDepthZone.TooShallow, stopDepthZone(depth - 1.5, depth))
+            assertEquals(StopDepthZone.TooDeep, stopDepthZone(depth + 1.5, depth))
+        }
         assertEquals(StopDepthZone.Unknown, stopDepthZone(null, 5.0))
         assertEquals(StopDepthZone.OnTarget, stopDepthZone(0.0, 0.0))
     }
@@ -69,20 +72,41 @@ class DiveProfileTest {
         assertEquals(sequence, d.state.alertSequence)
     }
 
-    @Test fun `both depth boundaries count but excursions pause and resume without crediting the crossing`() {
+    @Test fun `shallow violation holds earned time until target crossing and deeper guidance counts`() {
         val d = Dive(); d.ascend(); d.at(4.0); d.at(6.0)
         assertEquals(2000, d.state.active!!.stopElapsedMs)
-        d.at(3.9)
+        d.at(3.5)
         assertEquals(DiveStopPhase.TooShallow, d.state.active!!.phase)
-        repeat(5) { d.at(3.9) }
-        d.at(4.0)
+        repeat(5) { d.at(3.5) }
+        d.at(4.99)
+        assertEquals(DiveStopPhase.TooShallow, d.state.active!!.phase)
         assertEquals(2000, d.state.active!!.stopElapsedMs)
         d.at(5.0)
         d.at(6.1)
+        assertEquals(3000, d.state.active!!.stopElapsedMs)
+        d.at(6.6)
         assertEquals(DiveStopPhase.TooDeep, d.state.active!!.phase)
         d.at(5.0)
         assertEquals(3000, d.state.active!!.stopElapsedMs)
         assertEquals(1, d.state.alertSequence)
+    }
+
+    @Test fun `deep return arrow history ends at the target and depth loss only advances the manual clock`() {
+        val d = Dive(); d.ascend(); repeat(5) { d.at(5.0) }
+        assertFalse(d.at(5.1).returningFromDeep)
+        assertTrue(d.at(6.1).returningFromDeep)
+        repeat(8) { d.at(6.1) }
+        for (depth in listOf(5.5, 5.2, 5.1)) assertTrue(d.at(depth).returningFromDeep)
+        assertFalse(d.at(5.0004).returningFromDeep)
+        val session = d.state.active!!
+        d.state = DiveProfileTracker.tick(d.state, d.now + 3000, true)
+        val anchor = d.state.depthLossStartedMs!!
+        assertEquals(session.remainingSeconds.toLong() - 6, d.state.manualRemainingSeconds(anchor + 6000))
+        assertEquals(0L, d.state.manualRemainingSeconds(anchor + 300_000))
+        assertEquals(anchor, DiveProfileTracker.unavailable(d.state, anchor + 300_000).depthLossStartedMs)
+        assertEquals(session.stopElapsedMs, d.at(5.0, 310_000).active!!.stopElapsedMs)
+        assertNull(d.state.depthLossStartedMs)
+        assertNotEquals(DiveStopPhase.Complete, d.state.active!!.phase)
     }
 
     @Test fun `missing disconnected duplicate invalid and delayed data never earn stop time`() {

@@ -1,20 +1,19 @@
 package com.mobiledivecontrol.ui.welcome
 
+import com.mobiledivecontrol.ui.components.MessageBanner
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -37,8 +36,8 @@ import com.mobiledivecontrol.theme.DiveColors
 import kotlinx.coroutines.delay
 
 /**
- * The welcome card shown first on every launch: logo, "Welcome to" / "NAUTICASE", and the one physical
- * instruction that has to happen before anything else — put the phone in and seal the housing.
+ * The welcome card leads every launch. On a fresh install the seal instruction appears on the
+ * housing animation after permission setup. Returning users see it on this card.
  *
  * It owns its own clock: after [durationMs] it calls [onFinished] exactly once, and only then
  * does MainActivity start Android's permission prompts. Taps are swallowed rather than routed to
@@ -51,14 +50,11 @@ import kotlinx.coroutines.delay
 @Composable
 fun WelcomeSplashScreen(
     modifier: Modifier = Modifier,
+    showSealInstruction: Boolean = true,
     durationMs: Long = NauticaseBranding.WELCOME_SCREEN_DURATION_MS,
     onFinished: () -> Unit = {},
 ) {
     val finish by rememberUpdatedState(onFinished)
-    val reveal = remember { Animatable(0f) }
-    LaunchedEffect(Unit) {
-        reveal.animateTo(1f, tween(WELCOME_FADE_IN_MS))
-    }
     LaunchedEffect(durationMs) {
         delay(durationMs.coerceAtLeast(0L))
         finish()
@@ -77,14 +73,7 @@ fun WelcomeSplashScreen(
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
-            modifier = Modifier.graphicsLayer { alpha = reveal.value },
         ) {
-            Image(
-                painter = painterResource(NauticaseBranding.LOGO),
-                contentDescription = "${NauticaseBranding.APP_NAME} logo",
-                modifier = Modifier.size((LOGO_DP * scale).dp),
-            )
-            Spacer(Modifier.height((10 * scale).dp))
             Text(
                 text = NauticaseBranding.WELCOME_LINE,
                 color = DiveColors.TextSecondary,
@@ -93,24 +82,19 @@ fun WelcomeSplashScreen(
                 letterSpacing = 0.08.em,
                 textAlign = TextAlign.Center,
             )
-            Text(
-                text = NauticaseBranding.APP_NAME,
-                color = DiveColors.TextPrimary,
-                fontSize = (50 * scale).sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 0.22.em,
-                textAlign = TextAlign.Center,
-                // Wide tracking adds trailing space after the last glyph; pad the start to match
-                // so the word sits optically centred under the logo.
-                modifier = Modifier.padding(start = (11 * scale).dp),
+            Spacer(Modifier.height((8 * scale).dp))
+            val logo = painterResource(NauticaseBranding.LOGO)
+            Image(
+                painter = logo,
+                contentDescription = NauticaseBranding.APP_NAME,
+                modifier = Modifier.width((LOGO_WIDTH_DP * scale).dp)
+                    .aspectRatio(logo.intrinsicSize.width / logo.intrinsicSize.height),
             )
+            if (!showSealInstruction) return@Column
             Spacer(Modifier.height((22 * scale).dp))
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .background(DiveColors.Warning, RoundedCornerShape((12 * scale).dp))
-                    .padding(horizontal = (28 * scale).dp, vertical = (10 * scale).dp),
-            ) {
+            val reveal = remember { Animatable(0f) }
+            LaunchedEffect(Unit) { reveal.animateTo(1f, tween(WELCOME_FADE_IN_MS)) }
+            MessageBanner(DiveColors.Warning, modifier = Modifier.graphicsLayer { alpha = reveal.value }) {
                 Text(
                     text = NauticaseBranding.WELCOME_PROMPT,
                     color = Color.Black,
@@ -127,6 +111,6 @@ fun WelcomeSplashScreen(
 private const val WELCOME_FADE_IN_MS = 350
 private const val REFERENCE_WIDTH_DP = 720f
 private const val REFERENCE_HEIGHT_DP = 360f
-private const val LOGO_DP = 132f
+private const val LOGO_WIDTH_DP = 350f
 private const val MIN_SCALE = 0.6f
 private const val MAX_SCALE = 1.6f

@@ -1,11 +1,12 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
 }
 
 android {
     namespace = "com.mobiledivecontrol"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.mobiledivecontrol"
@@ -22,32 +23,32 @@ android {
         buildConfig = true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion = libs.versions.compose.compiler.get()
-    }
-
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-        // Marking a type stable only ever lets Compose SKIP a composable whose arguments compare
-        // equal to the previous composition; anything genuinely changed still recomposes and
-        // draws identically. See compose_stability.conf for why these types need it.
-        freeCompilerArgs += listOf(
-            "-P",
-            "plugin:androidx.compose.compiler.plugins.kotlin:stabilityConfigurationPath=" +
-                "${rootProject.projectDir}/compose_stability.conf",
-        )
-    }
-
     buildTypes {
+        if (file("src/depthLab").isDirectory && providers.gradleProperty("includeDepthLab").orNull != "false") {
+            create("depthLab") {
+                initWith(getByName("debug"))
+                applicationIdSuffix = ".depthlab"
+                versionNameSuffix = "-depth-lab"
+                matchingFallbacks += "debug"
+            }
+        }
         release {
             isMinifyEnabled = false
         }
     }
+}
+
+kotlin {
+    compilerOptions.jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+}
+
+composeCompiler {
+    stabilityConfigurationFiles.add(rootProject.layout.projectDirectory.file("compose_stability.conf"))
 }
 
 dependencies {

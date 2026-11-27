@@ -21,6 +21,8 @@ object RecordingClock {
     val paused: MutableState<Boolean> = mutableStateOf(false)
     /** URI exists after all finalised session segments have been assembled for preview. */
     val reviewUri: MutableState<Uri?> = mutableStateOf(null)
+    /** Count from the finalized Slow Motion video track, including all resumed segments. */
+    val reviewFrameCount: MutableState<Int?> = mutableStateOf(null)
     /** Preview clock for raw 48 fps selections; frame selection is deferred to Save. */
     val reviewPlaybackSpeed: MutableState<Float> = mutableStateOf(1f)
     val reviewFinalizing: MutableState<Boolean> = mutableStateOf(false)

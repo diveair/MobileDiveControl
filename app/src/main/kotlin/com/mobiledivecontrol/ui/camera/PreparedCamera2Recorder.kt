@@ -43,7 +43,21 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         val nativeStabilization: Boolean = true,
         val hyperlapseAuto: Boolean = false,
         val physicalCameraId: String? = null,
-    )
+        val uhdProfile: UhdCaptureProfile? = null,
+        val regularUhd: Boolean = false,
+        /** Viewfinder buffer for the UHD high-speed relay, oriented like the camera's display transform. */
+        val relayViewfinder: Size = Size(1080, 1920),
+    ) {
+        val relay: Boolean get() = uhdProfile?.relay == true
+        val previewSize: Size get() = when {
+            relay -> relayViewfinder
+            uhdProfile?.samsungSlowMotion == true -> SamsungUhdSlowMotion.previewSize
+            regularUhd -> Size(1920, 1080)
+            else -> size
+        }
+        val constrained: Boolean get() = uhdProfile?.constrained ?: ((highSpeedFps ?: 0) >= 100)
+        val directPreview: Boolean get() = uhdProfile != null || constrained
+    }
     data class Controls(
         val look: LookPlan? = null,
         val zoom: Float = 1f,
@@ -52,6 +66,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         val fixedFocus: Boolean = false,
         val singleAf: Boolean = false,
         val focusAssist: Boolean = false,
+        val exposureAssist: Int = 0,
     )
 
     private val main = Handler(Looper.getMainLooper())
@@ -65,6 +80,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
     private var nightAccumulator: HyperlapseNightAccumulator? = null
     private var nightInput: Surface? = null
     private var previewInput: Surface? = null
+    private var relay: UhdHighSpeedRelay? = null
     private var focusPreview: FocusPeakingSurfaceProcessor? = null
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
@@ -83,7 +99,10 @@ internal class PreparedCamera2Recorder(private val context: Context) {
     private var onError: ((Throwable) -> Unit)? = null
     private var onFinalized: ((Result<Long>) -> Unit)? = null
     private var sourceRange: Range<Int>? = null
+    private var physicalFpsControl = false
     private var previewRange: Range<Int>? = null
+    private var thermalPreviewRange: Range<Int>? = null
+    private var reduceUhdPreview = false
     private var preparedPreviewRange: Range<Int>? = null
     private var availability: CameraManager.AvailabilityCallback? = null
     private var observedFocus: Float? = null
@@ -116,9 +135,14 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         } catch (_: IllegalArgumentException) { bitmap.recycle(); callback(null) }
     }
 
-    fun prepare(host: PreviewView, selection: Config, values: Controls, onReady: () -> Unit,
+    fun prepare(host: PreviewView, requested: Config, values: Controls, onReady: () -> Unit,
         onPresented: () -> Unit, onError: (Throwable) -> Unit) {
         check(!ownsCamera)
+        // The relay draws the camera's display transform itself; give the viewfinder buffer the
+        // orientation SurfaceFlinger would otherwise produce from a 1920x1080 camera buffer.
+        val selection = if (!requested.relay) requested else requested.copy(relayViewfinder =
+            if ((runCatching { context.getSystemService(CameraManager::class.java).getCameraCharacteristics(requested.cameraId)
+                    .get(CameraCharacteristics.SENSOR_ORIENTATION) }.getOrNull() ?: 90) % 180 == 0) Size(1920, 1080) else Size(1080, 1920))
         config = selection
         controls = values
         this.onReady = onReady
@@ -136,13 +160,13 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         }
         val surfaceView = SurfaceView(context).apply {
             setZOrderMediaOverlay(true)
-            holder.setFixedSize(selection.size.width, selection.size.height)
+            holder.setFixedSize(selection.previewSize.width, selection.previewSize.height)
         }
         view = surfaceView
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 if (token != generation) return
-                if ((selection.highSpeedFps ?: 0) >= 100) {
+                if (selection.directPreview) {
                     // Constrained high-speed output topology stays camera -> display/encoder.
                     previewInput = holder.surface
                     open(selection, holder, token)
@@ -156,8 +180,10 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                 }
                 val processor = FocusPeakingSurfaceProcessor({ action -> main.post(action); Unit })
                 focusPreview = processor
+                processor.reduceViewfinderLoad = reduceUhdPreview
                 processor.peakingEnabled = controls.focusAssist
-                processor.attachDirectPreview(selection.size, holder.surface, if (selection.night) 0 else rotation,
+                processor.exposureAssistMode = controls.exposureAssist
+                processor.attachDirectPreview(selection.previewSize, holder.surface, if (selection.night) 0 else rotation,
                     onReady = { displayInput ->
                         if (token != generation) return@attachDirectPreview
                         previewInput = displayInput
@@ -166,7 +192,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                             nightAccumulator = accumulator
                             accumulator.setMode(NightAccumulationMode.TRAILS)
                             accumulator.setOutputIntervalNs(HyperlapseNightMath.outputIntervalNs(selection.captureRate))
-                            accumulator.setPreviewMaxFps(30)
+                            accumulator.setPreviewMaxFps(if (reduceUhdPreview) 15 else 30)
                             accumulator.setDisplayRotation(rotation)
                             accumulator.start(onInputSurfaceReady = { surface ->
                                 if (token == generation) {
@@ -202,18 +228,18 @@ internal class PreparedCamera2Recorder(private val context: Context) {
     private fun open(selection: Config, holder: SurfaceHolder, token: Int) {
         try {
             val manager = context.getSystemService(CameraManager::class.java)
+            physicalFpsControl = Build.VERSION.SDK_INT >= 28 && selection.regularUhd && selection.physicalCameraId != null &&
+                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE in manager.getCameraCharacteristics(selection.cameraId).availablePhysicalCameraRequestKeys.orEmpty()
             @Suppress("UNCHECKED_CAST")
             hyperlapseAutoKey = if (selection.hyperlapseAuto) manager.getCameraCharacteristics(selection.cameraId)
                 .availableCaptureRequestKeys.firstOrNull {
                     it.name == "samsung.android.control.recordingMotionSpeedMode"
                 } as? CaptureRequest.Key<Int> else null
-            if (selection.highSpeedFps != null && selection.highSpeedFps >= 100) {
+            if (selection.constrained) {
                 val map = checkNotNull(manager.getCameraCharacteristics(selection.cameraId)
                     .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP))
                 sourceRange = map.getHighSpeedVideoFpsRangesFor(selection.size)
-                    .filter { it.lower == it.upper &&
-                        if (selection.slowMotion) it.upper == SlowMotionRecordingPolicy.sourceFrameRate(selection.highSpeedFps)
-                        else it.upper >= selection.highSpeedFps.coerceAtLeast(120) }
+                    .filter { it.lower == it.upper && it.upper == selection.highSpeedFps }
                     .minByOrNull { it.upper }
                     ?: error("No high-speed stream for ${selection.size} at ${selection.highSpeedFps} fps")
                 previewRange = map.getHighSpeedVideoFpsRangesFor(selection.size)
@@ -226,7 +252,16 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             } else if (selection.highSpeedFps != null) {
                 val sourceFps = SlowMotionRecordingPolicy.sourceFrameRate(selection.highSpeedFps)
                 sourceRange = Range(sourceFps, sourceFps)
-                previewRange = Range(30, 30)
+                previewRange = if (selection.uhdProfile != null) {
+                    val ranges = manager.getCameraCharacteristics(selection.cameraId)
+                        .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                        .orEmpty()
+                    val preferred = if (selection.uhdProfile.samsungSlowMotion)
+                        SamsungUhdSlowMotion.THERMAL_VIEWFINDER_FPS else 15
+                    thermalPreviewRange = ranges.filter { it.lower == it.upper && it.upper in preferred..30 }
+                        .minByOrNull { it.upper }
+                    ranges.firstOrNull { it.lower == 30 && it.upper == 30 } ?: sourceRange
+                } else Range(30, 30)
             }
             // Keep an advertised preview-only fallback while the old recorder drains. Stable
             // Samsung high-speed preview uses both targets once a suspended recorder is ready.
@@ -237,12 +272,17 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             }
             input = MediaCodec.createPersistentInputSurface()
             prepareNextRecorder()
+            if (selection.relay) relay = UhdHighSpeedRelay(selection.size.width, selection.size.height,
+                checkNotNull(input), previewInput, boottimeSource = manager.getCameraCharacteristics(selection.cameraId)
+                    .get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME)
+                .apply { recording = false }
             val deviceCallback = object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (token != generation) { camera.close(); return }
                     device = camera
                     try {
                         if (selection.nativeLog) SamsungNativeLogPipeline.configureCamera(camera, selection.nativeStabilization)
+                        if (selection.uhdProfile?.samsungSlowMotion == true) SamsungUhdSlowMotion.configureCamera(camera)
                         createSession(camera, holder, token)
                     } catch (error: Throwable) { fail(error) }
                 }
@@ -283,7 +323,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         val next = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(context) else MediaRecorder()
         try {
             if (selection.nativeLog) SamsungNativeLogPipeline.initializeRecorder(next)
-            val audio = selection.nativeLog && selection.recordAudio && context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            val audio = (selection.nativeLog || selection.highSpeedFps != null) && selection.recordAudio && context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
             if (selection.nativeLog) {
                 nativePendingTracks = if (audio) 2 else 1
                 nativeTracksStartedAt = 0L
@@ -320,13 +360,9 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                 next.setOrientationHint((sensorOrientation - displayDegrees + 360) % 360)
             }
             if (selection.highSpeedFps == null && !selection.nativeLog) next.setCaptureRate(selection.captureRate)
-            val recorderSlowMotion = selection.slowMotion && (selection.highSpeedFps ?: 0) >= 120
-            // Like Samsung's native recorder, declare both the sensor and playback rates.
-            // Stagefright uses capture rate for encoder operating-rate/temporal layers as well
-            // as timestamps. Declaring only 30 fps can lose whole high-speed batches under load.
-            if (recorderSlowMotion) next.setCaptureRate(cadence.toDouble())
-            next.setVideoFrameRate(selection.playbackFps)
-            val bitrate = if (selection.nativeLog) SamsungNativeLogPipeline.BITRATE else if (selection.slowMotion) {
+            // Capture at the sensor clock. MediaRecorder.setCaptureRate disables microphone audio.
+            next.setVideoFrameRate(if (selection.highSpeedFps != null) cadence else selection.playbackFps)
+            val bitrate = if (selection.nativeLog) SamsungNativeLogPipeline.BITRATE else if (selection.slowMotion || selection.uhdProfile != null) {
                 val mime = if (selection.codec == TimeLapseVideoCodec.HEVC) MediaFormat.MIMETYPE_VIDEO_HEVC
                     else MediaFormat.MIMETYPE_VIDEO_AVC
                 val encoderRange = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
@@ -334,11 +370,10 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                     .mapNotNull { codec -> runCatching { codec.getCapabilitiesForType(mime).videoCapabilities }
                         .getOrNull()?.takeIf { it.areSizeAndRateSupported(selection.size.width, selection.size.height, cadence.toDouble()) } }
                     .firstOrNull()?.bitrateRange ?: error("No encoder for ${selection.size} at $cadence fps")
-                // With capture-rate enabled, the encoder budget uses the slowed playback clock.
-                // Normal 48/60 sessions retain their real-time 60 fps clock and full source budget.
-                val budgetFps = if (recorderSlowMotion) selection.playbackFps else cadence
-                SlowMotionRecordingPolicy.bitrate(selection.size.width, selection.size.height, budgetFps.toDouble(),
-                    selection.codec == TimeLapseVideoCodec.HEVC).coerceIn(encoderRange.lower, encoderRange.upper)
+                val target = if (selection.uhdProfile?.samsungSlowMotion == true) SamsungUhdSlowMotion.HEVC_BITRATE
+                    else SlowMotionRecordingPolicy.bitrate(selection.size.width, selection.size.height, cadence.toDouble(),
+                        selection.codec == TimeLapseVideoCodec.HEVC)
+                encoderRange.clamp(target)
             } else (selection.size.width.toLong() * selection.size.height * cadence / 8)
                 .coerceIn(20_000_000L, 100_000_000L).toInt()
             next.setVideoEncodingBitRate(bitrate)
@@ -397,7 +432,8 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             }
         }
         try {
-            val surfaces = nightInput?.let { listOf(it) } ?: listOf(checkNotNull(previewInput), checkNotNull(input))
+            val surfaces = (relay?.cameraSurface ?: nightInput)?.let { listOf(it) }
+                ?: listOf(checkNotNull(previewInput), checkNotNull(input))
             if (config?.nativeLog == true) {
                 val outputs = listOf(SamsungNativeLogPipeline.output(checkNotNull(previewInput), false),
                     SamsungNativeLogPipeline.output(checkNotNull(input), true))
@@ -408,22 +444,46 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                 SamsungNativeLogPipeline.configureRequest(request, checkNotNull(config).nativeStabilization)
                 configuration.setSessionParameters(request.build())
                 camera.createCaptureSession(configuration)
-            } else if (Build.VERSION.SDK_INT >= 28 && config?.physicalCameraId != null) {
+            } else if (Build.VERSION.SDK_INT >= 28 && (config?.physicalCameraId != null || config?.regularUhd == true)) {
+                val selection = checkNotNull(config)
+                val useCases = if (Build.VERSION.SDK_INT >= 33 && selection.regularUhd)
+                    context.getSystemService(CameraManager::class.java).getCameraCharacteristics(camera.id)
+                        .get(CameraCharacteristics.SCALER_AVAILABLE_STREAM_USE_CASES) ?: longArrayOf() else longArrayOf()
                 val outputs = surfaces.map { surface ->
-                    OutputConfiguration(surface).apply { setPhysicalCameraId(config?.physicalCameraId) }
+                    OutputConfiguration(surface).apply {
+                        selection.physicalCameraId?.let(::setPhysicalCameraId)
+                        if (Build.VERSION.SDK_INT >= 33 && useCases.isNotEmpty()) {
+                            val use = if (surface === input) CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_RECORD
+                                else CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW
+                            if (use.toLong() in useCases) streamUseCase = use.toLong()
+                        }
+                    }
                 }
-                val sessionType = if ((config?.highSpeedFps ?: 0) >= 100) SessionConfiguration.SESSION_HIGH_SPEED
+                val sessionType = if (config?.constrained == true) SessionConfiguration.SESSION_HIGH_SPEED
                     else SessionConfiguration.SESSION_REGULAR
-                camera.createCaptureSession(SessionConfiguration(sessionType,
-                    outputs, { command -> main.post(command); Unit }, callback))
+                val configuration = SessionConfiguration(sessionType, outputs, { command -> main.post(command); Unit }, callback)
+                if (selection.regularUhd) {
+                    val request = recordRequest(camera)
+                    request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, sourceRange)
+                    if (selection.uhdProfile?.samsungSlowMotion == true) {
+                        request.set(CaptureRequest.CONTROL_ZOOM_RATIO, selection.uhdProfile.zoom)
+                        SamsungUhdSlowMotion.configureRequest(request)
+                    }
+                    controls.look?.stabilizationMode?.let { request.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, it) }
+                    if (physicalFpsControl) request.setPhysicalCameraKey(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                        checkNotNull(sourceRange), checkNotNull(selection.physicalCameraId))
+                    configuration.setSessionParameters(request.build())
+                }
+                camera.createCaptureSession(configuration)
             }
-            else if ((config?.highSpeedFps ?: 0) >= 100) camera.createConstrainedHighSpeedCaptureSession(surfaces, callback, main)
+            else if (config?.constrained == true) camera.createConstrainedHighSpeedCaptureSession(surfaces, callback, main)
             else camera.createCaptureSession(surfaces, callback, main)
         } catch (error: Throwable) { fail(error) }
     }
 
     fun update(values: Controls) {
         focusPreview?.peakingEnabled = values.focusAssist
+        focusPreview?.exposureAssistMode = values.exposureAssist
         if (values == controls) return
         if (values.singleAf != controls.singleAf) singleAfTriggered = false
         controls = values
@@ -432,18 +492,43 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         }
     }
 
+    fun reduceUhdViewfinderLoad(reduce: Boolean) {
+        if (reduceUhdPreview == reduce) return
+        reduceUhdPreview = reduce
+        focusPreview?.reduceViewfinderLoad = reduce
+        nightAccumulator?.setPreviewMaxFps(if (reduce) 15 else 30)
+        val profile = config?.uhdProfile ?: return
+        if (!profile.constrained && !profile.relay && session != null && !stopping) {
+            // The previous repeating request stays active if the HAL rejects its replacement.
+            // An optional viewfinder change must never discard an in-progress recording.
+            try { repeat(startedAt > 0L) } catch (error: Exception) {
+                Log.w("DivePrepared", "Could not change thermal viewfinder cadence", error)
+            }
+        }
+    }
+
+    private fun recordRequest(camera: CameraDevice): CaptureRequest.Builder {
+        val physical = config?.physicalCameraId
+        return if (Build.VERSION.SDK_INT >= 28 && config?.regularUhd == true && physical != null)
+            camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD, setOf(physical))
+        else camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+    }
+
     private fun repeat(recording: Boolean, stopNativeRecording: Boolean = false) {
         val serial = ++repeatingSerial
         val selection = checkNotNull(config)
         val currentSession = checkNotNull(session)
-        val builder = checkNotNull(device).createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+        val builder = recordRequest(checkNotNull(device))
         // A prepared MediaRecorder consumes and discards surface buffers until start(). Keep
         // both high-speed targets active at an advertised fixed rate while it waits: Samsung's
         // variable preview-only route can deliver just 7.5 fps in dim light after a 240 fps take.
         // Remove the encoder target while its old recorder drains, then restore it after prepare.
         val preparedPreview = !recording && preparedPreviewRange != null && recorder != null && !stopping
         val accumulatedInput = nightInput
-        if (accumulatedInput != null) {
+        val relayOutput = relay
+        if (relayOutput != null) {
+            builder.addTarget(relayOutput.cameraSurface)
+        } else if (accumulatedInput != null) {
             builder.addTarget(accumulatedInput)
             nightAccumulator?.setEncoderSurface(if (recording) input else null)
         } else {
@@ -452,16 +537,20 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         }
         builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-        (if (recording) sourceRange else if (preparedPreview) preparedPreviewRange else previewRange)
-            ?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+        (if (recording) sourceRange else if (preparedPreview) preparedPreviewRange
+            else if (reduceUhdPreview) thermalPreviewRange ?: previewRange else previewRange)
+            ?.let { range ->
+                builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+                if (Build.VERSION.SDK_INT >= 28 && physicalFpsControl)
+                    builder.setPhysicalCameraKey(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range, checkNotNull(selection.physicalCameraId))
+            }
         builder.set(CaptureRequest.CONTROL_AF_MODE, if (controls.fixedFocus || controls.focus != null)
             CameraMetadata.CONTROL_AF_MODE_OFF else if (controls.singleAf) CameraMetadata.CONTROL_AF_MODE_AUTO
             else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         controls.focus?.let { builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, it) }
         controls.look?.let { look ->
             // Constrained sessions own 3A and cadence. Regular sessions use the same controls as CameraX.
-            val constrained = (selection.highSpeedFps ?: 0) >= 100
-            CameraControls.writeLook(Camera2RequestSink(builder), if (constrained) look.copy(
+            CameraControls.writeLook(Camera2RequestSink(builder), if (selection.directPreview) look.copy(
                 exposure = ExposurePlan.Auto((look.exposure as? ExposurePlan.Auto)?.evIndex, null),
                 whitePoint = WhitePointPlan.HalAuto(false), fpsRange = null,
             ) else look)
@@ -479,7 +568,8 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             }
         }
         builder.set(CaptureRequest.FLASH_MODE, if (controls.torch) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF)
-        builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+        if (!selection.regularUhd || controls.look?.stabilizationMode == null)
+            builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
         if (selection.slowMotion) {
             val chars = context.getSystemService(CameraManager::class.java).getCameraCharacteristics(selection.cameraId)
             if (chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES)
@@ -507,12 +597,18 @@ internal class PreparedCamera2Recorder(private val context: Context) {
             SamsungNativeLogPipeline.configureRequest(builder, selection.nativeStabilization)
             builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(selection.playbackFps, selection.playbackFps))
         }
+        if (selection.uhdProfile?.samsungSlowMotion == true) SamsungUhdSlowMotion.configureRequest(builder)
         hyperlapseAutoKey?.let { builder.set(it, 10) }
         val token = generation
         val callback = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                 if (token != generation) return
-                CameraControlTrace.record(if (selection.nativeLog) "NativeLog" else if (selection.highSpeedFps != null) "HighSpeed" else "Hyperlapse", request, result)
+                CameraControlTrace.record(when {
+                    selection.nativeLog -> "NativeLog"
+                    selection.regularUhd -> "RegularUhd"
+                    selection.highSpeedFps != null -> "HighSpeed"
+                    else -> "Hyperlapse"
+                }, request, result, context, s)
                 if (selection.nativeLog) {
                     // A persistent session can deliver a previous take's queued results after
                     // rearm. Only the current request may mark the next recorder ready.
@@ -524,6 +620,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                         }
                     } catch (error: Throwable) { fail(error); return }
                 }
+                relay?.failure?.let { error -> fail(IllegalStateException("UHD high-speed relay stopped", error)); return }
                 onCaptureTelemetry?.invoke(result)
                 if (selection.hyperlapseAuto) onHyperlapseCapture?.invoke(result)
                 observedFocus = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
@@ -552,7 +649,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
                     ready = true
                     Log.i("DivePrepared", "Preview ready $config; camera session prepared before shutter")
                     onReady?.invoke()
-                    if ((config?.highSpeedFps ?: 0) >= 100) view?.postOnAnimation {
+                    if (config?.directPreview == true) view?.postOnAnimation {
                         if (token == generation) onPresented?.invoke()
                     }
                 }
@@ -573,7 +670,24 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         }
         if (currentSession is CameraConstrainedHighSpeedCaptureSession)
             currentSession.setRepeatingBurst(currentSession.createHighSpeedRequestList(builder.build()), callback, main)
-        else currentSession.setRepeatingRequest(builder.build(), callback, main)
+        else if (recording && selection.uhdProfile != null && !selection.relay &&
+            (selection.uhdProfile.samsungSlowMotion || reduceUhdPreview)) {
+            // Every request feeds the UHD encoder. Only the first also updates the display.
+            val withPreview = builder.build()
+            builder.removeTarget(checkNotNull(previewInput))
+            val encoderOnly = builder.build()
+            val viewfinderFps = if (reduceUhdPreview && selection.uhdProfile.samsungSlowMotion)
+                SamsungUhdSlowMotion.THERMAL_VIEWFINDER_FPS else 30
+            val burst = List(selection.uhdProfile.fps / viewfinderFps) { if (it == 0) withPreview else encoderOnly }
+            try {
+                currentSession.setRepeatingBurst(burst, callback, main)
+            } catch (error: IllegalArgumentException) {
+                // Some regular sessions accept only a single target combination.
+                Log.w("DivePrepared", "Using full preview cadence for this session", error)
+                currentSession.setRepeatingRequest(withPreview, callback, main)
+            }
+        } else currentSession.setRepeatingRequest(builder.build(), callback, main)
+        relayOutput?.recording = recording
     }
 
     fun start(output: File, onStarted: () -> Unit, onFinalized: (Result<Long>) -> Unit) {
@@ -677,6 +791,11 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         } else release()
     }
 
+    fun dispose() {
+        release()
+        finalizer.shutdown()
+    }
+
     private fun fail(error: Throwable) {
         Log.e("DivePrepared", "Prepared recording failed", error)
         val callback = onFinalized
@@ -704,6 +823,8 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         ready = false
         runCatching { session?.close() }
         runCatching { device?.close() }
+        runCatching { relay?.release() }
+        relay = null
         nightAccumulator?.release()
         nightAccumulator = null
         nightInput = null
@@ -727,6 +848,7 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         stopping = false
         sourceRange = null
         previewRange = null
+        thermalPreviewRange = null
         preparedPreviewRange = null
         observedFocus = null
         releaseAfterStop = false
@@ -737,4 +859,5 @@ internal class PreparedCamera2Recorder(private val context: Context) {
         onError = null
         onFinalized = null
     }
+
 }

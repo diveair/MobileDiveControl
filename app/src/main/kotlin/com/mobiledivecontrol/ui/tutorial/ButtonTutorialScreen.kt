@@ -1,5 +1,15 @@
 package com.mobiledivecontrol.ui.tutorial
 
+import com.mobiledivecontrol.ui.components.MessageBanner
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
+import kotlin.math.roundToInt
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -17,6 +27,8 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.withFrameMillis
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithCache
@@ -34,6 +46,8 @@ import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
@@ -42,8 +56,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import com.mobiledivecontrol.core.BleConnectionState
+import com.mobiledivecontrol.ui.components.HousingLinkBanner
+import com.mobiledivecontrol.FirstLaunchSealStep
+import com.mobiledivecontrol.branding.NauticaseBranding
 import com.mobiledivecontrol.theme.DiveColors
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 
 /**
@@ -83,11 +101,34 @@ object IntroCarousel {
  */
 enum class IntroPhase {
     NeedsPermissions,
+    InsertAndSeal,
     TurnOnHousing,
     Connecting,
+    Reconnecting,
     JustConnected,
     Carousel,
     LinkLost,
+}
+
+internal fun introPhase(
+    sealStep: FirstLaunchSealStep,
+    permissionsGranted: Boolean,
+    bleState: BleConnectionState,
+    carouselStarted: Boolean,
+    everConnected: Boolean,
+): IntroPhase = when {
+    sealStep == FirstLaunchSealStep.WaitingForDialogs -> IntroPhase.NeedsPermissions
+    sealStep == FirstLaunchSealStep.OnHousingAnimation -> IntroPhase.InsertAndSeal
+    sealStep == FirstLaunchSealStep.PowerOn -> IntroPhase.TurnOnHousing
+    sealStep == FirstLaunchSealStep.Connecting -> IntroPhase.Connecting
+    sealStep == FirstLaunchSealStep.Connected -> IntroPhase.JustConnected
+    !permissionsGranted -> IntroPhase.NeedsPermissions
+    bleState == BleConnectionState.Ready -> if (carouselStarted) IntroPhase.Carousel else IntroPhase.JustConnected
+    bleState == BleConnectionState.Connecting ||
+        bleState == BleConnectionState.DiscoveringServices ||
+        bleState == BleConnectionState.Subscribing -> if (everConnected) IntroPhase.Reconnecting else IntroPhase.Connecting
+    everConnected -> IntroPhase.LinkLost
+    else -> IntroPhase.TurnOnHousing
 }
 
 /**
@@ -99,10 +140,9 @@ enum class IntroPhase {
  * screens swapping — which matters, because the thing being taught is that this drawing *is* the
  * housing in the diver's hands.
  *
- * The carousel runs itself. Nothing here waits for input: a diver holding a housing they have not
- * learned to use yet should not have to guess which button advances a lesson about which button does
- * what. Once permission setup is complete, one press of anything — or one tap — ends the intro for
- * the session. Permission-stage presses remain reserved for the native Android prompt bridge.
+ * First-run setup waits for the housing to power on and connect. Once the connected notice ends,
+ * the button lessons advance automatically and a housing press or screen tap can dismiss them.
+ * During permission setup the native Android prompt bridge has priority.
  *
  * Opaque black rather than a scrim over the viewfinder: a half-visible camera behind the drawing
  * invites the diver to try to use it, and the housing buttons are not routed to it yet.
@@ -121,6 +161,8 @@ fun IntroCarouselScreen(
     modifier: Modifier = Modifier,
     onDismiss: () -> Unit = {},
     onPermissionsSetup: () -> Unit = {},
+    firstLaunchSealStep: FirstLaunchSealStep = FirstLaunchSealStep.Done,
+    onIntroPromptFinished: (FirstLaunchSealStep) -> Unit = {},
 ) {
     // Once the link has been up, a later drop is a *loss* rather than a "still looking" — the diver
     // needs the difference, because one is normal startup and the other means something broke.
@@ -131,19 +173,27 @@ fun IntroCarouselScreen(
     val ready = bleState == BleConnectionState.Ready
 
     LaunchedEffect(ready) {
-        if (ready) everConnected = true
+        if (ready) everConnected = true else carouselStarted = false
     }
 
-    val phase = when {
-        !permissionsGranted -> IntroPhase.NeedsPermissions
-        ready && carouselStarted -> IntroPhase.Carousel
-        ready -> IntroPhase.JustConnected
-        everConnected -> IntroPhase.LinkLost
-        bleState == BleConnectionState.Connecting ||
-            bleState == BleConnectionState.DiscoveringServices ||
-            bleState == BleConnectionState.Subscribing ||
-            bleState == BleConnectionState.Reconnecting -> IntroPhase.Connecting
-        else -> IntroPhase.TurnOnHousing
+    val phase = introPhase(firstLaunchSealStep, permissionsGranted, bleState, carouselStarted, everConnected)
+
+    val currentLink = rememberUpdatedState(bleState)
+    LaunchedEffect(firstLaunchSealStep) {
+        when (firstLaunchSealStep) {
+            FirstLaunchSealStep.OnHousingAnimation -> delay(NauticaseBranding.WELCOME_SCREEN_DURATION_MS)
+            FirstLaunchSealStep.Connecting -> {
+                // Preserve the blue banner even if discovery and subscription finished in one UI frame.
+                delay(CONNECTING_MIN_DISPLAY_MS)
+                snapshotFlow { currentLink.value }.first { it == BleConnectionState.Ready }
+            }
+            FirstLaunchSealStep.Connected -> {
+                delay(com.mobiledivecontrol.ui.components.CONNECTED_NOTICE_MS)
+                carouselStarted = true
+            }
+            else -> return@LaunchedEffect
+        }
+        onIntroPromptFinished(firstLaunchSealStep)
     }
 
     // Let the connected banner stand on its own before the lesson starts. The diver has just been
@@ -151,9 +201,9 @@ fun IntroCarouselScreen(
     // rather than on the link, so the beat is measured from when the banner is actually on screen —
     // a link that comes up while the diver is still granting permissions has not shown them
     // anything yet.
-    if (phase == IntroPhase.JustConnected) {
+    if (phase == IntroPhase.JustConnected && firstLaunchSealStep == FirstLaunchSealStep.Done) {
         LaunchedEffect(Unit) {
-            delay(CONNECTED_BANNER_MS)
+            delay(com.mobiledivecontrol.ui.components.CONNECTED_NOTICE_MS)
             carouselStarted = true
         }
     }
@@ -283,18 +333,17 @@ fun IntroCarouselScreen(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black)
-            .pointerInput(phase) {
+            .pointerInput(phase, firstLaunchSealStep) {
                 detectTapGestures {
-                    if (phase == IntroPhase.NeedsPermissions) onPermissionsSetup() else onDismiss()
+                    when {
+                        phase == IntroPhase.NeedsPermissions -> onPermissionsSetup()
+                        firstLaunchSealStep == FirstLaunchSealStep.Done -> onDismiss()
+                    }
                 }
             },
     ) {
         HousingDiagram(
-            frame = if (phase == IntroPhase.Carousel) {
-                IntroCarousel.frameAt(frameIndex)
-            } else {
-                IntroFrame.Neutral
-            },
+            frame = if (phase == IntroPhase.Carousel) IntroCarousel.frameAt(frameIndex) else IntroFrame.Neutral,
             labelDim = if (phase == IntroPhase.Carousel) labelDim else null,
             highlightBoost = if (phase == IntroPhase.Carousel) pillFlash else null,
             modifier = Modifier.fillMaxSize(),
@@ -303,14 +352,16 @@ fun IntroCarouselScreen(
         // Each overlay is composed only while it has something to say. That is not tidiness: an
         // InfiniteTransition schedules a frame callback for as long as it is in composition, so an
         // invisible banner would keep the display awake at 60 Hz for nothing.
-        if (shouldShowIntroMessage(phase)) {
+        if (phase == IntroPhase.LinkLost) {
+            HousingLinkBanner(bleState, modifier = Modifier.align(Alignment.Center))
+        } else if (shouldShowIntroMessage(phase)) {
             IntroMessage(
                 phase = phase,
                 modifier = Modifier.fillMaxSize(),
             )
         }
 
-        if (shouldShowPermissionRecovery(phase, permissionDialogVisible)) {
+        if (missingPermissions.isNotEmpty() && shouldShowPermissionRecovery(phase, permissionDialogVisible)) {
             PermissionRecoveryMessage(
                 missingPermissions = missingPermissions,
                 modifier = Modifier.fillMaxSize(),
@@ -348,6 +399,7 @@ private fun IntroMessage(
     modifier: Modifier = Modifier,
 ) {
     val measurer = rememberTextMeasurer()
+    val instruction = phase.housingInstruction
     val pulse = rememberPulseAlpha(
         active = phase.pulses,
         min = BANNER_PULSE_MIN,
@@ -356,21 +408,22 @@ private fun IntroMessage(
         label = "intro_banner",
     )
 
-    Spacer(
-        modifier = modifier
-            .graphicsLayer { alpha = pulse.value }
-            .drawWithCache {
-                val scale = plateScale(size)
-                val origin = plateOrigin(size, scale)
-                val banner = measurer.layOutBanner(phase, scale, density, fontScale)
-
-                onDrawBehind {
-                    translate(left = origin.x, top = origin.y) {
-                        banner?.let { drawBanner(it, scale) }
-                    }
-                }
-            },
-    )
+    BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
+        val density = LocalDensity.current
+        val scale = plateScale(Size(constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat()))
+        val banner = remember(phase, scale, measurer, density) {
+            measurer.layOutBanner(phase, scale, density.density, density.fontScale)
+        } ?: return@BoxWithConstraints
+        val textHeight = banner.primary.size.height
+        MessageBanner(banner.fill, Modifier
+            .offset { IntOffset(0, ((BANNER_BOX.centreY - PLATE_H / 2f) * scale).roundToInt()) }
+            .then(if (instruction == null) Modifier else Modifier.semantics { contentDescription = instruction })
+            .graphicsLayer { alpha = pulse.value }) {
+            Canvas(Modifier.fillMaxWidth().height(with(density) { textHeight.toDp() })) {
+                drawBanner(banner, scale)
+            }
+        }
+    }
 }
 
 /** Native Android dialogs get the words and actions; this layer supplies only their artwork. */
@@ -385,6 +438,17 @@ internal fun shouldShowPermissionRecovery(
 
 /** The orange first-connection banner, shown once permissions are settled. */
 internal const val TURN_ON_HOUSING_PROMPT = "HOLD SHUTTER TO POWER ON & CONNECT BLUETOOTH"
+private const val CONNECTING_MIN_DISPLAY_MS = 700L
+
+private val IntroPhase.housingInstruction: String?
+    get() = when (this) {
+        IntroPhase.InsertAndSeal -> NauticaseBranding.WELCOME_PROMPT
+        IntroPhase.TurnOnHousing -> TURN_ON_HOUSING_PROMPT
+        IntroPhase.Connecting -> "CONNECTING TO HOUSING"
+        IntroPhase.Reconnecting -> "RECONNECTING TO HOUSING"
+        IntroPhase.JustConnected -> "CONNECTED TO HOUSING"
+        else -> null
+    }
 
 internal fun permissionRecoveryTapPrompt(): String =
     "TAP ANYWHERE ON SCREEN TO CONTINUE"
@@ -682,7 +746,6 @@ private class MeasuredBanner(
     val fill: Color,
     val ink: Color,
     val primary: TextLayoutResult,
-    val secondary: TextLayoutResult?,
     val badge: Boolean,
 )
 
@@ -695,9 +758,9 @@ private class MeasuredPermissions(
 
 /** Whether this phase's banner breathes. Steady means settled; breathing means still working. */
 private val IntroPhase.pulses: Boolean
-    get() = this == IntroPhase.TurnOnHousing ||
+    get() = this == IntroPhase.InsertAndSeal || this == IntroPhase.TurnOnHousing ||
         this == IntroPhase.Connecting ||
-        this == IntroPhase.LinkLost
+        this == IntroPhase.Reconnecting
 
 private fun TextMeasurer.layOutBanner(
     phase: IntroPhase,
@@ -706,12 +769,11 @@ private fun TextMeasurer.layOutBanner(
     fontScale: Float,
 ): MeasuredBanner? {
     val bold = TextStyle(fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-    val plain = TextStyle(fontWeight = FontWeight.Medium, textAlign = TextAlign.Center)
 
-    fun primary(text: String, box: PlateBox) = fitPlateText(
+    fun primary(text: String) = fitPlateText(
         text = text,
         style = bold,
-        box = box,
+        box = BANNER_TEXT_BOX,
         scale = scale,
         density = density,
         fontScale = fontScale,
@@ -720,52 +782,38 @@ private fun TextMeasurer.layOutBanner(
         maxLines = 2,
     )
 
-    fun secondary(text: String) = fitPlateText(
-        text = text,
-        style = plain,
-        box = BANNER_TEXT_BOX,
-        scale = scale,
-        density = density,
-        fontScale = fontScale,
-        startPlatePx = BANNER_SECONDARY_PX,
-        minPlatePx = BANNER_TEXT_MIN_PX,
-        maxLines = 2,
-    )
-
     return when (phase) {
         IntroPhase.NeedsPermissions, IntroPhase.Carousel -> null
 
-        IntroPhase.TurnOnHousing -> MeasuredBanner(
+        IntroPhase.InsertAndSeal, IntroPhase.TurnOnHousing -> MeasuredBanner(
             fill = DiveColors.Warning,
             ink = Color.Black,
-            primary = primary(TURN_ON_HOUSING_PROMPT, BANNER_TEXT_BOX),
-            secondary = null,
+            primary = primary(checkNotNull(phase.housingInstruction)),
             badge = false,
         )
 
-        IntroPhase.Connecting -> MeasuredBanner(
-            fill = DiveColors.Warning,
-            ink = Color.Black,
-            primary = primary("CONNECTING TO HOUSING", BANNER_TEXT_BOX),
-            secondary = null,
-            badge = false,
-        )
-
-        IntroPhase.JustConnected -> MeasuredBanner(
-            fill = ConnectedLime,
-            ink = Color.Black,
-            primary = primary("HOUSING CONNECTED", BANNER_BADGE_TEXT_BOX),
-            secondary = null,
-            badge = true,
-        )
-
-        IntroPhase.LinkLost -> MeasuredBanner(
-            fill = DiveColors.Critical,
+        IntroPhase.Connecting, IntroPhase.Reconnecting -> MeasuredBanner(
+            fill = DiveColors.OceanBlue,
             ink = Color.White,
-            primary = primary("HOUSING DISCONNECTED", BANNER_TEXT_BOX),
-            secondary = secondary("Hold SHUTTER for 3 seconds to turn it on"),
+            primary = primary(checkNotNull(phase.housingInstruction)),
             badge = false,
         )
+
+        IntroPhase.JustConnected -> {
+            val connecting = primary(checkNotNull(IntroPhase.Connecting.housingInstruction))
+            val label = measure(
+                text = checkNotNull(phase.housingInstruction),
+                style = connecting.layoutInput.style,
+                constraints = connecting.layoutInput.constraints,
+                maxLines = connecting.layoutInput.maxLines,
+            )
+            MeasuredBanner(
+                fill = ConnectedLime, ink = Color.Black, primary = label,
+                badge = true,
+            )
+        }
+
+        IntroPhase.LinkLost -> null // The HUD and onboarding share HousingLinkBanner.
     }
 }
 
@@ -817,34 +865,23 @@ private fun TextMeasurer.layOutPermissions(
 
 // --- plate-space painting ---------------------------------------------------------------------
 
-/**
- * A rounded plate-space banner across the housing port.
- *
- * The rectangle keeps the geometry measured off the reference, but grows downwards and upwards from
- * its centre when a second line needs the room. Fixed height plus clipped text is the one outcome
- * this must never produce.
- */
+/** Paint the instruction and connection badge inside the shared message frame. */
 private fun DrawScope.drawBanner(banner: MeasuredBanner, scale: Float) {
-    val gap = BANNER_LINE_GAP * scale
-    val contentHeight = banner.primary.size.height.toFloat() +
-        (banner.secondary?.let { gap + it.size.height } ?: 0f)
-    val height = maxOf(BANNER_BOX.height * scale, contentHeight + 2f * BANNER_PAD_Y * scale)
-    val width = BANNER_BOX.width * scale
-    val centreX = BANNER_BOX.centreX * scale
-    val centreY = BANNER_BOX.centreY * scale
+    val contentHeight = banner.primary.size.height.toFloat()
+    val width = size.width
+    val centreX = center.x
+    val centreY = center.y
 
-    drawRoundRect(
-        color = banner.fill,
-        topLeft = Offset(centreX - width / 2f, centreY - height / 2f),
-        size = Size(width, height),
-        cornerRadius = CornerRadius(BANNER_CORNER * scale),
-    )
-
-    val badgeRadius = BANNER_BADGE_R * scale
-    val rowWidth = banner.primary.size.width +
-        if (banner.badge) BANNER_BADGE_GAP * scale + badgeRadius * 2f else 0f
+    // Fit the tick and its gap in the space left by the full-size headline.
+    val badgeAndGap = 2f * BANNER_BADGE_R + BANNER_BADGE_GAP
+    val badgeScale = if (banner.badge) {
+        val available = width - 2f * BANNER_BADGE_INSET * scale - banner.primary.size.width
+        (available / badgeAndGap).coerceIn(0f, scale)
+    } else 0f
+    val badgeRadius = BANNER_BADGE_R * badgeScale
+    val rowWidth = banner.primary.size.width + badgeAndGap * badgeScale
     val rowLeft = centreX - rowWidth / 2f
-    var y = centreY - contentHeight / 2f
+    val y = centreY - contentHeight / 2f
 
     drawText(
         textLayoutResult = banner.primary,
@@ -855,15 +892,6 @@ private fun DrawScope.drawBanner(banner: MeasuredBanner, scale: Float) {
         drawCheckBadge(
             centre = Offset(rowLeft + rowWidth - badgeRadius, y + banner.primary.size.height / 2f),
             radius = badgeRadius,
-        )
-    }
-
-    banner.secondary?.let { second ->
-        y += banner.primary.size.height + gap
-        drawText(
-            textLayoutResult = second,
-            color = banner.ink.copy(alpha = BANNER_SECONDARY_INK),
-            topLeft = Offset(centreX - second.size.width / 2f, y),
         )
     }
 }
@@ -935,7 +963,6 @@ private fun DrawScope.drawPermissions(
 // --- timing ------------------------------------------------------------------------------------
 
 /** The connected banner gets a beat of its own before the lesson takes the screen. */
-private const val CONNECTED_BANNER_MS = 2500L
 private const val PERMISSION_TAP_FLASH_HALF_MS = 450
 private val PermissionTapRed = Color(0xFFFF2020)
 
@@ -1050,18 +1077,13 @@ private const val PILL_TEXT_MIN_PX = 28f
  */
 private val BANNER_BOX = PlateBox(left = 571f, top = 482f, right = 1472f, bottom = 618f)
 private val BANNER_TEXT_BOX = PlateBox(left = 615f, top = 470f, right = 1428f, bottom = 630f)
-private val BANNER_BADGE_TEXT_BOX = PlateBox(left = 615f, top = 470f, right = 1320f, bottom = 630f)
-private const val BANNER_CORNER = 24f
-private const val BANNER_PAD_Y = 26f
 private const val BANNER_PRIMARY_PX = 64f
-private const val BANNER_SECONDARY_PX = 44f
 private const val BANNER_TEXT_MIN_PX = 24f
-private const val BANNER_LINE_GAP = 14f
-private const val BANNER_SECONDARY_INK = 0.82f
 
 /** The tick badge in 1.jpg measures ~72 plate px across, set ~42 px clear of the text. */
 private const val BANNER_BADGE_R = 36f
 private const val BANNER_BADGE_GAP = 42f
+private const val BANNER_BADGE_INSET = 16f
 
 private val PERMISSION_TEXT_BOX = PlateBox(left = 535f, top = 300f, right = 1535f, bottom = 780f)
 private const val PERMISSION_TITLE_PX = 72f

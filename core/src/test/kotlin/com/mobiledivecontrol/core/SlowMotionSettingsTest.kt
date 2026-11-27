@@ -6,6 +6,50 @@ import kotlin.test.assertTrue
 
 class SlowMotionSettingsTest {
     @Test
+    fun `housing FPS control uses the same resolution and rate as the recorder`() {
+        for (uhdRates in listOf(listOf(60), listOf(60, 120))) {
+            val rates = mapOf("FHD" to listOf(120, 240), "UHD 4K" to uhdRates)
+            val caps = CameraCapabilities(galaxyS24VideoModes = true, videoCaptureLens = "1x",
+                videoFrameRatesByResolution = rates)
+            for ((resolution, allowed) in rates) {
+                for (saved in listOf(60, 120, 240)) {
+                    val base = camera(saved)
+                    val state = base.copy(capabilities = caps, settingValues = base.settingValues +
+                        mapOf("slow_motion.resolution" to resolution, "slow_motion.playback_fps" to "30fps"))
+                    val bar = CameraCatalog.settingsBarItems(state)
+                    val index = bar.indexOfFirst { it is BottomBarItem.Setting && it.spec.id == "slow_motion.frame_rate" }
+                    val control = requireNotNull(state.copy(settingsCursor = index).selectedSetting)
+                    val recorder = CameraCatalog.settingsFor(state).single { it.id == "slow_motion.frame_rate" }
+                    assertEquals(allowed.map { "${it}fps" }, control.options)
+                    assertEquals(recorder.options, control.options)
+                    assertEquals(CameraCatalog.currentValue(state, recorder), CameraCatalog.currentValue(state, control))
+                    if (saved in allowed) assertEquals("${saved}fps", CameraCatalog.currentValue(state, control))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `a late high speed profile preserves the playback rate selected for review`() {
+        val initial = CameraCatalog.launchCameraState(CameraModeId.SlowMotion)
+        val requested = initial.copy(
+            settingValues = initial.settingValues + mapOf(
+                "slow_motion.resolution" to "FHD",
+                "slow_motion.frame_rate" to "60fps",
+                "slow_motion.playback_fps" to "30fps",
+            ),
+        )
+        val caps = CameraCapabilities(
+            galaxyS24VideoModes = true,
+            videoCaptureLens = "1x",
+            videoFrameRatesByResolution = mapOf("FHD" to listOf(120, 240)),
+        )
+        val state = CameraCatalog.resnapToClippedLadders(requested.copy(capabilities = caps))
+        assertEquals("120fps", state.settingValues["slow_motion.frame_rate"])
+        assertEquals("30fps", state.settingValues["slow_motion.playback_fps"])
+    }
+
+    @Test
     fun `slow motion camera limits never rewrite another modes saved settings`() {
         val original = camera(240).let { it.copy(settingValues = it.settingValues + mapOf(
             "pro.exposure_value" to "+4.0",

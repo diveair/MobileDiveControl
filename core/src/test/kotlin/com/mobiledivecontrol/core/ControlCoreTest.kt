@@ -8,6 +8,43 @@ import kotlin.test.assertTrue
 
 class ControlCoreTest {
     @Test
+    fun `on-screen OK navigates offline without connecting the housing or masking later BLE signals`() {
+        val core = ControlCore(initialState = AppState(camera = CameraCatalog.launchCameraState(CameraModeId.ExpertRaw)))
+        core.advanceBle(BleSignal.StartScan)
+        val before = core.state
+        val press = core.handleNotificationPayload(HousingCharacteristic.ButtonEvents.shortHex,
+            byteArrayOf(0x50), source = SensorPacketSource.Simulation)
+        assertEquals(CameraUiZone.ModeRail, press.state.camera.focusedZone)
+        assertEquals(BleConnectionState.Scanning, press.state.bleConnectionState)
+        assertEquals(false, press.state.housing.connected)
+        assertEquals(before.housing.connectedAtMs, press.state.housing.connectedAtMs)
+        assertEquals(false, press.state.housing.inputEnabled)
+        assertEquals(HousingSealTransitions.Banner.B01, press.state.safety.sealMonitor.banner)
+        assertTrue(press.effects.none { it is PlatformEffect.ExecuteHousing })
+
+        val ready = core.advanceBle(BleSignal.Ready)
+        assertEquals(HousingSealTransitions.Banner.B12, ready.state.safety.sealMonitor.banner)
+        val disconnected = core.advanceBle(BleSignal.Disconnect)
+        assertEquals(BleConnectionState.Reconnecting, disconnected.state.bleConnectionState)
+        assertEquals(HousingSealTransitions.Banner.B01, disconnected.state.safety.sealMonitor.banner)
+    }
+
+    @Test
+    fun `offline panel input cannot unlock controls or send a housing command`() {
+        val core = ControlCore(initialState = AppState(mode = AppMode.Safety))
+        val shutter = core.handleNotificationPayload(HousingCharacteristic.ButtonEvents.shortHex,
+            byteArrayOf(0x20), source = SensorPacketSource.Simulation)
+        assertTrue(shutter.effects.isEmpty())
+        val radio = core.handleButtonPayload(byteArrayOf(0x50))
+        assertEquals(AppMode.Safety, radio.state.mode)
+        assertTrue("Housing input is disabled." in radio.notes)
+        val locked = ControlCore(initialState = AppState(controlsLocked = true))
+        val press = locked.handleNotificationPayload(HousingCharacteristic.ButtonEvents.shortHex,
+            byteArrayOf(0x50), source = SensorPacketSource.Simulation)
+        assertTrue("Controls are locked." in press.notes)
+    }
+
+    @Test
     fun `mode up down never opens side menu from either closed camera focus state`() {
         val modes = CameraCatalog.centerModeCycle
         for (mode in modes) {
@@ -333,15 +370,15 @@ class ControlCoreTest {
 
         // Explicitly open the rail; its default is Track Heading at index 0.
         core.dispatch(CameraCommand.OpenModeRail)
-        // Navigate Up: should wrap around to last index
+        assertEquals(CameraRailAction.ShutOff, core.dispatch(CameraCommand.NavigateUp).state.camera.primaryHighlightedEntry.action)
         val wrapUpOutcome = core.dispatch(CameraCommand.NavigateUp)
         val lastIndex = CameraCatalog.primaryRailEntries.lastIndex
         assertEquals(CameraUiZone.ModeRail, wrapUpOutcome.state.camera.focusedZone)
         assertEquals(lastIndex, wrapUpOutcome.state.camera.highlightedPrimaryIndex)
 
-        // Navigate Down: should wrap back to 0
         val wrapDownOutcome = core.dispatch(CameraCommand.NavigateDown)
-        assertEquals(0, wrapDownOutcome.state.camera.highlightedPrimaryIndex)
+        assertEquals(CameraCatalog.SHUT_OFF_RAIL_INDEX, wrapDownOutcome.state.camera.highlightedPrimaryIndex)
+        assertEquals(0, core.dispatch(CameraCommand.NavigateDown).state.camera.highlightedPrimaryIndex)
     }
 
     @Test
@@ -352,6 +389,7 @@ class ControlCoreTest {
         val originalCameraMode = core.state.camera.activeMode
 
         core.dispatch(CameraCommand.OpenModeRail)
+        assertEquals("Shut Off", core.dispatch(CameraCommand.NavigateUp).state.camera.primaryHighlightedEntry.label)
         val diveEntry = core.dispatch(CameraCommand.NavigateUp)
         assertEquals("Dive Settings", diveEntry.state.camera.primaryHighlightedEntry.label)
         val lastEntry = core.dispatch(CameraCommand.NavigateUp)
@@ -809,7 +847,7 @@ class ControlCoreTest {
         ).state.camera
 
         assertEquals(120, CameraCatalog.captureFrameRateFps(highSpeed.settingValues["pro_video.frame_rate"]))
-        assertEquals(23.976, CameraCatalog.playbackFrameRateFps(highSpeed.settingValues["pro_video.frame_rate"]))
+        assertEquals(CameraCatalog.MATCH_CAPTURE, highSpeed.settingValues["pro_video.playback_fps"])
         assertEquals("Off", highSpeed.settingValues["pro_video.log"])
         assertEquals("Auto", highSpeed.settingValues["pro_video.iso"])
         assertEquals("Auto", highSpeed.settingValues["pro_video.shutter_speed"])
@@ -854,7 +892,7 @@ class ControlCoreTest {
 
         assertEquals("On", log.settingValues["pro_video.log"])
         assertEquals(
-            CameraCatalog.proVideoFrameRateOption(60),
+            "30fps",
             log.settingValues["pro_video.frame_rate"],
         )
     }
@@ -886,7 +924,7 @@ class ControlCoreTest {
         ).state.camera
         assertEquals("FHD", fhd.settingValues["pro_video.resolution"])
         assertEquals(
-            CameraCatalog.proVideoFrameRateOption(120),
+            "120fps",
             fhd.settingValues["pro_video.frame_rate"],
         )
 
@@ -896,7 +934,7 @@ class ControlCoreTest {
         ).state.camera
         assertEquals("UHD 4K", uhd.settingValues["pro_video.resolution"])
         assertEquals(
-            CameraCatalog.proVideoFrameRateOption(30),
+            "30fps",
             uhd.settingValues["pro_video.frame_rate"],
         )
 
@@ -906,7 +944,7 @@ class ControlCoreTest {
         ).state.camera
         assertEquals("8K", eightK.settingValues["pro_video.resolution"])
         assertEquals(
-            CameraCatalog.proVideoFrameRateOption(30),
+            "30fps",
             eightK.settingValues["pro_video.frame_rate"],
         )
     }
@@ -929,7 +967,8 @@ class ControlCoreTest {
             capabilities = caps,
             settingValues = CameraCatalog.defaultSettingValues +
                 ("pro_video.resolution" to "UHD 4K") +
-                ("pro_video.frame_rate" to "30fps"),
+                ("pro_video.frame_rate" to "30fps") +
+                ("pro_video.playback_fps" to "120fps"),
         )
         val fpsIndex = CameraCatalog.optionsMenuSettings(camera)
             .indexOfFirst { it.id == "pro_video.frame_rate" }
@@ -940,7 +979,7 @@ class ControlCoreTest {
         ).state.camera
 
         assertEquals(24, CameraCatalog.captureFrameRateFps(sixty.settingValues["pro_video.frame_rate"]))
-        assertEquals(23.976, CameraCatalog.playbackFrameRateFps(sixty.settingValues["pro_video.frame_rate"]))
+        assertEquals(CameraCatalog.MATCH_CAPTURE, sixty.settingValues["pro_video.playback_fps"])
         assertEquals("UHD 4K", sixty.settingValues["pro_video.resolution"])
     }
 
@@ -1832,7 +1871,7 @@ class ControlCoreTest {
     }
 
     @Test
-    fun `ok on the housing starts the vacuum check while the cap is off`() {
+    fun `down on the housing starts the vacuum check at the validated surface`() {
         val core = ControlCore()
         core.advanceBle(BleSignal.Ready)
         core.updatePermission(PermissionKind.Camera, true)
@@ -1844,10 +1883,13 @@ class ControlCoreTest {
         )
         assertEquals(SealState.CoverOpen, coverOpen.state.safety.sealState)
 
-        // 0x50 = OK. Borrowed by the seal check only in this window.
+        repeat(2) {
+            core.updateSensor(SensorUpdate.WaterPressure(101.3))
+            core.updateSensor(SensorUpdate.BarometricPressure(101.3))
+        }
         val start = core.handleNotificationPayload(
             HousingCharacteristic.ButtonEvents.shortHex,
-            byteArrayOf(0x50.toByte()),
+            byteArrayOf(0x61.toByte()),
             Instant.parse("2026-08-04T12:00:00Z"),
         )
 

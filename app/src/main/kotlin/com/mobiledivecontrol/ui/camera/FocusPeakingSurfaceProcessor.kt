@@ -177,6 +177,8 @@ void main() {
 
     // ── Public knobs ──────────────────────────────────────────────────
     @Volatile var peakingEnabled = false
+    @Volatile var reduceViewfinderLoad = false
+    private var lastPreviewTimestampNs = 0L
     /** 0 off, 1 zebra 70 IRE, 2 zebra 95 IRE, 3 false colour. */
     @Volatile var exposureAssistMode = 0
 
@@ -394,6 +396,7 @@ void main() {
                     }
                     val egl = EGL14.eglCreateWindowSurface(dpy, cfg, surface, intArrayOf(EGL14.EGL_NONE), 0)
                     check(egl != EGL14.EGL_NO_SURFACE) { "Could not connect portrait output" }
+                    if (frameShader is PortraitPhotoPreview) frameShader.onOutput(output)
                     effectOutputs += EffectOutput(output, egl, generation)
                     return@post
                 }
@@ -461,6 +464,9 @@ void main() {
             }
             st.updateTexImage()
             val sourceFrameTimestampNs = st.timestamp
+            // Drain every input buffer. On this preview-only output, skip the GPU pass
+            // between display frames. The encoder has its own surface.
+            if (skipWarmPreviewFrame(reduceViewfinderLoad, lastPreviewTimestampNs, sourceFrameTimestampNs)) return
             st.getTransformMatrix(stm)
             // Ask CameraX what the output surface actually wants: it composes the input
             // transform with whatever rotation/crop this pipeline shape introduces.
@@ -493,6 +499,7 @@ void main() {
 
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             if (EGL14.eglSwapBuffers(dpy, outEgl)) {
+                lastPreviewTimestampNs = sourceFrameTimestampNs
                 directFirstFrame?.let { callback ->
                     directFirstFrame = null
                     cbExecutor.execute { if (!released) callback() }
@@ -529,9 +536,13 @@ void main() {
             for (entry in effectOutputs) {
                 if (entry.generation != generation) continue
                 val output = entry.output
+                val preview = output.targets and androidx.camera.core.CameraEffect.PREVIEW != 0
+                // A combined target can feed a recording. Only skip a dedicated display surface.
+                if (output.targets == androidx.camera.core.CameraEffect.PREVIEW &&
+                    skipWarmPreviewFrame(reduceViewfinderLoad, lastPreviewTimestampNs, timestamp)) continue
                 if (!EGL14.eglMakeCurrent(dpy, entry.egl, entry.egl, ctx)) continue
                 output.updateTransformMatrix(outStm, stm)
-                val preview = output.targets and androidx.camera.core.CameraEffect.PREVIEW != 0
+                if (frameShader is PortraitPhotoPreview) frameShader.prepare(inTex, outStm)
                 GLES20.glViewport(0, 0, output.size.width, output.size.height)
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                 GLES20.glUseProgram(prog)
@@ -553,6 +564,7 @@ void main() {
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
                 android.opengl.EGLExt.eglPresentationTimeANDROID(dpy, entry.egl, timestamp)
                 if (EGL14.eglSwapBuffers(dpy, entry.egl) && preview) {
+                    lastPreviewTimestampNs = timestamp
                     lastDrawSuccessAtMs = SystemClock.elapsedRealtime()
                     CameraPipelineTelemetry.recordDisplayedFrame(cameraGeneration, lastDrawSuccessAtMs, timestamp)
                 }

@@ -19,7 +19,7 @@ class DepthGaugeColorTest {
     fun `heading shares arrow success colour when synchronized`() {
         assertEquals(
             DiveColors.Success,
-            headingReadoutColor(headingDegrees = 356.0, headingTargetSynchronized = true),
+            headingReadoutColor(formatHeading(356.0), headingTargetSynchronized = true),
         )
     }
 
@@ -27,7 +27,7 @@ class DepthGaugeColorTest {
     fun `heading uses navigation colour outside synchronization tolerance`() {
         assertEquals(
             DiveColors.HeadingViolet,
-            headingReadoutColor(headingDegrees = 356.0, headingTargetSynchronized = false),
+            headingReadoutColor(formatHeading(356.0), headingTargetSynchronized = false),
         )
     }
 
@@ -35,7 +35,14 @@ class DepthGaugeColorTest {
     fun `missing heading stays muted even with stale synchronization state`() {
         assertEquals(
             DiveColors.TextMuted,
-            headingReadoutColor(headingDegrees = null, headingTargetSynchronized = true),
+            headingReadoutColor(null, headingTargetSynchronized = true),
         )
+    }
+
+    @Test fun `bearing label retains wrap and cardinal boundaries`() {
+        assertEquals("000° N", formatHeading(-0.4))
+        assertEquals("000° N", formatHeading(359.6))
+        assertEquals("022° N", formatHeading(22.49))
+        assertEquals("023° NE", formatHeading(22.5))
     }
 }

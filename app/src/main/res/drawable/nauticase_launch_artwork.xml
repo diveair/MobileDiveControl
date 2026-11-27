@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Welcome artwork for the system starting window. -->
+    <item>
+        <inset android:insetLeft="20%" android:insetRight="20%"
+            android:insetTop="40%" android:insetBottom="31.64%">
+            <bitmap android:src="@drawable/nauticase_logo" android:gravity="fill" android:filter="true" />
+        </inset>
+    </item>
+    <item android:drawable="@drawable/nauticase_launch_greeting" />
+</layer-list>

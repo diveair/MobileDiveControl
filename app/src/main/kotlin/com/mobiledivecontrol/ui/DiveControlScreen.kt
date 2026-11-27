@@ -24,9 +24,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.mobiledivecontrol.FirstLaunchSealStep
 import com.mobiledivecontrol.core.AppMode
+import com.mobiledivecontrol.core.vacuumMenuAvailable
 import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.BleConnectionState
+import com.mobiledivecontrol.core.HousingSealTransitions.Banner
 import com.mobiledivecontrol.core.DiagnosticsCommand
 import com.mobiledivecontrol.core.PlatformEffect
 import com.mobiledivecontrol.core.SafetyState
@@ -34,6 +37,7 @@ import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.ui.camera.CameraShellScreen
 import com.mobiledivecontrol.ui.camera.PointingGesture
 import com.mobiledivecontrol.platform.CompassReading
+import kotlinx.coroutines.flow.StateFlow
 import com.mobiledivecontrol.ui.diagnostics.DiagnosticsScreen
 import com.mobiledivecontrol.ui.safety.SafetyScreen
 import com.mobiledivecontrol.ui.tutorial.IntroCarouselScreen
@@ -65,7 +69,8 @@ fun DiveControlScreen(
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)? = null,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     onPointingGesture: ((PointingGesture) -> Unit)? = null,
-    compassReading: CompassReading = CompassReading(),
+    compassReadings: StateFlow<CompassReading>,
+    onCompassMonitoring: (Boolean) -> Unit,
     targetHeading: Double? = null,
     onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit = {},
     onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit = {},
@@ -81,6 +86,9 @@ fun DiveControlScreen(
     capPromptVisible: Boolean = false,
     onCapPromptDismiss: () -> Unit = {},
     welcomeVisible: Boolean = false,
+    showSealOnWelcome: Boolean = true,
+    firstLaunchSealStep: FirstLaunchSealStep = FirstLaunchSealStep.Done,
+    onIntroPromptFinished: (FirstLaunchSealStep) -> Unit = {},
     onWelcomeFinished: () -> Unit = {},
     bluetoothEnabled: Boolean = true,
     modifier: Modifier = Modifier,
@@ -98,7 +106,9 @@ fun DiveControlScreen(
             onCapabilities = onCapabilities,
             onMeteredExposure = onMeteredExposure,
             onPointingGesture = onPointingGesture,
-            compassReading = compassReading,
+            compassReadings = compassReadings,
+            compassCovered = welcomeVisible || introVisible || capPromptVisible,
+            onCompassMonitoring = onCompassMonitoring,
             targetHeading = targetHeading,
             onCameraCommand = onCameraCommand,
             onGalleryCommand = onGalleryCommand,
@@ -113,6 +123,8 @@ fun DiveControlScreen(
         // camera mode that the user cannot operate yet.
         if (shouldShowIntroLayer(introVisible)) {
             IntroCarouselScreen(
+                firstLaunchSealStep = firstLaunchSealStep,
+                onIntroPromptFinished = onIntroPromptFinished,
                 permissionsGranted = permissionsGranted,
                 missingPermissions = missingPermissions,
                 permissionDialogVisible = permissionDialogVisible,
@@ -129,9 +141,6 @@ fun DiveControlScreen(
                 modifier = Modifier.fillMaxSize(),
             )
         }
-        if (!introVisible && !capPromptVisible) com.mobiledivecontrol.ui.dive.DiveAlertLayer(
-            state, useMetric, onDiveSettingsCommand)
-
         // Welcome card, shown first on every launch, above everything. It fades out onto what is
         // already composed underneath: the intro's housing artwork on a first launch (ready for the
         // permission prompts that follow), the live camera otherwise.
@@ -141,6 +150,7 @@ fun DiveControlScreen(
             exit = fadeOut(tween(WELCOME_FADE_OUT_MS)),
         ) {
             WelcomeSplashScreen(
+                showSealInstruction = showSealOnWelcome,
                 onFinished = onWelcomeFinished,
                 modifier = Modifier.fillMaxSize(),
             )
@@ -172,7 +182,9 @@ private fun DiveControlContent(
     onCapabilities: ((com.mobiledivecontrol.core.CameraCapabilities) -> Unit)?,
     onMeteredExposure: ((com.mobiledivecontrol.core.MeteredExposure) -> Unit)? = null,
     onPointingGesture: ((PointingGesture) -> Unit)? = null,
-    compassReading: CompassReading = CompassReading(),
+    compassReadings: StateFlow<CompassReading>,
+    compassCovered: Boolean,
+    onCompassMonitoring: (Boolean) -> Unit,
     targetHeading: Double? = null,
     onCameraCommand: (com.mobiledivecontrol.core.CameraCommand) -> Unit,
     onGalleryCommand: (com.mobiledivecontrol.core.GalleryCommand) -> Unit,
@@ -189,13 +201,17 @@ private fun DiveControlContent(
         AppMode.CameraLive else state.mode
     CameraHudOverlay(
         state = state.copy(mode = displayMode),
+        lifecycleOwner = lifecycleOwner,
         liveWaterPressureKpa = liveWaterPressure,
         useMetric = useMetric,
         bluetoothEnabled = bluetoothEnabled,
-        compassReading = compassReading,
+        compassReadings = compassReadings,
+        compassCovered = compassCovered,
+        onCompassMonitoring = onCompassMonitoring,
         targetHeading = targetHeading,
         hudVisible = displayMode != AppMode.Diagnostics && displayMode != AppMode.DiveSettings,
         onSafetyCommand = onSafetyCommand,
+        onDiveSettingsCommand = onDiveSettingsCommand.takeUnless { compassCovered },
     ) {
         AnimatedContent(
             // CameraLive <-> CameraAdjust used to create two CameraShellScreen instances during
@@ -211,6 +227,7 @@ private fun DiveControlContent(
             when (mode) {
                 AppMode.CameraLive, AppMode.CameraAdjust -> CameraShellScreen(
                     safetyStopActive = state.diveProfile.stopActive,
+                    vacuumMenuAvailable = state.vacuumMenuAvailable,
                     cameraState = state.camera,
                     safetyState = state.safety.copy(waterPressureKpa = liveWaterPressure),
                     cameraPermissionGranted = cameraPermissionGranted,
@@ -223,8 +240,8 @@ private fun DiveControlContent(
                     onMeteredExposure = onMeteredExposure,
                     onPointingGesture = onPointingGesture,
                     onCameraCommand = onCameraCommand,
-                    headingDegrees = compassReading.headingDegrees,
-                    warningMessage = cameraFailureBannerMessage(state.lastWarning),
+                    compassReadings = compassReadings,
+                    warningMessage = cameraFailureBannerMessage(state.lastWarning, state.safety.sealMonitor.banner, state.safety.warning),
                 )
                 AppMode.Safety -> SafetyScreen(safety = state.safety)
                 AppMode.Diagnostics -> DiagnosticsScreen(
@@ -253,11 +270,15 @@ private fun DiveControlContent(
  * permission, and seal states already have dedicated UI; repeating them here creates the exact
  * stacked "HOUSING DISCONNECTED" / "HOUSING NOT CONNECTED" duplication the user cannot dismiss.
  */
-internal fun cameraFailureBannerMessage(message: String?): String? {
+internal fun cameraFailureBannerMessage(message: String?, sealBanner: Banner = Banner.B00, sealWarning: String? = null): String? {
+    if (sealBanner == Banner.ConfirmRelease || sealBanner == Banner.Release) return null
     val value = message?.trim()?.takeIf(String::isNotEmpty) ?: return null
+    if (sealBanner == Banner.B17 && value == sealWarning) return null
     val duplicateStatus = value.startsWith("Housing ", ignoreCase = true) ||
         value.startsWith("Bluetooth ", ignoreCase = true) ||
         value.startsWith("GATT discovery:", ignoreCase = true) ||
+        (value.startsWith("Pressure unstable after ") && value.endsWith("s: leak detected.")) ||
+        (value.startsWith("Pressure back to ambient after ") && value.endsWith("s: cover open or seal lost.")) ||
         value.contains(" Permission:", ignoreCase = true) ||
         value.startsWith("Verified vacuum held across restart", ignoreCase = true)
     return value.takeUnless { duplicateStatus }

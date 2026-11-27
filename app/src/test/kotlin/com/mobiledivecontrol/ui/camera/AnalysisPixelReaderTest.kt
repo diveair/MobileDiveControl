@@ -11,9 +11,9 @@ import org.junit.jupiter.api.Test
 class AnalysisPixelReaderTest {
     private fun plane(bytes: ByteArray, rowStride: Int, pixelStride: Int) =
         object : ImageProxy.PlaneProxy {
-            override fun getBuffer() = ByteBuffer.wrap(bytes)
-            override fun getRowStride() = rowStride
-            override fun getPixelStride() = pixelStride
+            override val buffer: ByteBuffer get() = ByteBuffer.wrap(bytes)
+            override val rowStride = rowStride
+            override val pixelStride = pixelStride
         }
 
     private fun image(format: Int, vararg planes: ImageProxy.PlaneProxy): ImageProxy =

@@ -122,9 +122,12 @@ class CompassHeadingMonitor(context: Context) : SensorEventListener {
         if (!registered) return
         sensorManager.unregisterListener(this)
         registered = false
+        accuracy = CompassAccuracy.Unreliable
+        _reading.value = CompassReading(accuracy = accuracy)
     }
 
     override fun onSensorChanged(event: SensorEvent) {
+        if (!registered) return
         val now = SystemClock.elapsedRealtime()
         if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
             lastGyroX = event.values.getOrElse(0) { 0f }.toDouble()
@@ -227,15 +230,15 @@ class CompassHeadingMonitor(context: Context) : SensorEventListener {
         // Correct yaw in the basis as well as the number. Otherwise a steady "327°" could sit
         // above an arrow still moving on sub-degree raw magnetometer changes. World-up rotation
         // preserves the rotation matrix's pitch, roll and orthonormality.
-        val stableBasis = HeadingMath.alignBasisHeading(cameraBasis, stableHeading)
         if (now - lastPublishedAtMs >= PUBLISH_INTERVAL_MS) {
+            val stableBasis = HeadingMath.alignBasisHeading(cameraBasis, stableHeading)
             _reading.value = CompassReading(stableHeading, accuracy, stableBasis)
             lastPublishedAtMs = now
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, value: Int) {
-        if (sensor != magneticSensor) return
+        if (!registered || sensor != magneticSensor) return
         accuracy = when (value) {
             SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> CompassAccuracy.High
             SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> CompassAccuracy.Medium

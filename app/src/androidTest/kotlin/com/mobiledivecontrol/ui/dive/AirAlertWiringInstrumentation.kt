@@ -147,11 +147,47 @@ class AirAlertWiringInstrumentation : Instrumentation() {
             runOnMainSync {
                 fresh(settings)
                 core.restoreCameraSnapshot(core.state.camera.copy(activeMode = CameraModeId.ProVideo), AppMode.CameraLive)
-                sample(20.0); advance(29); now += 500; sample(5.0); publish()
+                sample(20.0); advance(28); now += 500; sample(7.0); publish()
+            }
+            show()
+            check(nodes().none { it.text?.toString()?.contains("SAFETY STOP") == true })
+            runOnMainSync {
+                check(!core.state.diveProfile.stopBannerVisible)
+                now += 500; sample(6.0)
+                check(!core.state.diveProfile.stopBannerVisible)
+                now += 500; sample(5.0); publish()
             }
             expect("OK  MINIMIZE")
             capture("stop-expanded-ok")
             click("OK  MINIMIZE")
+            expect("SAFETY STOP: 3:00 | 5.0m")
+            check(nodes().none { it.text?.contains(" | 5.0m | 5.0m") == true })
+            for (depth in listOf(3.5, 6.5)) {
+                for (rate in listOf(-6.0, 0.0, 6.0)) {
+                    runOnMainSync {
+                        val current = core.state.diveProfile
+                        val phase = when {
+                            depth < 5 -> DiveStopPhase.TooShallow
+                            rate < 0 -> DiveStopPhase.Holding
+                            else -> DiveStopPhase.TooDeep
+                        }
+                        val profile = current.copy(depthMeters = depth, verticalMetersPerMinute = rate,
+                            active = current.active!!.copy(phase = phase))
+                        rendered.value = core.state.copy(diveProfile = profile)
+                    }
+                    val direction = when {
+                        rate < 0 -> "ASCENDING"
+                        rate > 0 -> "DESCENDING"
+                        depth < 5 -> "DESCEND"
+                        else -> "TOO DEEP"
+                    }
+                    expect(if (depth < 5) "TOO SHALLOW" else "SAFETY STOP")
+                    expect(direction)
+                    if (rate == 0.0) check(nodes().none { it.text?.contains("ASCENDING") == true || it.text?.contains("DESCENDING") == true })
+                    check(nodes().none { it.text?.contains("WARNING $direction") == true || it.text?.contains("/sec") == true })
+                }
+            }
+            checks += "The minimized row shows direction at both warning depths and keeps the full motion badge closed"
             runOnMainSync {
                 check(core.state.diveProfile.stopPresentation == DiveStopPresentation.Minimized)
                 core.dispatch(DiveSettingsCommand.ExpandStop)
@@ -159,7 +195,7 @@ class AirAlertWiringInstrumentation : Instrumentation() {
             }
             expect("CHECK YOUR AIR"); expect("SAFETY STOP")
             fun assertStack() {
-                val stop = nodes().first { it.text?.toString()?.contains("SAFETY STOP") == true }
+                val stop = nodes().first { it.text?.toString()?.startsWith("SAFETY STOP: ") == true }
                 val air = nodes().first { it.text?.toString()?.contains("CHECK YOUR AIR") == true }
                 val a = android.graphics.Rect(); val b = android.graphics.Rect()
                 stop.getBoundsInScreen(a); air.getBoundsInScreen(b)

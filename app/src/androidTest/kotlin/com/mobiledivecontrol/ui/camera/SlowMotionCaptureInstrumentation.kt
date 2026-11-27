@@ -16,6 +16,8 @@ import com.mobiledivecontrol.MainActivity
 import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.CameraModeId
+import com.mobiledivecontrol.core.BottomBarItem
+import com.mobiledivecontrol.ui.currentCameraResolutionStatusLabel
 import com.mobiledivecontrol.viewmodel.DiveViewModel
 import java.io.File
 import org.json.JSONArray
@@ -31,7 +33,10 @@ class SlowMotionCaptureInstrumentation : Instrumentation() {
         start()
     }
 
-    override fun onStart() = runSlowMotionRecordingProbe(arguments)
+    override fun onStart() {
+        if (arguments.getString("thermalPreview") == "true") runThermalViewfinderProbe(arguments.getString("lens") ?: "1x")
+        else runSlowMotionRecordingProbe(arguments)
+    }
 }
 
 internal fun Instrumentation.runSlowMotionRecordingProbe(arguments: Bundle) {
@@ -75,23 +80,51 @@ internal fun Instrumentation.runSlowMotionRecordingProbe(arguments: Bundle) {
                 val spec = CameraCatalog.settingsFor(state).first { it.id == "$prefix.$suffix" }
                 val current = CameraCatalog.currentValue(state, spec)
                 require(value in spec.options) { "$suffix=$value unavailable: ${spec.options}" }
-                if (current != value) dispatch(CameraCommand.NudgeSetting(spec.id,
-                    spec.options.indexOf(value) - spec.options.indexOf(current)))
-                SystemClock.sleep(1800)
-                check(model.state.value.camera.settingValues[spec.id] == value) {
-                    "$suffix did not accept $value: ${model.state.value.camera.settingValues[spec.id]}"
+                if (current != value) {
+                    dispatch(CameraCommand.NudgeSetting(spec.id,
+                        spec.options.indexOf(value) - spec.options.indexOf(current)))
+                    await("$suffix=$value") {
+                        val camera = model.state.value.camera
+                        CameraCatalog.settingsFor(camera).firstOrNull { it.id == spec.id }
+                            ?.let { CameraCatalog.currentValue(camera, it) == value } == true
+                    }
+                    SystemClock.sleep(1800)
                 }
             }
-            select("lens", arguments.getString("lens") ?: "1x")
+            val lens = arguments.getString("lens") ?: "1x"
+            val initialCamera = model.state.value.camera
+            val initialOptions = CameraCatalog.settingsFor(initialCamera).associate { it.id to CameraCatalog.currentValue(initialCamera, it) }
+            select("lens", lens)
+            await("video capabilities for $lens") { model.state.value.camera.capabilities?.videoCaptureLens == lens }
             if (mode == CameraModeId.ProVideo) { select("log", "Off"); select("hdr", "Off") }
             val requestedResolution = arguments.getString("resolution")?.replace('_', ' ') ?: "FHD"
-            if (requestedResolution != "FHD") select("frame_rate", if (mode == CameraModeId.ProVideo) CameraCatalog.proVideoFrameRateOption(30) else "30fps")
             select("resolution", requestedResolution)
+            if (arguments.getString("qualify") == "true" && 120 in model.state.value.camera.capabilities?.pendingUhdRates.orEmpty()) {
+                val monitor = addMonitor(UhdRateTestActivity::class.java.name, null, false)
+                val qualification = try {
+                    dispatch(CameraCommand.VerifyUhdRates)
+                    checkNotNull(waitForMonitorWithTimeout(monitor, 10_000)) { "UHD test screen did not open" }
+                } finally { removeMonitor(monitor) }
+                val verdict = try { measureUhdRate(qualification, 120) } finally { runOnMainSync { qualification.finish() } }
+                report.put("qualification", verdict)
+                check(verdict.startsWith("Verified")) { verdict }
+                await("verified UHD 120 in the settings strip") {
+                    120 in model.state.value.camera.capabilities?.verifiedDirectUhdRates.orEmpty()
+                }
+            }
+            val camera = model.state.value.camera
+            val offered = CameraCatalog.settingsFor(camera).single { it.id == "$prefix.frame_rate" }.options
+            val rates = arguments.getString("rates")?.split(',')?.map(String::toInt)
+                ?: listOf(120, 240, 60).filter { "${it}fps" in offered }
+            report.put("lens", lens).put("resolution", requestedResolution)
+                .put("requestedRates", JSONArray(rates)).put("offeredRates", JSONArray(offered))
+            require(rates.isNotEmpty() && rates.all { "${it}fps" in offered }) {
+                "$mode $lens $requestedResolution requested $rates FPS; selectable rates: $offered"
+            }
             select(if (mode == CameraModeId.ProVideo) "exposure_value" else "exposure", arguments.getString("exposure") ?: "0.0")
             arguments.getString("torch")?.let { select("flash", it) }
             val clips = JSONArray()
             report.put("clips", clips)
-            val rates = (arguments.getString("rates") ?: "120,240,60,48").split(',').map(String::toInt)
             fun previewPhase(fps: Int, phase: String) {
                 if (arguments.getString("previewProbe") == "true") {
                     sendStatus(0, Bundle().apply { putString("stream", "Preview phase $fps $phase\n") })
@@ -99,13 +132,27 @@ internal fun Instrumentation.runSlowMotionRecordingProbe(arguments: Bundle) {
                 }
             }
             for (fps in rates) {
-                select("frame_rate", if (mode == CameraModeId.ProVideo) CameraCatalog.proVideoFrameRateOption(fps) else "${fps}fps")
+                select("frame_rate", "${fps}fps")
+                arguments.getString("playback")?.let { select("playback_fps", it) }
+                val selected = model.state.value.camera
+                if (mode == CameraModeId.SlowMotion) {
+                    val rail = CameraCatalog.settingsBarItems(selected).filterIsInstance<BottomBarItem.Setting>()
+                        .single { it.spec.id == "$prefix.frame_rate" }.spec
+                    check(rail.options == offered && CameraCatalog.currentValue(selected, rail) == "${fps}fps")
+                    check(currentCameraResolutionStatusLabel(selected)?.contains("$fps FPS ") == true)
+                }
                 arguments.getString("focus")?.let { select("focus_mode", it.replace('_', ' ')) }
                 arguments.getString("zoom")?.toDoubleOrNull()?.let {
                     dispatch(CameraCommand.SetZoom(it))
                     SystemClock.sleep(500)
                 }
                 check(model.state.value.camera.settingValues["$prefix.lens"] == (arguments.getString("lens") ?: "1x"))
+                if (arguments.getString("selectOnly") == "true") {
+                    sendStatus(0, Bundle().apply {
+                        putString("stream", "$lens: ${currentCameraResolutionStatusLabel(selected)}; rates=$offered\n")
+                    })
+                    continue
+                }
                 val previousSaved = latestSaved()
                 previewPhase(fps, "before")
                 sendStatus(0, Bundle().apply { putString("stream", "Capturing slow motion $fps fps\n") })
@@ -171,6 +218,14 @@ internal fun Instrumentation.runSlowMotionRecordingProbe(arguments: Bundle) {
                     check(frames > 0) { "Empty $fps fps recording" }
                     check(backwards == 0) { "Non-monotonic playback timestamps at $fps fps" }
                     clip.put("frames", frames).put("lastTimestampUs", previousUs)
+                    val measured = frames * 1000.0 / RecordingClock.durationMs.value
+                    clip.put("captureAverageFps", measured)
+                    if (mode == CameraModeId.SlowMotion) {
+                        check(RecordingClock.reviewFrameCount.value == frames) { "Review count differs from the MP4's $frames samples" }
+                        if (arguments.getString("verifyRate") == "true") {
+                            check(kotlin.math.abs(measured / fps - 1.0) <= 0.05) { "Requested $fps FPS, recorded $measured FPS" }
+                        }
+                    }
                 } finally { extractor.release() }
                 clips.put(clip)
                 report.put("settings", JSONObject(model.state.value.camera.settingValues))
@@ -194,6 +249,13 @@ internal fun Instrumentation.runSlowMotionRecordingProbe(arguments: Bundle) {
                     await("delete") { !model.state.value.camera.recording }
                 }
                 previewPhase(fps, "after")
+            }
+            if (arguments.getString("restoreSettings") == "true") {
+                for (suffix in listOf("lens", "resolution", "frame_rate", "playback_fps", "exposure")) {
+                    initialOptions["$prefix.$suffix"]?.let { select(suffix, it) }
+                }
+                val restored = model.state.value.camera
+                report.put("restoredHud", currentCameraResolutionStatusLabel(restored))
             }
             report.put("result", "passed")
             File(directory, "report.json").writeText(report.toString(2))

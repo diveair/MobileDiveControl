@@ -1,5 +1,6 @@
 package com.mobiledivecontrol.ui.gallery
 
+import com.mobiledivecontrol.ui.components.MessageBanner
 import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Size
@@ -1131,7 +1132,7 @@ private fun MoveDestinationGrid(galleryState: GalleryState, onCommand: (GalleryC
             onBack = { onCommand(GalleryCommand.Back) },
         )
         if (galleryState.moveTargets.isEmpty()) {
-            EmptyGallery(galleryState.operationMessage ?: "No other albums available")
+            Box(Modifier.weight(1f).fillMaxWidth()) { EmptyGallery(galleryState.operationMessage ?: "No other albums available") }
         } else {
             val gridState = rememberLazyGridState()
             LaunchedEffect(galleryState.moveTargetIndex) {
@@ -1142,7 +1143,7 @@ private fun MoveDestinationGrid(galleryState: GalleryState, onCommand: (GalleryC
                 state = gridState,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
-                modifier = Modifier.fillMaxSize().padding(18.dp),
+                modifier = Modifier.weight(1f).fillMaxWidth().padding(18.dp),
             ) {
                 itemsIndexed(galleryState.moveTargets, key = { _, item -> item.path }) { index, album ->
                     AlbumCard(
@@ -1363,14 +1364,9 @@ private fun EmptyGallery(message: String) {
 
 @Composable
 private fun OperationBanner(message: String, modifier: Modifier = Modifier) {
-    Text(
-        text = message,
-        color = DiveColors.TextPrimary,
-        style = MaterialTheme.typography.labelLarge,
-        modifier = modifier
-            .padding(top = 12.dp)
-            .background(DiveColors.DeepBlack.copy(alpha = 0.9f), RoundedCornerShape(12.dp))
-            .border(1.dp, DiveColors.DiveCyan.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
-            .padding(horizontal = 14.dp, vertical = 8.dp),
-    )
+    MessageBanner(DiveColors.DeepBlack.copy(alpha = 0.9f), modifier.padding(top = 12.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, DiveColors.DiveCyan.copy(alpha = 0.45f))) {
+        Text(message, color = DiveColors.TextPrimary, style = MaterialTheme.typography.labelLarge,
+            textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 14.dp))
+    }
 }

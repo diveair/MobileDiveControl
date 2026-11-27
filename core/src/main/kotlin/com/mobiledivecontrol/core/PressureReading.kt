@@ -36,3 +36,9 @@ fun pressureDepthMeters(waterKpa: Double?): Double? {
     return ((water - STANDARD_SURFACE_PRESSURE_KPA) / FRESHWATER_KPA_PER_METER)
         .coerceIn(0.0, 300.0)
 }
+
+fun depthInDisplayUnits(meters: Double, useMetric: Boolean): Double = if (useMetric) meters else meters * 3.28084
+
+/** The HUD rounds nonnegative depth to one decimal place in the selected unit. */
+fun depthReadsZero(meters: Double?, useMetric: Boolean): Boolean =
+    meters != null && meters >= 0.0 && depthInDisplayUnits(meters, useMetric) < 0.05

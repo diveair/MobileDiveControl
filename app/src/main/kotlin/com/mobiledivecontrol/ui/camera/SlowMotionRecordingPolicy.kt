@@ -3,8 +3,8 @@ package com.mobiledivecontrol.ui.camera
 /** Slow-motion policy only; ordinary Video, Pro Video and Hyperlapse keep their own contracts. */
 internal object SlowMotionRecordingPolicy {
     fun sourceFrameRate(captureFps: Int): Int {
-        require(captureFps in setOf(24, 30, 48, 60, 100, 120, 240))
-        return when (captureFps) { 48 -> 60; 100 -> 120; else -> captureFps }
+        require(captureFps > 0)
+        return captureFps
     }
 
     /** Match Samsung's FHD HEVC budget per frame on the encoder's configured timestamp clock. */

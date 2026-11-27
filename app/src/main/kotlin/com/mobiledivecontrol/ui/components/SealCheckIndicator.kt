@@ -1,9 +1,14 @@
 package com.mobiledivecontrol.ui.components
 
+import android.graphics.Typeface
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -11,8 +16,11 @@ import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -27,19 +35,27 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextGeometricTransform
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.mobiledivecontrol.core.NO_SUCTION_WARNING
+import com.mobiledivecontrol.core.HousingSealTransitions.Banner
+import com.mobiledivecontrol.core.HousingSealTransitions.Location
 import com.mobiledivecontrol.core.SLOW_LEAK_WARNING_PREFIX
-import com.mobiledivecontrol.core.VACUUM_NOT_BUILDING_WARNING
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.staticCompositionLocalOf
 import com.mobiledivecontrol.core.SafetyState
 import com.mobiledivecontrol.core.SafetyCommand
 import com.mobiledivecontrol.core.VacuumReleaseChoice
@@ -69,14 +85,18 @@ import kotlinx.coroutines.delay
  * Renders nothing at all when there is no housing on the link, when the check has been dismissed,
  * or ten seconds after a result — the viewfinder is the product.
  */
+val LocalSealBannerObserver = staticCompositionLocalOf<(Banner?) -> Unit> { {} }
+
 @Composable
 fun SealCheckIndicator(
     safety: SafetyState,
     housingConnected: Boolean,
+    zeroDepth: Boolean,
     /** Where the top-anchored elements sit; the centred banners ignore it by design. */
     topPadding: Dp = 0.dp,
     /** Actual top-chip/banner height, so neighbouring HUD elements never guess its footprint. */
     onTopContentHeightChanged: (Int) -> Unit = {},
+    showStatus: Boolean = true,
     /** Only the background edges remain visible while the full safety-stop card covers this banner. */
     coveredBackdrop: Color? = null,
     onCommand: (SafetyCommand) -> Unit = {},
@@ -93,33 +113,50 @@ fun SealCheckIndicator(
             resultVisible = false
         }
     }
-    val stage = if (housingConnected) sealStage(safety) else null
+    val holdStart = safety.leakMonitoringStartedAtEpochMs?.takeIf {
+        housingConnected && safety.sealMonitor.banner == Banner.B16 &&
+            (safety.sealState == SealState.LeakMonitoring || safety.sealState == SealState.Passed)
+    }
+    var phase by remember(holdStart) { androidx.compose.runtime.mutableIntStateOf(leakTestPhase(holdStart, System.currentTimeMillis())) }
+    LaunchedEffect(holdStart) {
+        if (holdStart == null) return@LaunchedEffect
+        for (boundary in listOf(4_500L, PROVISIONAL_MS)) {
+            delay((holdStart + boundary - System.currentTimeMillis()).coerceAtLeast(0L))
+            phase = leakTestPhase(holdStart, System.currentTimeMillis())
+        }
+    }
+    val stage = if (housingConnected) sealStage(safety, phase, zeroDepth) else null
     val visibleStage = stage?.takeUnless {
-        safety.sealState == SealState.Passed && !resultVisible
+        safety.sealMonitor.banner == Banner.Status && (!resultVisible || !showStatus)
     }
     val hasTopContent = visibleStage != null && !visibleStage.centered
     LaunchedEffect(hasTopContent) {
         if (!hasTopContent) onTopContentHeightChanged(0)
     }
+    val observer = LocalSealBannerObserver.current
+    val displayed = safety.sealMonitor.banner.takeIf { visibleStage != null }
+    DisposableEffect(observer, displayed) {
+        observer(displayed)
+        onDispose { observer(null) }
+    }
     if (visibleStage == null) return
 
     Box(modifier = modifier) {
         when {
-            safety.vacuumReleasedPrompt -> VacuumReleaseBanner(
-                safety = safety,
-                onCommand = onCommand,
-                modifier = Modifier.align(Alignment.Center).fillMaxWidth(CENTERED_BANNER_WIDTH),
-            )
-            // The two ask-the-diver moments take the centre of the screen: they are the only seal
-            // stages that exist purely to be answered, and centre is where an instruction that
-            // owns the next button press belongs. Everything that merely *reports* stays at the
-            // top edge where it cannot sit on the subject.
-            visibleStage.centered -> CenteredSealBanner(
-                stage = if (coveredBackdrop != null) visibleStage.copy(background = coveredBackdrop) else visibleStage,
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .fillMaxWidth(CENTERED_BANNER_WIDTH),
-            )
+            visibleStage.centered -> {
+                val release = displayed == Banner.Release || displayed == Banner.ConfirmRelease
+                MessageBanner(
+                    background = if (release) DiveColors.DeepBlack else (coveredBackdrop ?: visibleStage.background).copy(alpha = 0.94f),
+                    modifier = Modifier.align(Alignment.Center),
+                    border = if (release) BorderStroke(1.dp, DiveColors.DiveCyan.copy(alpha = 0.55f)) else null,
+                ) {
+                    when {
+                        release -> VacuumReleaseBanner(safety, onCommand)
+                        displayed == Banner.B15 -> InspectionBanner(visibleStage)
+                        else -> CenteredSealBanner(visibleStage, isVacuumSetup = displayed == Banner.B03)
+                    }
+                }
+            }
 
             visibleStage.fullWidth -> SealBanner(
                 stage = visibleStage,
@@ -142,44 +179,115 @@ fun SealCheckIndicator(
 }
 
 @Composable
+private fun vacuumHeadlineStyle() = MaterialTheme.typography.headlineSmall.copy(
+    fontWeight = FontWeight.Bold, fontSize = 24.sp, letterSpacing = 1.sp, textAlign = TextAlign.Center)
+
+@Composable
+private fun vacuumDetailStyle() = MaterialTheme.typography.titleMedium.copy(
+    fontWeight = FontWeight.SemiBold, fontSize = 17.sp, textAlign = TextAlign.Center)
+
+@Composable
+private fun InspectionBanner(stage: SealStage) {
+    val condensed = remember { FontFamily(Typeface.create("sans-serif-condensed", Typeface.BOLD)) }
+    Column(Modifier.fillMaxWidth().padding(start = 6.dp, end = 6.dp, top = 7.dp),
+        horizontalAlignment = Alignment.CenterHorizontally) {
+        AutoShrinkText(stage.headline, color = stage.foreground, maxLines = 1, modifier = Modifier.fillMaxWidth(),
+            style = vacuumHeadlineStyle().copy(fontSize = 26.sp, lineHeight = 28.sp, letterSpacing = 0.5.sp))
+        val detail = remember(stage.detail) { AnnotatedString(requireNotNull(stage.detail)) }
+        val preferred = vacuumDetailStyle().copy(fontFamily = condensed, fontWeight = FontWeight.Bold,
+            fontSize = 18.sp, lineHeight = 20.sp, letterSpacing = 0.sp)
+        val density = LocalDensity.current
+        val measurer = rememberTextMeasurer()
+        BoxWithConstraints(Modifier.fillMaxWidth().heightIn(min = with(density) { 24.sp.toDp() }), contentAlignment = Alignment.Center) {
+            val width = constraints.maxWidth
+            val fitted = remember(detail, preferred, width, measurer, density) {
+                val natural = measurer.measure(detail, style = preferred, softWrap = false, maxLines = 1).size.width
+                val fit = ((width - 2).coerceAtLeast(1).toFloat() / natural.coerceAtLeast(1)).coerceAtMost(1f)
+                // Keep the letters tall, with at most 10% extra condensation. Longer lines and
+                // narrower devices take the remaining adjustment in font size.
+                val stretch = fit.coerceAtLeast(0.9f)
+                var style = preferred.copy(fontSize = with(density) { (preferred.fontSize.toPx() * fit / stretch).toSp() },
+                    textGeometricTransform = TextGeometricTransform(scaleX = stretch))
+                // Android rounds glyph advances at the final size. Verify the complete line at that size.
+                val line = Constraints(maxWidth = (width - 2).coerceAtLeast(1))
+                while (style.fontSize.value > 1f &&
+                    measurer.measure(detail, style = style, constraints = line, maxLines = 1).hasVisualOverflow) {
+                    style = style.copy(fontSize = (style.fontSize.value - 0.25f).sp)
+                }
+                style
+            }
+            Text(detail, color = stage.foreground, style = fitted, maxLines = 1,
+                modifier = Modifier.fillMaxWidth())
+        }
+        Text(requireNotNull(stage.hint), color = stage.foreground.copy(alpha = 0.75f),
+            style = MaterialTheme.typography.labelLarge.copy(fontSize = 12.sp, lineHeight = 15.sp),
+            textAlign = TextAlign.Center)
+    }
+}
+
+@Composable
+private fun releaseHintStyle(asking: Boolean) = MaterialTheme.typography.labelSmall.copy(
+    fontSize = if (asking) 12.sp else 10.sp, lineHeight = if (asking) 16.sp else 13.sp, letterSpacing = 0.sp)
+
+@Composable
+private fun releaseButtonStyle(asking: Boolean): TextStyle {
+    val style = vacuumDetailStyle().copy(fontWeight = FontWeight.Bold)
+    if (asking) return style
+    val measurer = rememberTextMeasurer()
+    val available = with(LocalDensity.current) { releaseButtonMaxWidth.roundToPx() - 2 * releaseButtonPadding.roundToPx() }
+    return remember(measurer, style, available) {
+        var fitted = style
+        while (fitted.fontSize.value > 11f &&
+            measurer.measure(RELEASE_SETUP, style = fitted, softWrap = false).size.width > available) {
+            fitted = fitted.copy(fontSize = (fitted.fontSize.value - 1f).sp)
+        }
+        fitted
+    }
+}
+
+@Composable
 private fun VacuumReleaseBanner(safety: SafetyState, onCommand: (SafetyCommand) -> Unit, modifier: Modifier = Modifier) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = modifier.background(DiveColors.DeepBlack.copy(alpha = 0.96f), RoundedCornerShape(14.dp))
-            .border(1.dp, DiveColors.DiveCyan.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
-            .padding(16.dp),
-    ) {
-        Text("VACUUM RELEASED", color = DiveColors.TextPrimary,
-            style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(14.dp))
-        Row(modifier = Modifier.fillMaxWidth()) {
-            VacuumReleaseChoice.entries.forEachIndexed { index, choice ->
-                if (index > 0) Spacer(Modifier.width(12.dp))
-                val selected = safety.vacuumReleaseChoice == choice
-                val foreground = if (selected) DiveColors.DeepBlack else DiveColors.TextPrimary
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.weight(1f)
-                        .background(if (selected) DiveColors.DiveCyan else Color.Transparent, RoundedCornerShape(10.dp))
-                        .border(if (selected) 3.dp else 1.dp,
-                            if (selected) DiveColors.DiveCyan else DiveColors.TextPrimary.copy(alpha = 0.4f), RoundedCornerShape(10.dp))
-                        .selectable(selected = selected, role = Role.RadioButton,
-                            onClick = { onCommand(SafetyCommand.SelectVacuumReleaseChoice(choice)) })
-                        .padding(horizontal = 12.dp, vertical = 18.dp),
-                ) {
-                    AutoShrinkText(if (choice == VacuumReleaseChoice.ShutDown) "SHUT DOWN" else "RESTART PUMP",
-                        color = foreground, maxLines = 1, modifier = Modifier.fillMaxWidth(),
-                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold, textAlign = TextAlign.Center))
-                    Spacer(Modifier.height(6.dp))
-                    Text(if (choice == VacuumReleaseChoice.ShutDown) "HOLD OK" else "PRESS OK",
-                        color = foreground, style = MaterialTheme.typography.titleMedium)
+    val asking = safety.sealMonitor.banner == Banner.ConfirmRelease
+    val hintStyle = releaseHintStyle(asking)
+    Column(horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(top = 4.dp)) {
+        AutoShrinkText(if (asking) RELEASE_QUESTION else "VACUUM RELEASED", color = DiveColors.TextPrimary,
+            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold, textAlign = TextAlign.Center),
+            maxLines = 1, modifier = Modifier.fillMaxWidth().offset(y = 3.dp))
+        val buttonStyle = releaseButtonStyle(asking)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center,
+            modifier = Modifier.fillMaxWidth()) {
+            Text("LEFT / RIGHT TO SELECT", color = DiveColors.TextPrimary, style = hintStyle,
+                textAlign = TextAlign.End, modifier = Modifier.weight(1f).padding(end = 12.dp))
+            // Equal weights give both choices the width required by the longer label at the user's font scale.
+            Row(Modifier.width(IntrinsicSize.Max), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VacuumReleaseChoice.entries.forEach { choice ->
+                    val right = choice == VacuumReleaseChoice.RestartPump
+                    val selected = if (asking) safety.sealMonitor.releaseAnswerYes == right else safety.vacuumReleaseChoice == choice
+                    val foreground = if (selected) DiveColors.DeepBlack else DiveColors.TextPrimary
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.weight(1f).widthIn(min = if (asking) 76.dp else 118.dp)
+                            .selectable(selected = selected, role = Role.RadioButton) {
+                                onCommand(if (asking) SafetyCommand.SelectReleaseAnswer(right) else SafetyCommand.SelectVacuumReleaseChoice(choice))
+                            }.heightIn(min = 48.dp),
+                    ) {
+                        Text(if (asking) (if (right) "YES" else "NO") else (if (right) RELEASE_SETUP else "SHUT DOWN"),
+                            color = foreground, maxLines = 1, modifier = Modifier.fillMaxWidth()
+                                .background(if (selected) DiveColors.DiveCyan else Color.Transparent, RoundedCornerShape(5.dp))
+                                .border(1.dp, if (selected) DiveColors.DiveCyan else DiveColors.TextPrimary.copy(alpha = 0.45f), RoundedCornerShape(5.dp))
+                                .padding(horizontal = releaseButtonPadding, vertical = 4.dp),
+                            style = buttonStyle)
+                    }
                 }
             }
+            Box(Modifier.weight(1f).padding(start = 12.dp)) {
+                Text("MENU/OK CONFIRMS", color = DiveColors.DiveCyan, style = hintStyle,
+                    modifier = Modifier.clickable(role = Role.Button) {
+                        onCommand(if (asking) SafetyCommand.ConfirmReleaseAnswer else SafetyCommand.ConfirmVacuumReleaseChoice)
+                    }.padding(vertical = 3.dp))
+            }
         }
-        Spacer(Modifier.height(12.dp))
-        Text(if (safety.vacuumReleaseChoice == VacuumReleaseChoice.RestartPump && safety.coverOpen != true)
-            "REMOVE THE BLUE CAP TO RESTART" else "LEFT / RIGHT TO SELECT",
-            color = DiveColors.TextPrimary, style = MaterialTheme.typography.labelLarge)
     }
 }
 
@@ -225,24 +333,17 @@ private fun accented(full: String, spans: List<Pair<String, SpanStyle>>) = build
  * viewfinder, and an instruction ghosted over moving water reads as part of the scene.
  */
 @Composable
-private fun CenteredSealBanner(stage: SealStage, modifier: Modifier = Modifier) {
+private fun CenteredSealBanner(stage: SealStage, isVacuumSetup: Boolean) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = modifier
-            .background(
-                color = stage.background.copy(alpha = 0.94f),
-                shape = RoundedCornerShape(10.dp),
-            )
-            .padding(horizontal = 18.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.Center,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
     ) {
+        // Vacuum setup moves the space between lines above the title, keeping the dismissal hint anchored.
+        if (isVacuumSetup) Spacer(Modifier.height(5.dp))
         // One line, always: a centred headline is a verdict, and a verdict that wraps reads as
         // two competing verdicts. The shrink search absorbs the length instead.
-        val headlineStyle = MaterialTheme.typography.headlineSmall.copy(
-            fontWeight = FontWeight.Bold,
-            fontSize = 24.sp,
-            letterSpacing = 1.sp,
-            textAlign = TextAlign.Center,
-        )
+        val headlineStyle = vacuumHeadlineStyle()
         // One toggle drives every flashing accent on the banner. The accent flashes white/black
         // rather than sitting in a static colour: no single colour stands out against both the
         // caution amber and the critical red, but alternation does — the movement is the signal.
@@ -291,12 +392,8 @@ private fun CenteredSealBanner(stage: SealStage, modifier: Modifier = Modifier) 
             )
         }
         stage.detail?.let { detail ->
-            Spacer(modifier = Modifier.height(4.dp))
-            val detailStyle = MaterialTheme.typography.titleMedium.copy(
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 17.sp,
-                textAlign = TextAlign.Center,
-            )
+            Spacer(modifier = Modifier.height(if (isVacuumSetup) 1.dp else 4.dp))
+            val detailStyle = vacuumDetailStyle()
             val detailSpans = listOfNotNull(
                 stage.detailAccent?.let { it to SpanStyle(color = accentColor) },
                 stage.detailTint?.let { (text, base) ->
@@ -329,7 +426,7 @@ private fun CenteredSealBanner(stage: SealStage, modifier: Modifier = Modifier) 
         stage.columns?.let { (left, right) -> SealBannerColumns(left, right, stage.foreground) }
         stage.progress?.let { fraction -> VacuumProgress(fraction, stage.foreground) }
         stage.hint?.let { hint ->
-            Spacer(modifier = Modifier.height(2.dp))
+            if (!isVacuumSetup) Spacer(modifier = Modifier.height(2.dp))
             Text(
                 text = hint,
                 color = stage.foreground.copy(alpha = 0.75f),
@@ -397,47 +494,41 @@ private fun SealBannerColumn(lines: List<String>, foreground: Color, modifier: M
  */
 @Composable
 private fun SealBanner(stage: SealStage, modifier: Modifier = Modifier) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = modifier
-            .background(
-                color = stage.background.copy(alpha = 0.92f),
-                shape = RoundedCornerShape(6.dp),
-            )
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-    ) {
-        AutoShrinkText(
-            text = stage.headline,
-            color = stage.foreground,
-            style = MaterialTheme.typography.headlineSmall.copy(
-                fontWeight = FontWeight.Bold,
-                fontSize = 22.sp,
-                letterSpacing = 1.sp,
-                textAlign = TextAlign.Center,
-            ),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        stage.detail?.let { detail ->
+    MessageBanner(stage.background.copy(alpha = 0.92f), modifier) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(horizontal = 16.dp)) {
             AutoShrinkText(
-                text = detail,
+                text = stage.headline,
                 color = stage.foreground,
-                style = MaterialTheme.typography.titleMedium.copy(
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 16.sp,
+                style = MaterialTheme.typography.headlineSmall.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 22.sp,
+                    letterSpacing = 1.sp,
                     textAlign = TextAlign.Center,
                 ),
-                maxLines = 3,
                 modifier = Modifier.fillMaxWidth(),
             )
-        }
-        stage.progress?.let { fraction -> VacuumProgress(fraction, stage.foreground) }
-        stage.hint?.let { hint ->
-            Text(
-                text = hint,
-                color = stage.foreground.copy(alpha = 0.85f),
-                style = MaterialTheme.typography.labelLarge,
-                textAlign = TextAlign.Center,
-            )
+            stage.detail?.let { detail ->
+                AutoShrinkText(
+                    text = detail,
+                    color = stage.foreground,
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 16.sp,
+                        textAlign = TextAlign.Center,
+                    ),
+                    maxLines = 3,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            stage.progress?.let { fraction -> VacuumProgress(fraction, stage.foreground) }
+            stage.hint?.let { hint ->
+                Text(
+                    text = hint,
+                    color = stage.foreground.copy(alpha = 0.85f),
+                    style = MaterialTheme.typography.labelLarge,
+                    textAlign = TextAlign.Center,
+                )
+            }
         }
     }
 }
@@ -547,211 +638,73 @@ private data class SealStage(
  *
  * Order matters: a failure outranks everything, and a running motor outranks a prompt.
  */
-private fun sealStage(safety: SafetyState): SealStage? {
-    if (safety.vacuumReleasedPrompt) return SealStage(
-        headline = "VACUUM RELEASED",
-        centered = true,
-        background = DiveColors.DiveCyan,
-    )
-    // The adopted-vacuum reminder outranks the state branches for both monitoring AND passed:
-    // adoption starts a clock that keeps promoting the seal on its own, and a diver who leaves
-    // the intro up for three minutes must not have the cap question silently outrun by their own
-    // seal getting healthier. It shows until Menu/OK answers it, whatever tier the hold reaches.
-    val holding = safety.sealState == SealState.LeakMonitoring || safety.sealState == SealState.Passed
-    if (holding && safety.capCloseReminder && !safety.checkDismissed) {
-        return SealStage(
-            headline = "VACUUM REACHED",
-            detail = "CLOSE THE BLUE CAP",
-            hint = "Press Menu/OK for camera controls",
-            background = DiveColors.DiveCyan,
-            centered = true,
-        )
-    }
-    return sealStageFor(safety)
+internal fun leakTestPhase(start: Long?, now: Long): Int = when {
+    start == null || now - start < 4_500L -> 0
+    now - start < PROVISIONAL_MS -> 1
+    else -> 2
 }
 
-private fun sealStageFor(safety: SafetyState): SealStage? = when (safety.sealState) {
-
-    // The confirm is UP, which `InputRouter` intercepts in this state: pressing it says "I have
-    // checked and re-sealed", resets the seal to Unknown, and the normal start flow takes over.
-    // These banners only ever mean an EARLY depressurisation — a shell that vents after the
-    // provisional hold is treated as deliberately opened and never comes here.
-    //
-    // Which banner depends on what the app was TOLD about the cap. Menu/OK on the close-the-cap
-    // banner (`checkDismissed`, which survives into the hold and is cleared by every path that
-    // reopens the port) means the diver claimed a sealed housing — losing pressure after that
-    // claim is a leak, red and unambiguous. Without that acknowledgement the cap was plausibly
-    // still off and the release plausibly the diver's own hand on it, so the same event gets
-    // caution colours and language that allows for both readings.
-    SealState.Failed -> if (safety.restartFailAgoMinutes != null) {
-        // The boot record promised a proven seal and today's readings disproved it: the vacuum
-        // was lost while nobody was watching. The headline leads with how long ago the seal was
-        // last verified good, because "failed" without "since when" is not actionable.
-        val minutes = safety.restartFailAgoMinutes ?: -1L
-        val ago = when {
-            minutes < 0 -> null
-            minutes < 60 -> "$minutes min"
-            else -> "${minutes / 60}h ${minutes % 60}m"
-        }
-        SealStage(
-            headline = if (ago != null) "SEAL FAILED ($ago)" else "SEAL FAILED",
-            detail = if (ago != null) {
-                "DO NOT DIVE. Vacuum was lost while the app was closed.\nSeal last verified $ago ago.\nOpen Housing to check O-ring."
-            } else {
-                "DO NOT DIVE. Vacuum was lost while the app was closed.\nOpen Housing to check O-ring."
-            },
-            detailAccent = "DO NOT DIVE.",
-            hint = "Re-seal Housing, then PRESS UP to re-establish vacuum",
-            background = DiveColors.Critical,
-            foreground = Color.White,
-            centered = true,
-        )
-    } else if (safety.warning?.startsWith(SLOW_LEAK_WARNING_PREFIX) == true) {
-        // The decay watch caught a leak the housing's own firmware alarm is too coarse to see —
-        // its green light is probably STILL ON. Field case: a hair in the O-ring bled -21 to
-        // -15 kPa with the light green throughout. Named head-on, because a red banner beside a
-        // green light otherwise reads as the app being broken.
-        SealStage(
-            headline = "VACUUM SEAL RISK — SLOW LEAK",
-            detail = "DIVE NOT RECOMMENDED. Housing light may still show green —\nthis monitor is more sensitive. Open Housing,\ncheck O-ring and Gray Air Drain Valve.",
-            detailAccent = "DIVE NOT RECOMMENDED.",
-            hint = "Re-seal Housing, then PRESS UP to re-establish vacuum",
-            background = DiveColors.Critical,
-            foreground = Color.White,
-            centered = true,
-        )
-    } else if (safety.checkDismissed) {
-        SealStage(
-            headline = "VACUUM SEAL FAILED — LEAK DETECTED",
-            detail = "DO NOT DIVE. Remove BLUE CAP.\nOpen Housing to check O-ring.",
-            detailAccent = "DO NOT DIVE.",
-            detailTint = "BLUE CAP" to GestureBlue,
-            hint = "Re-seal Housing, then PRESS UP to re-establish vacuum",
-            background = DiveColors.Critical,
-            foreground = Color.White,
-            centered = true,
-        )
-    } else {
-        SealStage(
-            headline = "VACUUM INACTIVE — DO NOT DIVE",
-            headlineAccent = "DO NOT DIVE",
-            detail = "If you did not release vacuum seal,\nOpen Housing to inspect O-ring.",
-            hint = "Reseal housing, then PRESS UP to restore vacuum",
-            background = DiveColors.Warning,
-            centered = true,
-        )
+private fun sealStage(safety: SafetyState, holdPhase: Int, zeroDepth: Boolean): SealStage? {
+    val m = safety.sealMonitor
+    val earlyFailure = (safety.restartFailAgoMinutes ?: m.lostWhileOfflineMinutes)?.takeIf { it >= 0 }?.let {
+        if (it < 60) "SEAL FAILED ($it min)" else "SEAL FAILED (${it / 60}h ${it % 60}m)"
     }
-
-    // Centred like the cap prompt that follows it: the pump-to-cap sequence is one conversation,
-    // and its two banners appearing in the same spot means the diver's eyes never have to move.
-    // A stalled pump never lingers here — the machine stops the motor and drops back to the
-    // pre-pump state, where the diagnosis banners below take over.
-    SealState.Vacuuming -> SealStage(
-        headline = "VACUUM PUMPING",
-        detail = vacuumDetail(safety),
-        hint = "DOWN cancels",
-        progress = vacuumProgress(safety),
-        background = DiveColors.Warning,
-        centered = true,
-    )
-
-    // The cap has to be back on before leak detection means anything, so both of these states say
-    // the same physical thing. Showing it a beat early is better than a gap where nothing is asked.
-    //
-    // Dismissable, unlike the other in-flight stages: the pump has already reached target, so the
-    // diver who screws the cap on without reading the chip loses nothing by silencing it first.
-    SealState.MotorStopping,
-    SealState.WaitingForCoverClosed,
-        -> if (safety.checkDismissed) {
-        null
-    } else {
-        SealStage(
-            headline = "VACUUM REACHED",
-            detail = "CLOSE THE BLUE CAP",
-            hint = "Press Menu/OK for camera controls",
-            background = DiveColors.DiveCyan,
-            centered = true,
-        )
+    fun warning(title: String, detail: String, hint: String? = null, critical: Boolean = false,
+                background: Color = if (critical) DiveColors.Critical else DiveColors.Warning): SealStage =
+        SealStage(headline = title, detail = listOfNotNull(earlyFailure, detail).joinToString("\n"),
+            hint = hint, centered = true, foreground = if (critical) Color.White else DiveColors.DeepBlack,
+            background = background)
+    val setup = "DOWN for vacuum setup · MENU/OK acknowledges"
+    return when (m.banner) {
+        Banner.B00, Banner.B01 -> null
+        Banner.Release, Banner.ConfirmRelease -> SealStage(headline = "VACUUM RELEASED", background = DiveColors.DiveCyan, centered = true)
+        Banner.B03 -> SealStage(headline = "ESTABLISH VACUUM", detail = if (zeroDepth)
+            "Press DOWN to start vacuum pump." else RETURN_TO_SURFACE,
+            hint = if (m.inspected && safety.coverOpen != true) "Open the blue cap before starting the test. Press MENU/OK to dismiss."
+                else "Press MENU/OK to dismiss.",
+            centered = true, foreground = DiveColors.DeepBlack, background = DiveColors.Warning)
+        Banner.B04 -> warning("CAUTION — CHECK VACUUM SEAL", "Dive not recommended. Check O-ring, blue cap & silver air drain valve." +
+            if (safety.warning?.startsWith(SLOW_LEAK_WARNING_PREFIX) == true) " Housing light may still show green." else "", setup)
+        Banner.B05 -> warning("VACUUM INACTIVE — DO NOT DIVE", "Check seal. Press DOWN for vacuum setup.", "MENU/OK acknowledges")
+        Banner.B06 -> warning("CAUTION — RETURN TO SURFACE", "Possible vacuum leak. Surface safely. Remedy any water ingress.", "MENU/OK dismisses")
+        Banner.B07 -> warning("WARNING — VACUUM SEAL FAILURE", "Surface safely. Inspect housing seal and remedy any water ingress.", "MENU/OK acknowledges", true)
+        Banner.B08 -> warning("CAUTION — SEAL INTEGRITY UNCONFIRMED", "Surface safely. Inspect housing for water ingress.", "MENU/OK dismisses")
+        Banner.B09 -> warning("WARNING — NON-SEALED DIVE DETECTED", "Inspect housing seal and remedy any water ingress.", setup, true)
+        Banner.B10 -> warning("WARNING — VACUUM NOT ESTABLISHED", "Surface safely and inspect housing seal. Remedy water ingress.", "MENU/OK acknowledges", true)
+        Banner.B11 -> warning("CAUTION — VACUUM STATUS UNKNOWN", "Seal integrity cannot be confirmed. Surface safely if underwater.")
+        Banner.B12 -> warning("CAUTION — DEPTH STATUS UNKNOWN", "Depth unavailable. Confirm surface before any vacuum operation.")
+        Banner.B13 -> warning("CAUTION — INSPECT VACUUM SEAL", "Possible underwater seal loss. Inspect housing at surface and remedy any water ingress.", setup)
+        Banner.B14 -> warning("WARNING — INSPECT HOUSING", "Vacuum integrity may have failed underwater. Remedy any water ingress.", setup, true)
+        Banner.B15 -> SealStage(headline = "HOUSING SEAL CHECK REQUIRED", detail = when {
+            m.location == Location.Underwater -> "SURFACE SAFELY, REMEDY ANY WATER INGRESS, INSPECT O-RING, BLUE CAP & SILVER AIR DRAIN VALVE"
+            m.submergedSinceSealCheck -> "REMEDY ANY WATER OR SALT INGRESS, INSPECT O-RING, BLUE CAP & SILVER AIR DRAIN VALVE"
+            else -> "INSPECT O-RING INTEGRITY, CHECK BLUE CAP & SILVER AIR DRAIN VALVE FOR LEAKS"
+        }, hint = "then press MENU/OK to confirm", centered = true, background = DiveColors.Warning)
+        Banner.B16 -> if (holdPhase > 0) SealStage(headline = "LEAK TEST", plainChip = true,
+            background = if (holdPhase == 1) DiveColors.Critical else Color.Yellow)
+        else SealStage(headline = "VACUUM LEAK TEST", detail = when (safety.sealState) {
+            SealState.Vacuuming -> vacuumDetail(safety)
+            SealState.MotorStopping, SealState.WaitingForCoverClosed -> "CLOSE THE BLUE CAP"
+            else -> "Checking seal hold. Keep housing out of water."
+        }, hint = if (safety.sealState == SealState.Vacuuming) "Keep housing out of water. DOWN cancels." else null,
+            background = DiveColors.Warning, centered = true)
+        Banner.B17 -> warning("LEAK TEST FAILED — DO NOT DIVE", "Change O-ring. Inspect housing for damage." +
+            if (m.failures >= 4) " Contact manufacturer." else "", "DOWN to recheck at surface",
+            critical = true, background = DiveColors.CriticalDim)
+        Banner.B18 -> SealStage(headline = "LEAK TEST PASSED", hint = "Vacuum stable. Normal mode.", background = DiveColors.Success)
+        Banner.B19 -> warning("LEAK TEST INTERRUPTED", "Return to surface, reconnect and repeat test.", "DOWN to recheck at surface")
+        Banner.Cap -> warning("SEAL NOT CHECKED", "OPEN THE BLUE CAP TO START")
+        Banner.NoSuction -> warning("NO VACUUM SUCTION DETECTED", "Pump stopped. Unscrew blue cap fully. If already off, check housing seal.", setup)
+        Banner.NotBuilding -> warning("VACUUM NOT BUILDING", "Pump stopped. Check O-ring and silver air drain valve.", "At surface, press DOWN for leak check.")
+        Banner.Pumping -> SealStage(headline = "VACUUM PUMPING", detail = vacuumDetail(safety),
+            hint = "DOWN cancels", progress = vacuumProgress(safety), centered = true, background = DiveColors.Warning)
+        Banner.Reached -> SealStage(headline = "VACUUM REACHED", detail = "CLOSE THE BLUE CAP",
+            hint = CAMERA_CONTROLS_HINT, centered = true, background = DiveColors.DiveCyan)
+        Banner.Uncertain -> SealStage(headline = "SEAL UNCERTAIN", hint = safety.warning ?: "Re-run the check", background = DiveColors.Warning)
+        Banner.Status -> if (safety.sealState == SealState.Passed) SealStage(headline = passedLabel(safety),
+            background = if (safety.sealConfidence <= SealConfidence.Provisional) DiveColors.Warning else DiveColors.Success,
+            plainChip = true) else null
     }
-
-    // While the housing is being watched for leaks, the diver is shooting — the hold itself is
-    // reported by `VacuumCountdownChip` in the status row, and the adopted-vacuum reminder is
-    // already handled above the state branches.
-    SealState.LeakMonitoring -> null
-
-    // Amber until the hard verify: "SEAL OK (3 min)" is progress, not a verdict, and green on
-    // it would let a three-minute hold wear the same colour as a proven one. No accent bar —
-    // the announcement is the whole chip.
-    SealState.Passed -> SealStage(
-        headline = passedLabel(safety),
-        background = when (safety.sealConfidence) {
-            SealConfidence.Monitoring, SealConfidence.Provisional -> DiveColors.Warning
-            else -> DiveColors.Success
-        },
-        plainChip = true,
-    )
-
-    SealState.Warning -> SealStage(
-        headline = "SEAL UNCERTAIN",
-        hint = safety.warning ?: "Re-run the check",
-        background = DiveColors.Warning,
-    )
-
-    SealState.CoverOpen,
-    SealState.ReadyToVacuum,
-        -> when {
-        // The machine just shut the pump off on its own; these banners are the only place the
-        // diver learns why. Menu/OK retries (the router treats this state as a start prompt),
-        // DOWN closes them.
-        safety.warning == NO_SUCTION_WARNING && !safety.checkDismissed -> SealStage(
-            headline = "NO VACUUM SUCTION DETECTED",
-            detail = "Pump Stopped. Unscrew BLUE CAP Fully. Then\nPress Menu/OK to pump again. If BLUE CAP\nwas already off, Check Housing Seal.",
-            detailTint = "BLUE CAP" to GestureBlue,
-            hint = "DOWN closes this message",
-            background = DiveColors.Warning,
-            centered = true,
-        )
-        safety.warning == VACUUM_NOT_BUILDING_WARNING && !safety.checkDismissed -> SealStage(
-            headline = "VACUUM NOT BUILDING",
-            detail = "Pump Stopped. Air is leaking into Housing.\nCheck O-ring is clean/seated. Check Gray Air Drain Valve.\nSeal Housing. Next press Menu/OK to pump again.",
-            hint = "DOWN closes this message",
-            background = DiveColors.Warning,
-            centered = true,
-        )
-        else -> startPrompt(safety)
-    }
-
-    SealState.Unknown -> when {
-        safety.checkDismissed -> null
-        safety.coverOpen == true -> startPrompt(safety)
-        // Cover state unknown means the housing has not told us anything yet; claiming the seal is
-        // unchecked would be guessing, and the product does not guess about seal state.
-        safety.coverOpen == false -> if (safety.verifiedVacuumKpa != null) null else SealStage(
-            headline = "SEAL NOT CHECKED",
-            hint = "OPEN THE BLUE CAP TO START",
-            background = DiveColors.Warning,
-        )
-        else -> null
-    }
-}
-
-/**
- * The one moment OK is safe to borrow from the camera: the cap is physically off, so the diver is
- * on the boat with the housing open, not shooting.
- */
-private fun startPrompt(safety: SafetyState): SealStage? {
-    if (safety.checkDismissed || safety.coverOpen != true) return null
-    // A primed boot record awaiting its first pressure sample: the housing may be sealed and
-    // about to prove it. Half a second of silence beats flashing a pump offer that adoption is
-    // about to yank away.
-    if (safety.verifiedVacuumKpa != null) return null
-    return SealStage(
-        headline = "INSERT PHONE INTO HOUSING THEN",
-        detail = "PRESS MENU/OK TO START VACUUM PUMP",
-        hint = "DOWN dismisses",
-        background = DiveColors.Warning,
-        centered = true,
-    )
 }
 
 private fun passedLabel(safety: SafetyState): String {
@@ -818,6 +771,19 @@ fun VacuumCountdownChip(
     modifier: Modifier = Modifier,
 ) {
     if (!housingConnected) return
+
+    if (safety.sealMonitor.dismissedVacuumSetup) {
+        Column(
+            modifier = modifier.background(DiveColors.DeepBlack.copy(alpha = 0.8f), RoundedCornerShape(12.dp))
+                .padding(horizontal = 12.dp, vertical = 5.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text("DO NOT DIVE", color = DiveColors.Critical, style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold)
+            Text("Use Menu to Establish Seal", color = DiveColors.TextPrimary, style = MaterialTheme.typography.labelSmall)
+        }
+        return
+    }
 
     // The cluster exists whenever there is a vacuum worth reporting — the timer is only its
     // second act. MotorStopping and the cap wait have a live reading but no hold yet, and they
@@ -936,5 +902,9 @@ private const val HARD_VERIFY_MS = 300_000L
 /** How long a result stays on screen before the viewfinder gets its space back. */
 private const val RESULT_VISIBLE_MS = 10_000L
 
-/** Centred banners take a comfortable strip of the frame, never the whole width. */
-private const val CENTERED_BANNER_WIDTH = 0.6f
+private const val RELEASE_QUESTION = "DID YOU RELEASE THE VACUUM?"
+private const val RELEASE_SETUP = "VACUUM SETUP"
+private val releaseButtonPadding = 6.dp
+private val releaseButtonMaxWidth = 140.dp
+private const val RETURN_TO_SURFACE = "Return to surface, then press DOWN to start vacuum pump."
+private const val CAMERA_CONTROLS_HINT = "Press Menu/OK for camera controls"

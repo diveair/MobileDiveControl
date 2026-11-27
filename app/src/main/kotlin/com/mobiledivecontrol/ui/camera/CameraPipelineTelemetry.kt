@@ -125,6 +125,11 @@ object CameraPipelineTelemetry {
         event("BIND_WARNING $message")
     }
 
+    internal fun recordPortraitBackend(message: String) {
+        event("PORTRAIT $message")
+        android.util.Log.i("DiveCameraCtrl", "Portrait $message")
+    }
+
     fun recordPreviewSwapFailure(message: String) {
         previewSwapFailures.incrementAndGet()
         event("PREVIEW_SWAP_FAILURE $message")

@@ -70,6 +70,11 @@ fun SafetyScreen(
             .fillMaxSize()
             .background(DiveColors.DeepBlack),
     ) {
+        // The shared HUD owns the live inspection, the hold and its single verdict.
+        if (safety.sealMonitor.verification != com.mobiledivecontrol.core.Verification.Idle ||
+            safety.sealMonitor.banner !in setOf(com.mobiledivecontrol.core.HousingSealTransitions.Banner.B00,
+                com.mobiledivecontrol.core.HousingSealTransitions.Banner.Status) ||
+            safety.sealMonitor.incidents.isNotEmpty()) return@Box
         AnimatedContent(
             targetState = safety.sealState,
             transitionSpec = {
@@ -84,14 +89,14 @@ fun SafetyScreen(
                     icon = Icons.Rounded.Speed,
                     title = "Seal Check",
                     subtitle = "Verify housing is watertight before diving",
-                    instruction = "Press OK to begin",
+                    instruction = "Follow the housing status prompt.",
                     accentColor = DiveColors.DiveCyan,
                 )
                 SealState.CoverOpen -> StepPrompt(
                     icon = Icons.Rounded.LockOpen,
                     title = "Step 1: Open Suction Cover",
                     subtitle = coverStatusText(safety.coverOpen),
-                    instruction = "Open the suction cover, then press OK",
+                    instruction = "Follow the housing status prompt.",
                     accentColor = DiveColors.DiveCyan,
                     showLiveSensor = true,
                     sensorLabel = "Cover",
@@ -102,7 +107,7 @@ fun SafetyScreen(
                     icon = Icons.Rounded.FlipCameraAndroid,
                     title = "Step 2: Opening Solenoid Valve",
                     subtitle = "Valve opening to allow air extraction",
-                    instruction = "Press OK to start pump",
+                    instruction = "Follow the housing status prompt.",
                     accentColor = DiveColors.DiveTeal,
                 )
                 SealState.Vacuuming -> VacuumingStep(

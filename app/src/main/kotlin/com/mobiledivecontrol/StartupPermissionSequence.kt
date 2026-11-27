@@ -2,11 +2,12 @@ package com.mobiledivecontrol
 
 import android.Manifest
 import android.os.Build
+import com.mobiledivecontrol.platform.ble.BlePermissions
 
 /** The actual setup catalog, shared by the Activity and permission-sequence regression tests. */
 internal fun startupRuntimePermissionGroups(
-    sdkInt: Int,
-    bluetoothPermissions: List<String>,
+    sdkInt: Int = Build.VERSION.SDK_INT,
+    bluetoothPermissions: List<String> = BlePermissions.required(),
 ): List<List<Pair<String, String>>> = buildList {
     add(bluetoothPermissions.map { it to "Nearby devices  —  to find your housing" })
     add(listOf(Manifest.permission.CAMERA to "Camera  —  for photos and video"))
@@ -89,7 +90,10 @@ internal fun nextStartupPermissionStep(
             .filterNot(grantedPermissions::contains)
             .filterNot(attemptedPermissions::contains)
         if (requestable.isNotEmpty()) {
-            return StartupPermissionStep(StartupPermissionGate.Request, requestable)
+            // Android requires both location names when upgrading an approximate grant to precise.
+            val request = if (Manifest.permission.ACCESS_FINE_LOCATION in requestable &&
+                Manifest.permission.ACCESS_COARSE_LOCATION in group) group else requestable
+            return StartupPermissionStep(StartupPermissionGate.Request, request)
         }
     }
     if (popupControlRequired && !popupControlSatisfied) {

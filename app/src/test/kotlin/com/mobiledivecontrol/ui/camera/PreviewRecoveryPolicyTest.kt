@@ -8,6 +8,19 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class PreviewRecoveryPolicyTest {
+    @Test fun `Full FHD accepts the S24 viewport crop and rejects actual quality downgrades`() {
+        val full = 2340.0 / 1080
+        fun accepts(w: Int, h: Int, ratio: Double?) = boundVideoSizeSatisfiesRequest(1920, 1080, w, h, ratio)
+        assertTrue(accepts(1920, 886, full))
+        assertTrue(accepts(886, 1920, 1 / full))
+        assertTrue(accepts(1080, 1080, 1.0))
+        assertTrue(accepts(1440, 1080, 4.0 / 3))
+        assertTrue(accepts(1920, 1080, null))
+        assertFalse(accepts(1280, 720, full))
+        assertFalse(accepts(1920, 720, full))
+        assertFalse(accepts(1920, 886, 16.0 / 9))
+        assertFalse(accepts(720, 720, 1.0))
+    }
     @Test
     fun `camera reuse requires the same device and a disconnected preview consumer`() {
         assertTrue(canReuseCameraDevice("0", "0", true))

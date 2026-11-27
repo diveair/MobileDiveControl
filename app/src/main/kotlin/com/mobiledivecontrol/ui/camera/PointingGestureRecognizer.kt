@@ -1,10 +1,12 @@
 package com.mobiledivecontrol.ui.camera
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageProxy
 import com.google.mediapipe.framework.image.ByteBufferImageBuilder
+import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
@@ -47,35 +49,25 @@ internal class PointingGestureRecognizer(
     private val tracker = PointingGestureTracker()
 
     fun analyze(image: ImageProxy, frontCamera: Boolean) {
-        val now = SystemClock.uptimeMillis()
-        if (now - lastAnalyzedAtMs < ANALYSIS_INTERVAL_MS) {
-            image.close()
-            return
-        }
-        lastAnalyzedAtMs = now
-        val engine = recognizer ?: createRecognizer()?.also { recognizer = it }
-        if (engine == null) {
-            image.close()
-            return
-        }
-
-        val rotation = image.imageInfo.rotationDegrees
-        try {
-            val result = image.use { frame ->
-                val source = rgbaBuffer(frame)
-                ByteBufferImageBuilder(
-                    source,
-                    frame.width,
-                    frame.height,
-                    MPImage.IMAGE_FORMAT_RGBA,
-                ).build().use { mpImage ->
-                    engine.recognizeForVideo(
-                        mpImage,
-                        processingOptions(rotation),
-                        now,
-                    )
-                }
+        image.use { frame ->
+            recognize(frame.imageInfo.rotationDegrees, frontCamera) {
+                ByteBufferImageBuilder(rgbaBuffer(frame), frame.width, frame.height, MPImage.IMAGE_FORMAT_RGBA).build()
             }
+        }
+    }
+
+    fun analyzePreviewBitmap(frame: Bitmap) {
+        // A displayed TextureView already applies the front-facing mirror to its image.
+        recognize(0, false) { BitmapImageBuilder(frame).build() }
+    }
+
+    private inline fun recognize(rotation: Int, frontCamera: Boolean, input: () -> MPImage) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastAnalyzedAtMs < ANALYSIS_INTERVAL_MS) return
+        lastAnalyzedAtMs = now
+        val engine = recognizer ?: createRecognizer()?.also { recognizer = it } ?: return
+        try {
+            val result = input().use { mpImage -> engine.recognizeForVideo(mpImage, processingOptions(rotation), now) }
             recordInferenceLatency(SystemClock.uptimeMillis() - now)
             consume(result, now, mirrorHorizontally = frontCamera)
         } catch (error: RuntimeException) {
@@ -89,9 +81,6 @@ internal class PointingGestureRecognizer(
                 gpuDisabled = true
             }
             consume(null, now, mirrorHorizontally = frontCamera)
-        } finally {
-            // ImageProxy.close is idempotent; image.use above normally closed it already.
-            image.close()
         }
     }
 

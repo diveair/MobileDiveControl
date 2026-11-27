@@ -24,7 +24,10 @@ class AirGasWarningTest {
         val warned = tick(source)
         assertEquals(AirGasLevel.Reserve, warned.gasWarning!!.level)
         assertEquals(50.0, warned.gasWarning!!.projectedSurfaceBar!!, 1e-9)
-        assertEquals("HEAD TO YOUR SAFETY STOP", airGasTitle(warned.gasWarning!!, dive))
+        assertEquals("BEGIN PLANNED ASCENT TO SAFETY STOP", airGasTitle(warned.gasWarning!!, dive))
+        val started = dive.copy(active = dive.active!!.copy(stopStarted = true))
+        assertEquals("CHECK AIR RESERVE", airGasTitle(warned.gasWarning!!, started))
+        assertFalse(warned.gasWarning!!.promptsPlannedStopAscent(started))
         assertTrue(warned.gasWarning!!.visible)
     }
 

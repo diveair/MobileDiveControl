@@ -26,15 +26,15 @@ class SlowMotionRecordingPolicyTest {
     }
 
     @Test
-    fun `48 uses real 60 fps input and export retains a full quality budget`() {
-        assertEquals(60, SlowMotionRecordingPolicy.sourceFrameRate(48))
+    fun `capture uses the exact selected cadence and export retains a full quality budget`() {
+        assertEquals(48, SlowMotionRecordingPolicy.sourceFrameRate(48))
         val source = SlowMotionRecordingPolicy.bitrate(1920, 1080, 60.0, true)
         val export = SlowMotionRecordingPolicy.bitrate(1920, 1080, 30.0, true)
         assertEquals(source / 2, export)
         assertTrue(SlowMotionRecordingPolicy.bitrate(1920, 1080, 30.0, false) > export)
         assertEquals(30, SlowMotionRecordingPolicy.sourceFrameRate(30))
         assertEquals(24, SlowMotionRecordingPolicy.sourceFrameRate(24))
-        assertEquals(120, SlowMotionRecordingPolicy.sourceFrameRate(100))
-        assertThrows(IllegalArgumentException::class.java) { SlowMotionRecordingPolicy.sourceFrameRate(90) }
+        assertEquals(100, SlowMotionRecordingPolicy.sourceFrameRate(100))
+        assertThrows(IllegalArgumentException::class.java) { SlowMotionRecordingPolicy.sourceFrameRate(0) }
     }
 }

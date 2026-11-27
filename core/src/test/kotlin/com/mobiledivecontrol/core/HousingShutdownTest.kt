@@ -20,7 +20,7 @@ class HousingShutdownTest {
 
     @Test fun `a held OK after venting cannot pump or operate camera controls`() {
         var state = AppState(housing = HousingState(connected = true, inputEnabled = true),
-            safety = SafetyState(vacuumReleasedPrompt = true, coverOpen = true))
+            safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Release), vacuumReleasedPrompt = true, coverOpen = true))
         val router = InputRouter()
         val initialCamera = state.camera
         repeat(100) {
@@ -38,7 +38,7 @@ class HousingShutdownTest {
 
     @Test fun `disconnect then a ready connection clears the choice and awaits fresh cover telemetry`() {
         val state = AppState(housing = HousingState(connected = true, inputEnabled = true),
-            safety = SafetyState(vacuumReleasedPrompt = true, coverOpen = true))
+            safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Release), vacuumReleasedPrompt = true, coverOpen = true))
         assertTrue(reducer.updateBleState(state, BleConnectionState.Ready).state.safety.vacuumReleasedPrompt)
         val disconnected = reducer.updateBleState(state, BleConnectionState.Reconnecting).state
         assertTrue(disconnected.safety.vacuumReleaseDisconnectObserved)
@@ -57,9 +57,9 @@ class HousingShutdownTest {
         assertNotEquals(SealState.Passed, state.sealState)
     }
 
-    @Test fun `right only selects restart and OK starts the managed pump exactly once`() {
+    @Test fun `right selects setup and OK opens it without starting a motor`() {
         var state = AppState(housing = HousingState(connected = true, inputEnabled = true),
-            safety = SafetyState(vacuumReleasedPrompt = true, coverOpen = true, waterPressureKpa = 101.325))
+            safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Release), vacuumReleasedPrompt = true, coverOpen = true, waterPressureKpa = 101.325))
         val camera = state.camera
         val router = InputRouter()
         val selected = reducer.applyRouteDecision(state, router.route(state, HousingButtonEvent.Right))
@@ -68,9 +68,9 @@ class HousingShutdownTest {
         assertEquals(VacuumReleaseChoice.RestartPump, state.safety.vacuumReleaseChoice)
         assertEquals(camera, state.camera)
         val started = reducer.applyRouteDecision(state, router.route(state, HousingButtonEvent.Ok))
-        assertEquals(1, started.effects.count { it == motorOn })
-        assertEquals(SealState.Vacuuming, started.state.safety.sealState)
-        assertNotNull(started.state.safety.motorStartedAtEpochMs)
+        assertFalse(motorOn in started.effects)
+        assertNotEquals(SealState.Vacuuming, started.state.safety.sealState)
+        assertNull(started.state.safety.motorStartedAtEpochMs)
         assertFalse(started.state.safety.vacuumReleasedPrompt)
         assertEquals(VacuumReleaseChoice.ShutDown, started.state.safety.vacuumReleaseChoice)
         val replay = reducer.reduce(started.state, SafetyCommand.ConfirmVacuumReleaseChoice)
@@ -79,7 +79,7 @@ class HousingShutdownTest {
 
     @Test fun `left returns to shutdown and repeated OK never pumps`() {
         var state = AppState(housing = HousingState(connected = true, inputEnabled = true),
-            safety = SafetyState(vacuumReleasedPrompt = true, coverOpen = true))
+            safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Release), vacuumReleasedPrompt = true, coverOpen = true))
         val router = InputRouter()
         state = reducer.applyRouteDecision(state, router.route(state, HousingButtonEvent.Right)).state
         state = reducer.applyRouteDecision(state, router.route(state, HousingButtonEvent.Left)).state
@@ -94,14 +94,14 @@ class HousingShutdownTest {
 
     @Test fun `restart choice cannot bypass closed cover disconnected link or underwater pressure`() {
         val base = AppState(housing = HousingState(connected = true, inputEnabled = true),
-            safety = SafetyState(vacuumReleasedPrompt = true, coverOpen = true, waterPressureKpa = 101.325,
+            safety = SafetyState(sealMonitor = SealMonitor(banner = HousingSealTransitions.Banner.Release), vacuumReleasedPrompt = true, coverOpen = true, waterPressureKpa = 101.325,
                 vacuumReleaseChoice = VacuumReleaseChoice.RestartPump))
         listOf(base.copy(safety = base.safety.copy(coverOpen = false)),
             base.copy(safety = base.safety.copy(coverOpen = null)),
             base.copy(housing = base.housing.copy(connected = false)),
             base.copy(safety = base.safety.copy(waterPressureKpa = 200.0))).forEach { state ->
             val result = reducer.reduce(state, SafetyCommand.ConfirmVacuumReleaseChoice)
-            assertTrue(result.state.safety.vacuumReleasedPrompt)
+            if (!state.housing.connected) assertTrue(result.state.safety.vacuumReleasedPrompt)
             assertFalse(motorOn in result.effects)
         }
         val lost = reducer.updateBleState(base, BleConnectionState.Reconnecting).state

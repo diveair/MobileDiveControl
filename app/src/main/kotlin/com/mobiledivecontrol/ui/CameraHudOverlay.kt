@@ -7,7 +7,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.offset
@@ -17,6 +16,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
+import com.mobiledivecontrol.ui.components.formatHeading
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.lifecycle.LifecycleOwner
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -41,20 +45,29 @@ import com.mobiledivecontrol.core.AppMode
 import com.mobiledivecontrol.core.AppState
 import com.mobiledivecontrol.core.BleConnectionState
 import com.mobiledivecontrol.core.CameraState
+import com.mobiledivecontrol.core.CameraSettingSpec
 import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.CameraModeId
+import com.mobiledivecontrol.core.DiveSettingsCommand
+import com.mobiledivecontrol.core.HousingSealTransitions.Banner
+import com.mobiledivecontrol.ui.dive.DiveAlertLayer
+import com.mobiledivecontrol.ui.dive.compactStopVisible
 import com.mobiledivecontrol.core.NavigationArrowMesh
 import com.mobiledivecontrol.core.ProjectedArrowPoint
 import com.mobiledivecontrol.theme.DiveColors
 import com.mobiledivecontrol.ui.camera.ExpertRawCaptureState
+import com.mobiledivecontrol.ui.camera.RecordingClock
 import com.mobiledivecontrol.ui.components.ConnectionStatus
 import com.mobiledivecontrol.ui.components.DepthGauge
 import com.mobiledivecontrol.ui.components.liveHudNdlSeconds
 import com.mobiledivecontrol.ui.components.DualBatteryIndicator
 import com.mobiledivecontrol.ui.components.HousingLinkBanner
+import com.mobiledivecontrol.ui.components.LinkNotice
+import com.mobiledivecontrol.ui.components.rememberLinkNotice
 import com.mobiledivecontrol.ui.components.SealCheckIndicator
 import com.mobiledivecontrol.ui.components.VacuumCountdownChip
 import com.mobiledivecontrol.platform.CompassReading
+import kotlinx.coroutines.flow.StateFlow
 import com.mobiledivecontrol.core.HeadingMath
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -70,10 +83,14 @@ fun CameraHudOverlay(
     useMetric: Boolean = true,
     modifier: Modifier = Modifier,
     bluetoothEnabled: Boolean = true,
-    compassReading: CompassReading = CompassReading(),
+    compassReadings: StateFlow<CompassReading>,
+    onCompassMonitoring: (Boolean) -> Unit,
+    lifecycleOwner: LifecycleOwner?,
+    compassCovered: Boolean = false,
     targetHeading: Double? = null,
     hudVisible: Boolean = true,
     onSafetyCommand: (com.mobiledivecontrol.core.SafetyCommand) -> Unit = {},
+    onDiveSettingsCommand: ((DiveSettingsCommand) -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
@@ -82,19 +99,21 @@ fun CameraHudOverlay(
 
         // Full-screen menus such as Diagnostics already render these values in their own
         // layout. Keeping the camera HUD there would cover headings, formulae, and navigation.
-        if (!hudVisible) return@Box
+        if (!hudVisible || state.camera.recordingLocationChooserVisible) {
+            if (onDiveSettingsCommand != null) DiveAlertLayer(state, useMetric, onDiveSettingsCommand)
+            return@Box
+        }
 
-        // The save-album grid is a true modal owned by CameraShellScreen. Let it cover the
-        // camera HUD cleanly; the paused action rail restores every status pill when it closes.
-        if (state.camera.recordingLocationChooserVisible) return@Box
-
-        val skyGuideStatus = skyGuideStatusLabel(
-            camera = state.camera,
-            azimuthDegrees = ExpertRawCaptureState.skyAzimuthDegrees.value,
-            altitudeDegrees = ExpertRawCaptureState.skyAltitudeDegrees.value,
-            hasObserverLocation = ExpertRawCaptureState.observerLatitudeDegrees.value != null &&
-                ExpertRawCaptureState.observerLongitudeDegrees.value != null,
-        )
+        val showReadout = cameraDiveReadoutVisible(state.mode, state.camera)
+        val skyGuideEnabled = remember(state.camera) { skyGuideStatusEnabled(state.camera) }
+        val showSkyBearing = skyGuideEnabled && ExpertRawCaptureState.observerLatitudeDegrees.value != null &&
+            ExpertRawCaptureState.observerLongitudeDegrees.value != null
+        if (lifecycleOwner != null && !compassCovered && (showReadout || showSkyBearing)) {
+            LifecycleResumeEffect(onCompassMonitoring, lifecycleOwner = lifecycleOwner) {
+                onCompassMonitoring(true)
+                onPauseOrDispose { onCompassMonitoring(false) }
+            }
+        }
         OverlayPill(
             modifier = Modifier
                 .align(Alignment.TopStart)
@@ -109,10 +128,14 @@ fun CameraHudOverlay(
                     Spacer(modifier = Modifier.width(10.dp))
                     ConnectionStatus(bleState = state.bleConnectionState)
                 }
-                if (skyGuideStatus != null) {
+                if (skyGuideEnabled) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = skyGuideStatus,
+                        text = if (showSkyBearing) {
+                            val reading by compassReadings.collectAsState()
+                            formatSkyGuideBearing(reading.headingDegrees?.toFloat()
+                                ?: ExpertRawCaptureState.skyAzimuthDegrees.value, ExpertRawCaptureState.skyAltitudeDegrees.value)
+                        } else "SKY GUIDE",
                         color = DiveColors.TextPrimary,
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
@@ -129,7 +152,7 @@ fun CameraHudOverlay(
         // The wrapper Box is measured even when the chip inside renders nothing, so the seal
         // chip's anchor below collapses back to the default the moment the cluster disappears.
         var clusterHeightPx by remember { mutableIntStateOf(0) }
-        val currentResolutionStatus = currentCameraResolutionStatusLabel(state.camera)
+        val currentResolutionStatus = remember(state.camera) { currentCameraResolutionStatusLabel(state.camera) }
         Box(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -162,6 +185,18 @@ fun CameraHudOverlay(
                         fontFamily = FontFamily.Monospace,
                     )
                 }
+                if (state.camera.activeMode == CameraModeId.SlowMotion && state.camera.recordingPaused &&
+                    RecordingClock.reviewUri.value != null) {
+                    val frames = RecordingClock.reviewFrameCount.value
+                    val captureMs = RecordingClock.durationMs.value
+                    val measured = remember(frames, captureMs) {
+                        if (frames != null && captureMs > 0) {
+                            String.format(java.util.Locale.US, "%d frames · %.1f FPS avg", frames, frames * 1000.0 / captureMs)
+                        } else "Recorded FPS unavailable"
+                    }
+                    Text(measured, style = MaterialTheme.typography.labelSmall, color = DiveColors.TextPrimary,
+                        fontFamily = FontFamily.Monospace)
+                }
             }
         }
 
@@ -174,53 +209,9 @@ fun CameraHudOverlay(
         }.takeIf { it > 0.dp }
         val bottomPadding = cameraReadoutBottomPadding(state.mode, state.camera, measuredMenuHeight)
 
-        // Produce the projected arrow and its lock state once. Both the arrow and numeric heading
-        // consume this same result, so their colour cannot disagree at the tolerance boundary.
-        val targetArrowMesh = if (
-            state.mode == AppMode.CameraLive || state.mode == AppMode.CameraAdjust
-        ) {
-            compassReading.cameraBasis?.let { cameraBasis ->
-                targetHeading?.let { heading ->
-                    HeadingMath.navigationArrowMesh(cameraBasis, heading)
-                }
-            }
-        } else {
-            null
-        }
-        val headingTargetSynchronized = targetArrowMesh?.yawErrorDegrees?.let { turn ->
-            abs(turn) < TARGET_HEADING_SYNC_TOLERANCE_DEGREES
-        } == true
-
-        if (cameraDiveReadoutVisible(state.mode, state.camera)) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = bottomPadding),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                if (targetArrowMesh != null && targetHeading != null) {
-                    TargetHeadingArrow(
-                        mesh = targetArrowMesh,
-                        targetHeading = targetHeading,
-                        onHeading = headingTargetSynchronized,
-                        compact = bottomControlMenuOpen,
-                    )
-                    Spacer(modifier = Modifier.height(if (bottomControlMenuOpen) 1.dp else 3.dp))
-                }
-                OverlayPill(compact = bottomControlMenuOpen) {
-                    DepthGauge(
-                        // Optical centring: shift the glyph row within the pill, not the pill itself.
-                        modifier = Modifier.offset(y = 2.dp),
-                        waterPressureKpa = liveWaterPressureKpa,
-                        maxDepthMeters = state.maxDepthMeters,
-                        ndlSeconds = liveHudNdlSeconds(state.diveProfile),
-                        useMetric = useMetric,
-                        temperatureCelsius = state.safety.waterTemperatureC,
-                        headingDegrees = compassReading.headingDegrees,
-                        headingTargetSynchronized = headingTargetSynchronized,
-                    )
-                }
-            }
+        if (showReadout) {
+            HeadingReadout(state, compassReadings, targetHeading, liveWaterPressureKpa, useMetric,
+                bottomControlMenuOpen, Modifier.align(Alignment.BottomCenter).padding(bottom = bottomPadding))
             // Float in the gap above the mode button. Its height must never move the depth
             // pill or navigation arrow, including when pressure/time values alternate.
             com.mobiledivecontrol.ui.dive.AirPressureHud(
@@ -237,16 +228,27 @@ fun CameraHudOverlay(
         val density = LocalDensity.current
         val clusterBottom = with(density) { clusterHeightPx.toDp() }
         val sealTop = if (clusterHeightPx > 0) 16.dp + clusterBottom + SEAL_CLUSTER_GAP else SEAL_TOP
+        val underwaterSealAlert = state.safety.sealMonitor.banner in setOf(
+            com.mobiledivecontrol.core.HousingSealTransitions.Banner.B06, com.mobiledivecontrol.core.HousingSealTransitions.Banner.B07,
+            com.mobiledivecontrol.core.HousingSealTransitions.Banner.B08, com.mobiledivecontrol.core.HousingSealTransitions.Banner.B10)
+        val linkNotice = rememberLinkNotice(state)
+        val showSeal = bluetoothEnabled && linkNotice == null && (state.bleConnectionState == com.mobiledivecontrol.core.BleConnectionState.Ready ||
+            (state.housing.connected && underwaterSealAlert))
+        val compactStop = onDiveSettingsCommand != null && compactStopVisible(state)
+        var sealHeightPx by remember { mutableIntStateOf(0) }
+        val sealVisible = showSeal && !com.mobiledivecontrol.core.airAlertVisible(state)
         SealCheckIndicator(
             safety = state.safety,
-            housingConnected = state.housing.connected,
+            zeroDepth = com.mobiledivecontrol.core.depthReadsZero(
+                com.mobiledivecontrol.core.pressureDepthMeters(liveWaterPressureKpa), useMetric),
+            housingConnected = sealVisible,
+            showStatus = !compactStop,
+            onTopContentHeightChanged = { sealHeightPx = it },
             onCommand = onSafetyCommand,
             topPadding = sealTop,
             coveredBackdrop = if (state.diveProfile.stopExpanded)
                 com.mobiledivecontrol.ui.dive.safetyStopAccent(state.diveProfile) else null,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(start = 16.dp, end = 16.dp),
+            modifier = Modifier.fillMaxSize(),
         )
 
         // Every housing-link state owns the same dead-centre anchor. Keeping the placement here,
@@ -255,23 +257,19 @@ fun CameraHudOverlay(
         val alertAir = state.airAlerts.simulation?.air ?: state.airAlerts
         val airMessageVisible = !com.mobiledivecontrol.core.airAlertPresentationBlocked(state) &&
             (alertAir.prompt != null || alertAir.entry != null || alertAir.gasWarning?.visible == true)
-        if (!airMessageVisible) HousingLinkBanner(
+        if (!airMessageVisible && !(showSeal && underwaterSealAlert)) HousingLinkBanner(
             bleState = state.bleConnectionState,
             bluetoothEnabled = bluetoothEnabled,
             housingBatteryPercent = state.housing.batteryPercent,
-            modifier = Modifier
-                .align(Alignment.Center)
-                .then(
-                    if (bluetoothEnabled) {
-                        Modifier.padding(start = 16.dp, end = 16.dp)
-                    } else {
-                        // Bluetooth-off remains full width, but now shares the same vertical
-                        // centre as every housing-link banner.
-                        Modifier
-                    },
-                )
-                .fillMaxWidth(),
+            reconnectingSession = state.safety.sealMonitor.wasDisconnected,
+            showConnected = linkNotice == LinkNotice.Connected,
+            modifier = Modifier.align(Alignment.Center),
         )
+        if (onDiveSettingsCommand != null) {
+            val aboveStop = if (sealVisible && state.safety.sealMonitor.banner != Banner.Status && sealHeightPx > 0)
+                with(density) { sealHeightPx.toDp() } + SEAL_CLUSTER_GAP else 0.dp
+            DiveAlertLayer(state, useMetric, onDiveSettingsCommand, compactTop = sealTop + aboveStop)
+        }
     }
 }
 
@@ -365,7 +363,7 @@ private fun TargetHeadingArrow(
 
 
 /** Same slot the link banner uses, since the two are never both relevant with a healthy link. */
-private val SEAL_TOP = 64.dp
+internal val SEAL_TOP = 64.dp
 
 /** Breathing room between the vacuum cluster's bottom edge and the seal chip below it. */
 private val SEAL_CLUSTER_GAP = 6.dp
@@ -395,6 +393,45 @@ internal fun cameraReadoutBottomPadding(mode: AppMode, camera: CameraState, meas
     else -> 28.dp
 }
 
+@Composable
+private fun HeadingReadout(
+    state: AppState,
+    compassReadings: StateFlow<CompassReading>,
+    targetHeading: Double?,
+    liveWaterPressureKpa: Double?,
+    useMetric: Boolean,
+    compact: Boolean,
+    modifier: Modifier,
+) {
+    val reading = compassReadings.collectAsState()
+    val headingLabel by remember(reading) { derivedStateOf {
+        reading.value.headingDegrees?.let(::formatHeading)
+    } }
+    // The arrow consumes the full-precision basis. With no target, only a change in the
+    // displayed bearing needs to invalidate the readout.
+    val mesh = if ((state.mode == AppMode.CameraLive || state.mode == AppMode.CameraAdjust) && targetHeading != null)
+        reading.value.cameraBasis?.let { HeadingMath.navigationArrowMesh(it, targetHeading) } else null
+    val synchronized = mesh?.yawErrorDegrees?.let { abs(it) < TARGET_HEADING_SYNC_TOLERANCE_DEGREES } == true
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        if (mesh != null && targetHeading != null) {
+            TargetHeadingArrow(mesh = mesh, targetHeading = targetHeading, onHeading = synchronized, compact = compact)
+            Spacer(Modifier.height(if (compact) 1.dp else 3.dp))
+        }
+        OverlayPill(compact = compact) {
+            DepthGauge(
+                modifier = Modifier.offset(y = 2.dp),
+                waterPressureKpa = liveWaterPressureKpa,
+                maxDepthMeters = state.maxDepthMeters,
+                ndlSeconds = liveHudNdlSeconds(state.diveProfile),
+                useMetric = useMetric,
+                temperatureCelsius = state.safety.waterTemperatureC,
+                headingLabel = headingLabel,
+                headingTargetSynchronized = synchronized,
+            )
+        }
+    }
+}
+
 internal fun cameraDiveReadoutVisible(mode: AppMode, camera: CameraState): Boolean =
     mode != AppMode.Gallery && !camera.panoramaReviewAvailable
 
@@ -405,21 +442,22 @@ internal fun skyGuideStatusLabel(
     altitudeDegrees: Float,
     hasObserverLocation: Boolean,
 ): String? {
-    if (camera.activeMode != CameraModeId.ExpertRaw) return null
-    val setting = CameraCatalog.settingsFor(camera).firstOrNull { it.id == "expert.sky_guide" }
-        ?: return null
-    if (CameraCatalog.currentValue(camera, setting) != "On") return null
-    return if (hasObserverLocation) {
-        "SKY GUIDE  ${azimuthDegrees.roundToInt().toString().padStart(3, '0')}°  " +
-            "${altitudeDegrees.roundToInt()}° ALT"
-    } else {
-        "SKY GUIDE"
-    }
+    if (!skyGuideStatusEnabled(camera)) return null
+    return if (hasObserverLocation) formatSkyGuideBearing(azimuthDegrees, altitudeDegrees) else "SKY GUIDE"
 }
 
+private fun skyGuideStatusEnabled(camera: CameraState): Boolean {
+    if (camera.activeMode != CameraModeId.ExpertRaw) return false
+    val setting = CameraCatalog.settingsFor(camera).firstOrNull { it.id == "expert.sky_guide" }
+        ?: return false
+    return CameraCatalog.currentValue(camera, setting) == "On"
+}
+
+private fun formatSkyGuideBearing(azimuth: Float, altitude: Float) =
+    "SKY GUIDE  ${azimuth.roundToInt().toString().padStart(3, '0')}°  ${altitude.roundToInt()}° ALT"
+
 /** The selected file resolution, or the photo pixel count when that mode has no size selector. */
-internal fun currentCameraResolutionLabel(camera: CameraState): String? {
-    val settings = CameraCatalog.settingsFor(camera)
+internal fun currentCameraResolutionLabel(camera: CameraState, settings: List<CameraSettingSpec> = CameraCatalog.settingsFor(camera)): String? {
     val resolution = settings.firstOrNull { it.id.endsWith(".resolution") }
         ?: settings.firstOrNull { it.id.endsWith(".megapixels") }
         ?: return null
@@ -428,14 +466,19 @@ internal fun currentCameraResolutionLabel(camera: CameraState): String? {
 
 /** One compact HUD line: active dynamic range first, followed by the encoded resolution. */
 internal fun currentCameraResolutionStatusLabel(camera: CameraState): String? {
-    val resolution = currentCameraResolutionLabel(camera) ?: return null
-    val dynamicRange = currentCameraHdrLogLabel(camera)
-    return listOfNotNull(dynamicRange, resolution).joinToString(" ")
+    val settings = CameraCatalog.settingsFor(camera)
+    val resolution = currentCameraResolutionLabel(camera, settings) ?: return null
+    val dynamicRange = currentCameraHdrLogLabel(camera, settings)
+    val fps = if (camera.activeMode in setOf(CameraModeId.Video, CameraModeId.ProVideo, CameraModeId.SlowMotion)) {
+        settings.firstOrNull { it.id.endsWith(".frame_rate") }?.let {
+            CameraCatalog.captureFrameRateFps(CameraCatalog.currentValue(camera, it))?.let { rate -> "$rate FPS" }
+        }
+    } else null
+    return listOfNotNull(dynamicRange, fps, resolution).joinToString(" ")
 }
 
 /** The active video dynamic-range choice, without repeating the camera mode name. */
-internal fun currentCameraHdrLogLabel(camera: CameraState): String? {
-    val settings = CameraCatalog.settingsFor(camera)
+internal fun currentCameraHdrLogLabel(camera: CameraState, settings: List<CameraSettingSpec> = CameraCatalog.settingsFor(camera)): String? {
     val log = settings.firstOrNull { it.id.endsWith(".log") }
     val hdr = settings.firstOrNull { it.id.endsWith(".hdr") || it.id.endsWith(".hdr_log") }
     val active = mutableListOf<String>()

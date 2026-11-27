@@ -24,6 +24,12 @@ class ButtonEventNormalizer(
     private var lastEvent: HousingButtonEvent? = null
     private var lastAcceptedAt: Instant? = null
     private var repeatCount: Int = 0
+    private var suppressRepeats = false
+
+    /** A selection that changed the foreground UI consumes the rest of this physical press. */
+    fun suppressRepeatsOfLastPress() {
+        suppressRepeats = true
+    }
 
     fun accept(event: HousingButtonEvent, at: Instant): AcceptedButtonEvent? {
         val previousEvent = lastEvent
@@ -55,6 +61,8 @@ class ButtonEventNormalizer(
 
         lastEvent = event
         lastAcceptedAt = at
+        if (!continuesRepeatSequence) suppressRepeats = false
+        if (suppressRepeats) return null
         return AcceptedButtonEvent(event = event, repeatCount = repeatCount)
     }
 
@@ -62,5 +70,6 @@ class ButtonEventNormalizer(
         lastEvent = null
         lastAcceptedAt = null
         repeatCount = 0
+        suppressRepeats = false
     }
 }

@@ -43,13 +43,13 @@ internal val EIGHT_K_SIZE: Size
  * width, height, minimum fps, maximum fps, recording limit and vendor flags.
  * Keep only the exact 8K rates the native recording table claims.
  */
-internal fun samsungVendorEightKFrameRates(configurations: IntArray?): List<Int> =
+internal fun samsungVendorEightKFrameRates(configurations: IntArray?, fixedRates: Set<Int> = emptySet()): List<Int> =
     configurations
         ?.asList()
         ?.chunked(6)
         .orEmpty()
         .filter { row -> row.size == 6 && row[0] == EIGHT_K_WIDTH && row[1] == EIGHT_K_HEIGHT }
-        .flatMap { row -> listOf(24, 30).filter { fps -> fps in row[2]..row[3] } }
+        .flatMap { row -> (fixedRates + row[2] + row[3]).filter { fps -> fps > 0 && fps in row[2]..row[3] } }
         .distinct()
         .sorted()
 
@@ -106,7 +106,7 @@ internal class Camera2EightKRecorder(
         onFinalized: (Result<Long>) -> Unit,
     ) {
         check(!isBusy) { "An 8K recording is already active or starting" }
-        require(request.fps == 24 || request.fps == 30) { "8K requires 24 or 30 fps" }
+        require(request.fps > 0) { "8K requires a positive capture rate" }
         this.request = request
         this.onStarted = onStarted
         this.onFinalized = onFinalized
@@ -168,7 +168,11 @@ internal class Camera2EightKRecorder(
                     } else {
                         MediaCodecInfo.CodecProfileLevel.HEVCProfileMain
                     },
-                    MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel6,
+                    when {
+                        request.fps <= 30 -> MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel6
+                        request.fps <= 60 -> MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel61
+                        else -> MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel62
+                    },
                 )
             }
             if (request.audioEnabled) {
@@ -335,7 +339,7 @@ internal class Camera2EightKRecorder(
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest,
             result: android.hardware.camera2.TotalCaptureResult) {
             if (session !== this@Camera2EightKRecorder.session) return
-            CameraControlTrace.record("EightK", request, result)
+            CameraControlTrace.record("EightK", request, result, context, session)
             onCaptureTelemetry?.invoke(result)
         }
     }
