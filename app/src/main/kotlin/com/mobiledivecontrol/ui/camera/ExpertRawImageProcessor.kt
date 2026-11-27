@@ -118,8 +118,11 @@ internal object ExpertRawImageProcessor {
             onProgress(1.0)
             return@runCatching output
         }
-        files.drop(1).forEachIndexed { index, file ->
-            val decoded = decodeMutable(file)
+        val rowsPerChunk = minOf(32, output.height, Int.MAX_VALUE / output.width)
+        val a = IntArray(rowsPerChunk * output.width)
+        val b = IntArray(a.size)
+        for (index in 1 until files.size) {
+            val decoded = decodeMutable(files[index])
             val frame = if (decoded.width == output.width && decoded.height == output.height) {
                 decoded
             } else {
@@ -131,10 +134,13 @@ internal object ExpertRawImageProcessor {
                 output = output,
                 incoming = frame,
                 mode = mode,
-                completedBeforeIncoming = index + 1,
+                completedBeforeIncoming = index,
+                a = a,
+                b = b,
+                chunkRows = rowsPerChunk,
             )
             frame.recycle()
-            onProgress((index + 2).toDouble() / files.size)
+            onProgress((index + 1).toDouble() / files.size)
         }
         output
     }
@@ -211,10 +217,13 @@ internal object ExpertRawImageProcessor {
         incoming: Bitmap,
         mode: ExpertRawBlendMode,
         completedBeforeIncoming: Int,
+        a: IntArray,
+        b: IntArray,
+        chunkRows: Int,
     ) {
-        val chunkRows = 32
-        val a = IntArray(output.width * chunkRows)
-        val b = IntArray(output.width * chunkRows)
+        // With 8-bit channels and a divisor >= 256 the floor of the weighted average is
+        // always the previous channel or one below it. This bound is exact and avoids overflow.
+        val weight = min(completedBeforeIncoming, 255)
         var top = 0
         while (top < output.height) {
             val rows = min(chunkRows, output.height - top)
@@ -222,7 +231,7 @@ internal object ExpertRawImageProcessor {
             output.getPixels(a, 0, output.width, 0, top, output.width, rows)
             incoming.getPixels(b, 0, output.width, 0, top, output.width, rows)
             for (i in 0 until count) {
-                a[i] = blendPixel(a[i], b[i], mode, completedBeforeIncoming)
+                a[i] = blendPixel(a[i], b[i], mode, weight)
             }
             output.setPixels(a, 0, output.width, 0, top, output.width, rows)
             top += rows
@@ -242,32 +251,24 @@ internal object ExpertRawImageProcessor {
         val bg = second shr 8 and 0xff
         val bb = second and 0xff
         fun luma(r: Int, g: Int, b: Int) = r * 54 + g * 183 + b * 19
-        val (r, g, b) = when (mode) {
-            ExpertRawBlendMode.Add -> Triple(
+        fun rgb(r: Int, g: Int, b: Int) = (0xff shl 24) or (r shl 16) or (g shl 8) or b
+        return when (mode) {
+            ExpertRawBlendMode.Add -> rgb(
                 min(255, ar + br),
                 min(255, ag + bg),
                 min(255, ab + bb),
             )
             ExpertRawBlendMode.Average -> {
                 val total = completedBeforeIncoming + 1
-                Triple(
+                rgb(
                     (ar * completedBeforeIncoming + br) / total,
                     (ag * completedBeforeIncoming + bg) / total,
                     (ab * completedBeforeIncoming + bb) / total,
                 )
             }
-            ExpertRawBlendMode.Bright -> if (luma(br, bg, bb) > luma(ar, ag, ab)) {
-                Triple(br, bg, bb)
-            } else {
-                Triple(ar, ag, ab)
-            }
-            ExpertRawBlendMode.Dark -> if (luma(br, bg, bb) < luma(ar, ag, ab)) {
-                Triple(br, bg, bb)
-            } else {
-                Triple(ar, ag, ab)
-            }
+            ExpertRawBlendMode.Bright -> (if (luma(br, bg, bb) > luma(ar, ag, ab)) second else first) or (0xff shl 24)
+            ExpertRawBlendMode.Dark -> (if (luma(br, bg, bb) < luma(ar, ag, ab)) second else first) or (0xff shl 24)
         }
-        return (0xff shl 24) or (r shl 16) or (g shl 8) or b
     }
 
     private fun mixArgb(sharp: Int, blurred: Int, amount: Double): Int {

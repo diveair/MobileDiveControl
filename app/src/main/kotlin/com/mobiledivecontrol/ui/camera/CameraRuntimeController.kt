@@ -85,6 +85,7 @@ import com.mobiledivecontrol.core.CameraCatalog
 import com.mobiledivecontrol.core.CameraModeId
 import com.mobiledivecontrol.core.CameraCommand
 import com.mobiledivecontrol.core.CameraState
+import com.mobiledivecontrol.core.CameraSettingSpec
 import com.mobiledivecontrol.core.AutofocusHoldPolicy
 import com.mobiledivecontrol.core.FocusCurveMode
 import com.mobiledivecontrol.core.SamsungLogProfile
@@ -10128,14 +10129,27 @@ class CameraRuntimeController(
         shader.strength = (currentValue(state, ".effect_strength")?.toFloatOrNull() ?: 4f).coerceIn(0f, 7f) / 7f
     }
 
-    private data class ResolvedCatalog(val state: CameraState, val settings: List<com.mobiledivecontrol.core.CameraSettingSpec>)
+    private class ResolvedCatalog(val settings: List<CameraSettingSpec>) {
+        val bySuffix = buildMap {
+            for (spec in settings) {
+                val dot = spec.id.lastIndexOf('.')
+                if (dot >= 0) putIfAbsent(spec.id.substring(dot), spec)
+            }
+        }
+    }
     @Volatile private var resolvedCatalog: ResolvedCatalog? = null
 
-    private fun currentValue(cameraState: CameraState, vararg suffixes: String): String? {
+    private fun currentValue(cameraState: CameraState, suffix: String): String? {
+        val settings = CameraCatalog.settingsFor(cameraState)
         val cached = resolvedCatalog
-        val settings = if (cached?.state === cameraState) cached.settings else
-            CameraCatalog.settingsFor(cameraState).also { resolvedCatalog = ResolvedCatalog(cameraState, it) }
-        val spec = settings.firstOrNull { setting -> suffixes.any { suffix -> setting.id.endsWith(suffix) } }
+        val catalog = if (cached != null && cached.settings === settings) cached else
+            ResolvedCatalog(settings).also { resolvedCatalog = it }
+        return catalog.bySuffix[suffix]?.let { CameraCatalog.currentValue(cameraState, it) }
+    }
+
+    private fun currentValue(cameraState: CameraState, vararg suffixes: String): String? {
+        // Several legacy alternatives can match; preserve the first match in catalog order.
+        val spec = CameraCatalog.settingsFor(cameraState).firstOrNull { setting -> suffixes.any { setting.id.endsWith(it) } }
             ?: return null
         return CameraCatalog.currentValue(cameraState, spec)
     }

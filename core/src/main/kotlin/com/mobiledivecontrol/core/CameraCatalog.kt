@@ -385,8 +385,41 @@ object CameraCatalog {
     fun proVideoFrameRateOption(captureFps: Int, playbackFps: Double = captureFps.toDouble()): String =
         "${captureFps}fps/${frameRateLabel(playbackFps)}fps playback"
 
-    /** [settingsFor] with every clamp the CameraState itself implies — the one call the reducer and UI share. */
+    private class ResolvedSettings(val camera: CameraState, val settings: List<CameraSettingSpec>) {
+        private val isoId = settings.firstOrNull { it.id.endsWith(".iso") }?.id
+        // Include the graph's own keys as well as the controls: some legacy mode prefixes differ.
+        private val choiceIds = buildSet {
+            val prefix = modeKey(camera.activeMode)
+            add("$prefix.lens")
+            add("$prefix.resolution")
+            add("$prefix.frame_rate")
+            for (spec in settings) {
+                if (spec.id.endsWith(".resolution") || spec.id.endsWith(".frame_rate") ||
+                    spec.id.endsWith(".log") || spec.id == isoId) add(spec.id)
+            }
+        }
+
+        fun matches(next: CameraState) = camera.activeMode == next.activeMode &&
+            camera.deviceVariant == next.deviceVariant && camera.capabilities === next.capabilities &&
+            camera.detectedLenses === next.detectedLenses &&
+            (camera.settingValues === next.settingValues || choiceIds.all { camera.settingValues[it] == next.settingValues[it] }) &&
+            (camera.sliderSensitivities === next.sliderSensitivities || isoId == null ||
+                camera.sliderSensitivities[isoId] == next.sliderSensitivities[isoId])
+    }
+
+    // Immutable snapshots keep reads lock-free. Concurrent misses may evict an entry early.
+    @Volatile private var recentResolvedSettings = emptyList<ResolvedSettings>()
+
+    /** The same hardware and selection produce the same control limits for the reducer, HUD and camera. */
     fun settingsFor(camera: CameraState): List<CameraSettingSpec> {
+        val recent = recentResolvedSettings
+        for (entry in recent) if (entry.matches(camera)) return entry.settings
+        val settings = resolveSettings(camera)
+        recentResolvedSettings = listOf(ResolvedSettings(camera, settings)) + recent.take(7)
+        return settings
+    }
+
+    private fun resolveSettings(camera: CameraState): List<CameraSettingSpec> {
         val settings = settingsFor(
             camera.activeMode,
             camera.deviceVariant,

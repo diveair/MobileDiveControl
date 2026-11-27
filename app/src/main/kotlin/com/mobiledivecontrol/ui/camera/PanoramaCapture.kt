@@ -101,6 +101,11 @@ internal fun panoramaProfileTone(
     }.coerceIn(0, 255)
 }
 
+private object PanoramaToneTables {
+    val hdr = IntArray(256) { panoramaProfileTone(it, PanoramaDynamicRangeProfile.Hdr) }
+    val log = IntArray(256) { panoramaProfileTone(it, PanoramaDynamicRangeProfile.Log) }
+}
+
 /** Applies the selected luma curve while preserving hue and deliberately controlling chroma. */
 internal fun panoramaProfileArgb(
     pixel: Int,
@@ -111,16 +116,10 @@ internal fun panoramaProfileArgb(
     val green = pixel ushr 8 and 0xff
     val blue = pixel and 0xff
     val luma = (54 * red + 183 * green + 19 * blue + 128) shr 8
-    val mappedLuma = panoramaProfileTone(luma, profile)
-    val saturation = when (profile) {
-        PanoramaDynamicRangeProfile.Hdr -> 282 // 1.10x: vivid HDR presentation
-        PanoramaDynamicRangeProfile.Log -> 184 // 0.72x: flat grading profile
-        PanoramaDynamicRangeProfile.Off -> 256
-    }
-    val lumaShift = mappedLuma - luma
-    fun channel(value: Int): Int = (
-        luma + (value - luma) * saturation / 256 + lumaShift
-        ).coerceIn(0, 255)
+    val hdr = profile == PanoramaDynamicRangeProfile.Hdr
+    val mappedLuma = (if (hdr) PanoramaToneTables.hdr else PanoramaToneTables.log)[luma]
+    val saturation = if (hdr) 282 else 184
+    fun channel(value: Int): Int = (mappedLuma + (value - luma) * saturation / 256).coerceIn(0, 255)
     return (pixel and -0x1000000) or
         (channel(red) shl 16) or
         (channel(green) shl 8) or

@@ -9,6 +9,26 @@ import kotlin.test.assertTrue
 class CameraCatalogTest {
 
     @Test
+    fun `meter changes reuse the resolved controls and camera input changes invalidate them`() {
+        val state = CameraState(activeMode = CameraModeId.Pro, detectedLenses = listOf("1x", "3x"))
+        val original = CameraCatalog.settingsFor(state)
+        assertTrue(original === CameraCatalog.settingsFor(state.copy(meteredExposure = MeteredExposure(iso = 320))))
+        val focused = state.copy(settingValues = state.settingValues + ("pro.manual_focus" to "0.635"))
+        val unchangedLimits = CameraCatalog.settingsFor(focused)
+        assertTrue(unchangedLimits === original)
+        assertEquals("0.635", CameraCatalog.currentValue(focused, unchangedLimits.first { it.id == "pro.manual_focus" }))
+        val changed = state.copy(capabilities = CameraCapabilities(isoMin = 100, isoMax = 800))
+        val clipped = CameraCatalog.settingsFor(changed)
+        assertTrue(clipped !== original)
+        assertTrue(clipped.first { it.id == "pro.iso" }.options.all { it == "Auto" || it.toInt() in 100..800 })
+        val customIso = changed.copy(settingValues = changed.settingValues + ("pro.iso" to "317"))
+        assertContains(CameraCatalog.settingsFor(customIso).first { it.id == "pro.iso" }.options, "317")
+        assertEquals(listOf("1x"), CameraCatalog.settingsFor(customIso.copy(detectedLenses = listOf("1x")))
+            .first { it.id == "pro.lens" }.options)
+        assertTrue(CameraCatalog.settingsFor(state.copy(activeMode = CameraModeId.Food)).none { it.id == "pro.iso" })
+    }
+
+    @Test
     fun `S24 capture menus intersect each shooting mode with the active lens`() {
         val all = listOf(15, 24, 26, 30, 60, 100, 120, 240)
         val rawRates = listOf("SD 480p", "HD 720p", "FHD 1920×824", "FHD", "UHD 4K", "8K").associateWith { all }
